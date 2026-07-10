@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/">
+        <file>custom.qss</file>
+        <file>icon_ruler.png</file>
+    </qresource>
+</RCC>
