@@ -1,0 +1,17 @@
+# Ignore STM32 build directories
+**/Debug/
+**/Release/
+
+# Ignore compiled object files and binaries
+*.o
+*.su
+*.cyclo
+*.d
+*.elf
+*.map
+*.hex
+*.bin
+*.list
+
+# Local IDE files
+.metadata/
