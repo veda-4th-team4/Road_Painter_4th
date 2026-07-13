@@ -52,7 +52,11 @@ void MX_USART1_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART1_Init 2 */
-
+  /*
+   * Raspberry Pi 명령 링크:
+   * PA9=TX, PA10=RX, 115200 baud, 8-N-1, 3.3 V TTL.
+   * main.c에서 HAL_UART_Receive_IT()로 1-byte 인터럽트 수신을 시작합니다.
+   */
   /* USER CODE END USART1_Init 2 */
 
 }
@@ -81,7 +85,11 @@ void MX_USART2_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
-
+  /*
+   * Nucleo ST-Link Virtual COM 디버그 링크:
+   * PA2=TX, PA3=RX, 115200 baud, 8-N-1.
+   * main.c가 사람이 읽는 부팅/진단 문자열만 이 포트에 출력합니다.
+   */
   /* USER CODE END USART2_Init 2 */
 
 }
@@ -103,15 +111,24 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     PA9     ------> USART1_TX
     PA10     ------> USART1_RX
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_9|GPIO_PIN_10;
+    /* PA9: USART1_TX */
+    GPIO_InitStruct.Pin = GPIO_PIN_9;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+    /*
+     * PA10: USART1_RX. Raspberry Pi가 분리된 동안 입력이 부유하며 가짜 바이트를
+     * 만들지 않도록 UART idle 레벨인 HIGH로 내부 Pull-up합니다.
+     */
+    GPIO_InitStruct.Pin = GPIO_PIN_10;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
     /* USART1 interrupt Init */
-    HAL_NVIC_SetPriority(USART1_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
     HAL_NVIC_EnableIRQ(USART1_IRQn);
   /* USER CODE BEGIN USART1_MspInit 1 */
 
@@ -138,7 +155,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     /* USART2 interrupt Init */
-    HAL_NVIC_SetPriority(USART2_IRQn, 0, 0);
+    HAL_NVIC_SetPriority(USART2_IRQn, 2, 0);
     HAL_NVIC_EnableIRQ(USART2_IRQn);
   /* USER CODE BEGIN USART2_MspInit 1 */
 

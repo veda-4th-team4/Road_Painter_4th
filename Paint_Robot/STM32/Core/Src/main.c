@@ -19,15 +19,17 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "gpio.h"
+#include "tim.h"
 #include "usart.h"
 
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
 #include <string.h>
 
-#include "packet_parser.h"
+#include "motor.h"
+#include "servo.h"
+#include "uart_protocol.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -48,7 +50,6 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint8_t rx_raw_byte; // 하드웨어 1바이트 수신 버퍼
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -92,21 +93,37 @@ int main(void) {
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_USART1_UART_Init();
+  MX_TIM1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  Packet_Parser_Init(&huart1);
-  HAL_UART_Receive_IT(&huart1, &rx_raw_byte, 1);
-  /*  if (HAL_UART_Receive_IT(&huart2, &rx_test_byte, 1) != HAL_OK) {
-        // 인터럽트 개방 실패 시 Nucleo 보드의 LD2(초록 LED)를 켭니다.
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
-    }*/
-  char boot_msg[] = "=== STM32 Paint Robot Telemetry Boot OK ===\r\n";
+  /*
+   * 초기화 순서가 중요합니다.
+   * 1) GPIO가 먼저 EN=HIGH(드라이버 비활성) 안전 상태를 만듭니다.
+   * 2) TIM1 서보 PWM을 OFF 위치에서 시작합니다.
+   * 3) TIM2 20 kHz 모터 실시간 interrupt를 시작합니다.
+   * 4) 마지막으로 USART1 바이너리 프로토콜 수신을 시작합니다.
+   */
+  if (Servo_Init() != HAL_OK || Motor_Init() != HAL_OK) {
+    Error_Handler();
+  }
+
+  /*
+   * USART1(PA9 TX/PA10 RX): V-[HW] UART 바이너리 프레임, 115200-8-N-1
+   * USART2(PA2 TX/PA3 RX): ST-Link Virtual COM 디버그 출력, 115200-8-N-1
+   */
+  if (UartProtocol_Init(&huart1, &huart2) != HAL_OK) {
+    Error_Handler();
+  }
+
+  char boot_msg[] = "=== STM32 Paint Robot Binary Control Ready ===\r\n";
   HAL_UART_Transmit(&huart2, (uint8_t *)boot_msg, strlen(boot_msg), 100);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1) {
-    Packet_Parser_Process();
+    /* 비블로킹 RX 파싱, 300 ms watchdog, 10 Hz STATUS 송신 */
+    UartProtocol_Process(HAL_GetTick());
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -159,16 +176,21 @@ void SystemClock_Config(void) {
 
 /* USER CODE BEGIN 4 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART1) {
-        /* Push received byte into the packet parser ring buffer */
-    	Packet_Parser_Push_Byte(rx_raw_byte);
-    	
-        /* Toggle debugging LED to indicate data transfer */
-    	HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-        
-        /* Re-enable UART interrupt to receive the next byte */
-        HAL_UART_Receive_IT(&huart1, &rx_raw_byte, 1);
-    }
+  if (huart->Instance == USART1) {
+    UartProtocol_RxCpltCallback(huart);
+  }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == USART1) {
+    UartProtocol_TxCpltCallback(huart);
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == USART1) {
+    UartProtocol_ErrorCallback(huart);
+  }
 }
 /* USER CODE END 4 */
 
@@ -178,7 +200,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
  */
 void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /*
+   * Fail-safe: GPIO 초기화 이후 발생한 치명 오류에서는 STEP을 LOW로 만들고
+   * 두 DRV8825를 즉시 비활성화(EN=HIGH)한 뒤 정지합니다.
+   */
+  if (__HAL_RCC_GPIOB_IS_CLK_ENABLED()) {
+    Motor_ForceDisable();
+  }
   __disable_irq();
   while (1) {
   }

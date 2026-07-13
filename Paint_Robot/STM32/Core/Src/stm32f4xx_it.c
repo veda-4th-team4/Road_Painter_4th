@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "motor.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -58,7 +59,7 @@
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
 /* USER CODE BEGIN EV */
-
+extern TIM_HandleTypeDef htim2;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -200,12 +201,26 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /**
+  * @brief TIM2 20 kHz motor real-time tick.
+  */
+void TIM2_IRQHandler(void)
+{
+  /* HAL 전체 dispatcher보다 짧은 경로로 update flag만 처리합니다. */
+  if (__HAL_TIM_GET_FLAG(&htim2, TIM_FLAG_UPDATE) != RESET &&
+      __HAL_TIM_GET_IT_SOURCE(&htim2, TIM_IT_UPDATE) != RESET)
+  {
+    __HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
+    Motor_TickISR();
+  }
+}
+
+/**
   * @brief This function handles USART1 global interrupt.
   */
 void USART1_IRQHandler(void)
 {
   /* USER CODE BEGIN USART1_IRQn 0 */
-
+  /* Raspberry Pi UART IRQ. 실제 바이트 처리는 HAL_UART_RxCpltCallback에서 수행. */
   /* USER CODE END USART1_IRQn 0 */
   HAL_UART_IRQHandler(&huart1);
   /* USER CODE BEGIN USART1_IRQn 1 */
@@ -219,7 +234,7 @@ void USART1_IRQHandler(void)
 void USART2_IRQHandler(void)
 {
   /* USER CODE BEGIN USART2_IRQn 0 */
-
+  /* ST-Link Virtual COM UART IRQ. 현재는 주로 송신용이며 HAL에 위임. */
   /* USER CODE END USART2_IRQn 0 */
   HAL_UART_IRQHandler(&huart2);
   /* USER CODE BEGIN USART2_IRQn 1 */
