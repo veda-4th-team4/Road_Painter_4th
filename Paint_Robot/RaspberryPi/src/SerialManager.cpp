@@ -16,23 +16,23 @@ SerialManager::~SerialManager() {
 }
 
 bool SerialManager::Init() {
-    // 1. wiringPi 로우 레벨 환경 초기화
+    // 1. Initialize wiringPi low-level GPIO
     if (wiringPiSetup() == -1) {
-        std::cerr << "[SerialManager] 오류: wiringPi 초기화 실패" << std::endl;
+        std::cerr << "[SerialManager] Error: wiringPi initialization failed" << std::endl;
         return false;
     }
 
-    // 2. 외부 확장 핀 모드를 ALT0(시리얼 전용)로 강제 변환
+    // 2. Set GPIO 14/15 pins to ALT0 mode for hardware serial UART
     pinModeAlt(14, TG_ALT0); 
     pinModeAlt(15, TG_ALT0);
 
-    // 3. 포트 개방
+    // 3. Open serial port
     if ((fd = serialOpen(device_path.c_str(), baudrate)) < 0) {
-        std::cerr << "[SerialManager] 오류: 포트 개방 실패 (" << device_path << ")" << std::endl;
+        std::cerr << "[SerialManager] Error: Failed to open serial port (" << device_path << ")" << std::endl;
         return false;
     }
 
-    std::cout << "[SerialManager] 인프라 바인딩 성공: " << device_path << " (" << baudrate << " bps)" << std::endl;
+    std::cout << "[SerialManager] Successfully bound to " << device_path << " (" << baudrate << " bps)" << std::endl;
     return true;
 }
 
@@ -48,14 +48,16 @@ uint8_t SerialManager::calculate_crc8(const uint8_t *data, uint8_t len) {
     for (uint8_t i = 0; i < len; i++) {
         crc ^= data[i];
         for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x80) crc = (crc << 1) ^ 0x07;
-            else crc <<= 1;
+            if (crc & 0x80) {
+                crc = (crc << 1) ^ 0x07;
+            } else {
+                crc <<= 1;
+            }
         }
     }
     return crc;
 }
 
-// 명세서 규격 공통 패킷 조립 및 유선 송신 엔진
 bool SerialManager::send_packet(uint8_t cmd, const uint8_t *payload, uint8_t payload_len) {
     if (fd < 0) return false;
 
@@ -68,14 +70,14 @@ bool SerialManager::send_packet(uint8_t cmd, const uint8_t *payload, uint8_t pay
         std::memcpy(&tx_buf[3], payload, payload_len);
     }
 
-    // CRC8 연산 및 패킹 (LEN 위치부터 PAYLOAD 끝단까지 = payload_len + 2바이트 크기)
+    // Calculate CRC8 over LEN, CMD, and PAYLOAD (total length = payload_len + 2)
     uint8_t crc_val = calculate_crc8(&tx_buf[1], payload_len + 2);
     tx_buf[3 + payload_len] = crc_val;
     tx_buf[4 + payload_len] = 0x55; // ETX
 
     int total_frame_size = payload_len + 5;
 
-    // 바이트 직렬 스트림 송신
+    // Transmit raw byte stream
     for (int i = 0; i < total_frame_size; i++) {
         serialPutchar(fd, tx_buf[i]);
     }

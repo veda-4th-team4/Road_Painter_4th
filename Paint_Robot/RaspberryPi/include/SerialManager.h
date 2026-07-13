@@ -1,46 +1,64 @@
 #ifndef __SERIAL_MANAGER_H__
 #define __SERIAL_MANAGER_H__
 
-#include <cstdint>
 #include <string>
+#include "RobotTypes.h"
 
-// 명세서 규격 1바이트 정렬 구조체 정의들
-#pragma pack(push, 1)
-typedef struct {
-    int16_t left_sps;
-    int16_t right_sps;
-} Msg_SetSpeed_t; // CMD 0x01
-
-typedef struct {
-    uint8_t nozzle_on;
-} Msg_ControlNozzle_t; // CMD 0x02
-
-typedef struct {
-    uint8_t fault_reason;
-} Msg_EStop_t; // CMD 0x03
-#pragma pack(pop)
-
+/**
+ * @brief Handles low-level UART serial communications with the STM32 controller.
+ */
 class SerialManager {
+public:
+    SerialManager(const std::string& dev = "/dev/ttyAMA0", uint32_t baud = 115200);
+    ~SerialManager();
+
+    /**
+     * @brief Initializes wiringPi and opens the serial port.
+     * @return true if successful, false otherwise.
+     */
+    bool Init();
+
+    /**
+     * @brief Closes the serial port file descriptor.
+     */
+    void Close();
+
+    /**
+     * @brief Sends speed control commands to the STM32.
+     * @param left Target steps-per-second for left motor.
+     * @param right Target steps-per-second for right motor.
+     * @return true if transmission succeeded.
+     */
+    bool SendSetSpeed(int16_t left, int16_t right);
+
+    /**
+     * @brief Controls the spray nozzle state.
+     * @param on 1 to turn on the nozzle, 0 to turn off.
+     * @return true if transmission succeeded.
+     */
+    bool SendControlNozzle(uint8_t on);
+
+    /**
+     * @brief Sends an emergency stop request with a fault reason.
+     * @param reason The safety fault identifier.
+     * @return true if transmission succeeded.
+     */
+    bool SendEmergencyStop(uint8_t reason);
+
 private:
     int fd;
     std::string device_path;
     uint32_t baudrate;
 
-    // 내부 유틸리티 함수
+    /**
+     * @brief Computes a CRC-8 checksum for outgoing packets.
+     */
     uint8_t calculate_crc8(const uint8_t *data, uint8_t len);
+
+    /**
+     * @brief Builds the serial frame and transmits it.
+     */
     bool send_packet(uint8_t cmd, const uint8_t *payload, uint8_t payload_len);
-
-public:
-    SerialManager(const std::string& dev = "/dev/ttyAMA0", uint32_t baud = 115200);
-    ~SerialManager();
-
-    bool Init();
-    void Close();
-
-    // 상위 계층에 노출할 하드웨어 추상화 API 멤버 함수
-    bool SendSetSpeed(int16_t left, int16_t right);
-    bool SendControlNozzle(uint8_t on);
-    bool SendEmergencyStop(uint8_t reason);
 };
 
 #endif // __SERIAL_MANAGER_H__
