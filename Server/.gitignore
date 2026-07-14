@@ -11,6 +11,9 @@ certs/*.key
 # 캘리브레이션 결과는 현장에서 생성 (원하면 버전관리로 바꿔도 됨)
 config/*.yaml
 
+# 사용자 계정 데이터 (비번 해시 포함) - 절대 커밋 금지
+config/users.json
+
 # 파이썬
 __pycache__/
 calib_frames/

@@ -118,8 +118,10 @@ void TlsServer::sessionThread(ClientPtr c) {
                 shutdown(it->second->fd, SHUT_RDWR);  // 이전 세션 스레드가 정리
             clients_[role] = c;
         }
-        timeval tv0{0, 0};  // 등록 후엔 무한 대기 (읽기 블로킹)
-        setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
+        // 등록 후: ROBOT은 STATUS 주기전송(하트비트) 규칙이 있어 10초 무수신이면
+        // 끊김으로 간주. QT/CCTV는 한동안 조용할 수 있으므로 무한 대기.
+        timeval tvAfter = (role == "ROBOT") ? timeval{10, 0} : timeval{0, 0};
+        setsockopt(c->fd, SOL_SOCKET, SO_RCVTIMEO, &tvAfter, sizeof(tvAfter));
         logf("[INFO] [접속] %s %s", role.c_str(), c->peer.c_str());
         sendTo(role, makeMsg("ACK", {{"msg", "registered as " + role}}));
 

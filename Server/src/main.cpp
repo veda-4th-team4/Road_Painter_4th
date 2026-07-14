@@ -31,8 +31,13 @@ int main() {
         std::string cmd;
         while (std::getline(std::cin, cmd)) {
             if (cmd == "path") {
-                json p = json::parse(R"({"points":[[0,0],[1.5,0],[1.5,3.0]]})");
-                bool ok = srv.sendTo("ROBOT", makeMsg("PATH", p));
+                // 테스트 경로: 2m 직진(도색) -> 우회전 90도 -> 1m 직진(도색)
+                json segs = json::parse(R"([
+                    {"op":"MOVE","dist_m":2.0,"paint":true},
+                    {"op":"TURN","angle_deg":-90},
+                    {"op":"MOVE","dist_m":1.0,"paint":true}
+                ])");
+                bool ok = srv.sendTo("ROBOT", makePathMsg(segs));
                 logf("[INFO] PATH 전송 %s", ok ? "성공" : "실패");
             } else if (cmd == "estop") {
                 srv.sendTo("ROBOT", makeMsg("CMD", {{"cmd", "ESTOP"}}));
