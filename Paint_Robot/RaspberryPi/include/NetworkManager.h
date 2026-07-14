@@ -11,7 +11,7 @@
 #include "RobotTypes.h"
 
 #define DEFAULT_SERVER_IP   "192.168.0.8"
-#define DEFAULT_SERVER_PORT 9000
+#define DEFAULT_SERVER_PORT 8443
 
 /**
  * @brief Manages TCP socket connection to the Vision Server and handles packets.
@@ -95,9 +95,9 @@ private:
     bool ssl_read_line(std::string& buf, std::string& line);
 
     /**
-     * @brief Serializes and writes a JSON message over the SSL stream.
+     * @brief Writes a raw JSON message over the SSL stream.
      */
-    bool ssl_send_line(const std::string& type, const std::string& payload_json);
+    bool ssl_send_line(const std::string& raw_json_message);
 
     /**
      * @brief Internal helper to parse raw incoming buffers.
