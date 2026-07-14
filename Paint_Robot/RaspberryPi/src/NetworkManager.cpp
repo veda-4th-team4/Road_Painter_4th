@@ -101,10 +101,11 @@ bool NetworkManager::Init() {
     std::cout << "[NetworkManager] Secure TLS connection established." << std::endl;
 
     // 7. Transmit HELLO registration message to server
+    json hello_payload = {{"role", "ROBOT"}};
     json hello_msg = {
         {"type", "HELLO"},
         {"seq", ++msg_seq},
-        {"role", "ROBOT"}
+        {"payload", hello_payload}
     };
     if (!ssl_send_line(hello_msg.dump())) {
         std::cerr << "[NetworkManager] Error: Failed to transmit HELLO frame." << std::endl;
@@ -160,15 +161,17 @@ bool NetworkManager::SendStatus(const Msg_Status_t& status) {
     if (!is_connected || !ssl_connection) return false;
 
     // Parse STM32 metrics to match server STATUS schema
+    json status_payload = {
+        {"state", (status.flags & 0x01) ? "ESTOP" : "MOVING"},
+        {"x", static_cast<double>(status.left_steps) * 0.001},  // Dummy scale
+        {"y", static_cast<double>(status.right_steps) * 0.001}, // Dummy scale
+        {"battery", 100}                                       // Default percentage
+    };
+
     json status_msg = {
         {"type", "STATUS"},
         {"seq", ++msg_seq},
-        {"left_steps", status.left_steps},
-        {"right_steps", status.right_steps},
-        {"state", (status.flags & 0x01) ? 2 : 1}, // 0: IDLE, 1: RUN, 2: ESTOP
-        {"stall", false},
-        {"batt_mV", 12000},                        // 12V dummy
-        {"obstacle_mm", -1}                        // Obstacle default
+        {"payload", status_payload}
     };
 
     return ssl_send_line(status_msg.dump());
@@ -239,19 +242,20 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
     try {
         json msg = json::parse(line);
         std::string type = msg.value("type", "");
+        json payload = msg.value("payload", json::object());
 
         if (type == "PATH") {
             std::lock_guard<std::mutex> lock(path_mutex);
             current_path.clear();
             
-            // Read coordinate array from flat "wp" key
-            auto wp_list = msg.value("wp", json::array());
-            for (const auto& pt : wp_list) {
-                if (pt.is_array() && pt.size() >= 3) {
+            // Read coordinate array from nested "points" key
+            auto points = payload.value("points", json::array());
+            for (const auto& pt : points) {
+                if (pt.is_array() && pt.size() >= 2) {
                     Waypoint_t wp;
                     wp.x = pt[0].get<float>();
                     wp.y = pt[1].get<float>();
-                    wp.nozzle_on = pt[2].get<int>(); // 0 or 1 spray control
+                    wp.nozzle_on = (pt.size() >= 3) ? pt[2].get<int>() : 1; // paint if present, else ON
                     wp.speed = 0.05f; // default target speed
                     current_path.push_back(wp);
                 }
@@ -264,17 +268,17 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
             SendStatus(path_ack_status);
             std::cout << "[NetworkManager] [TEST] PATH received -> Sent status response to server." << std::endl;
 
-        } else if (type == "POSE") {
+        } else if (type == "POS") {
             std::lock_guard<std::mutex> lock(pose_mutex);
             
-            // Read absolute tracking position from flat JSON fields
-            latest_pose.x = msg.value("x", 0.0f);
-            latest_pose.y = msg.value("y", 0.0f);
-            latest_pose.theta = msg.value("th", 0.0f);
-            latest_pose.timestamp_ms = static_cast<uint64_t>(msg.value("t", 0.0) * 1000.0); // Convert sec to ms
+            // Read absolute tracking position from nested payload fields
+            latest_pose.x = payload.value("x", 0.0f);
+            latest_pose.y = payload.value("y", 0.0f);
+            latest_pose.theta = payload.value("theta", 0.0f);
+            latest_pose.timestamp_ms = static_cast<uint64_t>(payload.value("t", 0.0) * 1000.0); // Convert sec to ms
             
             // Convert conf float [0.0 ~ 1.0] to uint8_t percentage [0 ~ 100]
-            float conf_val = msg.value("conf", 0.0f);
+            float conf_val = payload.value("conf", 0.0f);
             latest_pose.confidence = static_cast<uint8_t>(conf_val * 100.0f);
             
             has_new_pose = true;
@@ -282,11 +286,17 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
             // [Test Echo] Send status response back to server upon receiving absolute position
             Msg_Status_t pose_ack_status = {1000, 2000, 0x00}; // Dummy steps: 1000, 2000
             SendStatus(pose_ack_status);
-            std::cout << "[NetworkManager] [TEST] POSE received -> Sent status response to server." << std::endl;
+            std::cout << "[NetworkManager] [TEST] POS received -> Sent status response to server." << std::endl;
 
         } else if (type == "ACK") {
-            json payload = msg.value("payload", json::object());
             std::cout << "[NetworkManager] Received ACK from server: " << payload.value("msg", "") << std::endl;
+        } else if (type == "CMD") {
+            std::string cmd = payload.value("cmd", "");
+            std::cout << "[NetworkManager] Received CMD from server: " << cmd << std::endl;
+            if (cmd == "ESTOP") {
+                // Example handling: raise emergency flag
+                latest_pose.confidence = 0; // Invalidate pose
+            }
         } else {
             std::cout << "[NetworkManager] Unknown message type: " << type << std::endl;
         }
