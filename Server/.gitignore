@@ -15,3 +15,5 @@ config/*.yaml
 __pycache__/
 calib_frames/
 *.npz
+config/server_token.txt
+server
