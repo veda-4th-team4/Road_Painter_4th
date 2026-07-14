@@ -68,8 +68,8 @@ void VideoWidget::mousePressEvent(QMouseEvent *event) {
             update(); //
         }
     }
-    // 💡 [핵심 추가] 오른쪽 마우스 클릭: 경로 지정 최종 완료 및 종료
-    // =======================================================
+
+    // [핵심 추가] 오른쪽 마우스 클릭: 경로 지정 최종 완료 및 종료
     else if (event->button() == Qt::RightButton) {
         if (m_currentMode == InteractionMode::DrawLinePath) {
             // 최소 1개 이상의 포인트가 입력되었을 때만 완료 처리
@@ -77,7 +77,7 @@ void VideoWidget::mousePressEvent(QMouseEvent *event) {
                 // 상호작용 모드를 일반(Normal) 모드로 전환하여 노란색 가이드선과 마우스 추적을 종료
                 m_currentMode = InteractionMode::Normal;
 
-                // 💡 [핵심 추가] 경로가 완성되었으므로 MainWindow 측으로 좌표 리스트를 송신
+                // [핵심 추가] 경로가 완성되었으므로 MainWindow 측으로 좌표 리스트를 송신
                 emit pathDrawingFinished(m_pathPoints);
 
                 update(); // 노란 가이드선 제거 및 최종 선 확정을 위해 화면 갱신
@@ -140,9 +140,7 @@ void VideoWidget::paintEvent(QPaintEvent *event) {
                 painter.drawLine(p1, p2); //
             }
 
-            // =======================================================
-            // [💡 발전형 추가] 포인트 위에 번호와 좌표(X, Y) 표시 로직
-            // =======================================================
+            // [발전형 추가] 포인트 위에 번호와 좌표(X, Y) 표시 로직
             // 출력 형태 예시: "1. (145, 280)"
             QString infoText = QString("%1. (%2, %3)")
                                    .arg(i + 1)
@@ -196,7 +194,7 @@ void VideoWidget::paintEvent(QPaintEvent *event) {
             painter.setPen(QPen(Qt::yellow, 2));
             painter.drawEllipse(pCurrent, 4, 4);
 
-            // [💡 가이드 기능 추가] 마우스를 따라다니는 실시간 다음 번호 및 좌표 미리보기
+            // [가이드 기능 추가] 마우스를 따라다니는 실시간 다음 번호 및 좌표 미리보기
             QString nextInfoText = QString("%1. (%2, %3)")
                                        .arg(m_pathPoints.size() + 1)
                                        .arg(currentImgPos.x())

@@ -1,5 +1,6 @@
 #include "video_worker.h"
 #include <QDebug>
+#include <opencv2/objdetect/aruco_detector.hpp>
 
 video_worker::video_worker(const QString& rtspUrl, QObject *parent)
     : QThread(parent), m_rtspUrl(rtspUrl), m_stopRequested(false) {
@@ -32,7 +33,6 @@ void video_worker::run() {
 
     stats.isConnected = true;
     emit statsUpdated(stats);
-
 
     // FPS 및 Latency 측정을 위한 타이머 변수들
     QElapsedTimer fpsTimer;
@@ -141,7 +141,7 @@ void video_worker::run() {
             cv::cvtColor(ycrcb, processedFrame, cv::COLOR_YCrCb2BGR);
         }
         else if (m_filterMode == FilterMode::FlipUpDown) {
-            // 👈 0은 상하반전(X축 기준 flip), 1은 좌우반전(Y축 기준 flip)입니다.
+            // 0은 상하반전(X축 기준 flip), 1은 좌우반전(Y축 기준 flip)입니다.
             cv::flip(processedFrame, processedFrame, -1);
         }// 💡 실시간 호모그래피 (Top View) 필터 추가
         else if (m_filterMode == FilterMode::TopView) {
@@ -152,8 +152,8 @@ void video_worker::run() {
                 if (m_homographySrcPoints.size() == 4) {
                     // 출력될 Top View 평면의 크기 (400x600 고정 예시)
                     std::vector<cv::Point2f> dstPoints = {
-                        cv::Point2f(0, 0), cv::Point2f(400, 0),
-                        cv::Point2f(400, 600), cv::Point2f(0, 600)
+                        cv::Point2f(0, 0), cv::Point2f(500, 0),
+                        cv::Point2f(500, 500), cv::Point2f(0, 500)
                     };
 
                     // JSON 파일에서 가져온 사용자의 실제 클릭 좌표로 행렬 연산
@@ -162,9 +162,10 @@ void video_worker::run() {
                 m_updateHomography = false;
             }
 
+
             if (!H.empty()) {
                 cv::Mat warped;
-                cv::warpPerspective(processedFrame, warped, H, cv::Size(400, 600));
+                cv::warpPerspective(processedFrame, warped, H, cv::Size(500, 500));
                 processedFrame = warped;
             } else {
                 // 4개의 점이 아닐 경우 등 에러 상황 시 원본 영상 위에 경고 문구 출력
@@ -172,18 +173,36 @@ void video_worker::run() {
                             cv::Point(20, 120), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 0, 255), 2);
             }
         }
+        else if (m_filterMode == FilterMode::DetectArUco) {
+            // 1. 사용할 ArUco 사전(Dictionary) 정의 (가장 대중적인 6x6 사이즈, 250개 ID)
+            // ※ OpenCV 4.7+ 부터 ArUco 가 objdetect 모듈로 이동. ArucoDetector 클래스 방식 사용.
+            //    Detector 는 매 프레임 새로 만들 필요가 없으므로 static 으로 1회 생성.
+            static const cv::aruco::Dictionary dictionary =
+                cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250);
+            static const cv::aruco::ArucoDetector detector(dictionary,
+                                                           cv::aruco::DetectorParameters());
 
-        // --- 상단 데이터 및 자막 표시 텍스트 그리기 (필터 처리된 영상 위에 오버레이) ---
-        std::string text = "FPS: " + std::to_string(stats.fps).substr(0, 4) +
-                           " | Latency: " + std::to_string(stats.latencyMs).substr(0, 4) + "ms";
+            // 검출된 마커의 모서리 좌표들과 ID를 담을 벡터
+            std::vector<std::vector<cv::Point2f>> markerCorners;
+            std::vector<int> markerIds;
 
-        cv::putText(processedFrame,
-                    text,
-                    cv::Point(20, 40),
-                    cv::FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    cv::Scalar(0, 255, 0), // 녹색
-                    2);
+            // 2. 마커 검출 수행
+            detector.detectMarkers(processedFrame, markerCorners, markerIds);
+
+            // 3. 마커가 화면에 1개 이상 검출되었다면 초록색 테두리와 ID 번호 그리기
+            if (markerIds.size() > 0) {
+                cv::aruco::drawDetectedMarkers(processedFrame, markerCorners, markerIds);
+
+                // (선택) 좌측 상단에 검출된 마커 개수 텍스트 표시
+                std::string msg = "Detected Markers: " + std::to_string(markerIds.size());
+                cv::putText(processedFrame, msg, cv::Point(20, 120),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 0), 2);
+            }
+        }
+
+        // 상단 데이터 및 자막 표시 텍스트 그리기 (필터 처리된 영상 위에 오버레이)
+        // std::string text = "FPS: " + std::to_string(stats.fps).substr(0, 4) +"  Latency: " + std::to_string(stats.latencyMs).substr(0, 4) + "ms";
+        // cv::putText(processedFrame, text, cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
 
         if (!stats.isConnected) {
             cv::putText(processedFrame, "DISCONNECTED", cv::Point(20, 80),
