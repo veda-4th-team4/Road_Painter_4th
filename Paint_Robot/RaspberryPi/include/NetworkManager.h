@@ -10,12 +10,15 @@
 #include <openssl/err.h>
 #include "RobotTypes.h"
 
+#define DEFAULT_SERVER_IP   "192.168.0.8"
+#define DEFAULT_SERVER_PORT 9000
+
 /**
  * @brief Manages TCP socket connection to the Vision Server and handles packets.
  */
 class NetworkManager {
 public:
-    NetworkManager(const std::string& ip, uint16_t port);
+    NetworkManager(const std::string& ip = DEFAULT_SERVER_IP, uint16_t port = DEFAULT_SERVER_PORT);
     ~NetworkManager();
 
     /**

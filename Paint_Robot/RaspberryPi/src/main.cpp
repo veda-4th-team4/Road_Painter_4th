@@ -5,14 +5,10 @@
 #include <unistd.h>
 #include <string>
 
-int main(int argc, char** argv) {
-    // Parse target server IP (default: 192.168.0.8)
-    std::string server_ip = (argc > 1) ? argv[1] : "192.168.0.8";
-    const uint16_t server_port = 9000; // Target TLS port defined in ICD
-
+int main() {
     // 1. Initialize modular components
     SerialManager robot_comm("/dev/ttyAMA0", 115200);
-    NetworkManager net_manager(server_ip, server_port);
+    NetworkManager net_manager; // Defaults to IP and Port in NetworkManager.h
     PathFollower path_follower;
 
     // 2. Initialize serial communications
@@ -22,7 +18,7 @@ int main(int argc, char** argv) {
     }
 
     // 3. Initialize network communications
-    std::cout << "[MAIN] Starting TLS network link to " << server_ip << ":" << server_port << "..." << std::endl;
+    std::cout << "[MAIN] Starting TLS network link to " << DEFAULT_SERVER_IP << ":" << DEFAULT_SERVER_PORT << "..." << std::endl;
     if (!net_manager.Init()) {
         std::cerr << "[MAIN] Warning: Network link failed. Starting in local test-only mode." << std::endl;
     }
