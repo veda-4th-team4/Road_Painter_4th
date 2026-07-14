@@ -11,7 +11,7 @@
 #include "RobotTypes.h"
 
 #define DEFAULT_SERVER_IP   "192.168.0.8"
-#define DEFAULT_SERVER_PORT 8443
+#define DEFAULT_SERVER_PORT 9000
 
 /**
  * @brief Manages TCP socket connection to the Vision Server and handles packets.
