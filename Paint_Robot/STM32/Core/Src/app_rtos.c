@@ -14,8 +14,10 @@
 #include "task.h"
 #include "uart_protocol.h"
 #include "uart_transport.h"
+#include "usart.h"
 
 #include <stddef.h>
+#include <stdio.h>
 
 #define COMMAND_QUEUE_DEPTH       8U
 #define COMM_TASK_STACK_WORDS     768U
@@ -41,6 +43,67 @@ static uint8_t pending_transport_errors;
 /** @brief FreeRTOS tick을 wrap-safe millisecond 값으로 변환합니다. */
 static uint32_t ticks_to_ms(TickType_t ticks) {
   return (uint32_t)ticks * (uint32_t)portTICK_PERIOD_MS;
+}
+
+/**
+ * @brief 검증 후 ControlTask까지 전달된 명령을 USART2 진단 포트에 출력합니다.
+ * @param frame 수신한 명령 frame입니다.
+ * @param handled payload와 command가 유효하면 1, 거부되면 0입니다.
+ * @note 명령 UART인 USART1에는 문자열을 섞지 않습니다.
+ */
+static void debug_log_command(const UartFrame_t *frame, uint8_t handled) {
+  char message[128];
+  int length;
+
+  if (frame == NULL) {
+    return;
+  }
+
+  if (!handled) {
+    length = snprintf(message, sizeof(message),
+                      "[RCV REJECT] CMD: 0x%02X | LEN: %u\r\n",
+                      frame->command, frame->length);
+  } else {
+    switch (frame->command) {
+    case UART_CMD_SET_SPEED:
+      length = snprintf(
+          message, sizeof(message),
+          "[RCV VALID] CMD: 0x01 | Left: %d sps, Right: %d sps\r\n",
+          (int)UartProtocol_ReadI16Le(&frame->payload[0]),
+          (int)UartProtocol_ReadI16Le(&frame->payload[2]));
+      break;
+
+    case UART_CMD_NOZZLE:
+      length = snprintf(message, sizeof(message),
+                        "[RCV VALID] CMD: 0x02 | Nozzle Request: %s\r\n",
+                        frame->payload[0] ? "ON" : "OFF");
+      break;
+
+    case UART_CMD_ESTOP:
+      length = snprintf(message, sizeof(message),
+                        "[RCV VALID] CMD: 0x03 | E-Stop Reason: 0x%02X\r\n",
+                        frame->payload[0]);
+      break;
+
+    case UART_CMD_CLEAR_ESTOP:
+      length = snprintf(message, sizeof(message),
+                        "[RCV VALID] CMD: 0x04 | Clear E-Stop Request\r\n");
+      break;
+
+    default:
+      length = snprintf(message, sizeof(message),
+                        "[RCV VALID] CMD: 0x%02X | LEN: %u\r\n",
+                        frame->command, frame->length);
+      break;
+    }
+  }
+
+  if (length > 0) {
+    uint16_t tx_length =
+        (uint16_t)((length < (int)sizeof(message)) ? length
+                                                   : (int)sizeof(message) - 1);
+    (void)HAL_UART_Transmit(&huart2, (uint8_t *)message, tx_length, 50U);
+  }
 }
 
 /** @brief ESTOP을 우선 전달하고 일반 명령을 FIFO로 전달합니다. */
@@ -146,8 +209,9 @@ static void ControlTask(void *argument) {
   (void)argument;
   for (;;) {
     if (xQueueReceive(command_queue, &frame, service_period) == pdPASS) {
-      (void)RobotControl_HandleFrame(
+      uint8_t handled = RobotControl_HandleFrame(
           &frame, ticks_to_ms(xTaskGetTickCount()));
+      debug_log_command(&frame, handled);
     }
     RobotControl_Service(ticks_to_ms(xTaskGetTickCount()));
   }
