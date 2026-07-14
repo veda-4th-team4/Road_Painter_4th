@@ -3,11 +3,16 @@
 #include "PathFollower.h"
 #include <iostream>
 #include <unistd.h>
+#include <string>
 
-int main() {
+int main(int argc, char** argv) {
+    // Parse target server IP (default: 192.168.0.8)
+    std::string server_ip = (argc > 1) ? argv[1] : "192.168.0.8";
+    const uint16_t server_port = 9000; // Target TLS port defined in ICD
+
     // 1. Initialize modular components
     SerialManager robot_comm("/dev/ttyAMA0", 115200);
-    NetworkManager net_manager("192.168.0.10", 8080); // Default server IP and Port (stub)
+    NetworkManager net_manager(server_ip, server_port);
     PathFollower path_follower;
 
     // 2. Initialize serial communications
@@ -16,8 +21,11 @@ int main() {
         return 1;
     }
 
-    // 3. Initialize network communications (Optional stub link for now)
-    net_manager.Init();
+    // 3. Initialize network communications
+    std::cout << "[MAIN] Starting TLS network link to " << server_ip << ":" << server_port << "..." << std::endl;
+    if (!net_manager.Init()) {
+        std::cerr << "[MAIN] Warning: Network link failed. Starting in local test-only mode." << std::endl;
+    }
 
     std::cout << "[MAIN] Main Controller Sequence Active." << std::endl;
 

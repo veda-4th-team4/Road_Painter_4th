@@ -4,6 +4,10 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <thread>
+#include <atomic>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include "RobotTypes.h"
 
 /**
@@ -26,7 +30,7 @@ public:
     void Close();
 
     /**
-     * @brief Non-blocking worker function to receive and parse incoming server packets.
+     * @brief Serves as a placeholder for low-level connection state checks.
      */
     void Process();
 
@@ -57,6 +61,15 @@ private:
     int client_fd;
     bool is_connected;
 
+    // OpenSSL variables
+    SSL_CTX* ssl_ctx;
+    SSL* ssl_connection;
+    std::mutex write_mutex;
+
+    // Background thread configuration
+    std::thread rx_thread;
+    std::atomic<bool> rx_alive;
+
     // Mutex protectors for shared data
     std::mutex pose_mutex;
     std::mutex path_mutex;
@@ -66,11 +79,27 @@ private:
 
     std::vector<Waypoint_t> current_path;
     bool has_new_path;
+    std::atomic<uint32_t> msg_seq;
+
+    /**
+     * @brief Background worker loop to read incoming data from socket.
+     */
+    void rx_loop();
+
+    /**
+     * @brief Reads a full line (terminated by '\n') from the SSL stream.
+     */
+    bool ssl_read_line(std::string& buf, std::string& line);
+
+    /**
+     * @brief Serializes and writes a JSON message over the SSL stream.
+     */
+    bool ssl_send_line(const std::string& type, const std::string& payload_json);
 
     /**
      * @brief Internal helper to parse raw incoming buffers.
      */
-    void parse_incoming_data(const uint8_t* buffer, size_t size);
+    void parse_incoming_data(const std::string& line);
 };
 
 #endif /* __NETWORK_MANAGER_H__ */
