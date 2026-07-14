@@ -3,11 +3,12 @@
 #include "PathFollower.h"
 #include <iostream>
 #include <unistd.h>
+#include <string>
 
 int main() {
     // 1. Initialize modular components
     SerialManager robot_comm("/dev/ttyAMA0", 115200);
-    NetworkManager net_manager("192.168.0.10", 8080); // Default server IP and Port (stub)
+    NetworkManager net_manager; // Defaults to IP and Port in NetworkManager.h
     PathFollower path_follower;
 
     // 2. Initialize serial communications
@@ -16,8 +17,11 @@ int main() {
         return 1;
     }
 
-    // 3. Initialize network communications (Optional stub link for now)
-    net_manager.Init();
+    // 3. Initialize network communications
+    std::cout << "[MAIN] Starting TLS network link to " << DEFAULT_SERVER_IP << ":" << DEFAULT_SERVER_PORT << "..." << std::endl;
+    if (!net_manager.Init()) {
+        std::cerr << "[MAIN] Warning: Network link failed. Starting in local test-only mode." << std::endl;
+    }
 
     std::cout << "[MAIN] Main Controller Sequence Active." << std::endl;
 
