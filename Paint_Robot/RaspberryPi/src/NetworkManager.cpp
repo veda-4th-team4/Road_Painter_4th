@@ -264,6 +264,11 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
             has_new_path = true;
             std::cout << "[NetworkManager] Path data update: " << current_path.size() << " waypoints received." << std::endl;
 
+            // [Test Echo] Send status response back to server upon receiving path
+            Msg_Status_t path_ack_status = {0, 0, 0};
+            SendStatus(path_ack_status);
+            std::cout << "[NetworkManager] [TEST] PATH received -> Sent status response to server." << std::endl;
+
         } else if (type == "POS") {
             std::lock_guard<std::mutex> lock(pose_mutex);
             latest_pose.x = payload.value("x", 0.0f);
@@ -272,6 +277,11 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
             latest_pose.timestamp_ms = payload.value("ts", 0);
             latest_pose.confidence = 100; // Set confidence high on valid packet
             has_new_pose = true;
+
+            // [Test Echo] Send status response back to server upon receiving absolute position
+            Msg_Status_t pose_ack_status = {1000, 2000, 0x00}; // Dummy steps: 1000, 2000
+            SendStatus(pose_ack_status);
+            std::cout << "[NetworkManager] [TEST] POS received -> Sent status response to server." << std::endl;
 
         } else if (type == "ACK") {
             std::cout << "[NetworkManager] Received ACK from server: " << payload.value("msg", "") << std::endl;
