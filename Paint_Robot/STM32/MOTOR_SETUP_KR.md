@@ -6,7 +6,10 @@
 프레임, 바이트 순서, `0x01 SET_SPEED`, CRC-8, 115200-8-N-1을 그대로
 적용했습니다. PDF에 없는 안전 항목은 SRS 부록 C.5에 따라 확장했습니다.
 
-- USART1 비동기 바이너리 RX/TX와 송신 큐
+- FreeRTOS Kernel v10.3.1 Native API, 런타임 heap 없는 정적 할당
+- `CommunicationTask`와 `ControlTask`의 2-task 구조
+- USART1 interrupt RX stream buffer와 비동기 TX queue
+- HAL/RTOS 비종속 UART frame codec
 - `0x01 SET_SPEED`, `0x02 NOZZLE`, `0x03 ESTOP`
 - SRS 안전 확장 `0x04 CLEAR_ESTOP`, STM32 송신 `0x81 STATUS`
 - TIM2 20 kHz 좌우 독립 STEP과 Q16 정수 가감속
@@ -14,6 +17,24 @@
 - PA8/TIM1_CH1 50 Hz 서보 PWM
 - 10 Hz 누적 좌우 스텝/상태 보고
 
+실시간 STEP 생성은 RTOS task로 옮기지 않았습니다. TIM2 priority 0 ISR이 계속
+20 kHz로 `Motor_TickISR()`을 직접 실행합니다. FreeRTOS는 UART 처리, 명령 실행,
+watchdog 및 STATUS 주기만 관리합니다.
+{
+  TIM2 ISR을 사용하는 이유
+STEP 신호는 정확한 시간 간격이 중요하기 때문입니다.
+
+TIM2 20 kHz = 50 µs마다 실행
+FreeRTOS tick = 1 ms
+최대 속도 = 2,000 microsteps/s
+최대 속도에서 STEP 주기 = 500 µs
+RTOS task로 STEP을 만들면 다른 task, UART, scheduler 때문에 실행 시점이 흔들립니다. 그러면 모터 소음, 진동, 탈조가 발생할 수 있습니다.
+
+그래서 역할을 분리했습니다.
+
+TIM2 ISR: STEP 펄스, 가감속, DIR 처리
+RTOS task: UART, 명령 처리, watchdog, STATUS
+}
 ASCII `straight_...`, `left_...`, `right_...`, `DONE/ERR` 경로는 제거했습니다.
 RPi는 응답을 기다렸다 다음 명령을 보내는 방식이 아니라 최신 속도를 주기적으로
 갱신하고, 별도로 들어오는 STATUS를 비동기로 처리해야 합니다.
@@ -128,18 +149,90 @@ flags 비트:
 
 - TIM1 clock 84 MHz, prescaler 83, period 19999, CH1 PWM
 - TIM2 clock 84 MHz, prescaler 83, period 49, update IRQ 20 kHz
-- TIM2 IRQ priority 0, USART1 priority 1, USART2 priority 2
+- TIM5: HAL 전용 1 ms timebase
+- FreeRTOS kernel tick: SysTick 1 kHz
+- TIM2 IRQ priority 0, USART1 priority 6, USART2 priority 7
+- SysTick/PendSV/TIM5 priority 15
+- `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY=5`
 
 통신:
 
 - USART1 PA9/PA10, 115200-8-N-1, RX/TX, global interrupt
 - USART2 PA2/PA3, 115200-8-N-1, ST-Link VCP 진단
 
-`Robot_Painter.ioc`에 위 설정이 반영되어 있습니다. CubeMX 코드를 다시 생성한
-뒤에는 TIM2 IRQ가 `Motor_TickISR()`를 직접 호출하는지, USART HAL callbacks가
-`UartProtocol_*Callback()`으로 전달되는지 반드시 diff로 확인하십시오.
+`Robot_Painter.ioc`에 TIM5 HAL timebase와 NVIC 값이 반영되어 있습니다. CubeMX
+코드를 다시 생성한 뒤에는 TIM2 IRQ가 `Motor_TickISR()`를 직접 호출하는지,
+USART HAL callbacks가 `UartTransport_*Callback()`으로 전달되는지 반드시
+diff로 확인하십시오.
 
-## 5. DRV8825와 전원 필수 확인
+## 5. FreeRTOS 구조와 메모리
+
+### 5.1 Task
+
+- `CommunicationTask`, priority 2, stack 768 words
+  - USART1 RX stream을 blocking 방식으로 읽습니다.
+  - frame parser와 CRC 검증을 수행합니다.
+  - 완성된 명령을 command queue로 전달합니다.
+  - 100 ms마다 기존 `0x81 STATUS`를 송신합니다.
+- `ControlTask`, priority 3, stack 384 words
+  - command queue에서 명령을 받아 Motor/Servo API를 호출합니다.
+  - ESTOP 명령은 queue 앞에 넣어 일반 명령보다 먼저 실행합니다.
+  - 10 ms마다 SET_SPEED 300 ms watchdog을 검사합니다.
+
+Motor task, Servo task, Telemetry task 및 FreeRTOS software timer는 만들지
+않았습니다. 하드웨어 PWM과 TIM2 ISR이 이미 해당 실시간 역할을 수행하므로
+task를 추가하면 context switch와 동기화 비용만 늘어납니다.
+
+### 5.2 정적 RTOS 객체
+
+- `xTaskCreateStatic()`으로 task 2개 생성
+- `xQueueCreateStatic()`으로 8-slot command queue 생성
+- `xStreamBufferCreateStatic()`으로 실효 256-byte RX stream 생성
+- idle task TCB/stack도 `vApplicationGetIdleTaskMemory()`로 제공
+- `configSUPPORT_DYNAMIC_ALLOCATION=0`
+- `configUSE_TIMERS=0`
+
+`AppRtos_GetStackWatermarks()`를 debugger에서 호출하면 두 task의 최소 잔여
+stack word 수를 확인할 수 있습니다. 실기 부하 시험 후 여유량을 측정하고 stack을
+줄이거나 늘리십시오.
+
+### 5.3 ISR 호출 규칙
+
+- TIM2 priority 0: `Motor_TickISR()`만 호출하며 FreeRTOS API 사용 금지
+- USART1 priority 6: `xStreamBufferSendFromISR()` 사용 가능
+- USART2 priority 7: 진단 UART
+- FreeRTOS task: `Motor_SetTargetSps()`, `Motor_RequestEStop()`,
+  `Motor_ClearEStop()`, `Servo_SetNozzle()` 호출
+
+`configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY=5`보다 높은 priority 0~4 ISR은
+FreeRTOS API를 절대 호출하면 안 됩니다.
+
+### 5.4 CubeMX 재생성 주의
+
+FreeRTOS v10.3.1은 `Middlewares/Third_Party/FreeRTOS`에 필요한 Native kernel
+소스만 고정했습니다. CMSIS-RTOS wrapper와 heap 구현은 사용하지 않습니다.
+CubeMX에서 별도의 CMSIS FreeRTOS wrapper를 추가하지 마십시오.
+
+현재 HAL release는 `USE_RTOS=1`을 금지하므로
+`stm32f4xx_hal_conf.h`의 `USE_RTOS`는 **0이 정상**입니다. 대신
+`HAL_TIM_MODULE_ENABLED`와 `TICK_INT_PRIORITY=15`가 필요합니다.
+
+CubeMX Generate Code 전:
+
+1. Git working tree를 확인하고 별도 branch에서 실행합니다.
+2. `Keep User Code`를 활성화합니다.
+3. HAL Timebase Source를 TIM5로 유지합니다.
+4. TIM2=0, USART1=6, USART2=7을 유지합니다.
+
+Generate Code 후:
+
+1. `.cproject`의 FreeRTOS `Source/include`와 `ARM_CM4F` include path를 확인합니다.
+2. `Middlewares` source entry가 유지되는지 확인합니다.
+3. SVC/PendSV/SysTick handler가 FreeRTOS port와 중복 정의되지 않는지 확인합니다.
+4. TIM2 USER CODE 영역과 UART callback forwarding을 확인합니다.
+5. 반드시 `git diff` 후 빌드합니다.
+
+## 6. DRV8825와 전원 필수 확인
 
 - CIH-4248은 1.8도/step, 정격 1.8 A/phase 모터입니다.
 - MODE0=L, MODE1=L, MODE2=H일 때 코드 가정인 1/16 microstep입니다.
@@ -157,7 +250,7 @@ flags 비트:
 - 3S/4S 배터리 요구가 문서 간 다르므로 실제 배터리를 확정한 후 벅 입력 정격,
   커패시터 전압 정격, 저전압 차단 조건을 함께 확정해야 합니다.
 
-## 6. 조정값
+## 7. 조정값
 
 `Core/Inc/robot_config.h`에서 다음을 조정합니다.
 
@@ -173,7 +266,7 @@ steps/rev, 1/16 microstep, 직결 기준 이론상 약 15.43 microsteps/mm입니
 실제 주행에서는 타이어 눌림, 미끄럼, 축간거리 오차가 있으므로 RPi의 odometry
 상수를 실차 측정으로 보정하십시오.
 
-## 7. 최초 시험 순서
+## 8. 최초 시험 순서
 
 1. 차체를 띄우고 모터 전원을 끈 상태에서 GND, TX/RX 교차, 단락을 확인합니다.
 2. 서보 혼을 분리하고 NOZZLE OFF/ON PWM 방향과 기계 한계를 확인합니다.
@@ -189,13 +282,21 @@ steps/rev, 1/16 microstep, 직결 기준 이론상 약 15.43 microsteps/mm입니
 9. STATUS 좌우 누적 스텝의 부호/증가량과 실제 바퀴 방향을 대조합니다.
 10. 저속에서 발열/탈조/전압강하를 확인한 뒤 단계적으로 제한 속도를 올립니다.
 
-## 8. 실제 빌드 파일
+## 9. 실제 빌드 파일
 
-- `Core/Inc/uart_protocol.h`, `Core/Src/uart_protocol.c`: 프레임/CRC/RX/TX/watchdog
+- `Core/Inc/FreeRTOSConfig.h`: 정적 할당, priority, kernel 설정
+- `Core/Src/freertos_hooks.c`: idle task 정적 메모리, stack/assert fail-safe
+- `Core/Inc/app_rtos.h`, `Core/Src/app_rtos.c`: task/queue 생성과 data flow
+- `Core/Inc/uart_protocol.h`, `Core/Src/uart_protocol.c`: 순수 frame/CRC codec
+- `Core/Inc/uart_transport.h`, `Core/Src/uart_transport.c`: USART1/RTOS transport
+- `Core/Inc/robot_control.h`, `Core/Src/robot_control.c`: 명령·안전·watchdog
 - `Core/Inc/motor.h`, `Core/Src/motor.c`: Q16 가감속/STEP/ESTOP/step counter
 - `Core/Inc/servo.h`, `Core/Src/servo.c`: NOZZLE PWM
 - `Core/Inc/tim.h`, `Core/Src/tim.c`: TIM1/TIM2 설정
-- `Core/Src/main.c`: 초기화, main service loop, HAL UART callback 연결
-- `Core/Src/stm32f4xx_it.c`: TIM2와 USART IRQ
+- `Core/Src/stm32f4xx_hal_timebase_tim.c`: TIM5 HAL tick
+- `Core/Src/main.c`: peripheral/application 초기화와 scheduler 시작
+- `Core/Src/stm32f4xx_it.c`: TIM2/TIM5/USART IRQ
 - `Core/Inc/robot_config.h`: 속도/안전/서보 조정값
 - `Robot_Painter.ioc`: CubeMX 원본 설정
+- `Tests/test_uart_protocol.py`: 실행 가능한 wire golden vector test
+- `Tests/uart_protocol_test.c`: 순수 C codec golden test

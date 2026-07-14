@@ -86,51 +86,67 @@
 #define ROBOT_LEFT_FORWARD_LEVEL  GPIO_PIN_SET
 #define ROBOT_RIGHT_FORWARD_LEVEL GPIO_PIN_SET /* TODO(USER): 공중시험 확인 */
 
-/* DRV8825 nENBL은 Active-Low: LOW=출력 활성, HIGH=출력 차단 */
-#define ROBOT_DRIVER_ENABLE_LEVEL  GPIO_PIN_RESET
+/** @brief DRV8825 nENBL 출력 활성 레벨(Active-Low). */
+#define ROBOT_DRIVER_ENABLE_LEVEL GPIO_PIN_RESET
+
+/** @brief DRV8825 nENBL 출력 차단 레벨. */
 #define ROBOT_DRIVER_DISABLE_LEVEL GPIO_PIN_SET
 
-/* 정지 시 홀딩 토크 유지. ESTOP 완료 시에는 이 값과 관계없이 출력을 차단합니다. */
+/**
+ * @brief 정상 정지 시 홀딩 토크 유지 여부입니다.
+ * @note ESTOP 완료 시에는 이 값과 관계없이 출력을 차단합니다.
+ */
 #define ROBOT_HOLD_TORQUE_WHEN_IDLE 1U
 
 /* ==========================================================================
  * 3. TIM2 실시간 스텝 제어
  * ========================================================================== */
 
-/* TIM2 update IRQ 주파수. 50 us tick에서 STEP High/Low를 각각 한 tick 유지합니다. */
+/**
+ * @brief TIM2 update interrupt 주파수 [Hz].
+ * @details 20 kHz에서는 50 us tick이며 STEP HIGH를 최소 한 tick 유지합니다.
+ */
 #define ROBOT_MOTOR_TICK_HZ 20000U
 
-/* RPi가 보낼 수 있는 좌/우 목표 속도 절댓값 [microsteps/s] */
+/** @brief 좌우 목표 속도의 최대 절댓값 [microsteps/s]. */
 #define ROBOT_MAX_SPS 2000
 
-/* 정상 및 ESTOP 감속도 [microsteps/s^2] */
+/** @brief 정상 주행 목표 변경에 적용할 가감속도 [microsteps/s^2]. */
 #define ROBOT_ACCEL_SPS2       1200U
+
+/** @brief ESTOP 감속에 적용할 가감속도 [microsteps/s^2]. */
 #define ROBOT_ESTOP_DECEL_SPS2 4000U
 
-/* SET_SPEED가 이 시간 이상 끊기면 자체 ESTOP (SRS C.5) */
+/** @brief 유효 SET_SPEED 미수신 시 자체 ESTOP까지의 시간 [ms]. */
 #define ROBOT_UART_WATCHDOG_MS 300U
 
-/* 0x81 STATUS 송신 주기 = 10 Hz */
+/** @brief 0x81 STATUS 송신 주기 [ms], 기본값은 10 Hz입니다. */
 #define ROBOT_STATUS_PERIOD_MS 100U
 
-/* CLEAR_ESTOP(0x04) 안전키. Little-Endian payload는 5A A5입니다. */
+/** @brief CLEAR_ESTOP(0x04) 안전키이며 Little-Endian payload는 5A A5입니다. */
 #define ROBOT_CLEAR_ESTOP_KEY 0xA55AU
 
 /* ==========================================================================
- * 4. UART 바이너리 프로토콜 버퍼
+ * 4. UART transport 정적 버퍼
  * ========================================================================== */
 
+/** @brief FreeRTOS RX stream buffer의 수신 용량 [byte]. */
 #define ROBOT_UART_RX_RING_SIZE 256U
-#define ROBOT_UART_MAX_PAYLOAD   16U
-#define ROBOT_UART_MAX_FRAME     (ROBOT_UART_MAX_PAYLOAD + 5U)
+
+/** @brief 비동기 STATUS 송신 ring queue의 슬롯 수입니다. */
 #define ROBOT_UART_TX_QUEUE_DEPTH 4U
 
 /* ==========================================================================
  * 5. PA8 / TIM1_CH1 도장 서보
  * ========================================================================== */
 
-#define ROBOT_SERVO_PERIOD_US 20000U /* 50 Hz */
-#define ROBOT_SERVO_OFF_US     1000U /* 실기구 시험 후 보정 */
-#define ROBOT_SERVO_ON_US      2000U /* 실기구 시험 후 보정 */
+/** @brief 서보 PWM 주기 [us], 20 ms는 50 Hz입니다. */
+#define ROBOT_SERVO_PERIOD_US 20000U
+
+/** @brief 노즐 OFF 위치의 PWM HIGH 폭 [us], 실기구 시험 후 보정합니다. */
+#define ROBOT_SERVO_OFF_US 1000U
+
+/** @brief 노즐 ON 위치의 PWM HIGH 폭 [us], 실기구 시험 후 보정합니다. */
+#define ROBOT_SERVO_ON_US 2000U
 
 #endif /* __ROBOT_CONFIG_H__ */

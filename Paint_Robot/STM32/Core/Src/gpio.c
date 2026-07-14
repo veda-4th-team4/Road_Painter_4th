@@ -29,24 +29,19 @@
 /* Configure GPIO                                                             */
 /*----------------------------------------------------------------------------*/
 /* USER CODE BEGIN 1 */
-/*
- * [DRV8825 GPIO 설정 - Robot_Painter.ioc와 반드시 일치]
- * PB0 LEFT_STEP, PB1 LEFT_DIR, PB6 LEFT_EN
- * PB2 RIGHT_STEP, PB5 RIGHT_DIR, PB7 RIGHT_EN
- * 모두 Output Push-Pull / No Pull / High Speed.
- * nENBL은 Active-Low이므로 LEFT_EN/RIGHT_EN 초기 출력은 HIGH(비활성).
- *
- * 이 주석은 CubeMX 코드 재생성 후에도 USER CODE 영역에 보존됩니다.
+/**
+ * @brief DRV8825 GPIO 배치와 부팅 안전 상태입니다.
+ * @details PB0 LEFT_STEP, PB1 LEFT_DIR, PB6 LEFT_EN, PB2 RIGHT_STEP,
+ *          PB5 RIGHT_DIR, PB7 RIGHT_EN을 Push-Pull/No Pull/High Speed로
+ *          사용합니다. nENBL은 Active-Low이므로 EN 초기 출력은 HIGH입니다.
  */
 /* USER CODE END 1 */
 
-/** Configure pins as
-        * Analog
-        * Input
-        * Output
-        * EVENT_OUT
-        * EXTI
-*/
+/**
+ * @brief 사용자 버튼, 상태 LED 및 DRV8825 제어 GPIO를 초기화합니다.
+ * @details 모터 STEP/DIR은 LOW, 좌우 nENBL은 HIGH인 안전 상태를 출력한 뒤
+ *          PB0/PB1/PB2/PB5/PB6/PB7을 고속 push-pull output으로 설정합니다.
+ */
 void MX_GPIO_Init(void)
 {
 

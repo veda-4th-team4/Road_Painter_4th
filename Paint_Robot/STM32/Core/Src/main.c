@@ -25,11 +25,12 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <string.h>
-
+#include "FreeRTOS.h"
+#include "app_rtos.h"
 #include "motor.h"
 #include "servo.h"
-#include "uart_protocol.h"
+#include "task.h"
+#include "uart_transport.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -55,11 +56,36 @@
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+static HAL_StatusTypeDef Robot_Init(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/**
+ * @brief 모터, 노즐 및 정적 RTOS application을 안전한 순서로 초기화합니다.
+ * @return 모든 모듈이 시작되면 HAL_OK, 하나라도 실패하면 해당 오류입니다.
+ */
+static HAL_StatusTypeDef Robot_Init(void) {
+  HAL_StatusTypeDef status = Servo_Init();
+  if (status != HAL_OK) {
+    return status;
+  }
+
+  status = Motor_Init();
+  if (status != HAL_OK) {
+    return status;
+  }
+
+  status = AppRtos_Init(&huart1);
+  if (status != HAL_OK) {
+    return status;
+  }
+
+  static uint8_t boot_msg[] =
+      "=== STM32 Paint Robot Binary Control Ready ===\r\n";
+  (void)HAL_UART_Transmit(&huart2, boot_msg, sizeof(boot_msg) - 1U, 100U);
+  return HAL_OK;
+}
 /* USER CODE END 0 */
 
 /**
@@ -101,29 +127,22 @@ int main(void) {
    * 1) GPIO가 먼저 EN=HIGH(드라이버 비활성) 안전 상태를 만듭니다.
    * 2) TIM1 서보 PWM을 OFF 위치에서 시작합니다.
    * 3) TIM2 20 kHz 모터 실시간 interrupt를 시작합니다.
-   * 4) 마지막으로 USART1 바이너리 프로토콜 수신을 시작합니다.
+   * 4) 정적 task/queue를 만든 뒤 scheduler에서 USART1 수신을 시작합니다.
    */
-  if (Servo_Init() != HAL_OK || Motor_Init() != HAL_OK) {
-    Error_Handler();
-  }
-
   /*
    * USART1(PA9 TX/PA10 RX): V-[HW] UART 바이너리 프레임, 115200-8-N-1
    * USART2(PA2 TX/PA3 RX): ST-Link Virtual COM 디버그 출력, 115200-8-N-1
    */
-  if (UartProtocol_Init(&huart1, &huart2) != HAL_OK) {
+  if (Robot_Init() != HAL_OK) {
     Error_Handler();
   }
-
-  char boot_msg[] = "=== STM32 Paint Robot Binary Control Ready ===\r\n";
-  HAL_UART_Transmit(&huart2, (uint8_t *)boot_msg, strlen(boot_msg), 100);
+  vTaskStartScheduler();
+  Error_Handler();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1) {
-    /* 비블로킹 RX 파싱, 300 ms watchdog, 10 Hz STATUS 송신 */
-    UartProtocol_Process(HAL_GetTick());
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -175,22 +194,28 @@ void SystemClock_Config(void) {
 }
 
 /* USER CODE BEGIN 4 */
+/**
+ * @brief HAL UART 수신 완료 callback을 UART transport로 전달합니다.
+ * @param huart 수신 완료 이벤트를 발생시킨 UART 핸들입니다.
+ */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-  if (huart->Instance == USART1) {
-    UartProtocol_RxCpltCallback(huart);
-  }
+  UartTransport_RxCpltCallback(huart);
 }
 
+/**
+ * @brief HAL UART 송신 완료 callback을 UART transport로 전달합니다.
+ * @param huart 송신 완료 이벤트를 발생시킨 UART 핸들입니다.
+ */
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
-  if (huart->Instance == USART1) {
-    UartProtocol_TxCpltCallback(huart);
-  }
+  UartTransport_TxCpltCallback(huart);
 }
 
+/**
+ * @brief HAL UART 오류 callback을 UART transport 복구 처리로 전달합니다.
+ * @param huart 오류 이벤트를 발생시킨 UART 핸들입니다.
+ */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
-  if (huart->Instance == USART1) {
-    UartProtocol_ErrorCallback(huart);
-  }
+  UartTransport_ErrorCallback(huart);
 }
 /* USER CODE END 4 */
 
@@ -204,10 +229,10 @@ void Error_Handler(void) {
    * Fail-safe: GPIO 초기화 이후 발생한 치명 오류에서는 STEP을 LOW로 만들고
    * 두 DRV8825를 즉시 비활성화(EN=HIGH)한 뒤 정지합니다.
    */
+  __disable_irq();
   if (__HAL_RCC_GPIOB_IS_CLK_ENABLED()) {
     Motor_ForceDisable();
   }
-  __disable_irq();
   while (1) {
   }
   /* USER CODE END Error_Handler_Debug */

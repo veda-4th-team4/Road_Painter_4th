@@ -27,8 +27,10 @@
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
-/* USART1 init function */
-
+/**
+ * @brief Raspberry Pi 명령/STATUS 링크용 USART1을 초기화합니다.
+ * @details PA9 TX, PA10 RX, 115200-8-N-1, no flow control로 설정합니다.
+ */
 void MX_USART1_UART_Init(void)
 {
 
@@ -60,8 +62,11 @@ void MX_USART1_UART_Init(void)
   /* USER CODE END USART1_Init 2 */
 
 }
-/* USART2 init function */
-
+/**
+ * @brief ST-Link Virtual COM 진단 링크용 USART2를 초기화합니다.
+ * @details PA2 TX, PA3 RX, 115200-8-N-1로 설정하며 바이너리 명령에는
+ *          사용하지 않습니다.
+ */
 void MX_USART2_UART_Init(void)
 {
 
@@ -94,6 +99,10 @@ void MX_USART2_UART_Init(void)
 
 }
 
+/**
+ * @brief UART peripheral clock, GPIO alternate function 및 NVIC를 설정합니다.
+ * @param uartHandle 초기화 대상 UART HAL 핸들입니다.
+ */
 void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 {
 
@@ -128,7 +137,8 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     /* USART1 interrupt Init */
-    HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
+    /* FreeRTOS FromISR API 허용 범위(configLIBRARY_MAX...=5) 아래입니다. */
+    HAL_NVIC_SetPriority(USART1_IRQn, 6, 0);
     HAL_NVIC_EnableIRQ(USART1_IRQn);
   /* USER CODE BEGIN USART1_MspInit 1 */
 
@@ -155,7 +165,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     /* USART2 interrupt Init */
-    HAL_NVIC_SetPriority(USART2_IRQn, 2, 0);
+    HAL_NVIC_SetPriority(USART2_IRQn, 7, 0);
     HAL_NVIC_EnableIRQ(USART2_IRQn);
   /* USER CODE BEGIN USART2_MspInit 1 */
 
@@ -163,6 +173,10 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
   }
 }
 
+/**
+ * @brief UART peripheral clock, GPIO 및 NVIC 설정을 해제합니다.
+ * @param uartHandle 해제 대상 UART HAL 핸들입니다.
+ */
 void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 {
 

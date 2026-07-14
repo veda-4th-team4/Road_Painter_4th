@@ -3,6 +3,9 @@
  ******************************************************************************
  * @file    tim.c
  * @brief   TIM1 50 Hz servo PWM and TIM2 20 kHz motor control tick
+ * @details 84 MHz APB timer clock을 1 MHz counter clock으로 분주합니다.
+ *          TIM1은 PA8 PWM을, TIM2는 최고 우선순위 모터 tick interrupt를
+ *          제공합니다.
  ******************************************************************************
  */
 /* USER CODE END Header */
@@ -10,9 +13,14 @@
 #include "tim.h"
 #include "robot_config.h"
 
-TIM_HandleTypeDef htim1;
-TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim1; /**< 노즐 서보 PWM용 TIM1 HAL 핸들. */
+TIM_HandleTypeDef htim2; /**< 모터 실시간 tick용 TIM2 HAL 핸들. */
 
+/**
+ * @brief TIM1_CH1을 50 Hz PWM 모드로 초기화합니다.
+ * @details 84 MHz / 84 = 1 MHz counter와 20,000 count period를 사용하고
+ *          초기 pulse width는 ROBOT_SERVO_OFF_US입니다.
+ */
 void MX_TIM1_Init(void) {
   TIM_ClockConfigTypeDef clock = {0};
   TIM_MasterConfigTypeDef master = {0};
@@ -54,6 +62,10 @@ void MX_TIM1_Init(void) {
   HAL_TIM_MspPostInit(&htim1);
 }
 
+/**
+ * @brief TIM2를 모터 제어용 ROBOT_MOTOR_TICK_HZ base timer로 초기화합니다.
+ * @details 기본 20 kHz 설정에서는 1 MHz counter와 50 count period를 사용합니다.
+ */
 void MX_TIM2_Init(void) {
   TIM_ClockConfigTypeDef clock = {0};
   TIM_MasterConfigTypeDef master = {0};
@@ -79,6 +91,10 @@ void MX_TIM2_Init(void) {
   }
 }
 
+/**
+ * @brief TIM1/TIM2 peripheral clock과 TIM2 NVIC를 초기화합니다.
+ * @param htim_base 초기화 대상 base timer HAL 핸들입니다.
+ */
 void HAL_TIM_Base_MspInit(TIM_HandleTypeDef *htim_base) {
   if (htim_base->Instance == TIM1) {
     __HAL_RCC_TIM1_CLK_ENABLE();
@@ -90,6 +106,10 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef *htim_base) {
   }
 }
 
+/**
+ * @brief TIM1_CH1 출력을 위해 PA8을 alternate-function GPIO로 설정합니다.
+ * @param htim post-initialization 대상 타이머 HAL 핸들입니다.
+ */
 void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM1) {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -105,6 +125,10 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim) {
   }
 }
 
+/**
+ * @brief TIM1/TIM2 peripheral clock과 TIM2 NVIC를 해제합니다.
+ * @param htim_base 해제 대상 base timer HAL 핸들입니다.
+ */
 void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef *htim_base) {
   if (htim_base->Instance == TIM1) {
     __HAL_RCC_TIM1_CLK_DISABLE();

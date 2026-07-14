@@ -87,9 +87,10 @@ void Error_Handler(void);
 #define RIGHT_EN_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
-/*
- * 모터 핀은 Robot_Painter.ioc에 등록되어 위 Private defines 영역에 생성됩니다.
- * 핀을 바꿀 때 main.h만 직접 수정하지 말고 반드시 CubeMX Pinout도 함께 바꾸십시오.
+/**
+ * @brief 모터 및 서보 핀 정의의 원본은 Robot_Painter.ioc입니다.
+ * @warning 핀을 바꿀 때 main.h만 직접 수정하지 말고 CubeMX Pinout을 함께
+ *          변경해야 코드 재생성 후에도 일관성이 유지됩니다.
  */
 /* USER CODE END Private defines */
 
