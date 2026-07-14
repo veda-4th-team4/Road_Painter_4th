@@ -44,9 +44,11 @@ private:
     QSlider *m_sliderSaturation;
     // 필터 값을 보관할 변수 추가
     VideoSettingsDialog::Settings m_filters;
+    Settings m_defaultSettings;
 
 private slots:
     void onSliderValueChanged();
+    void resetToDefault();
 };
 
 #endif // VIDEOSETTINGSDIALOG_H

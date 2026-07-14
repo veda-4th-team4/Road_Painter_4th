@@ -19,7 +19,8 @@ enum class FilterMode {
     HighContrastGrayscale,
     HighContrastColor,
     FlipUpDown,
-    TopView              // 👈 실시간 호모그래피 보정 모드 추가
+    TopView,
+    DetectArUco
 };
 
 class video_worker : public QThread
