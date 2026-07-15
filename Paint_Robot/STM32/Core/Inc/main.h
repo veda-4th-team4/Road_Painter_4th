@@ -65,15 +65,33 @@ void Error_Handler(void);
 #define USART_RX_GPIO_Port GPIOA
 #define LD2_Pin GPIO_PIN_5
 #define LD2_GPIO_Port GPIOA
+#define SIG_SERVO_Pin GPIO_PIN_8
+#define SIG_SERVO_GPIO_Port GPIOA
+#define LEFT_STEP_Pin GPIO_PIN_0
+#define LEFT_STEP_GPIO_Port GPIOB
+#define LEFT_DIR_Pin GPIO_PIN_1
+#define LEFT_DIR_GPIO_Port GPIOB
+#define RIGHT_STEP_Pin GPIO_PIN_2
+#define RIGHT_STEP_GPIO_Port GPIOB
 #define TMS_Pin GPIO_PIN_13
 #define TMS_GPIO_Port GPIOA
 #define TCK_Pin GPIO_PIN_14
 #define TCK_GPIO_Port GPIOA
 #define SWO_Pin GPIO_PIN_3
 #define SWO_GPIO_Port GPIOB
+#define RIGHT_DIR_Pin GPIO_PIN_5
+#define RIGHT_DIR_GPIO_Port GPIOB
+#define LEFT_EN_Pin GPIO_PIN_6
+#define LEFT_EN_GPIO_Port GPIOB
+#define RIGHT_EN_Pin GPIO_PIN_7
+#define RIGHT_EN_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
-
+/**
+ * @brief 모터 및 서보 핀 정의의 원본은 Robot_Painter.ioc입니다.
+ * @warning 핀을 바꿀 때 main.h만 직접 수정하지 말고 CubeMX Pinout을 함께
+ *          변경해야 코드 재생성 후에도 일관성이 유지됩니다.
+ */
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

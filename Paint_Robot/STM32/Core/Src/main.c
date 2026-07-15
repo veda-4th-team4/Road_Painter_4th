@@ -19,15 +19,18 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "gpio.h"
+#include "tim.h"
 #include "usart.h"
 
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
-#include <string.h>
-
-#include "packet_parser.h"
+#include "FreeRTOS.h"
+#include "app_rtos.h"
+#include "motor.h"
+#include "servo.h"
+#include "task.h"
+#include "uart_transport.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -48,17 +51,41 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint8_t rx_raw_byte; // 하드웨어 1바이트 수신 버퍼
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+static HAL_StatusTypeDef Robot_Init(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/**
+ * @brief 모터, 노즐 및 정적 RTOS application을 안전한 순서로 초기화합니다.
+ * @return 모든 모듈이 시작되면 HAL_OK, 하나라도 실패하면 해당 오류입니다.
+ */
+static HAL_StatusTypeDef Robot_Init(void) {
+  HAL_StatusTypeDef status = Servo_Init();
+  if (status != HAL_OK) {
+    return status;
+  }
+
+  status = Motor_Init();
+  if (status != HAL_OK) {
+    return status;
+  }
+
+  status = AppRtos_Init(&huart1);
+  if (status != HAL_OK) {
+    return status;
+  }
+
+  static uint8_t boot_msg[] =
+      "=== STM32 Paint Robot Binary Control Ready ===\r\n";
+  (void)HAL_UART_Transmit(&huart2, boot_msg, sizeof(boot_msg) - 1U, 100U);
+  return HAL_OK;
+}
 /* USER CODE END 0 */
 
 /**
@@ -92,21 +119,30 @@ int main(void) {
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_USART1_UART_Init();
+  MX_TIM1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  Packet_Parser_Init(&huart1);
-  HAL_UART_Receive_IT(&huart1, &rx_raw_byte, 1);
-  /*  if (HAL_UART_Receive_IT(&huart2, &rx_test_byte, 1) != HAL_OK) {
-        // 인터럽트 개방 실패 시 Nucleo 보드의 LD2(초록 LED)를 켭니다.
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
-    }*/
-  char boot_msg[] = "=== STM32 Paint Robot Telemetry Boot OK ===\r\n";
-  HAL_UART_Transmit(&huart2, (uint8_t *)boot_msg, strlen(boot_msg), 100);
+  /*
+   * 초기화 순서가 중요합니다.
+   * 1) GPIO가 먼저 EN=HIGH(드라이버 비활성) 안전 상태를 만듭니다.
+   * 2) TIM1 서보 PWM을 OFF 위치에서 시작합니다.
+   * 3) TIM2 20 kHz 모터 실시간 interrupt를 시작합니다.
+   * 4) 정적 task/queue를 만든 뒤 scheduler에서 USART1 수신을 시작합니다.
+   */
+  /*
+   * USART1(PA9 TX/PA10 RX): V-[HW] UART 바이너리 프레임, 115200-8-N-1
+   * USART2(PA2 TX/PA3 RX): ST-Link Virtual COM 디버그 출력, 115200-8-N-1
+   */
+  if (Robot_Init() != HAL_OK) {
+    Error_Handler();
+  }
+  vTaskStartScheduler();
+  Error_Handler();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1) {
-    Packet_Parser_Process();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -158,17 +194,28 @@ void SystemClock_Config(void) {
 }
 
 /* USER CODE BEGIN 4 */
+/**
+ * @brief HAL UART 수신 완료 callback을 UART transport로 전달합니다.
+ * @param huart 수신 완료 이벤트를 발생시킨 UART 핸들입니다.
+ */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART1) {
-        /* Push received byte into the packet parser ring buffer */
-    	Packet_Parser_Push_Byte(rx_raw_byte);
-    	
-        /* Toggle debugging LED to indicate data transfer */
-    	HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
-        
-        /* Re-enable UART interrupt to receive the next byte */
-        HAL_UART_Receive_IT(&huart1, &rx_raw_byte, 1);
-    }
+  UartTransport_RxCpltCallback(huart);
+}
+
+/**
+ * @brief HAL UART 송신 완료 callback을 UART transport로 전달합니다.
+ * @param huart 송신 완료 이벤트를 발생시킨 UART 핸들입니다.
+ */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+  UartTransport_TxCpltCallback(huart);
+}
+
+/**
+ * @brief HAL UART 오류 callback을 UART transport 복구 처리로 전달합니다.
+ * @param huart 오류 이벤트를 발생시킨 UART 핸들입니다.
+ */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+  UartTransport_ErrorCallback(huart);
 }
 /* USER CODE END 4 */
 
@@ -178,8 +225,14 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
  */
 void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  /*
+   * Fail-safe: GPIO 초기화 이후 발생한 치명 오류에서는 STEP을 LOW로 만들고
+   * 두 DRV8825를 즉시 비활성화(EN=HIGH)한 뒤 정지합니다.
+   */
   __disable_irq();
+  if (__HAL_RCC_GPIOB_IS_CLK_ENABLED()) {
+    Motor_ForceDisable();
+  }
   while (1) {
   }
   /* USER CODE END Error_Handler_Debug */

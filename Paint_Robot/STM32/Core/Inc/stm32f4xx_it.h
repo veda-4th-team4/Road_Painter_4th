@@ -55,6 +55,9 @@ void SVC_Handler(void);
 void DebugMon_Handler(void);
 void PendSV_Handler(void);
 void SysTick_Handler(void);
+/** @brief TIM2 20 kHz update interrupt에서 모터 실시간 tick을 처리합니다. */
+void TIM2_IRQHandler(void);
+void TIM5_IRQHandler(void);
 void USART1_IRQHandler(void);
 void USART2_IRQHandler(void);
 /* USER CODE BEGIN EFP */

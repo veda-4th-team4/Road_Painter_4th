@@ -29,16 +29,19 @@
 /* Configure GPIO                                                             */
 /*----------------------------------------------------------------------------*/
 /* USER CODE BEGIN 1 */
-
+/**
+ * @brief DRV8825 GPIO 배치와 부팅 안전 상태입니다.
+ * @details PB0 LEFT_STEP, PB1 LEFT_DIR, PB6 LEFT_EN, PB2 RIGHT_STEP,
+ *          PB5 RIGHT_DIR, PB7 RIGHT_EN을 Push-Pull/No Pull/High Speed로
+ *          사용합니다. nENBL은 Active-Low이므로 EN 초기 출력은 HIGH입니다.
+ */
 /* USER CODE END 1 */
 
-/** Configure pins as
-        * Analog
-        * Input
-        * Output
-        * EVENT_OUT
-        * EXTI
-*/
+/**
+ * @brief 사용자 버튼, 상태 LED 및 DRV8825 제어 GPIO를 초기화합니다.
+ * @details 모터 STEP/DIR은 LOW, 좌우 nENBL은 HIGH인 안전 상태를 출력한 뒤
+ *          PB0/PB1/PB2/PB5/PB6/PB7을 고속 push-pull output으로 설정합니다.
+ */
 void MX_GPIO_Init(void)
 {
 
@@ -53,6 +56,18 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
+  /*
+   * 모터 출력의 안전한 부팅 상태:
+   * - STEP/DIR = LOW
+   * - EN1/EN2  = HIGH (DRV8825 nENBL 비활성)
+   * Motor_Init() 이후 실제 명령을 실행할 때만 EN을 LOW로 내립니다.
+   */
+  HAL_GPIO_WritePin(GPIOB,
+                    LEFT_STEP_Pin | LEFT_DIR_Pin | RIGHT_STEP_Pin |
+                        RIGHT_DIR_Pin,
+                    GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, LEFT_EN_Pin | RIGHT_EN_Pin, GPIO_PIN_SET);
+
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
@@ -65,6 +80,18 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+
+  /*
+   * DRV8825 제어 GPIO:
+   * PB0=STEP1, PB1=DIR1, PB6=EN1, PB2=STEP2, PB5=DIR2, PB7=EN2
+   * Push-Pull / No Pull / High Speed 출력으로 설정합니다.
+   */
+  GPIO_InitStruct.Pin = LEFT_STEP_Pin | LEFT_DIR_Pin | LEFT_EN_Pin |
+                        RIGHT_STEP_Pin | RIGHT_DIR_Pin | RIGHT_EN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
 }
 
