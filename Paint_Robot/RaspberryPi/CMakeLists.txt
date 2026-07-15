@@ -19,6 +19,4 @@ set(SOURCES
 add_executable(robot_exec ${SOURCES})
 target_link_libraries(robot_exec wiringPi OpenSSL::SSL OpenSSL::Crypto pthread)
 
-# 2) Robot Simulator Client Target
-add_executable(robot_sim src/robot_sim.cpp)
-target_link_libraries(robot_sim OpenSSL::SSL OpenSSL::Crypto pthread)
+
