@@ -1,0 +1,10 @@
+{
+    "path": [
+        { "sequence": 1, "x": 350, "y": 300 },
+        { "sequence": 2, "x": 900, "y": 300 },
+        { "sequence": 3, "x": 900, "y": 560 },
+        { "sequence": 4, "x": 350, "y": 560 },
+        { "sequence": 5, "x": 350, "y": 300 }
+    ],
+    "total_points": 5
+}
