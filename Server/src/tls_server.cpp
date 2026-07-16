@@ -5,6 +5,7 @@
 #include <openssl/err.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <csignal>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -47,6 +48,9 @@ TlsServer::~TlsServer() {
 }
 
 void TlsServer::run() {
+    // 끊긴 소켓에 쓰기(SSL_write/SSL_shutdown) 시 SIGPIPE로 프로세스가 죽지 않도록.
+    // (같은 role 재접속으로 기존 세션을 끊는 순간 서버 전체가 종료되는 문제 방지)
+    signal(SIGPIPE, SIG_IGN);
     logf("[INFO] Road-Painter TLS 서버 시작 0.0.0.0:%d", port_);
     for (;;) {
         sockaddr_in peer{};
