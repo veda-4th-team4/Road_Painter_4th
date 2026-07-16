@@ -9,7 +9,20 @@
 #endif
 
 SerialManager::SerialManager(const std::string& dev, uint32_t baud) 
-    : fd(-1), device_path(dev), baudrate(baud) {}
+    : fd(-1),
+      device_path(dev),
+      baudrate(baud),
+      rx_alive(false),
+      status_received_once(false),
+      rx_state(STATE_STX),
+      rx_len(0),
+      rx_cmd(0),
+      rx_payload_idx(0),
+      rx_calculated_crc(0),
+      rx_received_crc(0)
+{
+    std::memset(&latest_status, 0, sizeof(Msg_Status_t));
+}
 
 SerialManager::~SerialManager() {
     Close();
@@ -32,11 +45,19 @@ bool SerialManager::Init() {
         return false;
     }
 
-    std::cout << "[SerialManager] Successfully bound to " << device_path << " (" << baudrate << " bps)" << std::endl;
+    // 4. Spin up background receive thread
+    rx_alive = true;
+    rx_thread = std::thread(&SerialManager::rx_loop, this);
+
+    std::cout << "[SerialManager] Successfully bound to " << device_path << " (" << baudrate << " bps) and initialized RX pipeline." << std::endl;
     return true;
 }
 
 void SerialManager::Close() {
+    rx_alive = false;
+    if (rx_thread.joinable()) {
+        rx_thread.join();
+    }
     if (fd >= 0) {
         serialClose(fd);
         fd = -1;
@@ -46,13 +67,18 @@ void SerialManager::Close() {
 uint8_t SerialManager::calculate_crc8(const uint8_t *data, uint8_t len) {
     uint8_t crc = 0x00;
     for (uint8_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x80) {
-                crc = (crc << 1) ^ 0x07;
-            } else {
-                crc <<= 1;
-            }
+        crc = crc8_update(crc, data[i]);
+    }
+    return crc;
+}
+
+uint8_t SerialManager::crc8_update(uint8_t crc, uint8_t data) {
+    crc ^= data;
+    for (uint8_t bit = 0; bit < 8; bit++) {
+        if (crc & 0x80) {
+            crc = (crc << 1) ^ 0x07;
+        } else {
+            crc <<= 1;
         }
     }
     return crc;
@@ -101,4 +127,99 @@ bool SerialManager::SendEmergencyStop(uint8_t reason) {
     Msg_EStop_t payload;
     payload.fault_reason = reason;
     return send_packet(0x03, reinterpret_cast<const uint8_t*>(&payload), sizeof(Msg_EStop_t));
+}
+
+bool SerialManager::GetLatestStatus(Msg_Status_t& out_status) {
+    std::lock_guard<std::mutex> lock(status_mutex);
+    if (!status_received_once) {
+        return false;
+    }
+    out_status = latest_status;
+    return true;
+}
+
+void SerialManager::rx_loop() {
+    Msg_Status_t temp_status;
+    while (rx_alive) {
+        if (fd < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        int avail = serialDataAvail(fd);
+        if (avail <= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+
+        for (int i = 0; i < avail; i++) {
+            int ch = serialGetchar(fd);
+            if (ch < 0) break;
+            
+            if (parse_byte(static_cast<uint8_t>(ch), temp_status)) {
+                std::lock_guard<std::mutex> lock(status_mutex);
+                latest_status = temp_status;
+                status_received_once = true;
+            }
+        }
+    }
+}
+
+bool SerialManager::parse_byte(uint8_t byte, Msg_Status_t& out_status) {
+    switch (rx_state) {
+    case STATE_STX:
+        if (byte == 0xAA) {
+            rx_state = STATE_LEN;
+        }
+        break;
+
+    case STATE_LEN:
+        if (byte > 16) { // Max payload threshold
+            rx_state = STATE_STX;
+            break;
+        }
+        rx_len = byte;
+        rx_payload_idx = 0;
+        rx_calculated_crc = crc8_update(0, byte);
+        rx_state = STATE_CMD;
+        break;
+
+    case STATE_CMD:
+        rx_cmd = byte;
+        rx_calculated_crc = crc8_update(rx_calculated_crc, byte);
+        if (rx_len == 0) {
+            rx_state = STATE_CRC;
+        } else {
+            rx_state = STATE_PAYLOAD;
+        }
+        break;
+
+    case STATE_PAYLOAD:
+        rx_payload[rx_payload_idx++] = byte;
+        rx_calculated_crc = crc8_update(rx_calculated_crc, byte);
+        if (rx_payload_idx >= rx_len) {
+            rx_state = STATE_CRC;
+        }
+        break;
+
+    case STATE_CRC:
+        rx_received_crc = byte;
+        rx_state = STATE_ETX;
+        break;
+
+    case STATE_ETX:
+        rx_state = STATE_STX;
+        if (byte == 0x55 && rx_received_crc == rx_calculated_crc) {
+            if (rx_cmd == 0x81 && rx_len == sizeof(Msg_Status_t)) {
+                std::memcpy(&out_status, rx_payload, sizeof(Msg_Status_t));
+                return true;
+            }
+        }
+        break;
+
+    default:
+        rx_state = STATE_STX;
+        break;
+    }
+    return false;
 }

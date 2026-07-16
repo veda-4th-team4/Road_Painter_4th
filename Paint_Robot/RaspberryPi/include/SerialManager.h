@@ -2,6 +2,9 @@
 #define __SERIAL_MANAGER_H__
 
 #include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include "RobotTypes.h"
 
 /**
@@ -13,13 +16,13 @@ public:
     ~SerialManager();
 
     /**
-     * @brief Initializes wiringPi and opens the serial port.
+     * @brief Initializes wiringPi, opens the serial port, and spins up the RX thread.
      * @return true if successful, false otherwise.
      */
     bool Init();
 
     /**
-     * @brief Closes the serial port file descriptor.
+     * @brief Closes the serial port file descriptor and stops the RX thread.
      */
     void Close();
 
@@ -45,20 +48,58 @@ public:
      */
     bool SendEmergencyStop(uint8_t reason);
 
+    /**
+     * @brief Thread-safely fetches the latest received status packet.
+     * @param out_status Buffer to copy the fetched telemetry metrics.
+     * @return true if status was ever received.
+     */
+    bool GetLatestStatus(Msg_Status_t& out_status);
+
 private:
     int fd;
     std::string device_path;
     uint32_t baudrate;
 
+    // Receive thread parameters
+    std::thread rx_thread;
+    std::atomic<bool> rx_alive;
+    std::mutex status_mutex;
+    Msg_Status_t latest_status;
+    bool status_received_once;
+
+    // Parser State Machine Variables
+    ParserState_t rx_state;
+    uint8_t rx_len;
+    uint8_t rx_cmd;
+    uint8_t rx_payload[16];
+    uint8_t rx_payload_idx;
+    uint8_t rx_calculated_crc;
+    uint8_t rx_received_crc;
+
     /**
-     * @brief Computes a CRC-8 checksum for outgoing packets.
+     * @brief Computes a CRC-8 checksum for outgoing/incoming packets.
      */
     uint8_t calculate_crc8(const uint8_t *data, uint8_t len);
+
+    /**
+     * @brief Helper function to update incremental CRC8 byte by byte.
+     */
+    uint8_t crc8_update(uint8_t crc, uint8_t data);
 
     /**
      * @brief Builds the serial frame and transmits it.
      */
     bool send_packet(uint8_t cmd, const uint8_t *payload, uint8_t payload_len);
+
+    /**
+     * @brief Thread execution entry function for background serial reading.
+     */
+    void rx_loop();
+
+    /**
+     * @brief Evaluates a single incoming byte into the parser state machine.
+     */
+    bool parse_byte(uint8_t byte, Msg_Status_t& out_status);
 };
 
 #endif // __SERIAL_MANAGER_H__
