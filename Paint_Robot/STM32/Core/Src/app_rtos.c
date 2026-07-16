@@ -143,9 +143,20 @@ static void publish_status(void) {
   UartProtocol_WriteU32Le(&payload[4], status.right_steps);
   payload[8] = status.flags;
 
-  if (UartProtocol_EncodeFrame(UART_CMD_STATUS, payload, sizeof(payload), frame,
-                               sizeof(frame), &frame_length) &&
-      UartTransport_Send(frame, frame_length)) {
+  uint8_t encode_ok = UartProtocol_EncodeFrame(UART_CMD_STATUS, payload, sizeof(payload), frame,
+                                               sizeof(frame), &frame_length);
+  uint8_t send_ok = 0U;
+  if (encode_ok) {
+    send_ok = UartTransport_Send(frame, frame_length);
+  }
+
+  char dbg_msg[64];
+  int dbg_len = snprintf(dbg_msg, sizeof(dbg_msg), "[STATUS_TX] encode:%u, send:%u, flags:0x%02X\r\n", encode_ok, send_ok, status.flags);
+  if (dbg_len > 0) {
+    (void)HAL_UART_Transmit(&huart2, (uint8_t *)dbg_msg, (uint16_t)dbg_len, 50U);
+  }
+
+  if (encode_ok && send_ok) {
     RobotControl_StatusPublished();
     pending_transport_errors = 0U;
   }

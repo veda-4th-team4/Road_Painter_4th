@@ -85,6 +85,7 @@ uint8_t RobotControl_HandleFrame(const UartFrame_t *frame, uint32_t now_ms) {
 }
 
 void RobotControl_Service(uint32_t now_ms) {
+  /* Temporarily disabled for hardware debugging
   MotorSnapshot_t motor;
 
   if (!watchdog_armed) {
@@ -97,6 +98,7 @@ void RobotControl_Service(uint32_t now_ms) {
     Servo_SetNozzle(0U);
     Motor_RequestEStop(ESTOP_REASON_UART_TIMEOUT, 1U);
   }
+  */
 }
 
 void RobotControl_GetStatus(RobotStatus_t *status, uint8_t extra_status_flags) {

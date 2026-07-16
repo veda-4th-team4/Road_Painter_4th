@@ -202,7 +202,7 @@ HAL_StatusTypeDef Motor_Init(void) {
   set_direction(0U, 1);
   left_axis.direction_sign = 1;
   right_axis.direction_sign = 1;
-  driver_enable(0U);
+  driver_enable(1U); // Force enabled on boot for debugging
   return HAL_TIM_Base_Start_IT(&htim2);
 }
 
@@ -284,9 +284,11 @@ void Motor_TickISR(void) {
                      left_axis.target_q16 == 0 &&
                      right_axis.target_q16 == 0);
   if (stopped) {
+    /* Temporarily disabled for hardware debugging
     if (estop_latched || !ROBOT_HOLD_TORQUE_WHEN_IDLE) {
       driver_enable(0U);
     }
+    */
   }
 }
 
