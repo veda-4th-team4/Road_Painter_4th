@@ -2,6 +2,7 @@
 #define __ROBOT_TYPES_H__
 
 #include <stdint.h>
+#include <string>
 
 /**
  * @brief Common state indicators for packet parser state machine.
@@ -70,5 +71,15 @@ typedef struct {
     uint8_t nozzle_on;
     float speed;
 } Waypoint_t;
+
+/**
+ * @brief Segment structure containing path operation sequence (v0.2).
+ */
+typedef struct {
+    std::string op;       // "MOVE" or "TURN"
+    float dist_m;         // for MOVE
+    float angle_deg;      // for TURN
+    bool paint;           // for MOVE
+} Segment_t;
 
 #endif /* __ROBOT_TYPES_H__ */

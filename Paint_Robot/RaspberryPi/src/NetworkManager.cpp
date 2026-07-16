@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <iostream>
 #include <cstring>
+#include <chrono>
 
 using json = nlohmann::json;
 
@@ -19,7 +20,8 @@ NetworkManager::NetworkManager(const std::string& ip, uint16_t port)
       rx_alive(false),
       has_new_pose(false),
       has_new_path(false),
-      msg_seq(0)
+      msg_seq(0),
+      has_new_cmd(false)
 {
     std::memset(&latest_pose, 0, sizeof(Pose_t));
 }
@@ -30,6 +32,9 @@ NetworkManager::~NetworkManager() {
 
 bool NetworkManager::Init() {
     if (is_connected) return true;
+
+    // Clean up any previous state/threads safely
+    Close();
 
     // 1. Initialize OpenSSL client context
     ssl_ctx = SSL_CTX_new(TLS_client_method());
@@ -154,18 +159,32 @@ void NetworkManager::Close() {
 }
 
 void NetworkManager::Process() {
-    // Left empty since receiver is handled by the background thread.
+    if (!is_connected) {
+        static auto last_retry = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_retry).count() >= 5) {
+            last_retry = now;
+            std::cout << "[NetworkManager] Retrying connection to Vision Server..." << std::endl;
+            Init();
+        }
+    }
 }
 
 bool NetworkManager::SendStatus(const Msg_Status_t& status) {
     if (!is_connected || !ssl_connection) return false;
 
-    // Parse STM32 metrics to match server STATUS schema
+    std::string state_str = "IDLE";
+    if (status.flags & 0x02) {          // STATUS_FLAG_ESTOP (1U << 1)
+        state_str = "ESTOPPED";
+    } else if (status.flags & 0x01) {   // STATUS_FLAG_MOVING (1U << 0)
+        state_str = "MOVING";
+    }
+
+    bool painting_bool = (status.flags & 0x08) ? true : false; // STATUS_FLAG_NOZZLE (1U << 3)
+
     json status_payload = {
-        {"state", (status.flags & 0x01) ? "ESTOP" : "MOVING"},
-        {"x", static_cast<double>(status.left_steps) * 0.001},  // Dummy scale
-        {"y", static_cast<double>(status.right_steps) * 0.001}, // Dummy scale
-        {"battery", 100}                                       // Default percentage
+        {"state", state_str},
+        {"painting", painting_bool}
     };
 
     json status_msg = {
@@ -186,12 +205,20 @@ bool NetworkManager::GetLatestPose(Pose_t& out_pose) {
     return true;
 }
 
-bool NetworkManager::GetPath(std::vector<Waypoint_t>& out_path) {
+bool NetworkManager::GetPath(std::vector<Segment_t>& out_path) {
     std::lock_guard<std::mutex> lock(path_mutex);
     if (!has_new_path) return false;
     
     out_path = current_path;
     has_new_path = false;
+    return true;
+}
+
+bool NetworkManager::GetLatestCommand(std::string& out_cmd) {
+    std::lock_guard<std::mutex> lock(cmd_mutex);
+    if (!has_new_cmd) return false;
+    out_cmd = latest_cmd;
+    has_new_cmd = false;
     return true;
 }
 
@@ -205,6 +232,7 @@ void NetworkManager::rx_loop() {
             parse_incoming_data(line);
         } else {
             std::cerr << "[NetworkManager] SSL socket connection closed or error occurred." << std::endl;
+            is_connected = false;
             rx_alive = false;
         }
     }
@@ -248,20 +276,20 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
             std::lock_guard<std::mutex> lock(path_mutex);
             current_path.clear();
             
-            // Read coordinate array from nested "points" key
-            auto points = payload.value("points", json::array());
-            for (const auto& pt : points) {
-                if (pt.is_array() && pt.size() >= 2) {
-                    Waypoint_t wp;
-                    wp.x = pt[0].get<float>();
-                    wp.y = pt[1].get<float>();
-                    wp.nozzle_on = (pt.size() >= 3) ? pt[2].get<int>() : 1; // paint if present, else ON
-                    wp.speed = 0.05f; // default target speed
-                    current_path.push_back(wp);
+            // Read segment array from nested "segments" key
+            auto segments = payload.value("segments", json::array());
+            for (const auto& seg : segments) {
+                if (seg.is_object()) {
+                    Segment_t segment;
+                    segment.op = seg.value("op", "");
+                    segment.dist_m = seg.value("dist_m", 0.0f);
+                    segment.angle_deg = seg.value("angle_deg", 0.0f);
+                    segment.paint = seg.value("paint", false);
+                    current_path.push_back(segment);
                 }
             }
             has_new_path = true;
-            std::cout << "[NetworkManager] Path data update: " << current_path.size() << " waypoints received." << std::endl;
+            std::cout << "[NetworkManager] Path data update: " << current_path.size() << " segments received." << std::endl;
 
             // [Test Echo] Send status response back to server upon receiving path
             Msg_Status_t path_ack_status = {0, 0, 0};
@@ -293,10 +321,9 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
         } else if (type == "CMD") {
             std::string cmd = payload.value("cmd", "");
             std::cout << "[NetworkManager] Received CMD from server: " << cmd << std::endl;
-            if (cmd == "ESTOP") {
-                // Example handling: raise emergency flag
-                latest_pose.confidence = 0; // Invalidate pose
-            }
+            std::lock_guard<std::mutex> lock(cmd_mutex);
+            latest_cmd = cmd;
+            has_new_cmd = true;
         } else {
             std::cout << "[NetworkManager] Unknown message type: " << type << std::endl;
         }

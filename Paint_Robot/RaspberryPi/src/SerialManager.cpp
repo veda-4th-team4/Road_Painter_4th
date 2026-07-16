@@ -29,13 +29,13 @@ SerialManager::~SerialManager() {
 }
 
 bool SerialManager::Init() {
-    // 1. Initialize wiringPi low-level GPIO
-    if (wiringPiSetup() == -1) {
+    // 1. Initialize wiringPi low-level GPIO using BCM mapping
+    if (wiringPiSetupGpio() == -1) {
         std::cerr << "[SerialManager] Error: wiringPi initialization failed" << std::endl;
         return false;
     }
 
-    // 2. Set GPIO 14/15 pins to ALT0 mode for hardware serial UART
+    // 2. Set BCM GPIO 14/15 pins to ALT0 mode for hardware serial UART
     pinModeAlt(14, TG_ALT0); 
     pinModeAlt(15, TG_ALT0);
 
@@ -127,6 +127,11 @@ bool SerialManager::SendEmergencyStop(uint8_t reason) {
     Msg_EStop_t payload;
     payload.fault_reason = reason;
     return send_packet(0x03, reinterpret_cast<const uint8_t*>(&payload), sizeof(Msg_EStop_t));
+}
+
+bool SerialManager::SendClearEStop() {
+    uint16_t key = 0xA55A;
+    return send_packet(0x04, reinterpret_cast<const uint8_t*>(&key), sizeof(uint16_t));
 }
 
 bool SerialManager::GetLatestStatus(Msg_Status_t& out_status) {

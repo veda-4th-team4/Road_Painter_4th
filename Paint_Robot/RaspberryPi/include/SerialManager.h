@@ -12,7 +12,7 @@
  */
 class SerialManager {
 public:
-    SerialManager(const std::string& dev = "/dev/ttyAMA0", uint32_t baud = 115200);
+    SerialManager(const std::string& dev = "/dev/serial0", uint32_t baud = 115200);
     ~SerialManager();
 
     /**
@@ -47,6 +47,12 @@ public:
      * @return true if transmission succeeded.
      */
     bool SendEmergencyStop(uint8_t reason);
+    
+    /**
+     * @brief Sends a command to clear the emergency stop latch.
+     * @return true if transmission succeeded.
+     */
+    bool SendClearEStop();
 
     /**
      * @brief Thread-safely fetches the latest received status packet.

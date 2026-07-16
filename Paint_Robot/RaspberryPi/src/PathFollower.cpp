@@ -17,10 +17,10 @@ PathFollower::PathFollower()
 
 PathFollower::~PathFollower() {}
 
-void PathFollower::SetPath(const std::vector<Waypoint_t>& new_path) {
+void PathFollower::SetPath(const std::vector<Segment_t>& new_path) {
     path = new_path;
     current_waypoint_idx = 0;
-    std::cout << "[PathFollower] Path loaded with " << path.size() << " waypoints." << std::endl;
+    std::cout << "[PathFollower] Path loaded with " << path.size() << " segments." << std::endl;
 }
 
 void PathFollower::Update(const Pose_t& current_pose, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on) {
@@ -32,17 +32,24 @@ void PathFollower::Update(const Pose_t& current_pose, Msg_SetSpeed_t& out_speed,
         return;
     }
 
-    // TODO: Calculate tracking errors
-    // float cross_track_err = ...
-    // float heading_err = ...
-    
-    // TODO: Generate v and w control inputs via PID / Pure Pursuit
-    float target_v = 0.05f; // 5cm/s speed (example)
+    // Process segment-based operations (MOVE and TURN)
+    const auto& current_seg = path[current_waypoint_idx];
+    float target_v = 0.0f;
     float target_w = 0.0f;
+
+    if (current_seg.op == "MOVE") {
+        target_v = 0.05f; // 5 cm/s straight speed
+        target_w = 0.0f;
+        out_nozzle_on = current_seg.paint ? 1 : 0;
+    } else if (current_seg.op == "TURN") {
+        target_v = 0.0f;
+        // Positive angle_deg means left turn (positive angular velocity), negative is right turn
+        target_w = (current_seg.angle_deg > 0.0f) ? 0.2f : -0.2f; 
+        out_nozzle_on = 0;
+    }
 
     // Kinematic translation to steps-per-second
     out_speed = velocity_to_sps(target_v, target_w);
-    out_nozzle_on = path[current_waypoint_idx].nozzle_on;
 }
 
 Msg_SetSpeed_t PathFollower::velocity_to_sps(float v, float w) {
