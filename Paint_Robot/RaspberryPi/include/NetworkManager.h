@@ -53,10 +53,17 @@ public:
 
     /**
      * @brief Retrieves the path data received from the server.
-     * @param out_path Vector to populate with waypoints.
+     * @param out_path Vector to populate with segments.
      * @return true if a path is loaded.
      */
-    bool GetPath(std::vector<Waypoint_t>& out_path);
+    bool GetPath(std::vector<Segment_t>& out_path);
+
+    /**
+     * @brief Thread-safely fetches the latest received command from the server.
+     * @param out_cmd Reference to store the retrieved command.
+     * @return true if a new command is available.
+     */
+    bool GetLatestCommand(std::string& out_cmd);
 
 private:
     std::string server_ip;
@@ -80,9 +87,13 @@ private:
     Pose_t latest_pose;
     bool has_new_pose;
 
-    std::vector<Waypoint_t> current_path;
+    std::vector<Segment_t> current_path;
     bool has_new_path;
     std::atomic<uint32_t> msg_seq;
+
+    std::mutex cmd_mutex;
+    std::string latest_cmd;
+    bool has_new_cmd;
 
     /**
      * @brief Background worker loop to read incoming data from socket.
