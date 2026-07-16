@@ -20,3 +20,4 @@ calib_frames/
 *.npz
 config/server_token.txt
 server
+qt_sim

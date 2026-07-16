@@ -10,6 +10,10 @@ SRCS = src/main.cpp src/tls_server.cpp src/router.cpp src/user_store.cpp
 server: $(SRCS) src/*.hpp
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $@ $(LDLIBS)
 
+# 테스트용 시뮬레이터 (실제 로봇/Qt 코드 나오기 전까지 서버 검증용)
+qt_sim: tools/qt_sim.cpp
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
+
 clean:
-	rm -f server
+	rm -f server qt_sim
 .PHONY: clean

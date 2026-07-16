@@ -28,11 +28,13 @@ void Router::fromQt(const json& msg) {
         std::string id = payload.value("id", "");
         if (users_.login(id, payload.value("pw", ""))) {
             currentUser_ = id;
-            json H = users_.getH(id);
-            if (!H.is_null()) hMatrix_ = H;  // 저장된 H를 현재 세션에 복원
-            srv_.sendTo("QT", makeMsg("LOGIN_OK", {{"id", id}, {"H", H}}));
-            logf("[INFO] LOGIN %s 성공 (H행렬 %s)", id.c_str(),
-                 H.is_null() ? "없음 - 캘리브레이션 필요" : "전달");
+            json stored = users_.getCalib(id);
+            Calib c;
+            if (!stored.is_null() && calibFromJson(stored, c))
+                calib_ = c;  // 저장된 캘리브레이션을 현재 세션에 복원
+            srv_.sendTo("QT", makeMsg("LOGIN_OK", {{"id", id}, {"calib", stored}}));
+            logf("[INFO] LOGIN %s 성공 (캘리브레이션 %s)", id.c_str(),
+                 stored.is_null() ? "없음 - 캘리브레이션 필요" : "전달");
         } else {
             srv_.sendTo("QT", makeMsg("LOGIN_FAIL",
                                       {{"reason", "id 또는 비밀번호 불일치"}}));
@@ -43,11 +45,24 @@ void Router::fromQt(const json& msg) {
         srv_.sendTo("ROBOT", msg);
         bool toCctv = (cmd == "CALIB_START");
         if (toCctv) srv_.sendTo("CCTV", msg);
-        logf("[INFO] CMD %s -> ROBOT%s", cmd.c_str(), toCctv ? " + CCTV" : "");
+        // 수동 조작(조이스틱: 누르는 동안 이동, STOP=뗌)에 진입하면 자동 경로추종을
+        // 중단한다. 안 그러면 사용자가 로봇을 수동으로 움직이는 순간 서버가 '경로 이탈'로
+        // 판단해 재계획 PATH를 쏴서 수동 조작과 충돌한다. (자동 복귀는 새 BLUEPRINT 때)
+        bool manualCmd = (cmd == "FORWARD" || cmd == "BACKWARD" ||
+                          cmd == "TURN_LEFT" || cmd == "TURN_RIGHT" || cmd == "STOP");
+        if (manualCmd) {
+            manualMode_ = true;
+            planActive_ = false;  // 진행 중이던 자동 경로 폐기 (수동이 우선)
+        }
+        logf("[INFO] CMD %s -> ROBOT%s%s", cmd.c_str(), toCctv ? " + CCTV" : "",
+             manualCmd ? " [수동모드]" : "");
     } else if (type == "BLUEPRINT") {
+        // points = Qt가 top-view 픽셀 -> 바닥 미터 변환을 마친 좌표.
+        // (top-view 위에 그린 점은 정의상 바닥 평면 위라 높이 보정 불필요)
         blueprint_ = payload;
         planPts_.clear();
         planActive_ = false;
+        manualMode_ = false;  // 새 도면 = 자동 모드 복귀
         for (auto& p : payload.value("points", json::array()))
             planPts_.push_back({p[0].get<double>(), p[1].get<double>()});
         if (planPts_.size() < 2) {
@@ -82,18 +97,29 @@ void Router::fromCctv(const json& msg) {
     json payload = msg.value("payload", json::object());
 
     if (type == "POS") {
+        // corners = CCTV 원본 픽셀 좌표. 좌표 변환(undistort -> H_marker)은
+        // 여기(서버)서만 수행 - CCTV는 캘리브레이션 데이터를 가질 필요 없음.
         lastPos_ = payload;
-        srv_.sendTo("ROBOT", msg);  // 위치 보정용
-        srv_.sendTo("QT", msg);     // 모니터링용
+        srv_.sendTo("ROBOT", msg);  // 위치 보정용 (원본 그대로)
+        srv_.sendTo("QT", msg);     // 모니터링용 (원본 그대로)
 
         Pose p;
-        if (poseFromPos(payload, hMatrix_, p)) {
+        if (poseFromPos(payload, calib_, p)) {
             pose_ = p;
             poseValid_ = true;
+            // 계산된 pose(바닥 미터 좌표)를 QT에 전송 - top-view 위 로봇 표시용
+            srv_.sendTo("QT", makeMsg("POSE",
+                {{"x", std::round(p.x * 1000) / 1000},
+                 {"y", std::round(p.y * 1000) / 1000},
+                 {"theta_deg", std::round(p.theta * 180.0 / M_PI * 10) / 10}}));
         } else {
+            if (!calib_.valid)
+                logf("[WARN] POS 수신했으나 캘리브레이션 없음 - pose 계산 불가 (중계만 함)");
             return;  // pose를 못 구하면 중계만 하고 끝
         }
 
+        // 수동 조작 중엔 자동 경로/재계획을 하지 않는다 (POSE 모니터링은 위에서 이미 전송).
+        if (manualMode_) return;
         if (!planActive_) {
             tryPlanAndSend();  // 도면이 먼저 와 있었으면 이제 경로 전송
             return;
@@ -111,12 +137,25 @@ void Router::fromCctv(const json& msg) {
             }
         }
     } else if (type == "H_MATRIX") {
-        hMatrix_ = payload.value("H", json());
-        srv_.sendTo("QT", msg);  // Qt도 즉시 새 H로 top-view 갱신
-        if (!currentUser_.empty() && users_.setH(currentUser_, hMatrix_))
-            logf("[INFO] H 행렬 수신 - 사용자 '%s'에 영속 저장", currentUser_.c_str());
+        // 신규: payload.calib = {K, D, H_floor, H_marker, marker_height_m, version}
+        // 레거시: payload.H = [[...]x3] (왜곡 보정 없이 바닥/마커 공용으로 사용)
+        json bundle =
+            payload.contains("calib") ? payload["calib"] : payload.value("H", json());
+        Calib c;
+        if (!calibFromJson(bundle, c)) {
+            logf("[WARN] H_MATRIX 파싱 실패 - calib/H 형식 확인 필요: %s",
+                 payload.dump().c_str());
+            return;
+        }
+        calib_ = c;
+        srv_.sendTo("QT", msg);  // Qt도 즉시 새 캘리브레이션으로 top-view 갱신
+        if (!currentUser_.empty() && users_.setCalib(currentUser_, bundle))
+            logf("[INFO] 캘리브레이션 수신 (%s%s) - 사용자 '%s'에 영속 저장",
+                 c.hasMarker ? "H_marker 포함" : "H_marker 없음 - 시차 보정 생략됨",
+                 c.hasKD ? ", K/D 포함" : ", K/D 없음 - 왜곡 보정 생략됨",
+                 currentUser_.c_str());
         else
-            logf("[WARN] H 행렬 수신 - 로그인 사용자 없음, 세션에만 유지");
+            logf("[WARN] 캘리브레이션 수신 - 로그인 사용자 없음, 세션에만 유지");
     } else {
         logf("[WARN] CCTV로부터 알 수 없는 type: %s", type.c_str());
     }

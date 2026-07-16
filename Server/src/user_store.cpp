@@ -67,7 +67,7 @@ bool UserStore::registerUser(const std::string& id, const std::string& pw,
     unsigned char salt[16];
     RAND_bytes(salt, sizeof(salt));
     std::string saltHex = toHex(salt, sizeof(salt));
-    users_[id] = {{"salt", saltHex}, {"hash", hashPw(pw, saltHex)}, {"H", nullptr}};
+    users_[id] = {{"salt", saltHex}, {"hash", hashPw(pw, saltHex)}, {"calib", nullptr}};
     save();
     return true;
 }
@@ -79,16 +79,19 @@ bool UserStore::login(const std::string& id, const std::string& pw) {
     return hashPw(pw, u.value("salt", "")) == u.value("hash", "");
 }
 
-json UserStore::getH(const std::string& id) {
+json UserStore::getCalib(const std::string& id) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (!users_.contains(id)) return nullptr;
-    return users_[id].value("H", json());
+    json c = users_[id].value("calib", json());
+    if (c.is_null()) c = users_[id].value("H", json());  // 구버전 파일 호환
+    return c;
 }
 
-bool UserStore::setH(const std::string& id, const json& H) {
+bool UserStore::setCalib(const std::string& id, const json& calib) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (!users_.contains(id)) return false;
-    users_[id]["H"] = H;
+    users_[id]["calib"] = calib;
+    users_[id].erase("H");  // 구버전 키 정리
     save();
     return true;
 }
