@@ -37,7 +37,7 @@ int main() {
                     {"op":"TURN","angle_deg":-90},
                     {"op":"MOVE","dist_m":1.0,"paint":true}
                 ])");
-                bool ok = srv.sendTo("ROBOT", makePathMsg(segs));
+                bool ok = srv.sendTo("ROBOT", makePathMsg(segs, "draw"));
                 logf("[INFO] PATH 전송 %s", ok ? "성공" : "실패");
             } else if (cmd == "estop") {
                 srv.sendTo("ROBOT", makeMsg("CMD", {{"cmd", "ESTOP"}}));
