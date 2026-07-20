@@ -50,9 +50,11 @@ inline bool poseFromPos(const json& p, const Calib& calib, Pose& out) {
     return true;
 }
 
-// 시작 pose에서 폴리라인 pts를 그리는 TURN/MOVE 시퀀스 생성.
-// pts[0]까지는 이동만(paint=false), 이후 구간은 도색(paint=true).
-inline json buildSegments(const Pose& start, const std::vector<Pt>& pts) {
+// 시작 pose에서 폴리라인 pts를 따라가는 TURN/MOVE 시퀀스 생성.
+// firstPaint=false: pts[0]까지는 이동만(paint=false), 이후 구간은 도색(paint=true)
+// firstPaint=true : 첫 구간부터 도색 (도색 경로 전용 - 이미 시작점에 서 있는 경우)
+inline json buildSegments(const Pose& start, const std::vector<Pt>& pts,
+                          bool firstPaint = false) {
     json segs = json::array();
     double x = start.x, y = start.y, th = start.theta;
     for (size_t i = 0; i < pts.size(); ++i) {
@@ -64,9 +66,13 @@ inline json buildSegments(const Pose& start, const std::vector<Pt>& pts) {
         if (std::fabs(turn) > 2.0)  // 2도 미만 회전은 생략
             segs.push_back(
                 {{"op", "TURN"}, {"angle_deg", std::round(turn * 10) / 10}});
+        // heading_deg: 이 직진에서 바라봐야 할 절대 각도(월드 기준).
+        // 로봇은 무시해도 되고, 서버가 출발 전 정렬(READY/ALIGN/GO) 판정에 사용.
         segs.push_back({{"op", "MOVE"},
                         {"dist_m", std::round(dist * 1000) / 1000},
-                        {"paint", i > 0}});
+                        {"paint", firstPaint || i > 0},
+                        {"heading_deg",
+                         std::round(desired * 180.0 / M_PI * 10) / 10}});
         x = pts[i][0], y = pts[i][1], th = desired;
     }
     return segs;
