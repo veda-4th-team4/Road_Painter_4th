@@ -29,19 +29,26 @@ inline double normDeg(double a) {
 //   {"x":..,"y":..,"theta_deg":..} 가 오면 이미 바닥 좌표 값으로 보고 그대로 사용 (테스트용)
 inline bool poseFromPos(const json& p, const Calib& calib, Pose& out) {
     if (p.contains("x") && p.contains("y")) {
+        if (!p["x"].is_number() || !p["y"].is_number()) return false;
         out.x = p["x"].get<double>();
         out.y = p["y"].get<double>();
-        out.theta = p.value("theta_deg", 0.0) * M_PI / 180.0;
+        out.theta = (p.contains("theta_deg") && p["theta_deg"].is_number()
+                         ? p["theta_deg"].get<double>() : 0.0) * M_PI / 180.0;
         return true;
     }
     if (!p.contains("corners") || !p["corners"].is_array() ||
         p["corners"].size() != 4 || !calib.valid)
         return false;
     Pt c[4];
-    for (int i = 0; i < 4; ++i)
-        if (!pixelToMarkerPlane(calib, p["corners"][i][0].get<double>(),
-                                p["corners"][i][1].get<double>(), c[i]))
+    for (int i = 0; i < 4; ++i) {
+        const json& q = p["corners"][i];
+        if (!q.is_array() || q.size() < 2 || !q[0].is_number() ||
+            !q[1].is_number())
             return false;
+        if (!pixelToMarkerPlane(calib, q[0].get<double>(),
+                                q[1].get<double>(), c[i]))
+            return false;
+    }
     out.x = (c[0][0] + c[1][0] + c[2][0] + c[3][0]) / 4;
     out.y = (c[0][1] + c[1][1] + c[2][1] + c[3][1]) / 4;
     double fx = (c[0][0] + c[1][0]) / 2, fy = (c[0][1] + c[1][1]) / 2;  // 앞변 중점
