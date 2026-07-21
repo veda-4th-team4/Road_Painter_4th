@@ -1,0 +1,21 @@
+# host-specific config (see config.sh.example)
+config.sh
+
+# runtime output
+*.log
+calib_views/
+homography_experiments/
+ldc_check_log.csv
+ldc_snapshots.csv
+homography_reference.jpg
+homography_reference.json
+*.ppm
+
+# manual backups
+*.bak
+*.bak-*
+*.bak.*
+
+# python
+__pycache__/
+*.pyc
