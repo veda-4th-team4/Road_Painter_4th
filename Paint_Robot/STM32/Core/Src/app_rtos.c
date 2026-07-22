@@ -8,7 +8,9 @@
 #include "app_rtos.h"
 
 #include "FreeRTOS.h"
+#include "control_arbiter.h"
 #include "ir_remote.h"
+#include "motor.h"
 #include "queue.h"
 #include "robot_config.h"
 #include "robot_control.h"
@@ -58,12 +60,26 @@ static void debug_log_command(const UartFrame_t *frame, uint8_t handled) {
   }
 
   if (!handled) {
+    MotorSnapshot_t motor;
+    uint8_t sources;
+
     if (frame->command == UART_CMD_STATUS) {
       return;
     }
-    length = snprintf(message, sizeof(message),
-                      "[RCV REJECT] CMD: 0x%02X | LEN: %u\r\n",
-                      frame->command, frame->length);
+    Motor_GetSnapshot(&motor);
+    sources = ControlArbiter_GetEstopSources();
+    if (frame->command == UART_CMD_NOZZLE) {
+      length = snprintf(
+          message, sizeof(message),
+          "[RCV REJECT] CMD: 0x%02X | LEN: %u | pay:%u src:0x%02X latch:%u\r\n",
+          frame->command, frame->length, frame->payload[0], sources,
+          motor.estop_latched);
+    } else {
+      length = snprintf(
+          message, sizeof(message),
+          "[RCV REJECT] CMD: 0x%02X | LEN: %u | src:0x%02X latch:%u\r\n",
+          frame->command, frame->length, sources, motor.estop_latched);
+    }
   } else {
     switch (frame->command) {
     case UART_CMD_SET_SPEED:

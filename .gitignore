@@ -31,3 +31,13 @@ CLAUDE.md
 AGENTS.md
 .github/copilot-instructions.md
 
+# STM32 local / test (CubeIDE .project/.cproject/.ioc/FLASH.ld 는 유지)
+Paint_Robot/STM32/Tests/
+Paint_Robot/STM32/.settings/
+Paint_Robot/STM32/Robot_Painter Debug.launch
+Paint_Robot/STM32/STM32F401RETX_RAM.ld
+# 로컬 명세/PDF (STM32 펌웨어와 무관)
+Road-Painter_기술명세서_SRS_v1.6_최종 (1).md
+V-[HW] UART 통신-130726-071752.pdf
+V-Road-Painter 시스템 요구사항 명세서 (SRS)_SEMI_FIN-130726-054542.pdf
+V-\[HW\] UART 통신-130726-071752.pdf

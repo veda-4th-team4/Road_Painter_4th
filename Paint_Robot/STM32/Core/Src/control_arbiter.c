@@ -169,10 +169,11 @@ uint8_t ControlArbiter_HandleUartFrame(const UartFrame_t *frame,
       return 0U;
     }
     Motor_GetSnapshot(&motor);
-    Servo_SetNozzle((frame->payload[0] != 0U && !motor.estop_latched &&
-                     any_estop() == 0U)
-                        ? 1U
-                        : 0U);
+    /* SET_SPEED와 동일: ESTOP 중이면 노즐 명령도 거절 (이미 apply_estop에서 OFF) */
+    if (any_estop() != 0U || motor.estop_latched != 0U) {
+      return 0U;
+    }
+    Servo_SetNozzle(frame->payload[0] != 0U ? 1U : 0U);
     return 1U;
   }
 
@@ -195,12 +196,13 @@ uint8_t ControlArbiter_HandleUartFrame(const UartFrame_t *frame,
     if (Motor_ClearEStop() == 0U) {
       return 0U;
     }
-    estop_sources &= (uint8_t)~(ESTOP_SRC_SERVER | ESTOP_SRC_UART_TIMEOUT);
-    /* watchdog은 다음 SET_SPEED부터 다시 arm */
+    /*
+     * 안전키(0xA55A) + 완전정지면 모든 ESTOP 원인 해제.
+     * 예전에는 REMOTE를 남겨 VALID인데도 SET_SPEED가 계속 REJECT 됐음.
+     */
+    estop_sources = 0U;
+    ir_motion = IR_MOTION_IDLE;
     watchdog_armed = 0U;
-    if ((estop_sources & ESTOP_SRC_REMOTE) != 0U) {
-      Motor_RequestEStop(ESTOP_REASON_REMOTE, 0U);
-    }
     return 1U;
 
   case UART_CMD_SET_CONTROL_MODE:
@@ -229,11 +231,19 @@ uint8_t ControlArbiter_HandleIrEvent(const IrRemoteEvent_t *event,
       return 1U;
     }
     if ((estop_sources & ESTOP_SRC_REMOTE) != 0U) {
-      estop_sources &= (uint8_t)~ESTOP_SRC_REMOTE;
-      if (any_estop() == 0U) {
-        Servo_SetNozzle(0U);
-        (void)Motor_ClearEStop();
+      Servo_SetNozzle(0U);
+      /* 서버/timeout이 남아 있으면 REMOTE 비트만 해제 */
+      if ((estop_sources & (uint8_t)~ESTOP_SRC_REMOTE) != 0U) {
+        estop_sources &= (uint8_t)~ESTOP_SRC_REMOTE;
+        debug_log_ir(event->key, 1U, "remote bit clear (other remains)");
+        return 1U;
       }
+      if (Motor_ClearEStop() == 0U) {
+        /* REMOTE 비트 유지. 가짜 "clear"로 latch만 남는 상태 방지 */
+        debug_log_ir(event->key, 0U, "remote clear FAIL not stopped");
+        return 1U;
+      }
+      estop_sources &= (uint8_t)~ESTOP_SRC_REMOTE;
       debug_log_ir(event->key, 1U, "remote ESTOP clear");
     } else {
       apply_estop(ESTOP_SRC_REMOTE, ESTOP_REASON_REMOTE, 0U);
