@@ -19,6 +19,12 @@ set(SOURCES
 add_executable(robot_exec ${SOURCES})
 target_link_libraries(robot_exec wiringPi OpenSSL::SSL OpenSSL::Crypto pthread)
 
-# 2) Robot Simulator Client Target
-add_executable(robot_sim src/robot_sim.cpp)
-target_link_libraries(robot_sim OpenSSL::SSL OpenSSL::Crypto pthread)
+# 2) Stepper Motor Drive Test Tool
+set(MOTOR_TEST_SOURCES
+    src/motor_test.cpp
+    src/SerialManager.cpp
+)
+add_executable(motor_test ${MOTOR_TEST_SOURCES})
+target_link_libraries(motor_test wiringPi pthread)
+
+

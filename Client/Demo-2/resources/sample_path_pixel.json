@@ -1,0 +1,21 @@
+{
+    "type": "BLUEPRINT",
+    "seq": 1,
+    "payload": {
+        "points": [
+            [420.0, 260.0],
+            [1040.0, 260.0],
+            [1040.0, 580.0],
+            [420.0, 580.0]
+        ]
+    },
+    "meta": {
+        "app": "Road-Painter QML Client",
+        "schemaVersion": "1.1",
+        "createdAt": "2026-07-16T10:00:00",
+        "coordinateSpace": "pixel",
+        "imageSize": [1280, 720],
+        "closed": true,
+        "pointCount": 4
+    }
+}

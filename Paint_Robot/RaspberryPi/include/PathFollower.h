@@ -13,9 +13,9 @@ public:
     ~PathFollower();
 
     /**
-     * @brief Loads the target waypoints.
+     * @brief Loads the target path segments.
      */
-    void SetPath(const std::vector<Waypoint_t>& new_path);
+    void SetPath(const std::vector<Segment_t>& new_path);
 
     /**
      * @brief Computes cross-track/heading errors and outputs left/right motor target speed (sps).
@@ -26,7 +26,7 @@ public:
     void Update(const Pose_t& current_pose, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on);
 
 private:
-    std::vector<Waypoint_t> path;
+    std::vector<Segment_t> path;
     size_t current_waypoint_idx;
 
     // Robot physical constants

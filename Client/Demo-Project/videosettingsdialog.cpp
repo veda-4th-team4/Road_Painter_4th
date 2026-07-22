@@ -9,50 +9,43 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget *parent)
 
     setWindowTitle("비디오 설정");
 
-    auto layout = new QFormLayout(this);
-
-    // 슬라이더 초기화 함수 람다
-    auto createSlider = [](int min, int max, int init) {
-        auto slider = new QSlider(Qt::Horizontal);
-        slider->setRange(min, max);
-        slider->setValue(init);
-        return slider;
-    };
-
-    m_sliderBrightness = createSlider(-100, 100, 0);
-    m_sliderContrast   = createSlider(-100, 100, 0);
-    m_sliderSharpen    = createSlider(0, 100, 0);
-    m_sliderSaturation = createSlider(-100, 100, 0);
-
-    layout->addRow("밝기 (Brightness):", m_sliderBrightness);
-    layout->addRow("대비 (Contrast):", m_sliderContrast);
-    layout->addRow("선명도 (Sharpen):", m_sliderSharpen);
-    layout->addRow("채도 (Saturation):", m_sliderSaturation);
-
-    auto btnClose = new QPushButton("닫기", this);
-    layout->addRow(btnClose);
-
     // 슬라이더 값이 바뀔 때마다 변경 시그널 발생
-    connect(m_sliderBrightness, &QSlider::valueChanged, this, &VideoSettingsDialog::onSliderValueChanged);
-    connect(m_sliderContrast,   &QSlider::valueChanged, this, &VideoSettingsDialog::onSliderValueChanged);
-    connect(m_sliderSharpen,    &QSlider::valueChanged, this, &VideoSettingsDialog::onSliderValueChanged);
-    connect(m_sliderSaturation, &QSlider::valueChanged, this, &VideoSettingsDialog::onSliderValueChanged);
-    connect(btnClose, &QPushButton::clicked, this, &QDialog::accept);
+    connect(ui->sliderBrightness, &QSlider::valueChanged, this, &VideoSettingsDialog::onSliderValueChanged);
+    connect(ui->sliderContrast,   &QSlider::valueChanged, this, &VideoSettingsDialog::onSliderValueChanged);
+    connect(ui->sliderSharpen,    &QSlider::valueChanged, this, &VideoSettingsDialog::onSliderValueChanged);
+    connect(ui->sliderSaturation, &QSlider::valueChanged, this, &VideoSettingsDialog::onSliderValueChanged);
+    connect(ui->CloseBtn, &QPushButton::clicked, this, &QDialog::accept);
+    connect(ui->ResetBtn, &QPushButton::clicked, this, &VideoSettingsDialog::resetToDefault);
 }
 
 void VideoSettingsDialog::setInitialSettings(const Settings& settings) {
-    m_sliderBrightness->setValue(settings.brightness);
-    m_sliderContrast->setValue(settings.contrast);
-    m_sliderSharpen->setValue(settings.sharpen);
-    m_sliderSaturation->setValue(settings.saturation);
+    // 초기값
+    m_defaultSettings = settings;
+
+    // UI 반영
+    ui->sliderBrightness->setValue(settings.brightness);
+    ui->sliderContrast->setValue(settings.contrast);
+    ui->sliderSharpen->setValue(settings.sharpen);
+    ui->sliderSaturation->setValue(settings.saturation);
+}
+
+// 초기화 슬롯 구현
+void VideoSettingsDialog::resetToDefault() {
+    ui->sliderBrightness->setValue(m_defaultSettings.brightness);
+    ui->sliderContrast->setValue(m_defaultSettings.contrast);
+    ui->sliderSharpen->setValue(m_defaultSettings.sharpen);
+    ui->sliderSaturation->setValue(m_defaultSettings.saturation);
+
+    // 슬라이더가 이동했으므로 변경 시그널 즉시 발생
+    onSliderValueChanged();
 }
 
 void VideoSettingsDialog::onSliderValueChanged() {
     Settings currentSettings{
-        m_sliderBrightness->value(),
-        m_sliderContrast->value(),
-        m_sliderSharpen->value(),
-        m_sliderSaturation->value()
+        ui->sliderBrightness->value(),
+        ui->sliderContrast->value(),
+        ui->sliderSharpen->value(),
+        ui->sliderSaturation->value()
     };
     emit settingsChanged(currentSettings); // 메인 윈도우나 위젯으로 전송
 }

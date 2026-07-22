@@ -1,0 +1,4 @@
+build*/
+*.user
+path_temp.json
+CMakeLists.txt.user*

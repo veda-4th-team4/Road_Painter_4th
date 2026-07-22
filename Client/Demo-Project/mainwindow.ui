@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>1200</width>
+    <width>1260</width>
     <height>800</height>
    </rect>
   </property>
@@ -39,6 +39,25 @@
        <enum>QLayout::SizeConstraint::SetFixedSize</enum>
       </property>
       <item>
+       <widget class="QLabel" name="label_2">
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>20</height>
+         </size>
+        </property>
+        <property name="maximumSize">
+         <size>
+          <width>16777215</width>
+          <height>50</height>
+         </size>
+        </property>
+        <property name="text">
+         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p align=&quot;center&quot;&gt;&lt;span style=&quot; font-size:18pt; font-weight: 500;&quot;&gt;Road Painter&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+        </property>
+       </widget>
+      </item>
+      <item>
        <spacer name="verticalSpacer">
         <property name="orientation">
          <enum>Qt::Orientation::Vertical</enum>
@@ -55,12 +74,21 @@
        </spacer>
       </item>
       <item>
-       <widget class="QPushButton" name="pushButton_9">
+       <widget class="QPushButton" name="btnChannel">
+        <property name="enabled">
+         <bool>true</bool>
+        </property>
         <property name="sizePolicy">
          <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
           <horstretch>0</horstretch>
           <verstretch>0</verstretch>
          </sizepolicy>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
         </property>
         <property name="cursor">
          <cursorShape>PointingHandCursor</cursorShape>
@@ -70,7 +98,7 @@
         </property>
         <property name="icon">
          <iconset>
-          <normalon>:/icon_ruler.png</normalon>
+          <normalon>:/icon_cam-dark.png</normalon>
          </iconset>
         </property>
        </widget>
@@ -83,6 +111,12 @@
           <verstretch>0</verstretch>
          </sizepolicy>
         </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
+        </property>
         <property name="cursor">
          <cursorShape>PointingHandCursor</cursorShape>
         </property>
@@ -91,7 +125,7 @@
         </property>
         <property name="icon">
          <iconset>
-          <normalon>:/icon_ruler.png</normalon>
+          <normalon>:/icon_ruler-dark.png</normalon>
          </iconset>
         </property>
        </widget>
@@ -104,6 +138,12 @@
           <verstretch>0</verstretch>
          </sizepolicy>
         </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
+        </property>
         <property name="cursor">
          <cursorShape>PointingHandCursor</cursorShape>
         </property>
@@ -112,18 +152,24 @@
         </property>
         <property name="icon">
          <iconset>
-          <normalon>:/icon_ruler.png</normalon>
+          <normalon>:/iocn_video-dark.png</normalon>
          </iconset>
         </property>
        </widget>
       </item>
       <item>
-       <widget class="QPushButton" name="pushButton_5">
+       <widget class="QPushButton" name="btnRobot">
         <property name="sizePolicy">
          <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
           <horstretch>0</horstretch>
           <verstretch>0</verstretch>
          </sizepolicy>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
         </property>
         <property name="cursor">
          <cursorShape>PointingHandCursor</cursorShape>
@@ -133,18 +179,27 @@
         </property>
         <property name="icon">
          <iconset>
-          <normalon>:/icon_ruler.png</normalon>
+          <normalon>:/icon_robot-dark.png</normalon>
          </iconset>
         </property>
        </widget>
       </item>
       <item>
        <widget class="QPushButton" name="MarkerBtn">
+        <property name="enabled">
+         <bool>true</bool>
+        </property>
         <property name="sizePolicy">
          <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
           <horstretch>0</horstretch>
           <verstretch>0</verstretch>
          </sizepolicy>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
         </property>
         <property name="cursor">
          <cursorShape>PointingHandCursor</cursorShape>
@@ -154,7 +209,7 @@
         </property>
         <property name="icon">
          <iconset>
-          <normalon>:/icon_ruler.png</normalon>
+          <normalon>:/icon_marker-dark.png</normalon>
          </iconset>
         </property>
        </widget>
@@ -167,15 +222,21 @@
           <verstretch>0</verstretch>
          </sizepolicy>
         </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
+        </property>
         <property name="cursor">
          <cursorShape>PointingHandCursor</cursorShape>
         </property>
         <property name="text">
-         <string>보정</string>
+         <string>Top View 보기</string>
         </property>
         <property name="icon">
          <iconset>
-          <normalon>:/icon_ruler.png</normalon>
+          <normalon>:/icon_settings-dark.png</normalon>
          </iconset>
         </property>
        </widget>
@@ -226,6 +287,25 @@
        <enum>QLayout::SizeConstraint::SetFixedSize</enum>
       </property>
       <item>
+       <widget class="QLabel" name="label_3">
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>20</height>
+         </size>
+        </property>
+        <property name="maximumSize">
+         <size>
+          <width>16777215</width>
+          <height>50</height>
+         </size>
+        </property>
+        <property name="text">
+         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p align=&quot;center&quot;&gt;&lt;br/&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+        </property>
+       </widget>
+      </item>
+      <item>
        <spacer name="verticalSpacer_5">
         <property name="orientation">
          <enum>Qt::Orientation::Vertical</enum>
@@ -249,6 +329,12 @@
           <verstretch>0</verstretch>
          </sizepolicy>
         </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
+        </property>
         <property name="cursor">
          <cursorShape>PointingHandCursor</cursorShape>
         </property>
@@ -257,7 +343,7 @@
         </property>
         <property name="icon">
          <iconset>
-          <normalon>:/icon_ruler.png</normalon>
+          <normalon>:/icon_infinity-dark.png</normalon>
          </iconset>
         </property>
         <property name="iconSize">
@@ -276,6 +362,12 @@
           <verstretch>0</verstretch>
          </sizepolicy>
         </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
+        </property>
         <property name="cursor">
          <cursorShape>PointingHandCursor</cursorShape>
         </property>
@@ -284,7 +376,7 @@
         </property>
         <property name="icon">
          <iconset>
-          <normalon>:/icon_ruler.png</normalon>
+          <normalon>:/icon_settings-dark.png</normalon>
          </iconset>
         </property>
         <property name="iconSize">
@@ -296,33 +388,18 @@
        </widget>
       </item>
       <item>
-       <widget class="QPushButton" name="btnPathAdvanced">
-        <property name="sizePolicy">
-         <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
-          <horstretch>0</horstretch>
-          <verstretch>0</verstretch>
-         </sizepolicy>
-        </property>
-        <property name="cursor">
-         <cursorShape>PointingHandCursor</cursorShape>
-        </property>
-        <property name="text">
-         <string>고급 경로 지정</string>
-        </property>
-        <property name="icon">
-         <iconset>
-          <normalon>:/icon_ruler.png</normalon>
-         </iconset>
-        </property>
-       </widget>
-      </item>
-      <item>
        <widget class="QPushButton" name="pushButton_15">
         <property name="sizePolicy">
          <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
           <horstretch>0</horstretch>
           <verstretch>0</verstretch>
          </sizepolicy>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
         </property>
         <property name="cursor">
          <cursorShape>PointingHandCursor</cursorShape>
@@ -332,18 +409,27 @@
         </property>
         <property name="icon">
          <iconset>
-          <normalon>:/icon_ruler.png</normalon>
+          <normalon>:/icon_brush-dark.png</normalon>
          </iconset>
         </property>
        </widget>
       </item>
       <item>
-       <widget class="QPushButton" name="pushButton_13">
+       <widget class="QPushButton" name="btnProfile">
+        <property name="enabled">
+         <bool>true</bool>
+        </property>
         <property name="sizePolicy">
          <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
           <horstretch>0</horstretch>
           <verstretch>0</verstretch>
          </sizepolicy>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
         </property>
         <property name="cursor">
          <cursorShape>PointingHandCursor</cursorShape>
@@ -353,18 +439,54 @@
         </property>
         <property name="icon">
          <iconset>
-          <normalon>:/icon_ruler.png</normalon>
+          <normalon>:/iocn_data_load-dark.png</normalon>
          </iconset>
         </property>
        </widget>
       </item>
       <item>
-       <widget class="QPushButton" name="pushButton_4">
+       <widget class="QPushButton" name="btnLab">
+        <property name="enabled">
+         <bool>true</bool>
+        </property>
         <property name="sizePolicy">
          <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
           <horstretch>0</horstretch>
           <verstretch>0</verstretch>
          </sizepolicy>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
+        </property>
+        <property name="cursor">
+         <cursorShape>PointingHandCursor</cursorShape>
+        </property>
+        <property name="text">
+         <string>실험실</string>
+        </property>
+        <property name="icon">
+         <iconset>
+          <normalon>:/icon_test-dark.png</normalon>
+         </iconset>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="btnSettings">
+        <property name="sizePolicy">
+         <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+          <horstretch>0</horstretch>
+          <verstretch>0</verstretch>
+         </sizepolicy>
+        </property>
+        <property name="minimumSize">
+         <size>
+          <width>180</width>
+          <height>0</height>
+         </size>
         </property>
         <property name="cursor">
          <cursorShape>PointingHandCursor</cursorShape>
@@ -374,7 +496,7 @@
         </property>
         <property name="icon">
          <iconset>
-          <normalon>:/icon_ruler.png</normalon>
+          <normalon>:/icon_settings-dark.png</normalon>
          </iconset>
         </property>
        </widget>
@@ -404,7 +526,7 @@
     <rect>
      <x>0</x>
      <y>0</y>
-     <width>1200</width>
+     <width>1260</width>
      <height>22</height>
     </rect>
    </property>

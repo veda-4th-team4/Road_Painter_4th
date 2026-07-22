@@ -2,5 +2,24 @@
     <qresource prefix="/">
         <file>custom.qss</file>
         <file>icon_ruler.png</file>
+        <file>icon_brush.png</file>
+        <file>icon_cam.png</file>
+        <file>icon_data_load.png</file>
+        <file>icon_infinity.png</file>
+        <file>icon_marker.png</file>
+        <file>icon_robot.png</file>
+        <file>icon_settings.png</file>
+        <file>icon_test.png</file>
+        <file>icon_video.png</file>
+        <file>icon_ruler-dark.png</file>
+        <file>iocn_video-dark.png</file>
+        <file>icon_test-dark.png</file>
+        <file>icon_settings-dark.png</file>
+        <file>icon_robot-dark.png</file>
+        <file>icon_marker-dark.png</file>
+        <file>icon_infinity-dark.png</file>
+        <file>iocn_data_load-dark.png</file>
+        <file>icon_cam-dark.png</file>
+        <file>icon_brush-dark.png</file>
     </qresource>
 </RCC>

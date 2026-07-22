@@ -1,0 +1,8 @@
+#!/bin/bash
+# Port config template. Copy to config.sh and adjust for your environment:
+#   cp config.sh.example config.sh
+# config.sh itself is gitignored (real host-specific values, not committed).
+
+TCP_PORT=6000
+HTTP_PORT=8081
+SNAPSHOT_PORT=6001

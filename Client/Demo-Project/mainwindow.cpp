@@ -16,24 +16,23 @@ MainWindow::MainWindow(QWidget *parent)
 {
     ui->setupUi(this);
 
-    this->setWindowTitle("CCTV Smart Monitoring System (Qt)");
+    this->setWindowTitle("Road-Painter (Demo Version) v2");
     m_videoWidget = ui->label;
-    // setupUserInterface();
     setupBinding();
 
-    // 3. RTSP 주소 설정 및 Worker 스레드 생성 (시그널 연결 전에 반드시 먼저 생성!)
-    QString rtspUrl = "rtsp://localhost:8554/live";
-    m_worker = new video_worker(rtspUrl, this);
+    m_rtspUrl = "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream";
+    m_worker = new video_worker(m_rtspUrl, this);
 
-    // 4. 시그널-슬롯 연결 (m_worker가 생성된 후이므로 안전함)
-    // 통계치 데이터를 하단 상태바(StatusBar)에 업데이트하는 시그널
     connect(m_worker, &video_worker::statsUpdated, this, &MainWindow::updateStreamStats);
-
-    // 수신된 프레임 이미지를 커스텀 비디오 위젯에 전달하여 그리도록 하는 시그널
     connect(m_worker, &video_worker::frameReceived, m_videoWidget, &VideoWidget::updateBackground);
 
     // 5. 스트리밍 시작
     m_worker->start();
+
+    ui->btnChannel->setVisible(false);
+    ui->MarkerBtn->setVisible(false);
+    ui->btnLab->setVisible(false);
+    ui->btnProfile->setVisible(false);
 }
 
 MainWindow::~MainWindow()
@@ -45,10 +44,27 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
+void MainWindow::toggleTestMode(bool enable) {
+    m_isTestMode = enable;
+
+    // 테스트 모드 전용 버튼들 (예: btnDebug1, btnDebug2)
+    ui->btnChannel->setVisible(enable);
+    ui->MarkerBtn->setVisible(enable);
+    ui->btnLab->setVisible(enable);
+    ui->btnProfile->setVisible(enable);
+
+    // 상태 표시
+    if (enable) {
+        this->statusBar()->showMessage("테스트 모드 활성화됨");
+    } else {
+        this->statusBar()->showMessage("일반 모드로 복귀");
+    }
+}
+
 // 하단 상태바에 네트워크 상태 정보 출력
 void MainWindow::updateStreamStats(const StreamStats &stats) {
-    QString statusText = stats.isConnected ? "CONNECTED"
-                                           : "DISCONNECTED";
+    QString statusText = stats.isConnected ? "연결됨"
+                                           : "연결 끊김";
 
     QString info = QString("상태: %1 | FPS: %2 | 지연: %3 ms | 프레임 드롭: %4")
                        .arg(statusText)
@@ -64,11 +80,80 @@ void MainWindow::setupBinding() {
     connect(ui->btnNormal, &QPushButton::clicked, this, &MainWindow::onNormalBtnClicked);
     connect(ui->btnMeasure, &QPushButton::clicked, this, &MainWindow::onMeasureBtnClicked);
     connect(ui->btnPathLine, &QPushButton::clicked, this, &MainWindow::onPathBtnClicked);
+    connect(ui->btnSettings, &QPushButton::clicked, this, &MainWindow::onSettingBtnClicked);
+    connect(ui->btnChannel, &QPushButton::clicked, this, &MainWindow::onChannelBtnClicked);
+    connect(ui->btnRobot, &QPushButton::clicked, this, &MainWindow::onRobotBtnClicked);
+    connect(ui->btnLab, &QPushButton::clicked, this, &MainWindow::onLabBtnClicked);
 
     // 비디오 설정 버튼 바인딩 추가
     connect(ui->btnVideoConfig, &QPushButton::clicked, this, &MainWindow::onVideoConfigBtnClicked);
     connect(m_videoWidget, &VideoWidget::pathDrawingFinished, this, &MainWindow::handlePathDrawingFinished);
     connect(ui->CaliBtn, &QPushButton::clicked, this, &MainWindow::onCaliBtnClicked);
+    connect(ui->MarkerBtn, &QPushButton::clicked, this, &MainWindow::onMarkerBtnClicked);
+}
+
+void MainWindow::onLabBtnClicked() {
+    // 💡 비모달 다이얼로그 생성 시 현재 RTSP 주소(m_rtspUrl)를 넘겨줍니다.
+    LabDialog *dialog = new LabDialog(m_rtspUrl, this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose); // 창이 닫히면 메모리 자동 해제
+
+    // 💡 다이얼로그에서 주소 변경 시그널이 오면 메인 윈도우의 스레드 재시작 슬롯과 연결
+    connect(dialog, &LabDialog::rtspUrlChanged, this, &MainWindow::changeRtspStream);
+
+    dialog->show(); // 화면에 띄우기
+}
+
+// 3. 💡 [신규 구현] 실제 RTSP 스트림을 안전하게 교체하는 로직
+void MainWindow::changeRtspStream(const QString &newUrl) {
+    if (newUrl.isEmpty() || m_rtspUrl == newUrl) return; // 주소가 비었거나 같으면 무시
+
+    m_rtspUrl = newUrl; // 새 주소 갱신
+
+    // 1단계: 기존에 동작 중이던 스레드를 안전하게 멈추고 메모리 해제
+    if (m_worker) {
+        m_worker->stop();
+        m_worker->wait();
+        delete m_worker;
+        m_worker = nullptr;
+    }
+
+    // 2단계: 변경된 주소로 새로운 스레드 객체 생성
+    m_worker = new video_worker(m_rtspUrl, this);
+
+    // 3단계: 시그널-슬롯 재연결
+    connect(m_worker, &video_worker::statsUpdated, this, &MainWindow::updateStreamStats);
+    connect(m_worker, &video_worker::frameReceived, m_videoWidget, &VideoWidget::updateBackground);
+
+    // 4단계: ⭐️ 중요! 새 스트림이 열려도 기존에 조절해 둔 영상 필터값(밝기, 대비 등) 유지 적용
+    m_worker->setVideoFilters(m_currentVideoSettings.brightness,
+                              m_currentVideoSettings.contrast,
+                              m_currentVideoSettings.sharpen,
+                              m_currentVideoSettings.saturation);
+
+    // 5단계: 재생 시작
+    m_worker->start();
+
+    this->statusBar()->showMessage("RTSP 스트림 주소 변경 완료: " + m_rtspUrl);
+}
+
+void MainWindow::onRobotBtnClicked() {
+    RobotSettings *dialog = new RobotSettings(this);
+    dialog->show(); // 화면에 띄우기
+}
+
+void MainWindow::onSettingBtnClicked() {
+    // 현재 모드 상태(m_isTestMode)를 넘겨주며 다이얼로그 생성
+    SettingDialog dlg(m_isTestMode, this);
+
+    // 다이얼로그에서 모드 변경 요청 신호가 들어오면 메인 윈도우의 toggleTestMode와 실시간 연결
+    connect(&dlg, &SettingDialog::requestModeChange, this, &MainWindow::toggleTestMode);
+
+    dlg.exec(); // 다이얼로그 모달 창 띄우기
+}
+
+void MainWindow::onChannelBtnClicked() {
+    ChannelSettings *dialog = new ChannelSettings(this);
+    dialog->show(); // 화면에 띄우기
 }
 
 void MainWindow::onVideoConfigBtnClicked() {
@@ -142,15 +227,21 @@ void MainWindow::onCaliBtnClicked() {
         m_worker->setFilterMode(FilterMode::TopView);
 
         this->statusBar()->showMessage("실시간 Top View 보정 모드 가동 중 (JSON 데이터 적용 완료)");
-        ui->CaliBtn->setText("원본 뷰로 복귀");
+        ui->CaliBtn->setText("원본 View 보기");
 
     } else {
         // 원본 영상으로 복귀
         m_worker->setFilterMode(FilterMode::Original);
         this->statusBar()->showMessage("원본 스트림 모드로 복귀");
-        ui->CaliBtn->setText("Top View 보정");
+        ui->CaliBtn->setText("Top View 보기");
     }
 }
+
+// void MainWindow::on_btnSettings_clicked() {
+//     SettingsDialog dlg(m_isTestMode, this); // 모드 상태 전달
+//     connect(&dlg, &SettingsDialog::requestModeChange, this, &MainWindow::toggleTestMode);
+//     dlg.exec();
+// }
 
 // 기본 대기 마우스 핸들러
 void MainWindow::onNormalBtnClicked() {
@@ -191,7 +282,7 @@ void MainWindow::handlePathDrawingFinished(const QList<QPoint>& points) {
         saveFilePath = QDir::current().absoluteFilePath("path_temp.json");
     }
     else if (result == 2) {
-        saveFilePath = QFileDialog::getSaveFileName(this, "경로 파일 내보내기", QDir::currentPath(), "JSON 파일 (*.json)");
+        saveFilePath = QFileDialog::getSaveFileName(this, "경로 작도", QDir::currentPath(), "JSON 파일 (*.json)");
         if (saveFilePath.isEmpty()) return;
     }
     else if (result == 3) { // 💡 호모그래피 보정 기능 선택 시
@@ -200,6 +291,7 @@ void MainWindow::handlePathDrawingFinished(const QList<QPoint>& points) {
     }
     // JSON 배열을 담을 객체
     QJsonArray jsonPathArray;
+
     // 💡 호모그래피(Top View) 변환 로직
     // =======================================================
     if (applyHomography) {
@@ -248,10 +340,7 @@ void MainWindow::handlePathDrawingFinished(const QList<QPoint>& points) {
             return;
         }
     }
-    // =======================================================
-    // 기본(원본) 좌표계 저장 로직
-    // =======================================================
-    else {
+    else { // 기본(원본) 좌표계 저장 로직
         for (int i = 0; i < points.size(); ++i) {
             QJsonObject pointObject;
             pointObject["sequence"] = i + 1;
@@ -279,6 +368,24 @@ void MainWindow::handlePathDrawingFinished(const QList<QPoint>& points) {
     file.write(jsonDoc.toJson(QJsonDocument::Indented)); // 보기 좋게 들여쓰기하여 저장
     file.close();
 
-    this->statusBar()->showMessage("경로 저장 완료: " + saveFilePath);
-    QMessageBox::information(this, "저장 완료", "성공적으로 경로 데이터가 저장되었습니다.\n경로: " + saveFilePath);
+    this->statusBar()->showMessage("작도 경로 저장 완료: " + saveFilePath);
+    QMessageBox::information(this, "저장 완료", "성공적으로 경로 정보가 저장되었습니다.\n파일 경로: " + saveFilePath);
+}
+
+void MainWindow::onMarkerBtnClicked() {
+    if (!m_worker) return;
+
+    // static 변수를 사용하여 토글 스위치처럼 작동하도록 만듭니다.
+    static bool isMarkerActive = false;
+    isMarkerActive = !isMarkerActive;
+
+    if (isMarkerActive) {
+        m_worker->setFilterMode(FilterMode::DetectArUco);
+        this->statusBar()->showMessage("실시간 ArUco 마커 검출 모드 가동 중");
+        ui->MarkerBtn->setText("마커 검출 중지"); // 켜졌을 때 버튼 텍스트 변경
+    } else {
+        m_worker->setFilterMode(FilterMode::Original);
+        this->statusBar()->showMessage("원본 스트림 모드로 복귀");
+        ui->MarkerBtn->setText("마커 검출 (ArUco)");
+    }
 }
