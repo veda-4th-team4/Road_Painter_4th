@@ -45,6 +45,38 @@ public:
     bool SendStatus(const Msg_Status_t& status);
 
     /**
+     * @brief Sends READY handshake message to server before starting a MOVE segment.
+     * @param seg_index The segment index (0-based) about to be executed.
+     * @return true if successfully sent.
+     */
+    bool SendReady(uint32_t seg_index);
+
+    /**
+     * @brief Thread-safely fetches the latest received ALIGN angle correction.
+     * @param out_angle_deg Output float to store the micro-rotation angle (deg).
+     * @return true if an ALIGN command is available.
+     */
+    bool GetAlignCommand(float& out_angle_deg);
+
+    /**
+     * @brief Checks if a GO signal was received and clears it.
+     * @return true if GO signal was received.
+     */
+    bool CheckAndClearGoSignal();
+
+    /**
+     * @brief Thread-safely fetches the latest DRIFT angle correction feedback.
+     * @param out_angle_deg Output float to store the drift angle (deg).
+     * @return true if a DRIFT update is available.
+     */
+    bool GetDriftCorrection(float& out_angle_deg);
+
+    /**
+     * @brief Gets the phase of the current path ("approach" or "draw").
+     */
+    std::string GetPathPhase();
+
+    /**
      * @brief Retrieves the latest pose data received from the server.
      * @param out_pose Reference to store the retrieved pose.
      * @return true if a valid pose exists.
@@ -88,12 +120,24 @@ private:
     bool has_new_pose;
 
     std::vector<Segment_t> current_path;
+    std::string current_path_phase;
     bool has_new_path;
     std::atomic<uint32_t> msg_seq;
 
     std::mutex cmd_mutex;
     std::string latest_cmd;
     bool has_new_cmd;
+
+    // v0.3 Protocol state variables
+    std::mutex align_mutex;
+    float align_angle_deg;
+    bool has_align_cmd;
+
+    std::atomic<bool> go_signal_received;
+
+    std::mutex drift_mutex;
+    float drift_angle_deg;
+    bool has_drift_cmd;
 
     /**
      * @brief Background worker loop to read incoming data from socket.

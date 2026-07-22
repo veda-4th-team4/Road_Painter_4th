@@ -73,13 +73,14 @@ typedef struct {
 } Waypoint_t;
 
 /**
- * @brief Segment structure containing path operation sequence (v0.2).
+ * @brief Segment structure containing path operation sequence (v0.3).
  */
 typedef struct {
     std::string op;       // "MOVE" or "TURN"
     float dist_m;         // for MOVE
     float angle_deg;      // for TURN
     bool paint;           // for MOVE
+    float heading_deg;    // Target heading orientation (v0.3)
 } Segment_t;
 
 #endif /* __ROBOT_TYPES_H__ */
