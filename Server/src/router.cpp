@@ -17,6 +17,29 @@ void Router::onMessage(const std::string& role, const json& msg) {
     else if (role == "ADMIN") fromAdmin(msg);
 }
 
+// TlsServer가 세션 등록/정리 시 통지 (재접속 교체는 false 없이 넘어감 - tls_server.cpp 참고)
+void Router::onPeerChange(const std::string& role, bool connected) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (role == "QT") {
+        if (connected) sendPeers();  // 막 접속한 QT에 현재 스냅샷 1회 전송
+        return;
+    }
+    if (role != "ROBOT" && role != "CCTV") return;  // QT 관심사만 (ADMIN 등 무시)
+    sendPeers();
+    logf("[INFO] PEERS 통지 - %s %s", role.c_str(), connected ? "접속" : "해제");
+}
+
+// 현재 ROBOT/CCTV 접속 여부를 조회해 QT로 전송. QT 미접속이면 다른 중계와
+// 동일하게 sendTo가 WARN 로그만 남기고 조용히 실패한다 (특별 취급 안 함).
+void Router::sendPeers() {
+    bool robotOn = false, cctvOn = false;
+    for (auto& r : srv_.connectedRoles()) {
+        if (r == "ROBOT") robotOn = true;
+        else if (r == "CCTV") cctvOn = true;
+    }
+    srv_.sendTo("QT", makeMsg("PEERS", {{"robot", robotOn}, {"cctv", cctvOn}}));
+}
+
 // 관리자 창(admin_console)에서 온 명령. 점검/설치용이라 경로 실행 중이어도
 // 차단 없이 그대로 로봇에 전달한다 (QT 수동조작의 A안 차단과 다름).
 void Router::fromAdmin(const json& msg) {

@@ -13,6 +13,8 @@
 //               (로봇은 좌표를 받지 않음 - 각도 피드백 ALIGN/DRIFT로만 보정)
 //   CCTV  -> H_MATRIX  -> 캘리브레이션 번들(K,D,H_floor,H_marker) 수신,
 //               로그인 사용자에 영속 저장 + QT 중계
+//   ROBOT/CCTV 접속·해제 -> QT에 PEERS{"robot":bool,"cctv":bool} 통지
+//               (QT 접속 시에도 현재 스냅샷 1회 전송)
 #include "calib.hpp"
 #include "path_planner.hpp"
 #include "protocol.hpp"
@@ -24,8 +26,13 @@ class Router {
 public:
     explicit Router(TlsServer& srv) : srv_(srv), users_("config/users.json") {}
     void onMessage(const std::string& role, const json& msg);
+    // ROBOT/CCTV 접속·해제 시(TlsServer가 통지) QT에 PEERS로 알림.
+    // QT 자신이 막 접속했을 때도 호출되어 현재 접속 현황 스냅샷을 보낸다.
+    void onPeerChange(const std::string& role, bool connected);
 
 private:
+    // 현재 ROBOT/CCTV 접속 여부를 모아 PEERS 메시지로 QT에 전송
+    void sendPeers();
     void fromQt(const json& msg);
     void fromRobot(const json& msg);
     void fromCctv(const json& msg);

@@ -109,6 +109,14 @@ Qt ──① 로그인/도면/제어 (TLS) ──▶ 서버 192.168.0.8:9000
 | `STATUS` | `{"state":"IDLE"\|"MOVING"\|"ESTOPPED"\|"ERROR","painting":true}` | 대시보드 상태 표시 |
 | `POS` | `{"corners":[[u,v]x4]}` | CCTV 원본 픽셀 중계(모니터링용). 로봇 표시는 POSE를 쓰는 게 정확 |
 | `H_MATRIX` | `{"calib":{...}}` | 캘리브레이션 갱신 직후 중계. top-view 재생성 |
+| `PEERS` | `{"robot":true,"cctv":false}` | **로봇/CCTV 접속 상태.** 상단에 🟢/🔴 표시등 2개 다는 용도로 쓰세요 |
+
+- `PEERS`는 ROBOT/CCTV가 붙거나 끊길 때마다 옵니다. **Qt 자신이 접속한 직후에도
+  현재 상태 스냅샷을 1회 보내주니**, 별도로 물어볼 필요 없이 그냥 수신 루프에서
+  받아 표시등만 갱신하면 됩니다.
+- ⚠️ STATUS/POSE가 한동안 안 온다고 "로봇/CCTV가 없나 보다"라고 유추하지 마세요
+  (예: 로봇이 붙었지만 첫 STATUS 전송 전인 순간도 있습니다). 접속 여부는 반드시
+  `PEERS`로만 판단하세요.
 
 ## 5. top-view 생성 (calib 번들 사용)
 
@@ -154,6 +162,7 @@ Qt ──① 로그인/도면/제어 (TLS) ──▶ 서버 192.168.0.8:9000
 - [ ] 제어 UI → `CMD`(START_DRAW / ESTOP / RESUME / CALIB_START / 조이스틱)
 - [ ] `POSE` 수신 → top-view 위 로봇 표시, `STATUS` → 대시보드
 - [ ] `H_MATRIX` 수신 → top-view 재생성
+- [ ] `PEERS` 수신 → 로봇/CCTV 접속 표시등 갱신 (§4)
 - [ ] 끊기면 재접속 루프
 
 문의: 서버 파트. 전체 프로토콜 원문은 `Server/PROTOCOL.md`(QT 절)와

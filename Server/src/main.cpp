@@ -43,6 +43,9 @@ int main() {
         gpServer->setHandler([&](const std::string& role, const json& msg) {
             router.onMessage(role, msg);
         });
+        gpServer->setPeerHandler([&](const std::string& role, bool connected) {
+            router.onPeerChange(role, connected);
+        });
 
         // 네트워크 스레드 시작 (srv.run()은 블로킹)
         std::thread netThread([&] { gpServer->run(); });
