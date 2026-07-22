@@ -83,6 +83,10 @@
 //   POSE   payload: {"x":1.234,"y":0.567,"theta_deg":90.0}
 //     - 서버가 POS를 변환해 계산한 로봇 pose (바닥 미터 좌표) - top-view 표시용
 //   H_MATRIX : 캘리브레이션 갱신 직후 그대로 중계 (top-view 재생성용)
+//   PEERS  payload: {"robot":true,"cctv":false}
+//     - ROBOT/CCTV 접속·해제될 때마다 전송. QT 접속 직후에도 현재 스냅샷 1회 전송.
+//     - QT가 "로봇/CCTV가 지금 붙어있는지"를 STATUS/POS 유무로 유추하지 않고
+//       바로 알 수 있게 하는 접속 상태 신호 (2026-07-22 추가)
 //
 // [CCTV -> 서버]
 //   H_MATRIX payload: {"calib":{"version":1, "K":[[...]x3], "D":[k1,k2,p1,p2,k3],

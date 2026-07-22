@@ -37,6 +37,12 @@ TCP_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 6000
 HTTP_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8081
 SNAPSHOT_PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 6001
 WATCHDOG_S = 2.0
+# 카메라가 아직 서버(9000)에 role=CCTV로 직접 붙지 못하는 동안, 이 프로세스가
+# CAM_POSE를 POS로 통역해 대신 공급하는 다리(cctv_link_loop). 카메라 앱이
+# CCTV_CAMERA_SPEC.md대로 직결하게 되면 반드시 꺼야 한다 — 서버는 role당 연결을
+# 1개만 유지해서, 카메라와 이 다리가 동시에 role=CCTV로 붙으면 서로 계속 밀어내는
+# 재접속 핑퐁이 발생한다 (양쪽 다 3초 간격 자동 재접속 루프라 무한 반복됨).
+CCTV_BRIDGE_ENABLED = os.environ.get("RP_CCTV_BRIDGE", "1") not in ("0", "false", "off")
 SNAPSHOT_DIR = "."
 # Uploaded calibration-view JPEGs (CALIB_K_UPLOAD) go in their own subfolder
 # so they don't clutter the main directory with the .ppm/.csv/logs.
@@ -332,7 +338,14 @@ def cctv_forward_pos(corners):
 
 
 def cctv_link_loop():
-    """Maintain the CCTV-role connection to the relay server; reconnect forever."""
+    """Maintain the CCTV-role connection to the relay server; reconnect forever.
+
+    Skips entirely when CCTV_BRIDGE_ENABLED is false (camera connects to the
+    server directly as role=CCTV instead) - see the flag's comment above."""
+    if not CCTV_BRIDGE_ENABLED:
+        broadcast("[cctv-link] bridge OFF (RP_CCTV_BRIDGE=0) — 카메라 직결 모드, "
+                  "이 다리는 대기만 함")
+        return
     global _cctv_sock
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
@@ -474,9 +487,13 @@ def push_calib_to_server():
     if K is not None:
         bundle["K"] = K
         bundle["D"] = dist or [0, 0, 0, 0, 0]
-    # 캘리 결과는 데이터 경로(CCTV role)로 보낸다 - ADMIN은 감시/제어 전용
-    if cctv_send("H_MATRIX", {"calib": bundle}):
-        broadcast("[bridge] 캘리 결과를 서버로 전송(H_MATRIX, role=CCTV) — 저장+Qt 중계됨")
+    # ADMIN 연결로 보낸다 (CCTV 연결이 아님) - 서버 fromAdmin()이 H_MATRIX를
+    # CCTV와 동일하게 처리(저장+Qt 중계)하므로 동작은 같다. CCTV 연결(cctv_link_loop)은
+    # 카메라 직결 시 꺼지는(CCTV_BRIDGE_ENABLED) 대상이라, 그 연결에 캘리 결과를
+    # 얹으면 브리지를 끄는 순간 이 관리자 창의 캘리 도구도 같이 죽는다 - ADMIN
+    # 연결은 브리지와 무관하게 항상 떠 있으므로 여기 실어야 안전하다.
+    if server_send("H_MATRIX", {"calib": bundle}):
+        broadcast("[bridge] 캘리 결과를 서버로 전송(H_MATRIX, role=ADMIN) — 저장+Qt 중계됨")
 
 
 def tabbar(active):

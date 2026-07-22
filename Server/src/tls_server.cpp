@@ -178,6 +178,9 @@ void TlsServer::sessionThread(ClientPtr c) {
         long idleTimeoutMs = (role == "ROBOT") ? 10000 : 0;
         logf("[INFO] [접속] %s %s", role.c_str(), c->peer.c_str());
         sendTo(role, makeMsg("ACK", {{"msg", "registered as " + role}}));
+        // mtx_를 놓은 뒤 호출 - 핸들러(Router::onPeerChange)가 sendTo/connectedRoles로
+        // mtx_를 다시 잡으므로, 여기서 잡은 채 부르면 재귀 락으로 데드락난다.
+        if (peerHandler_) peerHandler_(role, true);
 
         // 수신 루프
         while (readLine(*c, buf, line, idleTimeoutMs)) {
@@ -205,11 +208,19 @@ void TlsServer::sessionThread(ClientPtr c) {
     // 정리: 먼저 레지스트리에서 제거해 새 sendTo가 이 연결을 못 잡게 하고,
     // sslMtx 안에서 dead 표시 후 해제한다 - 이미 ClientPtr를 쥔 다른 스레드가
     // 해제된 SSL에 SSL_write하는 use-after-free 방지 (sendTo는 dead 확인).
+    bool erased = false;
     if (!role.empty()) {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = clients_.find(role);
-        if (it != clients_.end() && it->second == c) clients_.erase(it);
+        // it->second == c 체크가 핵심: 재접속으로 교체된 옛 세션은 이미 다른
+        // ClientPtr로 덮어써져 있어 여기 안 걸린다 - "실제로 끊긴" 경우만
+        // false 이벤트가 나가고, 재접속 중 순간적인 false/true 깜빡임이 없다.
+        if (it != clients_.end() && it->second == c) {
+            clients_.erase(it);
+            erased = true;
+        }
     }
+    if (erased && peerHandler_) peerHandler_(role, false);  // mtx_ 밖에서 호출 (위와 동일 이유)
     {
         std::lock_guard<std::mutex> lk(c->sslMtx);
         c->dead = true;

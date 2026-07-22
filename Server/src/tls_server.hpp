@@ -15,11 +15,15 @@ class TlsServer {
 public:
     // (보낸 클라이언트 role, 파싱된 JSON 메시지)
     using Handler = std::function<void(const std::string&, const json&)>;
+    // (role, true=접속/false=해제). 재접속으로 기존 세션이 교체될 때는
+    // false가 안 나간다 (실제로 아무도 없어졌을 때만 호출 - sessionThread 참고).
+    using PeerHandler = std::function<void(const std::string&, bool)>;
 
     TlsServer(int port, const std::string& certFile, const std::string& keyFile);
     ~TlsServer();
 
     void setHandler(Handler h) { handler_ = std::move(h); }
+    void setPeerHandler(PeerHandler h) { peerHandler_ = std::move(h); }
     void run();  // accept 루프 (블로킹) - 별도 스레드에서 호출
     void shutdown();  // 리스닝 소켓 종료 (accept 루프에서 빠져나옴)
 
@@ -54,6 +58,7 @@ private:
     std::atomic<int> listenFd_{-1};
     SSL_CTX* ctx_ = nullptr;
     Handler handler_;
+    PeerHandler peerHandler_;
     std::mutex mtx_;                            // clients_ 보호
     std::map<std::string, ClientPtr> clients_;  // role -> 연결
 };
