@@ -8,6 +8,7 @@
 #include "app_rtos.h"
 
 #include "FreeRTOS.h"
+#include "ir_remote.h"
 #include "queue.h"
 #include "robot_config.h"
 #include "robot_control.h"
@@ -21,7 +22,7 @@
 
 #define COMMAND_QUEUE_DEPTH       8U
 #define COMM_TASK_STACK_WORDS     768U
-#define CONTROL_TASK_STACK_WORDS  384U
+#define CONTROL_TASK_STACK_WORDS  512U
 #define COMM_TASK_PRIORITY        (tskIDLE_PRIORITY + 2U)
 #define CONTROL_TASK_PRIORITY     (tskIDLE_PRIORITY + 3U)
 #define SERVICE_PERIOD_MS         10U
@@ -47,9 +48,6 @@ static uint32_t ticks_to_ms(TickType_t ticks) {
 
 /**
  * @brief 검증 후 ControlTask까지 전달된 명령을 USART2 진단 포트에 출력합니다.
- * @param frame 수신한 명령 frame입니다.
- * @param handled payload와 command가 유효하면 1, 거부되면 0입니다.
- * @note 명령 UART인 USART1에는 문자열을 섞지 않습니다.
  */
 static void debug_log_command(const UartFrame_t *frame, uint8_t handled) {
   char message[128];
@@ -60,6 +58,9 @@ static void debug_log_command(const UartFrame_t *frame, uint8_t handled) {
   }
 
   if (!handled) {
+    if (frame->command == UART_CMD_STATUS) {
+      return;
+    }
     length = snprintf(message, sizeof(message),
                       "[RCV REJECT] CMD: 0x%02X | LEN: %u\r\n",
                       frame->command, frame->length);
@@ -88,6 +89,11 @@ static void debug_log_command(const UartFrame_t *frame, uint8_t handled) {
     case UART_CMD_CLEAR_ESTOP:
       length = snprintf(message, sizeof(message),
                         "[RCV VALID] CMD: 0x04 | Clear E-Stop Request\r\n");
+      break;
+
+    case UART_CMD_SET_CONTROL_MODE:
+      length = snprintf(message, sizeof(message),
+                        "[RCV VALID] CMD: 0x05 | ignored (no mode)\r\n");
       break;
 
     default:
@@ -184,10 +190,6 @@ static void CommunicationTask(void *argument) {
     uint8_t new_transport_errors = UartTransport_TakeErrorFlags();
     pending_transport_errors |= new_transport_errors;
     if ((new_transport_errors & UART_TRANSPORT_ERROR_RX) != 0U) {
-      /*
-       * 한 바이트라도 유실되면 현재 frame 경계를 신뢰하지 않습니다.
-       * 남은 stream과 parser를 함께 폐기하고 다음 STX부터 재동기화합니다.
-       */
       UartTransport_DiscardRx();
       UartProtocol_ParserInit(&parser);
       RobotControl_ReportRxError();
@@ -198,7 +200,10 @@ static void CommunicationTask(void *argument) {
       UartParseResult_t result =
           UartProtocol_ParseByte(&parser, rx_bytes[index], &completed_frame);
       if (result == UART_PARSE_FRAME_READY) {
-        queue_command(&completed_frame);
+        /* 0x81 STATUS는 STM32→RPi 전용. RX로 들어오면(에코/오배선) 무시 */
+        if (completed_frame.command != UART_CMD_STATUS) {
+          queue_command(&completed_frame);
+        }
       } else if (result == UART_PARSE_ERROR) {
         RobotControl_ReportRxError();
       }
@@ -212,9 +217,12 @@ static void CommunicationTask(void *argument) {
   }
 }
 
-/** @brief 명령을 실행하고 UART SET_SPEED watchdog을 검사합니다. */
+/**
+ * @brief UART 명령, IR 이벤트, deadman/watchdog를 실행합니다.
+ */
 static void ControlTask(void *argument) {
   UartFrame_t frame;
+  IrRemoteEvent_t ir_event;
   const TickType_t service_period = pdMS_TO_TICKS(SERVICE_PERIOD_MS);
 
   (void)argument;
@@ -224,6 +232,20 @@ static void ControlTask(void *argument) {
           &frame, ticks_to_ms(xTaskGetTickCount()));
       debug_log_command(&frame, handled);
     }
+
+    while (IrRemote_PollEvent(&ir_event) != 0U) {
+      char ir_msg[48];
+      int ir_len = snprintf(
+          ir_msg, sizeof(ir_msg), "\r\n[IR Key]: 0x%02X%s\r\n", ir_event.key,
+          ir_event.is_repeat ? " (rpt)" : "");
+      if (ir_len > 0) {
+        (void)HAL_UART_Transmit(&huart2, (uint8_t *)ir_msg, (uint16_t)ir_len,
+                                50U);
+      }
+      (void)RobotControl_HandleIrEvent(&ir_event,
+                                       ticks_to_ms(xTaskGetTickCount()));
+    }
+
     RobotControl_Service(ticks_to_ms(xTaskGetTickCount()));
   }
 }
@@ -234,6 +256,11 @@ HAL_StatusTypeDef AppRtos_Init(UART_HandleTypeDef *command_uart) {
       &command_queue_control);
   if (command_queue == NULL ||
       UartTransport_Init(command_uart) != HAL_OK) {
+    return HAL_ERROR;
+  }
+
+  IrRemote_Init();
+  if (IrRemote_Start() != HAL_OK) {
     return HAL_ERROR;
   }
 

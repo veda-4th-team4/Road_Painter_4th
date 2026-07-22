@@ -19,19 +19,21 @@
 #define UART_PROTOCOL_MAX_FRAME     \
   (UART_PROTOCOL_MAX_PAYLOAD + UART_PROTOCOL_FRAME_OVERHEAD)
 
-#define UART_SET_SPEED_PAYLOAD_LEN    4U
-#define UART_NOZZLE_PAYLOAD_LEN       1U
-#define UART_ESTOP_PAYLOAD_LEN        1U
-#define UART_CLEAR_ESTOP_PAYLOAD_LEN  2U
-#define UART_STATUS_PAYLOAD_LEN       9U
+#define UART_SET_SPEED_PAYLOAD_LEN         4U
+#define UART_NOZZLE_PAYLOAD_LEN            1U
+#define UART_ESTOP_PAYLOAD_LEN             1U
+#define UART_CLEAR_ESTOP_PAYLOAD_LEN       2U
+#define UART_SET_CONTROL_MODE_PAYLOAD_LEN  1U
+#define UART_STATUS_PAYLOAD_LEN            9U
 
 /** @brief 기존 RPi와 호환되는 command ID입니다. */
 typedef enum {
-  UART_CMD_SET_SPEED   = 0x01U,
-  UART_CMD_NOZZLE      = 0x02U,
-  UART_CMD_ESTOP       = 0x03U,
-  UART_CMD_CLEAR_ESTOP = 0x04U,
-  UART_CMD_STATUS      = 0x81U
+  UART_CMD_SET_SPEED         = 0x01U,
+  UART_CMD_NOZZLE            = 0x02U,
+  UART_CMD_ESTOP             = 0x03U,
+  UART_CMD_CLEAR_ESTOP       = 0x04U,
+  UART_CMD_SET_CONTROL_MODE  = 0x05U,
+  UART_CMD_STATUS            = 0x81U
 } UartCommand_t;
 
 #define STATUS_FLAG_MOVING      (1U << 0)
@@ -40,6 +42,8 @@ typedef enum {
 #define STATUS_FLAG_NOZZLE      (1U << 3)
 #define STATUS_FLAG_RX_ERROR    (1U << 4)
 #define STATUS_FLAG_TX_OVERFLOW (1U << 5)
+/** @brief 예전 AUTO/MANUAL용. 모드 폐지 후 항상 0. */
+#define STATUS_FLAG_MANUAL      (1U << 6)
 
 /** @brief ESTOP payload 및 내부 안전정지 원인 코드입니다. */
 typedef enum {
@@ -47,6 +51,7 @@ typedef enum {
   ESTOP_REASON_RPI          = 0x01U,
   ESTOP_REASON_UART_TIMEOUT = 0x02U,
   ESTOP_REASON_UART_ERROR   = 0x03U,
+  ESTOP_REASON_REMOTE       = 0x04U,
   ESTOP_REASON_INTERNAL     = 0x7FU
 } EStopReason_t;
 

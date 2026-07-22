@@ -1,122 +1,65 @@
 /**
  ******************************************************************************
  * @file    robot_control.c
- * @brief   검증된 UART 명령 실행과 300 ms 통신 watchdog 정책
+ * @brief   검증된 UART 명령 실행과 arbiter 위임
  ******************************************************************************
  */
 
 #include "robot_control.h"
 
+#include "control_arbiter.h"
 #include "motor.h"
 #include "robot_config.h"
 #include "servo.h"
 
 #include <stddef.h>
 
-static uint8_t watchdog_armed;
-static uint32_t last_set_speed_ms;
 static volatile uint8_t rx_error_latched;
 
 void RobotControl_Init(void) {
-  watchdog_armed = 0U;
-  last_set_speed_ms = 0U;
   rx_error_latched = 0U;
+  ControlArbiter_Init();
 }
 
 uint8_t RobotControl_HandleFrame(const UartFrame_t *frame, uint32_t now_ms) {
+  uint8_t handled;
+
   if (frame == NULL) {
     RobotControl_ReportRxError();
     return 0U;
   }
 
-  switch (frame->command) {
-  case UART_CMD_SET_SPEED:
-    if (frame->length != UART_SET_SPEED_PAYLOAD_LEN) {
-      break;
-    }
-    last_set_speed_ms = now_ms;
-    watchdog_armed = 1U;
-    (void)Motor_SetTargetSps(
-        UartProtocol_ReadI16Le(&frame->payload[0]),
-        UartProtocol_ReadI16Le(&frame->payload[2]));
-    return 1U;
-
-  case UART_CMD_NOZZLE: {
-    MotorSnapshot_t motor;
-    if (frame->length != UART_NOZZLE_PAYLOAD_LEN ||
-        frame->payload[0] > 1U) {
-      break;
-    }
-    Motor_GetSnapshot(&motor);
-    Servo_SetNozzle((frame->payload[0] != 0U && !motor.estop_latched) ? 1U
-                                                                     : 0U);
-    return 1U;
+  handled = ControlArbiter_HandleUartFrame(frame, now_ms);
+  if (handled == 0U && frame->command != UART_CMD_STATUS) {
+    RobotControl_ReportRxError();
   }
-
-  case UART_CMD_ESTOP:
-    if (frame->length != UART_ESTOP_PAYLOAD_LEN) {
-      break;
-    }
-    Servo_SetNozzle(0U);
-    Motor_RequestEStop(frame->payload[0] != 0U ? frame->payload[0]
-                                               : ESTOP_REASON_RPI,
-                       0U);
-    return 1U;
-
-  case UART_CMD_CLEAR_ESTOP:
-    if (frame->length != UART_CLEAR_ESTOP_PAYLOAD_LEN ||
-        UartProtocol_ReadU16Le(frame->payload) != ROBOT_CLEAR_ESTOP_KEY) {
-      break;
-    }
-    Servo_SetNozzle(0U);
-    if (Motor_ClearEStop()) {
-      last_set_speed_ms = now_ms;
-      watchdog_armed = 1U;
-    }
-    return 1U;
-
-  case UART_CMD_STATUS:
-  default:
-    break;
-  }
-
-  RobotControl_ReportRxError();
-  return 0U;
+  return handled;
 }
 
 void RobotControl_Service(uint32_t now_ms) {
-  /* Temporarily disabled for hardware debugging
-  MotorSnapshot_t motor;
-
-  if (!watchdog_armed) {
-    return;
-  }
-
-  Motor_GetSnapshot(&motor);
-  if (!motor.estop_latched &&
-      (uint32_t)(now_ms - last_set_speed_ms) >= ROBOT_UART_WATCHDOG_MS) {
-    Servo_SetNozzle(0U);
-    Motor_RequestEStop(ESTOP_REASON_UART_TIMEOUT, 1U);
-  }
-  */
+  ControlArbiter_Service(now_ms);
 }
 
 void RobotControl_GetStatus(RobotStatus_t *status, uint8_t extra_status_flags) {
   MotorSnapshot_t motor;
   uint8_t flags = extra_status_flags;
+  uint8_t sources;
 
   if (status == NULL) {
     return;
   }
 
   Motor_GetSnapshot(&motor);
+  sources = ControlArbiter_GetEstopSources();
+
   if (motor.moving) {
     flags |= STATUS_FLAG_MOVING;
   }
-  if (motor.estop_latched) {
+  if (motor.estop_latched || sources != 0U) {
     flags |= STATUS_FLAG_ESTOP;
   }
-  if (motor.timeout_latched) {
+  if (motor.timeout_latched ||
+      (sources & ESTOP_SRC_UART_TIMEOUT) != 0U) {
     flags |= STATUS_FLAG_TIMEOUT;
   }
   if (Servo_IsNozzleOn()) {
@@ -125,6 +68,7 @@ void RobotControl_GetStatus(RobotStatus_t *status, uint8_t extra_status_flags) {
   if (rx_error_latched) {
     flags |= STATUS_FLAG_RX_ERROR;
   }
+  /* bit6 MANUAL: 모드 구분 폐지로 항상 0 */
 
   status->left_steps = motor.left_steps;
   status->right_steps = motor.right_steps;
@@ -142,4 +86,9 @@ void RobotControl_StatusPublished(void) {
   if (primask == 0U) {
     __enable_irq();
   }
+}
+
+uint8_t RobotControl_HandleIrEvent(const IrRemoteEvent_t *event,
+                                   uint32_t now_ms) {
+  return ControlArbiter_HandleIrEvent(event, now_ms);
 }

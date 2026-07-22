@@ -121,17 +121,20 @@ int main(void) {
   MX_USART1_UART_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   /*
    * 초기화 순서가 중요합니다.
    * 1) GPIO가 먼저 EN=HIGH(드라이버 비활성) 안전 상태를 만듭니다.
    * 2) TIM1 서보 PWM을 OFF 위치에서 시작합니다.
    * 3) TIM2 20 kHz 모터 실시간 interrupt를 시작합니다.
-   * 4) 정적 task/queue를 만든 뒤 scheduler에서 USART1 수신을 시작합니다.
+   * 4) TIM3 IR PWM-input을 시작합니다.
+   * 5) 정적 task/queue를 만든 뒤 scheduler에서 USART1 수신을 시작합니다.
    */
   /*
    * USART1(PA9 TX/PA10 RX): V-[HW] UART 바이너리 프레임, 115200-8-N-1
    * USART2(PA2 TX/PA3 RX): ST-Link Virtual COM 디버그 출력, 115200-8-N-1
+   * TIM3_CH1(PB4): IR 수신기
    */
   if (Robot_Init() != HAL_OK) {
     Error_Handler();

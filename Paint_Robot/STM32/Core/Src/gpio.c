@@ -68,9 +68,9 @@ void MX_GPIO_Init(void)
                     GPIO_PIN_RESET);
   HAL_GPIO_WritePin(GPIOB, LEFT_EN_Pin | RIGHT_EN_Pin, GPIO_PIN_SET);
 
-  /*Configure GPIO pin : B1_Pin */
+  /*Configure GPIO pin : B1_Pin (미사용, Nucleo 기본 사용자 버튼) */
   GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 

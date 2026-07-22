@@ -1,302 +1,184 @@
-# V-Road-Painter STM32 최종 통신·배선·시험 가이드
-
-## 1. 적용 기준과 구현 범위
+﻿# 1. 역할
 
-`V-[HW] UART 통신-130726-071752.pdf`를 UART 통신의 정본으로 사용합니다.
-프레임, 바이트 순서, `0x01 SET_SPEED`, CRC-8, 115200-8-N-1을 그대로
-적용했습니다. PDF에 없는 안전 항목은 SRS 부록 C.5에 따라 확장했습니다.
+- left_sps/right_sps -> 가감속 STEP, 노즐, ESTOP, STATUS
+- m/도/PATH/PD 안 함
+- 물리 ESTOP 없음. ESTOP = 서버 UART + IR POWER
+- AUTO/MANUAL 없음. ESTOP만 아니면 서버·IR 둘 다 가능
+- IR: 키 1회 = 펄스 후 정지
 
-- FreeRTOS Kernel v10.3.1 Native API, 런타임 heap 없는 정적 할당
-- `CommunicationTask`와 `ControlTask`의 2-task 구조
-- USART1 interrupt RX stream buffer와 비동기 TX queue
-- HAL/RTOS 비종속 UART frame codec
-- `0x01 SET_SPEED`, `0x02 NOZZLE`, `0x03 ESTOP`
-- SRS 안전 확장 `0x04 CLEAR_ESTOP`, STM32 송신 `0x81 STATUS`
-- TIM2 20 kHz 좌우 독립 STEP과 Q16 정수 가감속
-- 300 ms SET_SPEED watchdog과 감속 ESTOP latch
-- PA8/TIM1_CH1 50 Hz 서보 PWM
-- 10 Hz 누적 좌우 스텝/상태 보고
+---
 
-실시간 STEP 생성은 RTOS task로 옮기지 않았습니다. TIM2 priority 0 ISR이 계속
-20 kHz로 `Motor_TickISR()`을 직접 실행합니다. FreeRTOS는 UART 처리, 명령 실행,
-watchdog 및 STATUS 주기만 관리합니다.
-{
-  TIM2 ISR을 사용하는 이유
-STEP 신호는 정확한 시간 간격이 중요하기 때문입니다.
+## 2. 타이머 / IRQ
 
-TIM2 20 kHz = 50 µs마다 실행
-FreeRTOS tick = 1 ms
-최대 속도 = 2,000 microsteps/s
-최대 속도에서 STEP 주기 = 500 µs
-RTOS task로 STEP을 만들면 다른 task, UART, scheduler 때문에 실행 시점이 흔들립니다. 그러면 모터 소음, 진동, 탈조가 발생할 수 있습니다.
 
-그래서 역할을 분리했습니다.
+| 타이머     | 용도       | 설정                   |
+| ------- | -------- | -------------------- |
+| TIM1    | 서보 PA8   | 50 Hz                |
+| TIM2    | STEP     | 20 kHz Motor_TickISR |
+| TIM3    | IR PB4   | 1 us NEC             |
+| TIM5    | HAL tick | 1 ms                 |
+| SysTick | FreeRTOS | 1 kHz                |
 
-TIM2 ISR: STEP 펄스, 가감속, DIR 처리
-RTOS task: UART, 명령 처리, watchdog, STATUS
-}
-ASCII `straight_...`, `left_...`, `right_...`, `DONE/ERR` 경로는 제거했습니다.
-RPi는 응답을 기다렸다 다음 명령을 보내는 방식이 아니라 최신 속도를 주기적으로
-갱신하고, 별도로 들어오는 STATUS를 비동기로 처리해야 합니다.
 
-## 2. UART 전기·포트 설정
 
-- 속도: 115200 baud
-- 데이터: 8 bit
-- 패리티: 없음
-- 정지 비트: 1
-- 흐름 제어: 없음
-- STM32 USART1 TX PA9 → Raspberry Pi RXD GPIO15
-- STM32 USART1 RX PA10 ← Raspberry Pi TXD GPIO14
-- STM32와 Raspberry Pi는 3.3 V UART입니다. 5 V UART를 직접 연결하지 않습니다.
-- RPi, Nucleo, 두 DRV8825, 서보 전원 GND를 반드시 공통으로 연결합니다.
-- PA10은 RPi 분리 시 가짜 수신을 막기 위해 내부 Pull-up을 사용합니다.
-- USART2 PA2/PA3은 ST-Link Virtual COM 진단용이며 바이너리 제어에 쓰지 않습니다.
+| pri | IRQ                   |
+| --- | --------------------- |
+| 0   | TIM2                  |
+| 6   | TIM3, USART1          |
+| 7   | USART2                |
+| 15  | SysTick, PendSV, TIM5 |
 
-## 3. 바이너리 프레임
 
-모든 프레임은 다음 순서입니다.
+MAX_SYSCALL_INTERRUPT_PRIORITY=5. TIM2는 ISR 전용.
 
-`AA | LEN | CMD | PAYLOAD[LEN] | CRC8 | 55`
+---
 
-- `STX = 0xAA`, `ETX = 0x55`
-- `LEN`은 PAYLOAD 바이트 수만 의미합니다.
-- 다중 바이트 정수는 Little-Endian입니다.
-- CRC 범위는 `LEN`, `CMD`, `PAYLOAD`입니다. STX, CRC 자신, ETX는 제외합니다.
-- CRC-8은 polynomial `0x07`, initial `0x00`, xor-out `0x00`,
-  reflection 없음으로 계산합니다.
-- CRC/길이/ETX가 잘못된 프레임은 실행하지 않고 폐기합니다.
 
-### `0x01 SET_SPEED`: RPi → STM32
 
-PAYLOAD 길이는 4바이트입니다.
+## 3. 제어 정책
 
-- byte 0~1: `int16_t left_sps`
-- byte 2~3: `int16_t right_sps`
-- 단위: DRV8825 microsteps/s
-- 양수: 전진, 음수: 후진, 0: 정지
-- 펌웨어 제한: 각 축 `-2000`~`+2000` sps, 초과값은 제한값으로 포화
+1. 서버 ESTOP/CLEAR
+2. IR POWER (REMOTE)
+3. SET_SPEED/NOZZLE 또는 IR 방향·노즐
 
-예: 좌우 `+500 sps`
 
-`AA 04 01 F4 01 F4 01 B1 55`
+| SET_SPEED        | 동작                             |
+| ---------------- | ------------------------------ |
+| 좌·우 중 하나라도 0이 아님 | 주행, watchdog ON (300ms)        |
+| (0,0)            | 정지, watchdog OFF. IR 펄스 중이면 무시 |
+| 주행 중 선 끊김        | 300ms timeout ESTOP            |
+| watchdog OFF     | 리모컨 OK                         |
 
-RPi는 주행 중뿐 아니라 정지 명령도 100 ms 이하 주기로 계속 보내십시오.
-유효 SET_SPEED가 300 ms 동안 끊기면 STM32가 노즐을 끄고 자체 ESTOP합니다.
 
-### `0x02 NOZZLE`: RPi → STM32
+작업 종료: 서버에 DONE, STM에는 (0,0).
 
-PAYLOAD는 1바이트이며 `00=OFF`, `01=ON`입니다.
+ **ESTOP으로 끝내지 말 것**. 
 
-- ON 예: `AA 01 02 01 46 55`
-- ESTOP latch 중 ON 요청은 실행하지 않습니다.
-- ESTOP와 watchdog timeout은 노즐을 즉시 OFF로 만듭니다.
+꼭지점마다 (0,0) 후 계산 -> 다음 SPS: 문제 없음.
 
-### `0x03 ESTOP`: RPi → STM32
+---
 
-PAYLOAD 1바이트는 원인 코드입니다. `00`은 기본 RPi 요청 원인으로 처리합니다.
+## 4. UART
 
-- 예: `AA 01 03 01 53 55`
-- 수신 즉시 목표 속도를 0으로 바꾸고 ESTOP 감속도를 적용합니다.
-- 완전 정지 후 DRV8825 EN을 HIGH로 만들어 출력을 차단합니다.
-- 새 SET_SPEED는 ESTOP latch를 자동 해제하지 않습니다.
+- 115200-8-N-1, 3.3V
+- PA9->RPi RXD(GPIO15), PA10<-RPi TXD(GPIO14), GND
+- USART2: VCP / [IR ...]
+- AA|LEN|CMD|PAYLOAD|CRC8|55, CRC=LEN+CMD+PAYLOAD, poly 0x07
+- 블로킹 DONE/ERR 없음. STATUS로 판단
 
-### `0x04 CLEAR_ESTOP`: RPi → STM32
 
-PAYLOAD는 안전키 `uint16_t 0xA55A`입니다. 전송 바이트는 `5A A5`입니다.
+| CMD              | 방향       | LEN | 내용                    |
+| ---------------- | -------- | --- | --------------------- |
+| 0x01 SET_SPEED   | RPi->STM | 4   | int16 L/R sps,        |
+| 0x02 NOZZLE      | RPi->STM | 1   | 0 OFF / 1 ON          |
+| 0x03 ESTOP       | RPi->STM | 1   | reason (비상)           |
+| 0x04 CLEAR_ESTOP | RPi->STM | 2   | 5A A5, 완전정지 후         |
+| 0x81 STATUS      | STM->RPi | 9   | steps + flags, ~100ms |
 
-- 프레임: `AA 02 04 5A A5 7B 55`
-- 좌우 축이 완전히 정지한 경우에만 latch를 해제합니다.
-- 해제 전에 SET_SPEED 0 heartbeat를 시작하고, 해제 후에도 계속 전송하십시오.
 
-### `0x81 STATUS`: STM32 → RPi
+예) +500,+500: AA 04 01 F4 01 F4 01 B1 55
 
-STM32가 100 ms마다 전송하며 PAYLOAD는 9바이트입니다.
+### 0x81 STATUS PAYLOAD
 
-- byte 0~3: `uint32_t left_steps`
-- byte 4~7: `uint32_t right_steps`
-- byte 8: flags
 
-스텝 카운터는 전진 시 증가하고 후진 시 감소하는 32-bit modulo 값입니다.
-RPi에서 방향 포함 누적값으로 사용할 때는 동일 비트 패턴을 `int32_t`로
-재해석하십시오.
+| 바이트 | 타입        | 이름          | 의미         |
+| --- | --------- | ----------- | ---------- |
+| 0~3 | uint32 LE | left_steps  | 좌측 누적 STEP |
+| 4~7 | uint32 LE | right_steps | 우측 누적 STEP |
+| 8   | uint8     | flags       | 상태 비트      |
 
-flags 비트:
 
-- bit 0 `MOVING`
-- bit 1 `ESTOP`
-- bit 2 `TIMEOUT`
-- bit 3 `NOZZLE_ON`
-- bit 4 `RX_ERROR`
-- bit 5 `TX_OVERFLOW`
+스텝: 전진 시 +1, 후진 시 -1(uint32 wrap).
 
-개별 명령에 대한 블로킹 `DONE/ERR` 응답은 없습니다. 명령 수락과 실제 동작
-상태는 연속 STATUS flags/step 값으로 판단합니다.
+ RPi는 int32로 보고 차분 사용.(= 출력 펄스 수. 실제 미끄러짐은 미포함)
 
-## 4. STM32 핀과 CubeMX 설정
+스텝: 전진 시 +1, 후진 시 -1(uint32 wrap). RPi는 int32로 보고 차분 사용.  
+(= 출력 펄스 수. 실제 미끄러짐은 미포함)
 
-모터/서보:
 
-- PB0 `LEFT_STEP`: 좌측 DRV8825 STEP, GPIO output push-pull/high
-- PB1 `LEFT_DIR`: 좌측 DRV8825 DIR, GPIO output push-pull/high
-- PB6 `LEFT_EN`: 좌측 nENBL, LOW 활성, 부팅 초기값 HIGH
-- PB2 `RIGHT_STEP`: 우측 DRV8825 STEP, GPIO output push-pull/high
-- PB5 `RIGHT_DIR`: 우측 DRV8825 DIR, GPIO output push-pull/high
-- PB7 `RIGHT_EN`: 우측 nENBL, LOW 활성, 부팅 초기값 HIGH
-- PA8 `SIG_SERVO`: TIM1_CH1 PWM, 50 Hz
+| bit | 이름          | 1이면                      |
+| --- | ----------- | ------------------------ |
+| 0   | MOVING      | 움직이는 중                   |
+| 1   | ESTOP       | 비상정지 latch               |
+| 2   | TIMEOUT     | SET_SPEED 300ms 끊김 ESTOP |
+| 3   | NOZZLE      | 노즐 ON                    |
+| 4   | RX_ERROR    | UART 수신 오류               |
+| 5   | TX_OVERFLOW | STATUS 송신 큐 넘침           |
+| 6~7 | -           | 사용 안 함(0)                |
 
-타이머:
 
-- TIM1 clock 84 MHz, prescaler 83, period 19999, CH1 PWM
-- TIM2 clock 84 MHz, prescaler 83, period 49, update IRQ 20 kHz
-- TIM5: HAL 전용 1 ms timebase
-- FreeRTOS kernel tick: SysTick 1 kHz
-- TIM2 IRQ priority 0, USART1 priority 6, USART2 priority 7
-- SysTick/PendSV/TIM5 priority 15
-- `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY=5`
+---
 
-통신:
+## 5. IR
 
-- USART1 PA9/PA10, 115200-8-N-1, RX/TX, global interrupt
-- USART2 PA2/PA3, 115200-8-N-1, ST-Link VCP 진단
-
-`Robot_Painter.ioc`에 TIM5 HAL timebase와 NVIC 값이 반영되어 있습니다. CubeMX
-코드를 다시 생성한 뒤에는 TIM2 IRQ가 `Motor_TickISR()`를 직접 호출하는지,
-USART HAL callbacks가 `UartTransport_*Callback()`으로 전달되는지 반드시
-diff로 확인하십시오.
-
-## 5. FreeRTOS 구조와 메모리
+- PB4 TIM3_CH1, 3.3V. 키=ir_remote.h
 
-### 5.1 Task
 
-- `CommunicationTask`, priority 2, stack 768 words
-  - USART1 RX stream을 blocking 방식으로 읽습니다.
-  - frame parser와 CRC 검증을 수행합니다.
-  - 완성된 명령을 command queue로 전달합니다.
-  - 100 ms마다 기존 `0x81 STATUS`를 송신합니다.
-- `ControlTask`, priority 3, stack 384 words
-  - command queue에서 명령을 받아 Motor/Servo API를 호출합니다.
-  - ESTOP 명령은 queue 앞에 넣어 일반 명령보다 먼저 실행합니다.
-  - 10 ms마다 SET_SPEED 300 ms watchdog을 검사합니다.
-
-Motor task, Servo task, Telemetry task 및 FreeRTOS software timer는 만들지
-않았습니다. 하드웨어 PWM과 TIM2 ISR이 이미 해당 실시간 역할을 수행하므로
-task를 추가하면 context switch와 동기화 비용만 늘어납니다.
-
-### 5.2 정적 RTOS 객체
-
-- `xTaskCreateStatic()`으로 task 2개 생성
-- `xQueueCreateStatic()`으로 8-slot command queue 생성
-- `xStreamBufferCreateStatic()`으로 실효 256-byte RX stream 생성
-- idle task TCB/stack도 `vApplicationGetIdleTaskMemory()`로 제공
-- `configSUPPORT_DYNAMIC_ALLOCATION=0`
-- `configUSE_TIMERS=0`
-
-`AppRtos_GetStackWatermarks()`를 debugger에서 호출하면 두 task의 최소 잔여
-stack word 수를 확인할 수 있습니다. 실기 부하 시험 후 여유량을 측정하고 stack을
-줄이거나 늘리십시오.
-
-### 5.3 ISR 호출 규칙
-
-- TIM2 priority 0: `Motor_TickISR()`만 호출하며 FreeRTOS API 사용 금지
-- USART1 priority 6: `xStreamBufferSendFromISR()` 사용 가능
-- USART2 priority 7: 진단 UART
-- FreeRTOS task: `Motor_SetTargetSps()`, `Motor_RequestEStop()`,
-  `Motor_ClearEStop()`, `Servo_SetNozzle()` 호출
-
-`configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY=5`보다 높은 priority 0~4 ISR은
-FreeRTOS API를 절대 호출하면 안 됩니다.
-
-### 5.4 CubeMX 재생성 주의
-
-FreeRTOS v10.3.1은 `Middlewares/Third_Party/FreeRTOS`에 필요한 Native kernel
-소스만 고정했습니다. CMSIS-RTOS wrapper와 heap 구현은 사용하지 않습니다.
-CubeMX에서 별도의 CMSIS FreeRTOS wrapper를 추가하지 마십시오.
-
-현재 HAL release는 `USE_RTOS=1`을 금지하므로
-`stm32f4xx_hal_conf.h`의 `USE_RTOS`는 **0이 정상**입니다. 대신
-`HAL_TIM_MODULE_ENABLED`와 `TICK_INT_PRIORITY=15`가 필요합니다.
-
-CubeMX Generate Code 전:
-
-1. Git working tree를 확인하고 별도 branch에서 실행합니다.
-2. `Keep User Code`를 활성화합니다.
-3. HAL Timebase Source를 TIM5로 유지합니다.
-4. TIM2=0, USART1=6, USART2=7을 유지합니다.
-
-Generate Code 후:
-
-1. `.cproject`의 FreeRTOS `Source/include`와 `ARM_CM4F` include path를 확인합니다.
-2. `Middlewares` source entry가 유지되는지 확인합니다.
-3. SVC/PendSV/SysTick handler가 FreeRTOS port와 중복 정의되지 않는지 확인합니다.
-4. TIM2 USER CODE 영역과 UART callback forwarding을 확인합니다.
-5. 반드시 `git diff` 후 빌드합니다.
-
-## 6. DRV8825와 전원 필수 확인
-
-- CIH-4248은 1.8도/step, 정격 1.8 A/phase 모터입니다.
-- MODE0=L, MODE1=L, MODE2=H일 때 코드 가정인 1/16 microstep입니다.
-- nRESET과 nSLEEP이 확장보드에서 HIGH로 유지되어야 합니다.
-- 각 DRV8825 VMOT-GND 바로 옆에 최소 100 uF 전해 커패시터를 둡니다.
-- 전원 ON 상태에서 모터 커넥터를 탈착하지 않습니다.
-- 코일 한 쌍은 A1/A2, 다른 한 쌍은 B1/B2에 연결합니다.
-- 전류 제한은 실제 모듈 Rsense를 확인하고 제조사 공식으로 Vref를 설정합니다.
-- 1.8 A 연속 운전은 방열판/강제 냉각이 필요할 수 있으므로 낮은 전류부터
-  시작하고 모터와 드라이버 온도를 측정합니다.
-- 서보 5 V 배선은 MCU 전원과 별도 가지로 분기하고 서보 근처에 벌크
-  커패시터를 둡니다.
-- Nucleo를 외부 5 V와 ST-Link USB로 동시에 공급하기 전에 보드 전원 점퍼와
-  역급전 조건을 NUCLEO-F401RE 매뉴얼에서 확인합니다.
-- 3S/4S 배터리 요구가 문서 간 다르므로 실제 배터리를 확정한 후 벅 입력 정격,
-  커패시터 전압 정격, 저전압 차단 조건을 함께 확정해야 합니다.
-
-## 7. 조정값
-
-`Core/Inc/robot_config.h`에서 다음을 조정합니다.
-
-- `ROBOT_LEFT_FORWARD_LEVEL`, `ROBOT_RIGHT_FORWARD_LEVEL`: 바퀴 전진 DIR 극성
-- `ROBOT_MAX_SPS`: 최대 microsteps/s
-- `ROBOT_ACCEL_SPS2`: 정상 가감속도
-- `ROBOT_ESTOP_DECEL_SPS2`: ESTOP 감속도
-- `ROBOT_SERVO_OFF_US`, `ROBOT_SERVO_ON_US`: 실제 링크 기구에 맞는 서보 위치
-- `ROBOT_HOLD_TORQUE_WHEN_IDLE`: 정상 정지 시 홀딩 토크 유지 여부
-
-거리/각도 경로 계획은 이제 RPi가 담당합니다. 바퀴 지름 66 mm, 200 full
-steps/rev, 1/16 microstep, 직결 기준 이론상 약 15.43 microsteps/mm입니다.
-실제 주행에서는 타이어 눌림, 미끄럼, 축간거리 오차가 있으므로 RPi의 odometry
-상수를 실차 측정으로 보정하십시오.
-
-## 8. 최초 시험 순서
-
-1. 차체를 띄우고 모터 전원을 끈 상태에서 GND, TX/RX 교차, 단락을 확인합니다.
-2. 서보 혼을 분리하고 NOZZLE OFF/ON PWM 방향과 기계 한계를 확인합니다.
-3. SET_SPEED `+100,+100`을 100 ms 주기로 전송해 두 바퀴 전진을 확인합니다.
-4. 반대로 도는 축의 `ROBOT_*_FORWARD_LEVEL`만 바꿉니다.
-5. `+100,-100`, `-100,+100`으로 제자리 양방향 회전을 확인합니다.
-6. 주행 중 SET_SPEED 송신을 끊어 300 ms timeout, 감속, 노즐 OFF, ESTOP/TIMEOUT
-   flags를 확인합니다.
-7. 잘못된 CRC 프레임이 모터/노즐 상태를 바꾸지 않고 RX_ERROR를 보고하는지
-   확인합니다.
-8. ESTOP 후 잘못된 키로 해제되지 않고, 완전 정지 뒤 `5A A5` 키로만
-   해제되는지 확인합니다.
-9. STATUS 좌우 누적 스텝의 부호/증가량과 실제 바퀴 방향을 대조합니다.
-10. 저속에서 발열/탈조/전압강하를 확인한 뒤 단계적으로 제한 속도를 올립니다.
-
-## 9. 실제 빌드 파일
-
-- `Core/Inc/FreeRTOSConfig.h`: 정적 할당, priority, kernel 설정
-- `Core/Src/freertos_hooks.c`: idle task 정적 메모리, stack/assert fail-safe
-- `Core/Inc/app_rtos.h`, `Core/Src/app_rtos.c`: task/queue 생성과 data flow
-- `Core/Inc/uart_protocol.h`, `Core/Src/uart_protocol.c`: 순수 frame/CRC codec
-- `Core/Inc/uart_transport.h`, `Core/Src/uart_transport.c`: USART1/RTOS transport
-- `Core/Inc/robot_control.h`, `Core/Src/robot_control.c`: 명령·안전·watchdog
-- `Core/Inc/motor.h`, `Core/Src/motor.c`: Q16 가감속/STEP/ESTOP/step counter
-- `Core/Inc/servo.h`, `Core/Src/servo.c`: NOZZLE PWM
-- `Core/Inc/tim.h`, `Core/Src/tim.c`: TIM1/TIM2 설정
-- `Core/Src/stm32f4xx_hal_timebase_tim.c`: TIM5 HAL tick
-- `Core/Src/main.c`: peripheral/application 초기화와 scheduler 시작
-- `Core/Src/stm32f4xx_it.c`: TIM2/TIM5/USART IRQ
-- `Core/Inc/robot_config.h`: 속도/안전/서보 조정값
-- `Robot_Painter.ioc`: CubeMX 원본 설정
-- `Tests/test_uart_protocol.py`: 실행 가능한 wire golden vector test
-- `Tests/uart_protocol_test.c`: 순수 C codec golden test
+| 키              | 값         | 동작              |
+| -------------- | --------- | --------------- |
+| POWER          | 0x28      | REMOTE ESTOP 토글 |
+| UP/DOWN        | 0xC0/0x40 | 전/후 펄스          |
+| LEFT/RIGHT     | 0x70/0x58 | 90도 펄스          |
+| NOZZLE_UP/DOWN | 0xD0/0x1A | 노즐 OFF/ON       |
+
+
+NEC repeat 무시. ESTOP중 방향 거부.
+
+---
+
+## 6. 핀
+
+
+| 핀       | 용도            |
+| ------- | ------------- |
+| PB0/1/6 | L STEP/DIR/EN |
+| PB2/5/7 | R STEP/DIR/EN |
+| PA8     | 서보            |
+| PB4     | IR            |
+| PA9/10  | USART1        |
+| PA2/3   | USART2        |
+
+
+---
+
+## 7. FreeRTOS
+
+- 정적 할당, heap/timer 없음
+- CommunicationTask: UART + STATUS 100ms
+- ControlTask: 명령/IR/watchdog/펄스 종료
+- ESTOP = queue front
+
+---
+
+## 8. DRV8825
+
+- 1/16 (M0=L M1=L M2=H), 200 step/rev, D=66mm, W=166mm
+- VMOT 100uF+, GND 공통, 서보 5V 별도
+
+---
+
+## 9. robot_config.h
+
+
+| 항목                    | 의미                      |
+| --------------------- | ----------------------- |
+| FORWARD_LEVEL         | DIR 극성                  |
+| ROBOT_MAX_SPS         | **4000**                |
+| ACCEL / ESTOP_DECEL   | 가감속                     |
+| UART_WATCHDOG_MS      | 300                     |
+| MANUAL_DRIVE/TURN_SPS | IR 속도                   |
+| IR_FWD/REV_STEPS      | IR 전후 펄스                |
+| TURN_PULSE_THEORY_90  | **2012** 고정             |
+| TURN_K_SLIP_MILLI_*   | 슬립 K (milli, +-10=0.01) |
+| SERVO_OFF/ON_US       | 노즐                      |
+
+
+steps/m ~15434. RPi와 통일.
+
+---
+
+
+
+## 10. 파일
+
+`control_arbiter.*` `motor.*` `uart_protocol.*` `uart_transport.*` `ir_remote.*` `app_rtos.*` `robot_config.h` `Robot_Painter.ioc` `HARDWARE_WIRING_KR.md` `RPI_HANDOFF_FINAL_KR.md`
