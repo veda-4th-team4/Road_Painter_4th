@@ -19,6 +19,8 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 | **[PROTOCOL.md](PROTOCOL.md)** | 통신 규격 전체 (각 팀이 봐야 할 문서) |
 | [docs/TESTING.md](docs/TESTING.md) | 서버/Qt 테스트 가이드 |
 | [docs/CCTV_CAMERA_SPEC.md](docs/CCTV_CAMERA_SPEC.md) | 카메라 앱을 서버(9000)에 직접 붙이기 위한 CCTV팀 전달용 스펙 |
+| [docs/QT_CLIENT_SPEC.md](docs/QT_CLIENT_SPEC.md) | Qt 관제 클라이언트를 서버(9000)에 붙이기 위한 Qt팀 전달용 스펙 |
+| [docs/ROBOT_INTEGRATION_TODO.md](docs/ROBOT_INTEGRATION_TODO.md) | 로봇 RPi 코드의 v0.3 프로토콜 반영 갭 리스트 (로봇팀 전달용) |
 | [docs/REFACTOR_SUMMARY.md](docs/REFACTOR_SUMMARY.md) | graceful shutdown 개선 기록 |
 | [admin_console/PLAN.md](admin_console/PLAN.md) | 관리자 창 설계/진행 상황 |
 
