@@ -18,7 +18,32 @@ public:
     void SetPath(const std::vector<Segment_t>& new_path);
 
     /**
-     * @brief Computes cross-track/heading errors and outputs left/right motor target speed (sps).
+     * @brief Gets current active segment index (0-based).
+     */
+    size_t GetCurrentSegmentIndex() const { return current_waypoint_idx; }
+
+    /**
+     * @brief Gets current active segment info.
+     */
+    bool GetCurrentSegment(Segment_t& out_seg) const;
+
+    /**
+     * @brief Advances to the next path segment.
+     */
+    void AdvanceSegment();
+
+    /**
+     * @brief Checks if all path segments are completed.
+     */
+    bool IsPathFinished() const;
+
+    /**
+     * @brief Sets DRIFT angular correction feedback from server.
+     */
+    void SetDriftOffset(float offset_deg);
+
+    /**
+     * @brief Computes guidance error calculations and outputs left/right motor target speed (sps).
      * @param current_pose Current absolute coordinate of the robot.
      * @param out_speed Output struct to store speed commands.
      * @param out_nozzle_on Output command indicating if the paint spray nozzle should trigger.
@@ -28,6 +53,7 @@ public:
 private:
     std::vector<Segment_t> path;
     size_t current_waypoint_idx;
+    float drift_offset_deg;
 
     // Robot physical constants
     float wheel_diameter_m;

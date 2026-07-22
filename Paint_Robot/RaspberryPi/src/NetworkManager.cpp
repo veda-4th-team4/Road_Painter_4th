@@ -21,7 +21,13 @@ NetworkManager::NetworkManager(const std::string& ip, uint16_t port)
       has_new_pose(false),
       has_new_path(false),
       msg_seq(0),
-      has_new_cmd(false)
+      has_new_cmd(false),
+      align_angle_deg(0.0f),
+      has_align_cmd(false),
+      go_signal_received(false),
+      drift_angle_deg(0.0f),
+      has_drift_cmd(false),
+      current_path_phase("")
 {
     std::memset(&latest_pose, 0, sizeof(Pose_t));
 }
@@ -196,6 +202,44 @@ bool NetworkManager::SendStatus(const Msg_Status_t& status) {
     return ssl_send_line(status_msg.dump());
 }
 
+bool NetworkManager::SendReady(uint32_t seg_index) {
+    if (!is_connected || !ssl_connection) return false;
+
+    json ready_payload = {{"seg", seg_index}};
+    json ready_msg = {
+        {"type", "READY"},
+        {"seq", ++msg_seq},
+        {"payload", ready_payload}
+    };
+
+    return ssl_send_line(ready_msg.dump());
+}
+
+bool NetworkManager::GetAlignCommand(float& out_angle_deg) {
+    std::lock_guard<std::mutex> lock(align_mutex);
+    if (!has_align_cmd) return false;
+    out_angle_deg = align_angle_deg;
+    has_align_cmd = false;
+    return true;
+}
+
+bool NetworkManager::CheckAndClearGoSignal() {
+    return go_signal_received.exchange(false);
+}
+
+bool NetworkManager::GetDriftCorrection(float& out_angle_deg) {
+    std::lock_guard<std::mutex> lock(drift_mutex);
+    if (!has_drift_cmd) return false;
+    out_angle_deg = drift_angle_deg;
+    has_drift_cmd = false;
+    return true;
+}
+
+std::string NetworkManager::GetPathPhase() {
+    std::lock_guard<std::mutex> lock(path_mutex);
+    return current_path_phase;
+}
+
 bool NetworkManager::GetLatestPose(Pose_t& out_pose) {
     std::lock_guard<std::mutex> lock(pose_mutex);
     if (!has_new_pose) return false;
@@ -275,6 +319,7 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
         if (type == "PATH") {
             std::lock_guard<std::mutex> lock(path_mutex);
             current_path.clear();
+            current_path_phase = payload.value("phase", "draw");
             
             // Read segment array from nested "segments" key
             auto segments = payload.value("segments", json::array());
@@ -285,36 +330,31 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
                     segment.dist_m = seg.value("dist_m", 0.0f);
                     segment.angle_deg = seg.value("angle_deg", 0.0f);
                     segment.paint = seg.value("paint", false);
+                    segment.heading_deg = seg.value("heading_deg", 0.0f);
                     current_path.push_back(segment);
                 }
             }
             has_new_path = true;
-            std::cout << "[NetworkManager] Path data update: " << current_path.size() << " segments received." << std::endl;
+            std::cout << "[NetworkManager] Path update (phase=" << current_path_phase 
+                      << "): " << current_path.size() << " segments received." << std::endl;
 
-            // [Test Echo] Send status response back to server upon receiving path
-            Msg_Status_t path_ack_status = {0, 0, 0};
-            SendStatus(path_ack_status);
-            std::cout << "[NetworkManager] [TEST] PATH received -> Sent status response to server." << std::endl;
+        } else if (type == "ALIGN") {
+            float angle = payload.value("angle_deg", 0.0f);
+            std::cout << "[NetworkManager] Received ALIGN: " << angle << " deg" << std::endl;
+            std::lock_guard<std::mutex> lock(align_mutex);
+            align_angle_deg = angle;
+            has_align_cmd = true;
 
-        } else if (type == "POS") {
-            std::lock_guard<std::mutex> lock(pose_mutex);
-            
-            // Read absolute tracking position from nested payload fields
-            latest_pose.x = payload.value("x", 0.0f);
-            latest_pose.y = payload.value("y", 0.0f);
-            latest_pose.theta = payload.value("theta", 0.0f);
-            latest_pose.timestamp_ms = static_cast<uint64_t>(payload.value("t", 0.0) * 1000.0); // Convert sec to ms
-            
-            // Convert conf float [0.0 ~ 1.0] to uint8_t percentage [0 ~ 100]
-            float conf_val = payload.value("conf", 0.0f);
-            latest_pose.confidence = static_cast<uint8_t>(conf_val * 100.0f);
-            
-            has_new_pose = true;
+        } else if (type == "GO") {
+            std::cout << "[NetworkManager] Received GO signal from server." << std::endl;
+            go_signal_received = true;
 
-            // [Test Echo] Send status response back to server upon receiving absolute position
-            Msg_Status_t pose_ack_status = {1000, 2000, 0x00}; // Dummy steps: 1000, 2000
-            SendStatus(pose_ack_status);
-            std::cout << "[NetworkManager] [TEST] POS received -> Sent status response to server." << std::endl;
+        } else if (type == "DRIFT") {
+            float angle = payload.value("angle_deg", 0.0f);
+            std::cout << "[NetworkManager] Received DRIFT feedback: " << angle << " deg" << std::endl;
+            std::lock_guard<std::mutex> lock(drift_mutex);
+            drift_angle_deg = angle;
+            has_drift_cmd = true;
 
         } else if (type == "ACK") {
             std::cout << "[NetworkManager] Received ACK from server: " << payload.value("msg", "") << std::endl;
