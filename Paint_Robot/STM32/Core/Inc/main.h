@@ -92,6 +92,10 @@ void Error_Handler(void);
  * @warning 핀을 바꿀 때 main.h만 직접 수정하지 말고 CubeMX Pinout을 함께
  *          변경해야 코드 재생성 후에도 일관성이 유지됩니다.
  */
+
+/** @brief IR 수신기 입력. TIM3_CH1 / PB4 (기존 모터 핀과 비충돌). */
+#define IR_RX_Pin        GPIO_PIN_4
+#define IR_RX_GPIO_Port  GPIOB
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

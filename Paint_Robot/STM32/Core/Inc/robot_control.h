@@ -8,6 +8,7 @@
 #ifndef __ROBOT_CONTROL_H__
 #define __ROBOT_CONTROL_H__
 
+#include "ir_remote.h"
 #include "uart_protocol.h"
 
 #include <stdint.h>
@@ -21,6 +22,8 @@ typedef struct {
 
 void RobotControl_Init(void);
 uint8_t RobotControl_HandleFrame(const UartFrame_t *frame, uint32_t now_ms);
+uint8_t RobotControl_HandleIrEvent(const IrRemoteEvent_t *event,
+                                   uint32_t now_ms);
 void RobotControl_Service(uint32_t now_ms);
 void RobotControl_GetStatus(RobotStatus_t *status, uint8_t extra_status_flags);
 void RobotControl_ReportRxError(void);
