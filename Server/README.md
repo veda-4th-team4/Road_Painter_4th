@@ -1,16 +1,28 @@
 # Road-Painter 중앙 서버
 
-Qt(관제 UI) · 로봇(도색 로봇) · CCTV 세 클라이언트를 중계하고, 도면으로부터 로봇 경로를 생성하는 중앙 서버입니다. 서버 RPi에서 실행합니다.
+Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언트를 중계하고, 도면으로부터 로봇 경로를 생성하는 중앙 서버입니다. 서버 RPi에서 실행합니다.
 
 ## 하는 일
 
-- **TLS 릴레이**: 클라이언트가 role(QT / ROBOT / CCTV)로 등록하면, 메시지를 규칙에 따라 상대에게 중계
-- **로그인 / H행렬 저장**: 사용자(id/비번)별로 캘리브레이션 결과(호모그래피 H행렬)를 저장했다가 재로그인 시 Qt에 돌려줌
-- **경로 생성**: Qt가 보낸 도면(top-view 좌표) + CCTV 마커 검출로 파악한 로봇 위치를 조합해, 로봇용 동작 명령 시퀀스(직진/회전)를 만들어 전송
+- **TLS 릴레이**: 클라이언트가 role(QT / ROBOT / CCTV / ADMIN)로 등록하면, 메시지를 규칙에 따라 상대에게 중계
+- **로그인 / 캘리브레이션 저장**: 사용자(id/비번)별로 캘리브레이션 번들(K, D, H행렬)을 저장했다가 재로그인 시 Qt에 돌려줌
+- **경로 생성 (2단계)**: Qt 도면 + CCTV 마커로 파악한 로봇 위치를 조합해 동작 시퀀스(직진/회전)를 생성. 1단계 접근(approach) → Qt "그림그리기 시작" → 2단계 도색(draw)
+- **출발 전 정렬 / 주행 피드백**: MOVE 시작 전 READY/ALIGN/GO 핸드셰이크로 각도 미세조정, 직진 중 DRIFT로 각도 이탈 피드백
 - **이탈 감시·재계획**: 로봇이 계획 경로에서 0.3 m 이상 벗어나면 현재 위치 기준으로 경로를 다시 짜서 재전송
 - **하트비트**: 로봇이 10초간 무응답이면 연결 끊김으로 처리
+- **관리자 창 지원(ADMIN)**: 서버가 중계하는 모든 메시지 사본을 TAP으로 관리자 창에 전달(로그 모니터), 관리자 창에서 온 로봇 명령/캘리 결과를 처리
 
-메시지 형식·필드 등 통신 규격 전체는 **[PROTOCOL.md](PROTOCOL.md)** 참고 (각 팀이 봐야 할 문서).
+## 문서
+
+| 문서 | 내용 |
+|---|---|
+| **[PROTOCOL.md](PROTOCOL.md)** | 통신 규격 전체 (각 팀이 봐야 할 문서) |
+| [docs/TESTING.md](docs/TESTING.md) | 서버/Qt 테스트 가이드 |
+| [docs/CCTV_CAMERA_SPEC.md](docs/CCTV_CAMERA_SPEC.md) | 카메라 앱을 서버(9000)에 직접 붙이기 위한 CCTV팀 전달용 스펙 |
+| [docs/QT_CLIENT_SPEC.md](docs/QT_CLIENT_SPEC.md) | Qt 관제 클라이언트를 서버(9000)에 붙이기 위한 Qt팀 전달용 스펙 |
+| [docs/ROBOT_INTEGRATION_TODO.md](docs/ROBOT_INTEGRATION_TODO.md) | 로봇 RPi 코드의 v0.3 프로토콜 반영 갭 리스트 (로봇팀 전달용) |
+| [docs/REFACTOR_SUMMARY.md](docs/REFACTOR_SUMMARY.md) | graceful shutdown 개선 기록 |
+| [admin_console/PLAN.md](admin_console/PLAN.md) | 관리자 창 설계/진행 상황 |
 
 ## 파일 구성
 
@@ -20,16 +32,25 @@ Server/
 ├── PROTOCOL.md         통신 프로토콜 문서 (로봇/QT/CCTV 팀용)
 ├── gen_cert.sh         TLS 자체서명 인증서 생성 (최초 1회)
 ├── certs/              server.crt(공개) / server.key(비밀, git 제외)
+├── config/             users.json (서버가 자동 생성, git 제외)
+├── docs/               부속 문서 (테스트 가이드, CCTV 스펙, 리팩터 기록)
 ├── src/
-│   ├── main.cpp            시작점 + 테스트용 콘솔
-│   ├── tls_server.hpp/cpp  TLS 네트워크 층 (접속, role 등록, 세션 스레드)
-│   ├── router.hpp/cpp      메시지 라우팅 (중계 규칙 + 경로생성/재계획 판단)
+│   ├── main.cpp            시작점 + 테스트용 콘솔 + graceful shutdown
+│   ├── tls_server.hpp/cpp  TLS 네트워크 층 (접속, role 등록, 세션 스레드, ADMIN tap)
+│   ├── router.hpp/cpp      메시지 라우팅 (중계 규칙 + 경로생성/재계획/정렬 판단)
 │   ├── path_planner.hpp    경로 계산 (마커→pose, 도면→MOVE/TURN, 이탈 거리)
-│   ├── user_store.hpp/cpp  사용자 저장소 (비번 해시 + H행렬 영속화)
+│   ├── calib.hpp           캘리브레이션 번들 파싱 + undistort/호모그래피 수학
+│   ├── user_store.hpp/cpp  사용자 저장소 (비번 해시 + 캘리브레이션 영속화)
 │   ├── protocol.hpp        메시지 스펙 주석 + 생성 헬퍼
 │   └── log.hpp             타임스탬프 로그
-└── tools/
-    └── qt_sim.cpp          Qt 대역 테스트 클라이언트 (Qt 네트워킹 나오기 전 검증용)
+├── tools/
+│   └── qt_sim.cpp          Qt 대역 테스트 클라이언트 (Qt 네트워킹 나오기 전 검증용)
+└── admin_console/          관리자 창 (Python 웹 GUI - 카메라 캘리 도구 + 서버 로그/로봇 제어)
+    ├── web_gui.py              대시보드( / ), 로봇 제어( /robot ), 로그 모니터( /logs )
+    ├── pose_server.py          터미널판 카메라 하니스 (web_gui의 원형)
+    ├── start.sh                백그라운드 실행 스크립트 (포트는 config.sh에서)
+    ├── config.sh.example       포트 설정 템플릿 (config.sh로 복사해 사용, config.sh는 git 제외)
+    └── PLAN.md                 설계/진행 상황
 ```
 
 구조: 접속한 클라이언트마다 전담 스레드가 생겨 자기 소켓을 읽고, 받은 메시지는 Router가 규칙에 따라 다른 클라이언트 소켓으로 배달합니다 (thread-per-connection).
@@ -49,7 +70,23 @@ make
 ./server
 ```
 
-포트는 **9000** (TCP/TLS). 실행하면 포그라운드에서 돌며 로그를 출력합니다.
+포트는 **9000** (TCP/TLS). 실행하면 포그라운드에서 돌며 로그를 출력합니다. Ctrl+C 또는 `kill -TERM`으로 정상 종료됩니다.
+
+### 관리자 창 (admin_console)
+
+카메라 캘리브레이션 도구 + 서버 로그 모니터 + 로봇 제어 패널을 겸하는 웹 GUI입니다. 서버(9000)에 ADMIN(감시·제어)과 CCTV(카메라 좌표 통역) role로 접속합니다.
+
+```bash
+# 서버 실행 후 별도 터미널에서
+cd admin_console
+python3 web_gui.py [카메라TCP포트] [HTTP포트] [스냅샷포트]   # 기본 6000 8081 6001
+# 브라우저: http://<서버IP>:8081       카메라 캘리브레이션 대시보드
+#          http://<서버IP>:8081/robot  로봇 제어 + 상태 배너
+#          http://<서버IP>:8081/logs   서버 트래픽 로그 모니터 (role별 필터)
+# 서버가 다른 호스트면: RP_SERVER_HOST=x.x.x.x python3 web_gui.py
+```
+
+⚠️ 같은 카메라를 바라보는 web_gui 인스턴스는 **한 개만** 띄울 것 (카메라는 설정된 포트 하나로만 접속). 다른 인스턴스가 이미 카메라 포트를 쓰고 있으면 포트가 겹치지 않게 조정하세요.
 
 ### 테스트용 콘솔 명령 (서버 실행 중 입력)
 

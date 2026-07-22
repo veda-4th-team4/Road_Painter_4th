@@ -10,8 +10,22 @@
 //   - 서버 내부 월드 좌표계: 바닥 평면, 단위 미터.
 //
 // [클라이언트 -> 서버, 접속 직후 1회]
-//   HELLO  payload: {"role":"QT"|"ROBOT"|"CCTV"}
+//   HELLO  payload: {"role":"QT"|"ROBOT"|"CCTV"|"ADMIN"}
 //     -> 서버 응답 ACK payload: {"msg":"registered as ROBOT"}
+//
+// [ADMIN role - 관리자 창(admin_console/web_gui.py)이 사용]
+//   목적: (1) 서버가 중계하는 모든 메시지를 엿보고(로그 모니터)
+//         (2) 로봇에 명령을 내린다(점검/설치용).
+//   서버 -> ADMIN:
+//     TAP  payload: {"dir":"IN"|"OUT", "peer":"QT"|"ROBOT"|"CCTV", "msg":{원본메시지}}
+//       - dir=IN : peer가 서버로 보낸 메시지 사본 (peer -> 서버)
+//       - dir=OUT: 서버가 peer에게 보낸 메시지 사본 (서버 -> peer)
+//       - ADMIN 자신과 오간 메시지는 tap하지 않는다(무한 루프 방지).
+//   ADMIN -> 서버:
+//     CMD  payload: {"cmd":...}   -> ROBOT 전달 (CALIB_START는 CCTV에도)
+//     PATH payload: {"segments":[...]}  -> ROBOT 전달 (테스트 경로)
+//       - 관리자는 점검/설치용이라, 경로 실행 중이어도 차단 없이 항상 전달한다.
+//         (QT 수동조작이 도색 중 차단되는 것과 다름)
 //
 // [서버 -> 로봇]
 //   PATH   payload: {"phase":"approach"|"draw", "segments":[
@@ -83,8 +97,10 @@
 //     - CCTV는 절대 좌표 변환하지 말 것 (undistort도 하지 말 것).
 //       서버가 undistort(P=K 동등) -> H_marker -> pose 계산까지 담당.
 //     - 테스트용으로 {"x","y","theta_deg"}(바닥 미터 좌표)도 허용
-//     -> ROBOT/QT 중계 + POSE를 QT 전송 + 계획 경로에서 0.3m 초과 이탈 시
+//     -> QT 중계 + POSE를 QT 전송 + 계획 경로에서 0.3m 초과 이탈 시
 //        재계획 PATH 전송 (최소 3초 간격)
+//     - 로봇에는 중계하지 않음: 로봇은 좌표를 모르며(PATH 참고), 위치 보정은
+//       서버가 각도로 변환해 ALIGN/DRIFT로만 내려준다
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <string>

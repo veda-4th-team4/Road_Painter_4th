@@ -9,9 +9,36 @@ static long nowMs() {
 }
 
 void Router::onMessage(const std::string& role, const json& msg) {
+    // 세션 스레드마다 진입하므로 라우터 상태 접근을 직렬화 (router.hpp mtx_ 참고)
+    std::lock_guard<std::mutex> lk(mtx_);
     if (role == "QT") fromQt(msg);
     else if (role == "ROBOT") fromRobot(msg);
     else if (role == "CCTV") fromCctv(msg);
+    else if (role == "ADMIN") fromAdmin(msg);
+}
+
+// 관리자 창(admin_console)에서 온 명령. 점검/설치용이라 경로 실행 중이어도
+// 차단 없이 그대로 로봇에 전달한다 (QT 수동조작의 A안 차단과 다름).
+void Router::fromAdmin(const json& msg) {
+    std::string type = msg.value("type", "");
+    json payload = msg.value("payload", json::object());
+    if (type == "CMD") {
+        std::string cmd = payload.value("cmd", "");
+        srv_.sendTo("ROBOT", msg);
+        bool toCctv = (cmd == "CALIB_START");
+        if (toCctv) srv_.sendTo("CCTV", msg);
+        logf("[INFO] (ADMIN) CMD %s -> ROBOT%s", cmd.c_str(),
+             toCctv ? " + CCTV" : "");
+    } else if (type == "PATH") {
+        srv_.sendTo("ROBOT", msg);  // 관리자 테스트 경로
+        logf("[INFO] (ADMIN) PATH -> ROBOT (%zu 세그먼트)",
+             payload.value("segments", json::array()).size());
+    } else if (type == "H_MATRIX") {
+        // 관리자 창(카메라 캘리 도구)이 계산 결과를 서버로 올림 - CCTV와 동일 처리
+        handleHMatrix(msg);
+    } else {
+        logf("[WARN] ADMIN으로부터 알 수 없는 type: %s", type.c_str());
+    }
 }
 
 void Router::fromQt(const json& msg) {
@@ -75,8 +102,17 @@ void Router::fromQt(const json& msg) {
         planActive_ = false;
         awaitingStart_ = false;
         manualMode_ = false;  // 새 도면 = 자동 모드 복귀
-        for (auto& p : payload.value("points", json::array()))
+        for (auto& p : payload.value("points", json::array())) {
+            // 점 하나라도 형식이 어긋나면 도면 전체를 버린다 - 파싱이 중간에
+            // 끊겨 반쪽짜리 planPts_로 경로를 만드는 것을 방지
+            if (!p.is_array() || p.size() < 2 || !p[0].is_number() ||
+                !p[1].is_number()) {
+                planPts_.clear();
+                logf("[WARN] BLUEPRINT points 형식 오류 - 도면 무시");
+                return;
+            }
             planPts_.push_back({p[0].get<double>(), p[1].get<double>()});
+        }
         if (planPts_.size() < 2) {
             logf("[WARN] 도면에 points가 부족함 (%zu개) - 경로 생성 불가",
                  planPts_.size());
@@ -145,9 +181,10 @@ void Router::fromCctv(const json& msg) {
     if (type == "POS") {
         // corners = CCTV 원본 픽셀 좌표. 좌표 변환(undistort -> H_marker)은
         // 여기(서버)서만 수행 - CCTV는 캘리브레이션 데이터를 가질 필요 없음.
+        // 로봇에는 중계하지 않는다 - v0.3 설계에서 로봇은 좌표를 모르며,
+        // 위치 보정은 서버가 각도로 변환해 ALIGN/DRIFT로만 내려준다.
         lastPos_ = payload;
-        srv_.sendTo("ROBOT", msg);  // 위치 보정용 (원본 그대로)
-        srv_.sendTo("QT", msg);     // 모니터링용 (원본 그대로)
+        srv_.sendTo("QT", msg);  // 모니터링용 (원본 그대로)
 
         Pose p;
         if (poseFromPos(payload, calib_, p)) {
@@ -205,28 +242,34 @@ void Router::fromCctv(const json& msg) {
             }
         }
     } else if (type == "H_MATRIX") {
-        // 신규: payload.calib = {K, D, H_floor, H_marker, marker_height_m, version}
-        // 레거시: payload.H = [[...]x3] (왜곡 보정 없이 바닥/마커 공용으로 사용)
-        json bundle =
-            payload.contains("calib") ? payload["calib"] : payload.value("H", json());
-        Calib c;
-        if (!calibFromJson(bundle, c)) {
-            logf("[WARN] H_MATRIX 파싱 실패 - calib/H 형식 확인 필요: %s",
-                 payload.dump().c_str());
-            return;
-        }
-        calib_ = c;
-        srv_.sendTo("QT", msg);  // Qt도 즉시 새 캘리브레이션으로 top-view 갱신
-        if (!currentUser_.empty() && users_.setCalib(currentUser_, bundle))
-            logf("[INFO] 캘리브레이션 수신 (%s%s) - 사용자 '%s'에 영속 저장",
-                 c.hasMarker ? "H_marker 포함" : "H_marker 없음 - 시차 보정 생략됨",
-                 c.hasKD ? ", K/D 포함" : ", K/D 없음 - 왜곡 보정 생략됨",
-                 currentUser_.c_str());
-        else
-            logf("[WARN] 캘리브레이션 수신 - 로그인 사용자 없음, 세션에만 유지");
+        handleHMatrix(msg);
     } else {
         logf("[WARN] CCTV로부터 알 수 없는 type: %s", type.c_str());
     }
+}
+
+// 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용).
+//   신규: payload.calib = {K, D, H_floor, H_marker, marker_height_m, version}
+//   레거시: payload.H = [[...]x3] (왜곡 보정 없이 바닥/마커 공용으로 사용)
+void Router::handleHMatrix(const json& msg) {
+    json payload = msg.value("payload", json::object());
+    json bundle =
+        payload.contains("calib") ? payload["calib"] : payload.value("H", json());
+    Calib c;
+    if (!calibFromJson(bundle, c)) {
+        logf("[WARN] H_MATRIX 파싱 실패 - calib/H 형식 확인 필요: %s",
+             payload.dump().c_str());
+        return;
+    }
+    calib_ = c;
+    srv_.sendTo("QT", msg);  // Qt도 즉시 새 캘리브레이션으로 top-view 갱신
+    if (!currentUser_.empty() && users_.setCalib(currentUser_, bundle))
+        logf("[INFO] 캘리브레이션 수신 (%s%s) - 사용자 '%s'에 영속 저장",
+             c.hasMarker ? "H_marker 포함" : "H_marker 없음 - 시차 보정 생략됨",
+             c.hasKD ? ", K/D 포함" : ", K/D 없음 - 왜곡 보정 생략됨",
+             currentUser_.c_str());
+    else
+        logf("[WARN] 캘리브레이션 수신 - 로그인 사용자 없음, 세션에만 유지");
 }
 
 // 1단계: 로봇 현재 위치 -> 도면 시작점(planPts_[0])까지 접근 경로.

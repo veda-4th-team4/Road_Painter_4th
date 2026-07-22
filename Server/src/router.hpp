@@ -8,8 +8,9 @@
 //   ROBOT -> READY     -> MOVE 출발 직전 정렬 확인 요청. 서버가 CCTV pose의
 //               실제 각도와 목표 heading을 비교해 ALIGN(미세회전) 또는 GO 응답
 //   CCTV  -> POS       -> 원본 픽셀 4코너 수신. 서버가 undistort -> H_marker로
-//               pose 계산 (좌표 변환은 전부 서버 담당) + ROBOT/QT 중계 +
+//               pose 계산 (좌표 변환은 전부 서버 담당) + QT 중계 +
 //               계산된 POSE를 QT로 전송 + 이탈 시 재계획
+//               (로봇은 좌표를 받지 않음 - 각도 피드백 ALIGN/DRIFT로만 보정)
 //   CCTV  -> H_MATRIX  -> 캘리브레이션 번들(K,D,H_floor,H_marker) 수신,
 //               로그인 사용자에 영속 저장 + QT 중계
 #include "calib.hpp"
@@ -17,6 +18,7 @@
 #include "protocol.hpp"
 #include "tls_server.hpp"
 #include "user_store.hpp"
+#include <mutex>
 
 class Router {
 public:
@@ -27,6 +29,9 @@ private:
     void fromQt(const json& msg);
     void fromRobot(const json& msg);
     void fromCctv(const json& msg);
+    void fromAdmin(const json& msg);  // 관리자 창 -> 로봇 제어(CMD/PATH) + 캘리(H_MATRIX)
+    // 캘리브레이션 번들 수신 처리 (CCTV/ADMIN 공용): 저장 + Qt 중계
+    void handleHMatrix(const json& msg);
     // 도면+pose가 준비됐으면 1단계(시작점 접근) 경로를 로봇에 전송
     void tryPlanAndSend();
     // Qt의 START_DRAW 수신 시 2단계(도색) 경로를 로봇에 전송
@@ -39,6 +44,10 @@ private:
     static constexpr int kAlignMaxTries = 4;  // ALIGN 최대 반복 (초과 시 그냥 GO)
     static constexpr long kDriftPeriodMs = 200;  // 주행 중 각도 피드백(DRIFT) 최소 간격
 
+    // 각 클라이언트 세션 스레드가 onMessage()를 호출하므로 아래 상태 전부가
+    // 스레드 간 공유다 (예: QT의 BLUEPRINT가 planPts_를 비우는 동안 CCTV의
+    // POS가 순회하면 UB). onMessage() 전체를 이 뮤텍스 하나로 직렬화한다.
+    std::mutex mtx_;
     TlsServer& srv_;
     UserStore users_;          // id/pw/H행렬 영속 저장소
     std::string currentUser_;  // 로그인된 사용자 (단일 사용자 가정)
