@@ -6,3 +6,8 @@
 TCP_PORT=6000
 HTTP_PORT=8081
 SNAPSHOT_PORT=6001
+
+# 카메라가 서버(9000)에 role=CCTV로 직접 붙게 되면 0으로 바꿀 것.
+# 미설정/1(기본)이면 이 프로세스가 CAM_POSE->POS 통역 다리(cctv_link_loop)를 띄운다.
+# 켜둔 채로 카메라를 직결하면 서버에서 role=CCTV 재접속 핑퐁이 난다 (web_gui.py 상단 주석 참고).
+# RP_CCTV_BRIDGE=0
