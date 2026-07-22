@@ -251,22 +251,36 @@ void Motor_RequestEStop(uint8_t reason, uint8_t timeout) {
 
 /**
  * @brief 완전 정지 여부를 검사하여 ESTOP 관련 latch를 해제합니다.
- * @return 해제 성공 시 1, 아직 정지하지 않았으면 0입니다.
+ * @return 해제 성공 시 1, 아직 감속 중이면 0입니다.
+ * @note current/target이 0이면 STEP 잔여 HIGH(1틱)는 강제 하강시킵니다.
+ *       이 잔여 펄스가 clear를 막아 sources=0 / latch=1 불일치가 나던 경우가 있었습니다.
  */
 uint8_t Motor_ClearEStop(void) {
-  uint8_t stopped;
+  uint8_t speed_zero;
   uint32_t primask = motor_critical_enter();
-  stopped = (left_axis.current_q16 == 0 && right_axis.current_q16 == 0 &&
-             left_axis.target_q16 == 0 && right_axis.target_q16 == 0 &&
-             !left_axis.pulse_high && !right_axis.pulse_high);
-  if (stopped) {
-    estop_latched = 0U;
-    timeout_latched = 0U;
-    estop_reason = 0U;
-    emergency_decel = 0U;
+
+  speed_zero = (left_axis.current_q16 == 0 && right_axis.current_q16 == 0 &&
+                left_axis.target_q16 == 0 && right_axis.target_q16 == 0);
+  if (!speed_zero) {
+    motor_critical_exit(primask);
+    return 0U;
   }
+
+  if (left_axis.pulse_high) {
+    HAL_GPIO_WritePin(LEFT_STEP_GPIO_Port, LEFT_STEP_Pin, GPIO_PIN_RESET);
+    left_axis.pulse_high = 0U;
+  }
+  if (right_axis.pulse_high) {
+    HAL_GPIO_WritePin(RIGHT_STEP_GPIO_Port, RIGHT_STEP_Pin, GPIO_PIN_RESET);
+    right_axis.pulse_high = 0U;
+  }
+
+  estop_latched = 0U;
+  timeout_latched = 0U;
+  estop_reason = 0U;
+  emergency_decel = 0U;
   motor_critical_exit(primask);
-  return stopped;
+  return 1U;
 }
 
 /**

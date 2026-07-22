@@ -3,6 +3,7 @@
  * @file    control_arbiter.h
  * @brief   ESTOP 중재 및 IR 펄스 / UART SET_SPEED 실행
  * @note    AUTO/MANUAL 모드 구분 없음. 서버와 IR 모두 ESTOP이 아니면 사용 가능.
+ * @note    0x04 CLEAR_ESTOP(키 0xA55A)은 완전정지 시 SERVER/TIMEOUT/REMOTE를 모두 해제합니다.
  *          서버 주행 중에는 리모컨을 누르지 않으면 됩니다.
  ******************************************************************************
  */
