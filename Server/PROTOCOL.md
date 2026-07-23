@@ -1,9 +1,10 @@
 # Road-Painter 서버 통신 프로토콜 (v0.3)
 
-> 최종 수정: 2026-07-21 · 구현 기준: `feature/server` 브랜치 (`Server/src/protocol.hpp`와 동일 내용)
+> 최종 수정: 2026-07-23 · 구현 기준: `feature/server` 브랜치 (`Server/src/protocol.hpp`와 동일 내용)
 >
 > 2026-07-21 추가분: ADMIN role(관리자 창) + TAP, 경로 실행 중 수동조작 차단 규칙.
-> 문서 맨 아래 "v0.3 추가 변경(2026-07-21)" 참고.
+> 2026-07-23 추가분: REGISTER/LOGIN_OK cam_ip, DRAW_FAIL(경로 실패/대기 통지).
+> 문서 맨 아래 "v0.3 추가 변경" 절들 참고.
 
 ## 좌표계 규약 (v0.3 핵심 — 반드시 읽을 것)
 
@@ -168,9 +169,12 @@
 ### 송신: REGISTER / LOGIN (QT → 서버)
 
 ```json
-{"type":"REGISTER","seq":1,"payload":{"id":"user1","pw":"..."}}
+{"type":"REGISTER","seq":1,"payload":{"id":"user1","pw":"...","cam_ip":"192.168.0.31"}}
 {"type":"LOGIN","seq":2,"payload":{"id":"user1","pw":"..."}}
 ```
+
+- `cam_ip`: 선택. 회원가입 시 등록해두는 CCTV 카메라 IP — 서버는 검증 없이 저장만 하고
+  로그인 시 그대로 회신한다. Qt는 이 IP로 RTSP URL을 조립해 카메라 영상을 띄운다.
 
 서버 응답:
 
@@ -178,23 +182,25 @@
 |---|---|
 | `REGISTER_OK` | `{"id":"user1"}` |
 | `REGISTER_FAIL` | `{"reason":"이미 존재하는 id"}` 등 |
-| `LOGIN_OK` | `{"id":"user1","calib":{...}}` — 저장된 캘리브레이션 번들. **`null`이면 캘리브레이션 필요** |
+| `LOGIN_OK` | `{"id":"user1","calib":{...}\|null,"cam_ip":"192.168.0.31"\|null}` — `calib`은 저장된 캘리브레이션 번들(**`null`이면 캘리브레이션 필요**), `cam_ip`는 등록해둔 카메라 IP(없으면 `null`) |
 | `LOGIN_FAIL` | `{"reason":"id 또는 비밀번호 불일치"}` |
 
 - Qt는 `calib.H_floor`(+`K`,`D`)로 top-view를 생성한다: 프레임 왜곡 보정 → `warpPerspective(S·H_floor)` (S = 렌더링 축척 px/m)
+- `calib`이 `null`이면(캘리브레이션 미완료) Qt는 관리자 창(`admin_console`, 현 서버 `http://<서버IP>:8083` — `admin_console/config.sh`에서 설정) 접속 링크를 안내해 사용자가 캘리브레이션을 진행하게 한다. 이 URL은 Qt 쪽에 고정값으로 둔다 (서버가 내려주지 않음).
 
 ### 송신: CMD (QT → 서버)
 
-`{"cmd": ...}` — 서버가 ROBOT에 중계, `CALIB_START`는 CCTV에도 중계
+`{"cmd": ...}` — 서버가 ROBOT에 중계
 
-- 이벤트: `"ESTOP"` | `"RESUME"` | `"CALIB_START"`
+- 이벤트: `"ESTOP"` | `"RESUME"`
+- ⚠️ **캘리브레이션 시작(`CALIB_START`)은 QT가 보내지 않는다** (2026-07-23 변경). 카메라 설치/캘리브레이션은 **관리자 창(admin_console)에서 시작**한다 — 관리자 창이 ADMIN role로 `CALIB_START`를 보내면 서버가 ROBOT+CCTV에 중계한다. (서버는 하위호환으로 QT가 보낸 `CALIB_START`도 여전히 중계하지만, QT 쪽 캘리 시작 UI는 두지 않는다.) QT는 캘리 **결과**만 받는다: 로그인 시 `LOGIN_OK.calib`, 갱신 시 `H_MATRIX` 중계 → top-view 렌더링용.
 - **그리기 시작: `"START_DRAW"`** — "그림그리기 시작" 버튼. 로봇이 접근(1단계)을 마치고 시작점에 대기 중일 때 누르면, 서버가 도색 경로(PATH phase="draw")를 로봇에 전송한다. 이 명령은 로봇에 중계되지 않음 (로봇은 PATH 수신이 곧 시작 신호). 접근 미완료 상태면 서버가 무시하고 경고 로그만 남김.
 - 수동 조작(조이스틱): `"FORWARD"` | `"BACKWARD"` | `"TURN_LEFT"` | `"TURN_RIGHT"` | `"STOP"`
   - 버튼 누름 → 방향 명령, 뗌 → `STOP`. 이동량은 안 실음 (로봇 고정 속도).
 - ⚠️ **경로 실행 중에는 수동 조작이 차단된다** (2026-07-21 추가): 서버가 PATH를 보내
   로봇이 경로를 수행 중인 동안 QT의 수동 조작 CMD는 **로봇에 전달되지 않고 무시**된다
-  (도색 도중 조이스틱으로 그림을 망치는 것 방지 — 자동이 우선). `ESTOP`/`RESUME`/
-  `CALIB_START` 같은 비수동 명령은 항상 통과한다. 현재 거절 응답 메시지는 없으며
+  (도색 도중 조이스틱으로 그림을 망치는 것 방지 — 자동이 우선). `ESTOP`/`RESUME`
+  같은 비수동 명령은 항상 통과한다. 현재 거절 응답 메시지는 없으며
   서버 로그로만 확인 가능 (QT는 버튼이 안 먹는 것으로 보임).
 - **경로가 없는 상태에서 수동 조작 명령이 오면** 서버는 자동 경로추종/재계획을 중단하고
   수동 모드로 전환한다 (수동 이동을 서버가 '경로 이탈'로 오인해 재계획 PATH를 쏘는
@@ -230,6 +236,25 @@
     현재 상태 스냅샷을 1회 보내준다 (그때그때 물어볼 필요 없음).
   - STATUS/POSE가 한동안 안 온다고 "로봇이 없나?" 유추하지 말고, 이 메시지를
     직접 신뢰할 것 (예: 로봇이 접속만 하고 아직 STATUS 첫 전송 전인 순간도 있음).
+- `DRAW_FAIL`: **경로 생성/전송 실패 또는 대기 통지** (2026-07-23 추가)
+
+  ```json
+  {"type":"DRAW_FAIL","seq":25,"payload":{
+    "stage": "plan",
+    "reason": "no_pose",
+    "msg": "로봇 위치 미확인 - CCTV POS 수신 후 자동 전송 예정"
+  }}
+  ```
+
+  | 필드 | 설명 |
+  |---|---|
+  | `stage` | `"plan"` = BLUEPRINT 처리 중 문제 \| `"draw"` = START_DRAW 처리 중 문제 |
+  | `reason` | 코드. `plan`: `bad_points`(도면 형식 오류) / `no_pose`(로봇 위치 미확인 — 대기 성격, POS 오면 자동 재시도) / `robot_offline`(로봇 미접속). `draw`: `not_ready`(접근 완료 대기 상태 아님) / `no_pose` / `no_blueprint` / `robot_offline` |
+  | `msg` | 사람이 읽을 한글 설명 (UI 표시용) |
+
+  - `reason=no_pose`(stage=plan)는 완전한 실패가 아니라 "로봇 위치 확보되면 자동으로
+    PATH가 나갈 예정"이라는 대기 안내에 가깝다. Qt는 reason으로 구분해 표시 문구를
+    조정할 것.
 
 ---
 
@@ -316,12 +341,20 @@
 - `H_MATRIX` → CCTV가 보낸 것과 동일하게 처리 (저장 + QT 중계). 관리자 창의 캘리브레이션
   도구가 카메라 대신 캘리 결과를 올릴 때 사용
 
-### 카메라 통역 (과도기 구조)
+### 카메라 통역 (과도기 구조 — 2026-07-23 종료됨)
 
-카메라 앱이 아직 이 프로토콜(TLS+HELLO/POS)을 말하지 못하므로, 관리자 창이 카메라의
-자체 형식(CAM_POSE, 평문 TCP)을 받아 **CCTV role로 별도 접속해 POS로 통역**해 넣는다.
-카메라 앱이 직접 접속하게 되면(→ [docs/CCTV_CAMERA_SPEC.md](docs/CCTV_CAMERA_SPEC.md))
-이 통역은 제거 예정.
+과거엔 카메라 앱이 이 프로토콜(TLS+HELLO/POS)을 못 말해서, 관리자 창이 카메라의 자체
+형식(CAM_POSE, 평문 TCP)을 받아 **CCTV role로 별도 접속해 POS로 통역**해 넣었다.
+
+카메라 앱이 [docs/CCTV_CAMERA_SPEC.md](docs/CCTV_CAMERA_SPEC.md)대로 **9000에 role=CCTV로
+직접 접속하도록 구현 완료**되어, 이 통역 다리는 껐다 (`admin_console/config.sh`의
+`RP_CCTV_BRIDGE=0`). 관리자 창은 이제 ADMIN role(로그 tap + 캘리 도구 + 로봇 제어)로만
+9000에 붙고, 카메라의 실시간 POS는 카메라가 직접 보낸다. `RP_CCTV_BRIDGE=1`로 다시
+켜면 카메라와 관리자 창이 동시에 role=CCTV를 잡으려 해 서버가 재접속을 반복시키니
+주의(같은 role 재접속 시 기존 세션을 끊고 교체하는 동작 — "공통" 절 참고).
+
+관리자 창의 TCP_PORT(카메라 CAM_POSE 수신 포트)는 캘리 명령·스냅샷(CALIB_K 세션, LDC
+체크, .ppm 스냅샷) 용도로는 계속 쓴다 — 이건 9000으로 옮기지 않기로 한 채널이라 남아있음.
 
 ---
 
@@ -360,6 +393,27 @@
 
 ---
 
+## v0.3 추가 변경 (2026-07-23)
+
+1. **REGISTER/LOGIN에 카메라 IP(`cam_ip`)** — Qt가 회원가입 시 카메라 IP를 같이 등록하면
+   서버가 저장해뒀다가 로그인 시 `LOGIN_OK.cam_ip`로 회신한다. 서버는 형식 검증 없이
+   문자열을 그대로 저장·회신만 하며, RTSP URL 조립(포트·경로 포함)은 Qt 담당이다.
+   ("QT" 장 REGISTER/LOGIN 절 참고)
+2. **캘리브레이션 없을 때 관리자 창 안내** — `LOGIN_OK.calib`가 `null`이면 Qt는 관리자 창
+   웹 GUI(`admin_console`, 현 서버 `http://<서버IP>:8083`)로 이동하는 링크를 보여준다.
+   서버 코드/프로토콜 변경 없음 — Qt 쪽 UI 정책이며 URL은 Qt에 고정값으로 둔다.
+3. **`DRAW_FAIL` 신설** — BLUEPRINT/START_DRAW 처리 중 경로를 만들지 못하거나(도면 형식
+   오류, 로봇 미접속, 접근 완료 대기 상태 아님 등) 아직 불가능한 상태(로봇 위치 미확인)일
+   때 서버가 Qt에 통지한다. 이전에는 서버 로그에만 남고 Qt는 알 방법이 없었다.
+   ("QT" 장 수신 목록 DRAW_FAIL 절 참고)
+4. **캘리브레이션 시작 주체를 QT → 관리자 창으로 이동** — 카메라 설치/캘리브레이션은
+   관리자 창(admin_console)에서 시작한다. QT는 더 이상 `CALIB_START`를 보내지 않으며
+   캘리 시작 UI도 두지 않는다(캘리 **결과**만 `LOGIN_OK.calib`/`H_MATRIX`로 수신).
+   서버는 하위호환으로 QT의 `CALIB_START`도 여전히 중계한다(코드 변경 없음, 정책 변경).
+   ("QT" 장 CMD 절 + Phase 2 시나리오 참고)
+
+---
+
 ## 프로토콜 기반 전체 사용 시나리오
 
 이 장에서는 앞서 정의한 프로토콜 메시지들이 실제 시스템 운용 시나리오에서 어떻게 오가는지 Phase별로 나누어 설명한다.
@@ -374,7 +428,7 @@
 | **`ACK`** | 서버 → 클라이언트 | **연결 승인**: HELLO 요청을 정상 접수하여 세션 등록이 완료되었음을 클라이언트에 알리는 확인 응답이다. |
 | **`REGISTER` / `LOGIN`** | QT → 서버 | **사용자 인증 및 설정 요청**: 작업자가 시스템을 사용하기 위해 로그인을 시도한다. |
 | **`LOGIN_OK`** | 서버 → QT | **사용자 인증 승인 및 캘리브레이션 획득**: 로그인이 성공하면 서버는 해당 사용자가 관리하는 현장에 마지막으로 저장된 **캘리브레이션 번들 (`calib`)**을 반환한다. QT는 이를 사용하여 즉시 top-view 영상을 보정하여 렌더링한다. |
-| **`CMD`** | QT → 서버 → 로봇/CCTV | **이벤트 기반 제어 명령**: 캘리브레이션 시작(`CALIB_START`), 비상 정지(`ESTOP`), 재개(`RESUME`) 등 동작 제어 이벤트를 단방향(Fire-and-forget)으로 전달 및 중계한다. |
+| **`CMD`** | QT/관리자창 → 서버 → 로봇/CCTV | **이벤트 기반 제어 명령**: 비상 정지(`ESTOP`), 재개(`RESUME`) 등을 QT가, **캘리브레이션 시작(`CALIB_START`)은 관리자 창(ADMIN)이** 보내면 서버가 단방향(Fire-and-forget)으로 중계한다. |
 | **`H_MATRIX`** | CCTV → 서버 → QT | **캘리브레이션 프로필 등록 및 갱신**: 캘리브레이션 완료 시점에 CCTV가 계산한 렌즈 파라미터(K, D) 및 두 기하학적 평면 변환 행렬(H_floor, H_marker)을 보고한다. 서버는 이를 데이터베이스에 영속화하고, 실시간 화면 갱신을 위해 QT에 중계한다. |
 | **`BLUEPRINT`** | QT → 서버 | **작업 도면 전송**: 작업자가 top-view 화면에 드로잉한 점들을 바닥 평면의 **실제 미터 좌표(x, y)**로 변환하여 서버에 보낸다. 서버는 이 데이터를 바탕으로 실제 로봇의 동작 경로를 기하학적으로 설계한다. |
 | **`POS`** | CCTV → 서버 | **실시간 마커 코너 보고**: CCTV가 매 프레임 검출한 로봇의 4개 마커 꼭짓점의 **원본 픽셀 좌표**를 고주기(15~30Hz)로 전송한다. 연산 리소스 경량화를 위해 CCTV는 렌즈 왜곡이나 호모그래피 보정을 거치지 않은 날것 그대로를 보낸다. |
@@ -417,17 +471,18 @@ sequenceDiagram
 ```
 
 ### Phase 2. 설치 위치 캘리브레이션 (Calibration Phase)
-작업자가 카메라 설치 완료 후 캘리브레이션을 요청할 때의 흐름이다. QT에서 시작 명령을 보내면 서버가 CCTV와 ROBOT에 중계하고, CCTV는 연산을 마친 뒤 `H_MATRIX`를 통해 캘리브레이션 번들을 전송한다.
+카메라 설치 기사가 캘리브레이션을 시작하는 흐름이다. **캘리브레이션 시작은 관리자 창(admin_console)에서** 한다(2026-07-23 변경 — 이전엔 QT가 시작). 관리자 창이 ADMIN role로 `CALIB_START`를 보내면 서버가 CCTV와 ROBOT에 중계하고, CCTV는 연산을 마친 뒤 `H_MATRIX`를 통해 캘리브레이션 번들을 전송한다. 서버는 이를 저장하고 QT에 중계해 top-view를 갱신한다.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant QT as QT Client
+    participant Admin as 관리자 창(ADMIN)
     participant Server as 비전 서버
     participant CCTV as AI CCTV
     participant ROBOT as 로봇 제어기
+    participant QT as QT Client
 
-    QT->>Server: CMD (CALIB_START)
+    Admin->>Server: CMD (CALIB_START)
     Server->>ROBOT: CMD (CALIB_START)
     Server->>CCTV: CMD (CALIB_START)
 

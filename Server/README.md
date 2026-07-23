@@ -30,6 +30,7 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 Server/
 ├── Makefile            빌드 스크립트
 ├── PROTOCOL.md         통신 프로토콜 문서 (로봇/QT/CCTV 팀용)
+├── start.sh            통합 실행 (관리자 창 자동 시작 + 서버 실행)
 ├── gen_cert.sh         TLS 자체서명 인증서 생성 (최초 1회)
 ├── certs/              server.crt(공개) / server.key(비밀, git 제외)
 ├── config/             users.json (서버가 자동 생성, git 제외)
@@ -46,12 +47,16 @@ Server/
 ├── tools/
 │   └── qt_sim.cpp          Qt 대역 테스트 클라이언트 (Qt 네트워킹 나오기 전 검증용)
 └── admin_console/          관리자 창 (Python 웹 GUI - 카메라 캘리 도구 + 서버 로그/로봇 제어)
-    ├── web_gui.py              대시보드( / ), 로봇 제어( /robot ), 로그 모니터( /logs )
+    ├── web_gui.py              진입점: HTTP 라우팅 + 로봇 제어( /robot )·로그 모니터( /logs ) + main()
+    ├── cctv.py                 ★ CCTV 파트 (카메라 CAM_POSE·캘리브레이션·스냅샷 + 대시보드 UI) — CCTV팀 작업 파일
+    ├── rp_core.py              공통 코어 (설정 + 로그 브로드캐스트/SSE + 중앙 서버 ADMIN 링크)
     ├── pose_server.py          터미널판 카메라 하니스 (web_gui의 원형)
     ├── start.sh                백그라운드 실행 스크립트 (포트는 config.sh에서)
     ├── config.sh.example       포트 설정 템플릿 (config.sh로 복사해 사용, config.sh는 git 제외)
     └── PLAN.md                 설계/진행 상황
 ```
+
+관리자 창 모듈 의존 방향: `rp_core` ← `cctv` ← `web_gui` (단방향, 순환 없음). CCTV팀은 카메라·캘리브레이션 로직과 대시보드 UI가 모두 든 **`cctv.py`** 에서 작업하면 되고, 로그 출력(`broadcast`)·중앙 서버 전송(`server_send`)은 `rp_core`에서 가져다 씁니다.
 
 구조: 접속한 클라이언트마다 전담 스레드가 생겨 자기 소켓을 읽고, 받은 메시지는 Router가 규칙에 따라 다른 클라이언트 소켓으로 배달합니다 (thread-per-connection).
 
@@ -65,25 +70,33 @@ sudo apt install g++ make libssl-dev nlohmann-json3-dev
 ./gen_cert.sh 192.168.0.8
 # -> certs/server.crt 를 로봇/Qt/CCTV 클라이언트에 복사 (신뢰 CA로 사용)
 
-# 빌드 & 실행
+# 빌드 & 실행 (관리자 창 웹 GUI도 자동으로 같이 뜸)
 make
-./server
+./start.sh
 ```
 
 포트는 **9000** (TCP/TLS). 실행하면 포그라운드에서 돌며 로그를 출력합니다. Ctrl+C 또는 `kill -TERM`으로 정상 종료됩니다.
 
+`./start.sh`는 서버를 띄우기 전에 관리자 창(웹 GUI, 아래 참고)이 안 떠 있으면 백그라운드로
+자동 실행합니다 — Qt가 언제든 `http://<서버IP>:8083` 주소를 열 수 있게 하기 위함입니다
+(포트는 `admin_console/config.sh`에서 설정 — 기본 8081은 이 RPi에서 부팅 자동실행되는
+옛 복사본 `~/pos_receiver_eo`가 쓰고 있어 8083으로 비켜둠). 이미 그 포트에서 서비스
+중이면 그대로 재사용하고, 서버만 Ctrl+C로 꺼도 웹 창은 계속 살아 있습니다. 웹 GUI 없이
+서버만 띄우려면 기존처럼 `./server`를 직접 실행하면 됩니다.
+
 ### 관리자 창 (admin_console)
 
-카메라 캘리브레이션 도구 + 서버 로그 모니터 + 로봇 제어 패널을 겸하는 웹 GUI입니다. 서버(9000)에 ADMIN(감시·제어)과 CCTV(카메라 좌표 통역) role로 접속합니다.
+카메라 캘리브레이션 도구 + 서버 로그 모니터 + 로봇 제어 패널을 겸하는 웹 GUI입니다. 서버(9000)에 ADMIN(감시·제어)과 CCTV(카메라 좌표 통역) role로 접속합니다. 보통은 위의 `./start.sh`가 자동으로 띄워주므로 직접 실행할 일은 포트를 바꿀 때 정도입니다.
 
 ```bash
-# 서버 실행 후 별도 터미널에서
-cd admin_console
-python3 web_gui.py [카메라TCP포트] [HTTP포트] [스냅샷포트]   # 기본 6000 8081 6001
-# 브라우저: http://<서버IP>:8081       카메라 캘리브레이션 대시보드
-#          http://<서버IP>:8081/robot  로봇 제어 + 상태 배너
-#          http://<서버IP>:8081/logs   서버 트래픽 로그 모니터 (role별 필터)
+# 수동 실행 (서버 실행 후 별도 터미널에서)
+./admin_console/start.sh    # 포트는 admin_console/config.sh에서 (현 서버: 6100 8083 6101)
+# 또는: cd admin_console && python3 web_gui.py [카메라TCP포트] [HTTP포트] [스냅샷포트]
+# 브라우저: http://<서버IP>:8083       카메라 캘리브레이션 대시보드
+#          http://<서버IP>:8083/robot  로봇 제어 + 상태 배너
+#          http://<서버IP>:8083/logs   서버 트래픽 로그 모니터 (role별 필터)
 # 서버가 다른 호스트면: RP_SERVER_HOST=x.x.x.x python3 web_gui.py
+# 카메라 앱이 CAM_POSE를 보내는 대상(통역 다리)도 이 인스턴스의 TCP 포트(6100)로 맞출 것
 ```
 
 ⚠️ 같은 카메라를 바라보는 web_gui 인스턴스는 **한 개만** 띄울 것 (카메라는 설정된 포트 하나로만 접속). 다른 인스턴스가 이미 카메라 포트를 쓰고 있으면 포트가 겹치지 않게 조정하세요.

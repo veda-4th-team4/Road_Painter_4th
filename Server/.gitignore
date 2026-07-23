@@ -21,3 +21,4 @@ calib_frames/
 config/server_token.txt
 server
 qt_sim
+server.log

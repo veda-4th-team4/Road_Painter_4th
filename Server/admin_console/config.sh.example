@@ -3,11 +3,15 @@
 #   cp config.sh.example config.sh
 # config.sh itself is gitignored (real host-specific values, not committed).
 
-TCP_PORT=6000
-HTTP_PORT=8081
-SNAPSHOT_PORT=6001
+# 현 서버 RPi에서는 기본 포트(6000/8081/6001)를 부팅 자동실행되는 옛 복사본
+# (~/pos_receiver_eo)이 쓰고 있어서, 리포 인스턴스는 아래 포트로 비켜서 띄운다.
+# (Qt가 여는 관리자 창 주소 = http://<서버IP>:8083)
+TCP_PORT=6100
+HTTP_PORT=8083
+SNAPSHOT_PORT=6101
 
-# 카메라가 서버(9000)에 role=CCTV로 직접 붙게 되면 0으로 바꿀 것.
-# 미설정/1(기본)이면 이 프로세스가 CAM_POSE->POS 통역 다리(cctv_link_loop)를 띄운다.
+# 카메라가 서버(9000)에 role=CCTV로 직접 붙는지 여부.
+# 이 프로젝트의 카메라는 CCTV_CAMERA_SPEC.md대로 이미 직결 구현되어 있으므로 0(끔)이
+# 기본. 미설정/1이면 이 프로세스가 CAM_POSE->POS 통역 다리(cctv_link_loop)를 띄운다.
 # 켜둔 채로 카메라를 직결하면 서버에서 role=CCTV 재접속 핑퐁이 난다 (web_gui.py 상단 주석 참고).
-# RP_CCTV_BRIDGE=0
+RP_CCTV_BRIDGE=0

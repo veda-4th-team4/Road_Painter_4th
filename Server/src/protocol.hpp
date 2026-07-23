@@ -64,16 +64,21 @@
 //       오차 <= 2도(또는 3회 반복 초과)면 GO{} 응답. GO를 받으면 직진 시작.
 //
 // [QT -> 서버]
-//   REGISTER payload: {"id":"user1","pw":"..."}
+//   REGISTER payload: {"id":"user1","pw":"...","cam_ip":"192.168.0.31"}
 //     -> 응답 REGISTER_OK {"id":...} | REGISTER_FAIL {"reason":...}
+//        (cam_ip는 선택 - 카메라 IP. 서버는 검증 없이 저장만 함)
 //   LOGIN    payload: {"id":"user1","pw":"..."}
-//     -> 응답 LOGIN_OK {"id":..., "calib":{...}|null} | LOGIN_FAIL {"reason":...}
-//        (calib는 저장된 캘리브레이션 번들, null이면 캘리브레이션 필요)
-//   CMD      payload: {"cmd":...}  -> ROBOT 중계 (CALIB_START는 CCTV에도)
-//     이벤트 ESTOP/RESUME/CALIB_START + 수동 조작 FORWARD/BACKWARD/TURN_LEFT/
+//     -> 응답 LOGIN_OK {"id":..., "calib":{...}|null, "cam_ip":"..."|null}
+//        | LOGIN_FAIL {"reason":...}
+//        (calib는 저장된 캘리브레이션 번들, null이면 캘리브레이션 필요.
+//         cam_ip는 REGISTER 때 등록한 카메라 IP, 없으면 null)
+//   CMD      payload: {"cmd":...}  -> ROBOT 중계
+//     이벤트 ESTOP/RESUME + 수동 조작 FORWARD/BACKWARD/TURN_LEFT/
 //     TURN_RIGHT/STOP (조이스틱: 누르는 동안 이동, 이동량 없음)
 //     + START_DRAW ("그림그리기 시작" 버튼): 접근 완료 대기 중인 로봇에게
 //       서버가 도색 경로(PATH phase="draw")를 생성·전송. 로봇 중계는 안 함.
+//     ※ CALIB_START는 QT가 안 보냄(2026-07-23) - 캘리 시작은 관리자 창(ADMIN)
+//       담당. 서버는 하위호환으로 QT의 CALIB_START도 여전히 CCTV까지 중계함.
 //   BLUEPRINT payload: {"points":[[x,y],...]}  바닥 평면 미터 좌표 폴리라인
 //     - Qt가 top-view 픽셀 -> 미터 변환(÷ S px/m)을 마친 값. 서버는 재변환하지 않음.
 //     - 서버는 우선 1단계(시작점 접근) PATH만 전송. 도색은 START_DRAW 이후.
@@ -87,6 +92,11 @@
 //     - ROBOT/CCTV 접속·해제될 때마다 전송. QT 접속 직후에도 현재 스냅샷 1회 전송.
 //     - QT가 "로봇/CCTV가 지금 붙어있는지"를 STATUS/POS 유무로 유추하지 않고
 //       바로 알 수 있게 하는 접속 상태 신호 (2026-07-22 추가)
+//   DRAW_FAIL payload: {"stage":"plan"|"draw", "reason":"<코드>", "msg":"<설명>"}
+//     - 경로 생성/전송이 실패했거나(로봇 미접속, 접근 대기 상태 아님 등) 아직
+//       불가능한 상태(로봇 위치 미확인 - 대기 성격)일 때 통지 (2026-07-23 추가)
+//     - stage=plan: BLUEPRINT 처리 중 (reason: bad_points/no_pose/robot_offline)
+//     - stage=draw: START_DRAW 처리 중 (reason: not_ready/no_pose/no_blueprint/robot_offline)
 //
 // [CCTV -> 서버]
 //   H_MATRIX payload: {"calib":{"version":1, "K":[[...]x3], "D":[k1,k2,p1,p2,k3],
