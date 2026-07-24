@@ -337,6 +337,14 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
             has_new_path = true;
             std::cout << "[NetworkManager] Path update (phase=" << current_path_phase 
                       << "): " << current_path.size() << " segments received." << std::endl;
+            for (size_t i = 0; i < current_path.size(); ++i) {
+                const auto& s = current_path[i];
+                std::cout << "  [Seg " << i << "] op=" << s.op 
+                          << " | dist_m=" << s.dist_m 
+                          << " | angle_deg=" << s.angle_deg 
+                          << " | heading_deg=" << s.heading_deg 
+                          << " | paint=" << (s.paint ? "true" : "false") << std::endl;
+            }
 
         } else if (type == "ALIGN") {
             float angle = payload.value("angle_deg", 0.0f);
