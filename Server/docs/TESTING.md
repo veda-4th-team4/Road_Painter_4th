@@ -97,18 +97,23 @@ openssl s_client -quiet -connect 127.0.0.1:9000
 {"type":"STATUS","seq":2,"payload":{"state":"IDLE","painting":false}}
 ```
 
-**터미널 C — qt_sim** (3번에서 쓴 것): `login` 후 `blueprint` 전송.
+**터미널 C — qt_sim** (3번에서 쓴 것): `login` 후 `blueprint` 전송, 그 다음 **`cmd start_draw`** 전송 (2026-07-27부터: `blueprint`만으로는 로봇이 안 움직임 — 저장만 됨).
 
-기대 동작: 서버가 CCTV의 POS로 로봇 pose를 계산 → qt_sim에 `POSE` 전송, 도면 + pose를 조합 → ROBOT(터미널 B)에 `PATH` 전송. 각 콘솔에 찍히면 **end-to-end 정상**.
+기대 동작: 서버가 CCTV의 POS로 로봇 pose를 계산 → qt_sim에 `POSE` 전송. `blueprint`는 저장만 되고, **`cmd start_draw`를 보내야** 도면 + pose를 조합해 ROBOT(터미널 B)에 접근 `PATH`가 전송된다. 각 콘솔에 찍히면 **end-to-end 정상**.
 
 > `openssl s_client`는 자체서명 인증서라 접속 시 verify 경고를 찍지만 통신은 정상입니다.
+
+> 터미널 B(ROBOT 역할)가 `PATH_DONE`을 보내지 않는 단순 openssl 세션이라면, 접근 PATH 전송까지만 확인되고 도색 단계로는 자동 진행되지 않습니다(정상 — 실제 로봇이 `PATH_DONE`을 보내야 서버가 이어서 도색 PATH를 보냅니다). 도색까지 보려면 터미널 B에서 접근 PATH를 받은 뒤 `{"type":"PATH_DONE","seq":3,"payload":{"phase":"approach"}}`를 직접 붙여넣으세요.
 
 ## 5. 확인 포인트 체크리스트
 
 - [ ] qt_sim이 `LOGIN_OK` 받음
 - [ ] CCTV `POS` 전송 시 qt_sim에 `POSE {x,y,theta_deg}`가 옴 (서버가 변환한 것)
-- [ ] `blueprint` + POS가 모두 있을 때 ROBOT에 `PATH {segments}`가 옴
-- [ ] 서버 콘솔에 `[INFO] 경로 생성 완료` 로그
+- [ ] `blueprint` 전송만으로는 ROBOT에 아무것도 안 옴 (저장만 됨 확인)
+- [ ] `blueprint` 후 `cmd start_draw`를 보내면 ROBOT에 `PATH {phase:"approach", segments}`가 옴
+- [ ] 서버 콘솔에 `[INFO] 1단계 접근 경로 전송` 로그
+- [ ] (선택) ROBOT 역할에서 `PATH_DONE{phase:"approach"}`를 보내면 ROBOT에 `PATH {phase:"draw"}`가 이어서 옴 + 서버 콘솔에 `[INFO] 2단계 도색 경로 전송`
+- [ ] (선택) 이어서 `PATH_DONE{phase:"draw"}`를 보내면 qt_sim에 `DRAW_DONE`이 옴
 
 ## 6. 최초 1회 경로생성 테스트 (path_test) — 서버 RPi ↔ 로봇 RPi 중점
 

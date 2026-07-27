@@ -35,9 +35,10 @@
 //     - 로봇은 좌표를 모르므로 경로는 동작 명령 시퀀스로 전달.
 //     - PATH가 오면 기존 경로 즉시 폐기하고 새 경로로 교체 (TCP가 순서 보장).
 //     - phase="approach": 도면 시작점까지 이동(전부 paint=false) + 첫 도색 방향으로
-//       회전까지. 끝나면 로봇은 그 자리에서 대기 (Qt의 그리기 시작을 기다림).
+//       회전까지. 끝나면 로봇은 PATH_DONE을 보내고 그 자리에서 대기한다.
 //       마지막 TURN에는 heading_deg가 실려 READY 정렬 확인 가능.
-//     - phase="draw": Qt START_DRAW 후 전송되는 도색 경로(전부 paint=true).
+//     - phase="draw": 접근 완료(PATH_DONE) 직후 서버가 자동으로 보내는 도색
+//       경로(전부 paint=true). Qt가 버튼을 한 번 더 누르는 절차는 없다.
 //       로봇은 이 PATH를 받는 순간 IMU 현재 방향을 0도로 세팅하고 주행 시작.
 //   ALIGN  payload: {"angle_deg": -2.5}   // READY 응답: 출발 전 미세 회전 보정
 //   GO     payload: {}                    // READY 응답: 정렬 OK, 다음 동작 진행
@@ -62,6 +63,14 @@
 //     - 서버가 CCTV 마커로 잰 실제 각도와 그 MOVE의 heading_deg를 비교해서
 //       오차 > 2도면 ALIGN{angle_deg}(미세 회전 후 다시 READY),
 //       오차 <= 2도(또는 3회 반복 초과)면 GO{} 응답. GO를 받으면 직진 시작.
+//   PATH_DONE payload: {"phase":"approach"|"draw"}
+//     - 받은 PATH의 마지막 세그먼트까지 수행을 마쳤을 때 1회 전송 (2026-07-27 추가).
+//       phase는 방금 끝낸 PATH의 phase를 그대로 되돌려준다.
+//     - phase="approach" -> 서버가 곧바로 도색 PATH를 이어 보낸다 (Qt 개입 없음).
+//       phase="draw"     -> 서버가 경로 상태를 정리하고 QT에 DRAW_DONE을 통지한다.
+//     - 서버는 자기 상태로 단계를 판단하므로 phase가 없거나 어긋나도 동작한다
+//       (어긋나면 WARN 로그만 남김). 이탈 재계획으로 PATH가 교체된 경우에는
+//       "마지막으로 받은 PATH"를 끝냈을 때 보내면 된다.
 //
 // [QT -> 서버]
 //   REGISTER payload: {"id":"user1","pw":"...","cam_ip":"192.168.0.31"}
@@ -72,31 +81,43 @@
 //        | LOGIN_FAIL {"reason":...}
 //        (calib는 저장된 캘리브레이션 번들, null이면 캘리브레이션 필요.
 //         cam_ip는 REGISTER 때 등록한 카메라 IP, 없으면 null)
+//   SET_CAM_IP payload: {"cam_ip":"192.168.0.31"}   (2026-07-27 추가)
+//     -> 응답 SET_CAM_IP_OK {"cam_ip":"..."|null} | SET_CAM_IP_FAIL {"reason":...}
+//        (로그인 상태에서만 가능. REGISTER와 마찬가지로 형식 검증 없이 저장만 하고,
+//         빈 문자열을 보내면 등록을 지운다(null). Qt 설정란에서 카메라 교체용)
 //   CMD      payload: {"cmd":...}  -> ROBOT 중계
 //     이벤트 ESTOP/RESUME + 수동 조작 FORWARD/BACKWARD/TURN_LEFT/
 //     TURN_RIGHT/STOP (조이스틱: 누르는 동안 이동, 이동량 없음)
-//     + START_DRAW ("그림그리기 시작" 버튼): 접근 완료 대기 중인 로봇에게
-//       서버가 도색 경로(PATH phase="draw")를 생성·전송. 로봇 중계는 안 함.
+//     + START_DRAW ("그림그리기 시작" 버튼): 서버가 1단계(접근) 경로부터
+//       생성·전송하고, 이후 접근 완료 -> 도색 -> 완료까지 자동 진행한다.
+//       로봇 중계는 안 함.
 //     ※ CALIB_START는 QT가 안 보냄(2026-07-23) - 캘리 시작은 관리자 창(ADMIN)
 //       담당. 서버는 하위호환으로 QT의 CALIB_START도 여전히 CCTV까지 중계함.
 //   BLUEPRINT payload: {"points":[[x,y],...]}  바닥 평면 미터 좌표 폴리라인
 //     - Qt가 top-view 픽셀 -> 미터 변환(÷ S px/m)을 마친 값. 서버는 재변환하지 않음.
-//     - 서버는 우선 1단계(시작점 접근) PATH만 전송. 도색은 START_DRAW 이후.
+//     - 서버는 저장만 한다. 로봇은 START_DRAW 전까지 움직이지 않는다.
 //
 // [서버 -> QT]
-//   STATUS / POS : 그대로 중계 (모니터링용)
+//   STATUS : 그대로 중계 (모니터링용)
 //   POSE   payload: {"x":1.234,"y":0.567,"theta_deg":90.0}
 //     - 서버가 POS를 변환해 계산한 로봇 pose (바닥 미터 좌표) - top-view 표시용
+//     - CCTV의 POS 원본(픽셀)은 QT에 중계하지 않는다 (2026-07-27 변경).
+//       Qt에는 캘리브레이션이 없어 픽셀을 해석할 방법이 없기 때문.
 //   H_MATRIX : 캘리브레이션 갱신 직후 그대로 중계 (top-view 재생성용)
 //   PEERS  payload: {"robot":true,"cctv":false}
 //     - ROBOT/CCTV 접속·해제될 때마다 전송. QT 접속 직후에도 현재 스냅샷 1회 전송.
 //     - QT가 "로봇/CCTV가 지금 붙어있는지"를 STATUS/POS 유무로 유추하지 않고
 //       바로 알 수 있게 하는 접속 상태 신호 (2026-07-22 추가)
+//   DRAW_DONE payload: {}   (2026-07-27 추가)
+//     - 도색 경로를 끝까지 마쳤을 때 1회 통지 (로봇 PATH_DONE(draw)이 트리거).
+//       접근 완료는 Qt에 알리지 않는다 - Qt 입장에선 START_DRAW부터 여기까지가
+//       한 덩어리의 "그리는 중"이다.
 //   DRAW_FAIL payload: {"stage":"plan"|"draw", "reason":"<코드>", "msg":"<설명>"}
-//     - 경로 생성/전송이 실패했거나(로봇 미접속, 접근 대기 상태 아님 등) 아직
-//       불가능한 상태(로봇 위치 미확인 - 대기 성격)일 때 통지 (2026-07-23 추가)
-//     - stage=plan: BLUEPRINT 처리 중 (reason: bad_points/no_pose/robot_offline)
-//     - stage=draw: START_DRAW 처리 중 (reason: not_ready/no_pose/no_blueprint/robot_offline)
+//     - 경로 생성/전송이 실패했거나 아직 불가능한 상태(로봇 위치 미확인 - 대기
+//       성격)일 때 통지 (2026-07-23 추가)
+//     - stage=plan: BLUEPRINT 처리 중 (reason: bad_points)
+//     - stage=draw: START_DRAW 이후 처리 중
+//       (reason: no_blueprint/busy/no_pose/robot_offline/not_ready)
 //
 // [CCTV -> 서버]
 //   H_MATRIX payload: {"calib":{"version":1, "K":[[...]x3], "D":[k1,k2,p1,p2,k3],
@@ -111,8 +132,8 @@
 //     - CCTV는 절대 좌표 변환하지 말 것 (undistort도 하지 말 것).
 //       서버가 undistort(P=K 동등) -> H_marker -> pose 계산까지 담당.
 //     - 테스트용으로 {"x","y","theta_deg"}(바닥 미터 좌표)도 허용
-//     -> QT 중계 + POSE를 QT 전송 + 계획 경로에서 0.3m 초과 이탈 시
-//        재계획 PATH 전송 (최소 3초 간격)
+//     -> POSE를 QT 전송 (POS 원본은 중계하지 않음) + 계획 경로에서 0.3m 초과
+//        이탈 시 재계획 PATH 전송 (최소 3초 간격)
 //     - 로봇에는 중계하지 않음: 로봇은 좌표를 모르며(PATH 참고), 위치 보정은
 //       서버가 각도로 변환해 ALIGN/DRIFT로만 내려준다
 #include <nlohmann/json.hpp>

@@ -22,6 +22,8 @@ public:
     bool setCalib(const std::string& id, const json& calib);
     // 등록 시 저장한 카메라 IP (없으면 null 반환)
     json getCamIp(const std::string& id);
+    // 카메라 IP 변경 + 파일 반영 (Qt 설정란에서 교체. 빈 문자열이면 null로 지움)
+    bool setCamIp(const std::string& id, const std::string& camIp);
 
 private:
     void load();

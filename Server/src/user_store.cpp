@@ -102,3 +102,12 @@ json UserStore::getCamIp(const std::string& id) {
     if (!users_.contains(id)) return nullptr;
     return users_[id].value("cam_ip", json());
 }
+
+bool UserStore::setCamIp(const std::string& id, const std::string& camIp) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!users_.contains(id)) return false;
+    // registerUser와 동일 규약: 빈 문자열은 "등록 안 함"을 뜻하는 null로 저장
+    users_[id]["cam_ip"] = camIp.empty() ? json() : json(camIp);
+    save();
+    return true;
+}
