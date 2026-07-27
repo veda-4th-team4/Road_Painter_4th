@@ -22,3 +22,6 @@ config/server_token.txt
 server
 qt_sim
 server.log
+
+#테스트 코드
+path_test

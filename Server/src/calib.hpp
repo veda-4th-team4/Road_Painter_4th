@@ -3,8 +3,10 @@
 //
 // 좌표계 규약:
 //   - CCTV는 마커 코너를 "원본 픽셀 좌표"로만 보낸다 (변환 금지).
-//   - 서버가 undistort(왜곡 보정) -> H_marker 적용으로 바닥 미터 좌표를 계산한다.
-//   - H_floor/H_marker는 "왜곡 보정된 픽셀 -> 월드 평면 미터" 사영변환.
+//   - 서버가 undistort(왜곡 보정) -> H_marker 적용으로 바닥 좌표를 계산한다.
+//   - CCTV가 보내는 H_floor/H_marker는 "왜곡 보정된 픽셀 -> 월드 평면 mm" 사영변환이다.
+//     서버는 수신 즉시 mm -> m 로 정규화(normalizeBundleMmToM, ÷1000)하므로, 아래
+//     Calib 구조체(Hf/Hm)와 이후 모든 서버 좌표(pose/POSE/BLUEPRINT/PATH)는 미터 기준이다.
 //     (H_marker = 마커 장착 높이 평면용. 마커가 바닥에서 떠 있어 생기는
 //      시차(parallax)를 캘리브레이션 단계에서 흡수한 것)
 //
@@ -37,6 +39,32 @@ inline bool parseMat3(const json& j, double m[3][3]) {
         }
     }
     return true;
+}
+
+// 호모그래피 행렬의 0,1행에 스칼라 s를 곱한다 (world = H·[u,v,1]의 0,1행 / 2행이므로
+// 0,1행을 s배하면 변환 결과가 s배). 형식이 어긋난 원소는 건너뛴다(파싱 검증은 이후 단계).
+inline void scaleMat3Rows01(json& m, double s) {
+    if (!m.is_array() || m.size() != 3) return;
+    for (int r = 0; r < 2; ++r) {
+        if (!m[r].is_array() || m[r].size() != 3) return;
+        for (int c = 0; c < 3; ++c)
+            if (m[r][c].is_number()) m[r][c] = m[r][c].get<double>() * s;
+    }
+}
+
+// CCTV는 항상 mm 기준(pixel -> world mm) 호모그래피를 보낸다는 전제로, 서버 입구에서
+// 미터로 정규화(÷1000)한다. 이후 pose 계산/BLUEPRINT/POSE/PATH/QT top-view가 전부
+// 미터로 통일된다 (로봇에 나가는 dist_m도 그대로 미터). H_floor/H_marker(신규) 및
+// 레거시 단일 H 배열을 처리한다. K/D는 픽셀 단위라 건드리지 않는다.
+inline void normalizeBundleMmToM(json& bundle) {
+    const double s = 0.001;  // mm -> m
+    if (bundle.is_array()) {  // 레거시: 단일 H
+        scaleMat3Rows01(bundle, s);
+        return;
+    }
+    if (!bundle.is_object()) return;
+    if (bundle.contains("H_floor")) scaleMat3Rows01(bundle["H_floor"], s);
+    if (bundle.contains("H_marker")) scaleMat3Rows01(bundle["H_marker"], s);
 }
 
 // H_MATRIX payload의 번들(json) -> Calib. 신규 오브젝트/레거시 3x3 배열 모두 허용.

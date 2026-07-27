@@ -282,10 +282,14 @@ void Router::fromCctv(const json& msg) {
 // 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용).
 //   신규: payload.calib = {K, D, H_floor, H_marker, marker_height_m, version}
 //   레거시: payload.H = [[...]x3] (왜곡 보정 없이 바닥/마커 공용으로 사용)
+// CCTV는 mm 기준(pixel->world mm) 호모그래피를 보낸다. 서버 입구에서 미터로 정규화한 뒤
+// 저장/중계하므로, 이후 pose/POSE/BLUEPRINT/PATH와 QT top-view는 전부 미터로 통일된다.
 void Router::handleHMatrix(const json& msg) {
     json payload = msg.value("payload", json::object());
+    bool legacyH = !payload.contains("calib") && payload.contains("H");
     json bundle =
         payload.contains("calib") ? payload["calib"] : payload.value("H", json());
+    normalizeBundleMmToM(bundle);  // mm -> m (÷1000). 이후 번들은 미터 기준.
     Calib c;
     if (!calibFromJson(bundle, c)) {
         logf("[WARN] H_MATRIX 파싱 실패 - calib/H 형식 확인 필요: %s",
@@ -293,14 +297,18 @@ void Router::handleHMatrix(const json& msg) {
         return;
     }
     calib_ = c;
-    srv_.sendTo("QT", msg);  // Qt도 즉시 새 캘리브레이션으로 top-view 갱신
+    // 정규화된(미터) 번들로 다시 싸서 QT에 중계 + 영속 저장 - QT는 미터 H_floor로 top-view.
+    json outMsg = msg;
+    if (legacyH) outMsg["payload"]["H"] = bundle;
+    else outMsg["payload"]["calib"] = bundle;
+    srv_.sendTo("QT", outMsg);
     if (!currentUser_.empty() && users_.setCalib(currentUser_, bundle))
-        logf("[INFO] 캘리브레이션 수신 (%s%s) - 사용자 '%s'에 영속 저장",
+        logf("[INFO] 캘리브레이션 수신 (mm->m 정규화, %s%s) - 사용자 '%s'에 영속 저장",
              c.hasMarker ? "H_marker 포함" : "H_marker 없음 - 시차 보정 생략됨",
              c.hasKD ? ", K/D 포함" : ", K/D 없음 - 왜곡 보정 생략됨",
              currentUser_.c_str());
     else
-        logf("[WARN] 캘리브레이션 수신 - 로그인 사용자 없음, 세션에만 유지");
+        logf("[WARN] 캘리브레이션 수신 (mm->m 정규화) - 로그인 사용자 없음, 세션에만 유지");
 }
 
 // 1단계: 로봇 현재 위치 -> 도면 시작점(planPts_[0])까지 접근 경로.
