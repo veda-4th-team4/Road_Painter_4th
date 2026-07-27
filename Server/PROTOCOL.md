@@ -1,9 +1,11 @@
 # Road-Painter 서버 통신 프로토콜 (v0.3)
 
-> 최종 수정: 2026-07-23 · 구현 기준: `feature/server` 브랜치 (`Server/src/protocol.hpp`와 동일 내용)
+> 최종 수정: 2026-07-27 · 구현 기준: `feature/server` 브랜치 (`Server/src/protocol.hpp`와 동일 내용)
 >
 > 2026-07-21 추가분: ADMIN role(관리자 창) + TAP, 경로 실행 중 수동조작 차단 규칙.
 > 2026-07-23 추가분: REGISTER/LOGIN_OK cam_ip, DRAW_FAIL(경로 실패/대기 통지).
+> 2026-07-27 추가분: 그리기 흐름 자동화(PATH_DONE→DRAW_DONE), SET_CAM_IP,
+> POS의 QT 중계 중단, 관리자 창 로그인(ADMIN LOGIN) + 로그인 게이트.
 > 문서 맨 아래 "v0.3 추가 변경" 절들 참고.
 
 ## 좌표계 규약 (v0.3 핵심 — 반드시 읽을 것)

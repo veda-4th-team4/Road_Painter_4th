@@ -69,7 +69,8 @@
 //       seg = segments 배열에서 곧 실행할 MOVE의 인덱스 (0부터).
 //     - 서버가 CCTV 마커로 잰 실제 각도와 그 MOVE의 heading_deg를 비교해서
 //       오차 > 2도면 ALIGN{angle_deg}(미세 회전 후 다시 READY),
-//       오차 <= 2도(또는 3회 반복 초과)면 GO{} 응답. GO를 받으면 직진 시작.
+//       오차 <= 2도(또는 4회 반복 초과)면 GO{} 응답. GO를 받으면 직진 시작.
+//       (임계값/횟수 실제값은 router.hpp의 kAlignThresholdDeg/kAlignMaxTries)
 //   PATH_DONE payload: {"phase":"approach"|"draw"}
 //     - 받은 PATH의 마지막 세그먼트까지 수행을 마쳤을 때 1회 전송 (2026-07-27 추가).
 //       phase는 방금 끝낸 PATH의 phase를 그대로 되돌려준다.
