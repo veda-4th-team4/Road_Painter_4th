@@ -9,10 +9,19 @@
 PathFollower::PathFollower()
     : current_waypoint_idx(0),
       drift_offset_deg(0.0f),
-      wheel_diameter_m(0.065f), // 65mm wheels (example)
-      wheelbase_m(0.160f),      // 160mm wheel track (example)
-      gear_ratio(1.0f),         // Direct drive (example)
-      steps_per_rev(400)        // 0.9 deg steps (example)
+      is_turning(false),
+      turn_target_angle_deg(0.0f),
+      turn_target_steps(0),
+      turn_start_left_steps(0),
+      turn_start_right_steps(0),
+      is_moving_straight(false),
+      move_target_steps(0),
+      move_start_left_steps(0),
+      move_start_right_steps(0),
+      wheel_diameter_m(0.066f), // 66mm wheels
+      wheelbase_m(0.166f),      // 166mm wheel track
+      gear_ratio(1.0f),         // Direct drive
+      steps_per_rev(3200)       // 200 full steps * 16 microsteps = 3200
 {
 }
 
@@ -22,6 +31,8 @@ void PathFollower::SetPath(const std::vector<Segment_t>& new_path) {
     path = new_path;
     current_waypoint_idx = 0;
     drift_offset_deg = 0.0f;
+    is_turning = false;
+    is_moving_straight = false;
     std::cout << "[PathFollower] Path loaded with " << path.size() << " segments." << std::endl;
 }
 
@@ -35,6 +46,8 @@ void PathFollower::AdvanceSegment() {
     if (current_waypoint_idx < path.size()) {
         current_waypoint_idx++;
         drift_offset_deg = 0.0f; // Reset drift offset on segment change
+        is_turning = false;
+        is_moving_straight = false;
         std::cout << "[PathFollower] Advanced to segment index: " << current_waypoint_idx << std::endl;
     }
 }
@@ -45,6 +58,115 @@ bool PathFollower::IsPathFinished() const {
 
 void PathFollower::SetDriftOffset(float offset_deg) {
     drift_offset_deg = offset_deg;
+}
+
+uint32_t PathFollower::CalculateTurnSteps(float angle_deg) const {
+    // 90 deg = 2032.24 pulses (with K_slip = 1.01)
+    // 0.1 deg resolution: 2.258044 pulses per 0.1 deg (22.58044 pulses/deg)
+    float abs_angle = std::fabs(angle_deg);
+    float steps = abs_angle * 22.58044f;
+    return static_cast<uint32_t>(std::round(steps));
+}
+
+void PathFollower::StartTurn(float angle_deg, int32_t start_left_steps, int32_t start_right_steps) {
+    is_turning = true;
+    turn_target_angle_deg = angle_deg;
+    turn_target_steps = CalculateTurnSteps(angle_deg);
+    turn_start_left_steps = start_left_steps;
+    turn_start_right_steps = start_right_steps;
+    std::cout << "[PathFollower] StartTurn: target angle=" << angle_deg 
+              << " deg | target_steps=" << turn_target_steps << std::endl;
+}
+
+bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed) {
+    if (!is_turning) return true;
+
+    int32_t diff_left = cur_left_steps - turn_start_left_steps;
+    int32_t diff_right = cur_right_steps - turn_start_right_steps;
+    uint32_t delta_left = static_cast<uint32_t>(std::abs(diff_left));
+    uint32_t delta_right = static_cast<uint32_t>(std::abs(diff_right));
+    uint32_t progress_steps = (delta_left + delta_right) / 2;
+
+    if (progress_steps >= turn_target_steps) {
+        // Turn target reached
+        out_speed.left_sps = 0;
+        out_speed.right_sps = 0;
+        is_turning = false;
+        std::cout << "[PathFollower] Turn completed! Reached " << progress_steps 
+                  << "/" << turn_target_steps << " steps." << std::endl;
+        return true;
+    }
+
+    // Turn in progress (positive angle = left turn)
+    int16_t turn_sps = 400; // 400 sps turn speed
+    if (turn_target_angle_deg > 0.0f) {
+        // Left turn: Left wheel backward (-sps), Right wheel forward (+sps)
+        out_speed.left_sps = -turn_sps;
+        out_speed.right_sps = turn_sps;
+    } else {
+        // Right turn: Left wheel forward (+sps), Right wheel backward (-sps)
+        out_speed.left_sps = turn_sps;
+        out_speed.right_sps = -turn_sps;
+    }
+
+    return false;
+}
+
+uint32_t PathFollower::CalculateMoveSteps(float dist_m) const {
+    // 3200 steps/rev, 66mm wheel diameter -> C = pi * 0.066 = 0.20734515 m
+    // 3200 / 0.20734515 = 15433.09 steps/meter (~15.433 steps/mm)
+    float abs_dist = std::fabs(dist_m);
+    float steps = abs_dist * 15433.09f;
+    return static_cast<uint32_t>(std::round(steps));
+}
+
+void PathFollower::StartMove(float dist_m, int32_t start_left_steps, int32_t start_right_steps) {
+    is_moving_straight = true;
+    move_target_steps = CalculateMoveSteps(dist_m);
+    move_start_left_steps = start_left_steps;
+    move_start_right_steps = start_right_steps;
+    std::cout << "[PathFollower] StartMove: target dist=" << dist_m 
+              << " m | target_steps=" << move_target_steps << std::endl;
+}
+
+bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on, float imu_yaw_deg) {
+    if (!is_moving_straight) return true;
+
+    int32_t diff_left = cur_left_steps - move_start_left_steps;
+    int32_t diff_right = cur_right_steps - move_start_right_steps;
+    uint32_t delta_left = static_cast<uint32_t>(std::abs(diff_left));
+    uint32_t delta_right = static_cast<uint32_t>(std::abs(diff_right));
+    uint32_t progress_steps = (delta_left + delta_right) / 2;
+
+    Segment_t current_seg;
+    GetCurrentSegment(current_seg);
+
+    if (progress_steps >= move_target_steps) {
+        // Move target reached
+        out_speed.left_sps = 0;
+        out_speed.right_sps = 0;
+        out_nozzle_on = 0;
+        is_moving_straight = false;
+        std::cout << "[PathFollower] Move completed! Reached " << progress_steps 
+                  << "/" << move_target_steps << " steps." << std::endl;
+        return true;
+    }
+
+    // Straight move in progress with server DRIFT + IMU Yaw fusion correction
+    float target_v = 0.05f; // 5 cm/s
+    float total_heading_error = drift_offset_deg + imu_yaw_deg;
+    float target_w = -total_heading_error * 0.05f; 
+    out_speed = velocity_to_sps(target_v, target_w);
+    out_nozzle_on = current_seg.paint ? 1 : 0;
+
+    static int move_log_count = 0;
+    if (++move_log_count % 10 == 0) {
+        std::cout << "[PathFollower MOVE] Progress: " << progress_steps << "/" << move_target_steps
+                  << " steps | IMU Yaw: " << imu_yaw_deg << " deg | Server Drift: " << drift_offset_deg
+                  << " deg -> Target SPS (L: " << out_speed.left_sps << ", R: " << out_speed.right_sps << ")" << std::endl;
+    }
+
+    return false;
 }
 
 void PathFollower::Update(const Pose_t& current_pose, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on) {

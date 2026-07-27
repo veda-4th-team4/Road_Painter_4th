@@ -1,6 +1,7 @@
 #include "NetworkManager.h"
 #include "PathFollower.h"
 #include "SerialManager.h"
+#include "ImuManager.h"
 #include <iostream>
 #include <string>
 #include <unistd.h>
@@ -16,6 +17,7 @@ int main(int argc, char **argv) {
   SerialManager robot_comm("/dev/serial0", 115200);
   NetworkManager net_manager(server_ip, server_port);
   PathFollower path_follower;
+  ImuManager imu_manager;
 
   // 2. Initialize serial communications
   if (!robot_comm.Init()) {
@@ -24,7 +26,16 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // 3. Initialize network communications
+  // Clear startup ESTOP latch on STM32
+  robot_comm.SendClearEStop();
+  usleep(200000);
+
+  // 3. Initialize IMU sensor manager (returns false gracefully if I2C hardware is offline)
+  if (!imu_manager.Init()) {
+      std::cout << "[MAIN] Warning: IMU not detected. Running on step odometry fallback." << std::endl;
+  }
+
+  // 4. Initialize network communications
   std::cout << "[MAIN] Starting TLS network link to " << server_ip << ":"
             << server_port << "..." << std::endl;
   if (!net_manager.Init()) {
@@ -33,11 +44,14 @@ int main(int argc, char **argv) {
               << std::endl;
   }
 
-  std::cout << "[MAIN] Main Controller Sequence Active (v0.3 Protocol)." << std::endl;
+  std::cout << "[MAIN] Main Controller Sequence Active (v0.3 Protocol with IMU Support)." << std::endl;
 
   auto last_status_time = std::chrono::steady_clock::now();
   bool waiting_for_go = false;
   uint32_t ready_seg_sent = 0xFFFFFFFF; // Track last segment index READY was sent for
+
+  bool manual_override = false;
+  Msg_SetSpeed_t manual_speed = {0, 0};
 
   while (true) {
       // 1. Run network loop to check sockets and reconnect if needed
@@ -49,19 +63,26 @@ int main(int argc, char **argv) {
           std::cout << "[MAIN] Relaying command to STM32: " << cmd << std::endl;
           if (cmd == "ESTOP") {
               robot_comm.SendEmergencyStop(0x01);
+              manual_override = true;
+              manual_speed = {0, 0};
           } else if (cmd == "RESUME") {
               robot_comm.SendClearEStop();
+              manual_override = false;
           } else if (cmd == "FORWARD") {
-              robot_comm.SendSetSpeed(500, 500);
+              manual_override = true;
+              manual_speed = {500, 500};
           } else if (cmd == "BACKWARD") {
-              robot_comm.SendSetSpeed(-500, -500);
+              manual_override = true;
+              manual_speed = {-500, -500};
           } else if (cmd == "TURN_LEFT") {
-              robot_comm.SendSetSpeed(-300, 300);
+              manual_override = true;
+              manual_speed = {-300, 300};
           } else if (cmd == "TURN_RIGHT") {
-              robot_comm.SendSetSpeed(300, -300);
+              manual_override = true;
+              manual_speed = {300, -300};
           } else if (cmd == "STOP") {
-              robot_comm.SendSetSpeed(0, 0);
-              robot_comm.SendControlNozzle(0);
+              manual_override = true;
+              manual_speed = {0, 0};
           }
       }
 
@@ -71,8 +92,12 @@ int main(int argc, char **argv) {
           path_follower.SetPath(path);
           waiting_for_go = false;
           ready_seg_sent = 0xFFFFFFFF;
+          manual_override = false; // Reset manual override upon receiving autonomous path
           std::string phase = net_manager.GetPathPhase();
           std::cout << "[MAIN] New PATH received with phase=" << phase << std::endl;
+          if (phase == "draw") {
+              imu_manager.ResetYaw(0.0f); // Protocol requirement: Reset IMU Yaw to 0 deg when entering draw phase
+          }
       }
 
       // 4. Check DRIFT feedback from server (~5Hz)
@@ -85,19 +110,26 @@ int main(int argc, char **argv) {
       Msg_SetSpeed_t target_speed = {0, 0};
       uint8_t nozzle_on = 0;
 
-      if (!path_follower.IsPathFinished()) {
+      if (manual_override) {
+          target_speed = manual_speed;
+      } else if (!path_follower.IsPathFinished()) {
           Segment_t current_seg;
           if (path_follower.GetCurrentSegment(current_seg)) {
               if (current_seg.op == "MOVE") {
                   uint32_t seg_idx = static_cast<uint32_t>(path_follower.GetCurrentSegmentIndex());
+                  bool bypass_server_go = true; // Set to true to bypass server GO/ALIGN wait for continuous drive
                   
                   if (ready_seg_sent != seg_idx) {
-                      // Stop and send READY before executing MOVE
-                      robot_comm.SendSetSpeed(0, 0);
+                      // Send READY to server for logging, then proceed directly if bypass enabled
                       net_manager.SendReady(seg_idx);
                       ready_seg_sent = seg_idx;
-                      waiting_for_go = true;
-                      std::cout << "[MAIN] Sent READY for MOVE segment " << seg_idx << ", waiting for GO/ALIGN..." << std::endl;
+                      waiting_for_go = !bypass_server_go;
+                      if (waiting_for_go) {
+                          robot_comm.SendSetSpeed(0, 0);
+                          std::cout << "[MAIN] Sent READY for MOVE segment " << seg_idx << ", waiting for GO/ALIGN..." << std::endl;
+                      } else {
+                          std::cout << "[MAIN] [BYPASS GO] Starting MOVE segment " << seg_idx << " directly." << std::endl;
+                      }
                   }
 
                   if (waiting_for_go) {
@@ -105,14 +137,20 @@ int main(int argc, char **argv) {
                       float align_deg = 0.0f;
                       if (net_manager.GetAlignCommand(align_deg)) {
                           std::cout << "[MAIN] Executing ALIGN micro-turn: " << align_deg << " deg" << std::endl;
-                          // Micro-turn: positive = left turn
-                          int16_t turn_sps = (align_deg > 0.0f) ? -200 : 200;
-                          robot_comm.SendSetSpeed(-turn_sps, turn_sps);
-                          usleep(200000); // 200ms spot adjustment
-                          robot_comm.SendSetSpeed(0, 0);
-                          
-                          // Re-send READY after ALIGN adjustment
-                          net_manager.SendReady(seg_idx);
+                          Msg_Status_t status_snap{};
+                          if (robot_comm.GetLatestStatus(status_snap)) {
+                              path_follower.StartTurn(align_deg, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
+                          }
+                      }
+
+                      if (path_follower.IsTurning()) {
+                          Msg_Status_t status_snap{};
+                          if (robot_comm.GetLatestStatus(status_snap)) {
+                              if (path_follower.UpdateTurn(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed)) {
+                                  // Micro-turn completed: re-send READY
+                                  net_manager.SendReady(seg_idx);
+                              }
+                          }
                       }
 
                       // Check for GO signal
@@ -123,13 +161,38 @@ int main(int argc, char **argv) {
                   }
 
                   if (!waiting_for_go) {
-                      Pose_t dummy_pose{};
-                      path_follower.Update(dummy_pose, target_speed, nozzle_on);
+                      Msg_Status_t status_snap{};
+                      if (robot_comm.GetLatestStatus(status_snap)) {
+                          int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
+                          int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
+
+                          if (!path_follower.IsMovingStraight()) {
+                              path_follower.StartMove(current_seg.dist_m, l_steps, r_steps);
+                          }
+
+                          float imu_yaw = imu_manager.GetYaw();
+                          if (path_follower.UpdateMove(l_steps, r_steps, target_speed, nozzle_on, imu_yaw)) {
+                              // Move segment completed -> advance to next segment
+                              path_follower.AdvanceSegment();
+                          }
+                      }
                   }
-              } else {
-                  // "TURN" segment runs directly without READY handshake
-                  Pose_t dummy_pose{};
-                  path_follower.Update(dummy_pose, target_speed, nozzle_on);
+              } else if (current_seg.op == "TURN") {
+                  // "TURN" segment runs step-based precision turning
+                  Msg_Status_t status_snap{};
+                  if (robot_comm.GetLatestStatus(status_snap)) {
+                      int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
+                      int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
+
+                      if (!path_follower.IsTurning()) {
+                          path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
+                      }
+                      
+                      if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
+                          // Turn segment completed -> advance to next segment
+                          path_follower.AdvanceSegment();
+                      }
+                  }
               }
           }
       }
