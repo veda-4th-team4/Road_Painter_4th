@@ -11,16 +11,32 @@
 브라우저:  http://<이 Pi IP>:<http_port>            카메라 캘리브레이션
            http://<이 Pi IP>:<http_port>/robot      로봇 제어
            http://<이 Pi IP>:<http_port>/logs       로그 모니터
+           http://<이 Pi IP>:<http_port>/login      로그인 (아래 게이트)
+
+⚠️ 로그인 게이트: 위 세 화면과 모든 POST API는 중앙 서버(9000)에 LOGIN이 통과하기
+전까지 열리지 않고 /login으로 돌아간다. 캘리브레이션 결과가 "그 시점에 로그인된
+계정"에 저장되는 구조라(../src/router.cpp handleHMatrix), 로그인 없이 캘리를 끝내면
+결과가 세션에만 남고 사라지기 때문 - 순서를 사람이 기억하는 대신 구조로 강제한다.
+
+세션은 브라우저별이다: 로그인 성공 시 HttpOnly 세션 쿠키(rp_admin)를 발급하고,
+게이트는 그 쿠키를 rp_core의 세션 목록과 대조한다. 따라서
+  - 다른 PC/브라우저는 각자 로그인해야 하고 (한 명이 열어둔다고 다 열리지 않음)
+  - 브라우저를 닫으면 세션 쿠키가 사라져 재로그인이 필요하며
+  - 탭바의 '로그아웃'(POST /logout)으로 즉시 끊을 수 있고
+  - 서버 링크가 끊기면 모든 세션이 무효화된다 (rp_core.clear_login).
+판정이 서버 측 상태라 페이지 JS 조작으로는 우회되지 않는다.
 
 stdlib만 사용 (http.server + Server-Sent Events).
 """
+import html
 import http.server
 import json
 import queue
 import socketserver
 import threading
 import time
-from urllib.parse import urlparse
+from http.cookies import CookieError, SimpleCookie
+from urllib.parse import quote, urlparse
 
 import rp_core
 import cctv
@@ -132,7 +148,7 @@ themeLabel(document.documentElement.getAttribute('data-theme'));
 """
 
 
-def tabbar(active):
+def tabbar(active, user_id=None):
     """Sticky top tab bar shared by all admin pages. Uses theme variables so it
     matches whichever page it's injected into (camera dashboard defines them in
     its own <head>; robot/logs get them from THEME_HEAD)."""
@@ -142,11 +158,21 @@ def tabbar(active):
     theme_btn = ("" if active == "camera"
                  else '<button class="themeBtn" id="themeBtn" '
                       'onclick="toggleTheme()">테마</button>')
+    # 인라인 스타일로 직접 그린다 - 카메라 페이지(cctv.py PAGE)는 별도 스타일시트라
+    # .chip 클래스가 없을 수 있음(CCTV팀 파일이라 여기서 건드리지 않음).
+    # 로그아웃은 POST - <a href>로 두면 브라우저 프리페치에 로그아웃될 수 있다.
+    user_chip = (f'<span style="margin-right:8px;padding:6px 12px;border-radius:999px;'
+                 f'background:var(--field);border:1px solid var(--line);'
+                 f'color:var(--text2);font-size:13px">👤 '
+                 f'<b style="color:var(--text)">{html.escape(user_id)}</b></span>'
+                 f'<form method="POST" action="/logout" style="display:inline;margin-right:8px">'
+                 f'<button class="themeBtn" type="submit">로그아웃</button></form>'
+                 if user_id else "")
     return f"""<nav class="rp-tabbar">
   <a class="{cls('camera')}" href="/">📷 카메라 캘리브레이션</a>
   <a class="{cls('robot')}" href="/robot">🤖 로봇 제어</a>
   <a class="{cls('logs')}" href="/logs">📜 로그 모니터</a>
-  <span class="sp"></span>{theme_btn}
+  <span class="sp"></span>{user_chip}{theme_btn}
 </nav>
 <style>
 .rp-tabbar{{position:sticky;top:0;z-index:99999;display:flex;gap:4px;align-items:center;
@@ -247,7 +273,9 @@ function add(line){
     d.style.color='var(--warn)';
   d.textContent=line;
   log.appendChild(d);
-  while(log.childElementCount>600)log.removeChild(log.firstChild);
+  // DOM 상한 - 넘으면 오래된 줄부터 버린다. POS tap이 고주기로 흐르면 노드가
+  // 순식간에 쌓여 페이지가 느려지므로, 로봇 페이지는 곁다리 로그라 작게 잡는다.
+  while(log.childElementCount>200)log.removeChild(log.firstChild);
   log.scrollTop=log.scrollHeight;
 }
 // 서버 tap 로그를 파싱해 상단 상태 배너를 갱신한다.
@@ -259,8 +287,15 @@ function jsonAfter(line,key){  // "... KEY {json}" 에서 {json} 추출
   try{return JSON.parse(line.slice(i+key.length+1));}catch(e){return null;}
 }
 function updateStatus(line){
-  if(line.startsWith('[server] connected')){setDot('srvDot','on');$('srvState').textContent='연결됨';}
-  else if(line.startsWith('[server] link down')){setDot('srvDot','off');$('srvState').textContent='끊김(재시도)';}
+  if(line.startsWith('[server] connected')){
+    setDot('srvDot','on');$('srvState').textContent='연결됨';
+  }
+  else if(line.startsWith('[server] link down')){
+    setDot('srvDot','off');$('srvState').textContent='끊김(재시도)';
+    // 링크가 끊기면 서버 쪽 로그인 게이트도 잠긴다(rp_core). 새로고침하면
+    // 로그인 화면으로 돌아가므로 사용자에게 미리 알려준다.
+    add('[!] 서버 연결이 끊겼습니다 - 복구 후 다시 로그인이 필요합니다');
+  }
   if(line.startsWith('[tap]')&&line.includes('STATUS')){
     const m=jsonAfter(line,'STATUS');
     if(m){
@@ -325,6 +360,10 @@ __THEME_HEAD__
 __THEME_JS__
 const log=document.getElementById('log'), f=document.getElementById('f'),
       raw=document.getElementById('raw'), count=document.getElementById('count');
+// MAX_BUF: 필터를 껐다 켤 때 되살릴 수 있는 원본 줄 보관량.
+// MAX_DOM: 실제로 화면에 붙여두는 노드 수 (이게 크면 스크롤/렌더가 느려진다).
+// 로그 모니터는 전용 화면이라 로봇 페이지(200)보다는 넉넉히 준다.
+const MAX_BUF=1000, MAX_DOM=400;
 let lines=[];
 function keep(l){
   if(!raw.checked && !l.startsWith('[tap]') && !l.startsWith('[server]')
@@ -340,17 +379,17 @@ function cls(l){
   return 'muted';}
 function render(){
   log.innerHTML='';
-  const shown=lines.filter(keep).slice(-800);
+  const shown=lines.filter(keep).slice(-MAX_DOM);
   for(const l of shown){const d=document.createElement('div');
     d.className=cls(l); d.textContent=l; log.appendChild(d);}
   count.textContent=shown.length+' / '+lines.length+' 줄';
   log.scrollTop=log.scrollHeight;
 }
 function add(l){
-  lines.push(l); if(lines.length>4000)lines.shift();
+  lines.push(l); if(lines.length>MAX_BUF)lines.shift();
   if(keep(l)){const d=document.createElement('div');
     d.className=cls(l); d.textContent=l; log.appendChild(d);
-    while(log.childElementCount>800)log.removeChild(log.firstChild);
+    while(log.childElementCount>MAX_DOM)log.removeChild(log.firstChild);
     count.textContent=(log.childElementCount)+' / '+lines.length+' 줄';
     log.scrollTop=log.scrollHeight;}
 }
@@ -359,18 +398,162 @@ new EventSource('/events').onmessage=e=>add(e.data);
 </body></html>""".replace("__THEME_HEAD__", THEME_HEAD).replace("__THEME_JS__", THEME_JS))
 
 
+# 로그인 게이트. 서버(9000)에 LOGIN이 통과하기 전에는 관리자 창의 어떤 기능도
+# 열지 않고 이 화면만 보여준다 (do_GET/do_POST가 rp_core.get_logged_in_user()로
+# 판정 - 브라우저 JS 상태가 아니라 서버 측 상태라 페이지 조작으로 우회 불가).
+#
+# 왜 로그인을 먼저 받나: 캘리브레이션 결과는 "그 시점에 로그인된 계정"에 저장된다
+# (../src/router.cpp handleHMatrix). 로그인 없이 캘리를 끝내면 세션에만 남고
+# 서버 재시작 시 사라지는데, 나중에 로그인해도 소급 저장되지 않는다. 순서를
+# 사람이 기억하게 두는 대신 구조로 강제한다.
+LOGIN_PAGE = ("""<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>로그인 · Admin</title>
+__THEME_HEAD__
+<style>
+  main { max-width:420px; padding-top:12vh; }
+  .field { display:block; margin-bottom:10px; }
+  .field input { width:100%; padding:12px 14px; border:1px solid var(--line);
+                 border-radius:12px; background:var(--input); color:var(--text);
+                 font-size:15px; }
+  .field input:focus { outline:2px solid var(--blue); outline-offset:-1px; }
+  #msg { margin:12px 0 0; font-size:13px; min-height:19px; }
+  #msg.err { color:var(--red); }
+  #msg.ok { color:var(--green); }
+  .title { font-size:19px; font-weight:700; margin:0 0 6px; letter-spacing:-.3px; }
+  .sub { color:var(--text3); font-size:13px; line-height:1.6; margin:0 0 18px; }
+</style></head><body>
+<main>
+  <div class="card">
+    <p class="title">Road-Painter 관리자 창</p>
+    <p class="sub">캘리브레이션 결과는 <b>로그인한 계정</b>에 저장됩니다.
+      먼저 로그인해야 설치 작업 결과가 계정에 남습니다.</p>
+    <form id="f" autocomplete="on">
+      <label class="field">
+        <input id="loginId" name="username" placeholder="아이디" autocomplete="username" autofocus>
+      </label>
+      <label class="field">
+        <input id="loginPw" name="password" type="password" placeholder="비밀번호"
+               autocomplete="current-password">
+      </label>
+      <button class="btn blue" type="submit" style="width:100%" id="btn">로그인</button>
+    </form>
+    <p id="msg"></p>
+    <p class="hint" id="srvHint">서버 연결 확인 중…</p>
+  </div>
+</main>
+<script>
+__THEME_JS__
+const msg=document.getElementById('msg'), btn=document.getElementById('btn');
+function say(t,cls){msg.textContent=t;msg.className=cls||'';}
+document.getElementById('f').addEventListener('submit',function(e){
+  e.preventDefault();
+  const id=document.getElementById('loginId').value.trim();
+  const pw=document.getElementById('loginPw').value;
+  if(!id||!pw){say('아이디와 비밀번호를 입력하세요.','err');return;}
+  btn.disabled=true; say('확인 중…');
+  fetch('/server/login',{method:'POST',body:JSON.stringify({id:id,pw:pw})})
+    .then(r=>r.json().then(d=>({ok:r.ok,d:d})))
+    .then(function(r){
+      btn.disabled=false;
+      if(r.ok&&r.d.ok){
+        // 서버가 LOGIN_OK를 돌려줘 게이트가 열린 상태 - 원래 가려던 곳으로.
+        say('로그인 성공. 이동 중…','ok');
+        location.href=new URLSearchParams(location.search).get('next')||'/';
+      } else {
+        say(r.d.reason||'로그인에 실패했습니다.','err');
+        document.getElementById('loginPw').select();
+      }
+    })
+    .catch(function(){ btn.disabled=false; say('요청을 보내지 못했습니다.','err'); });
+});
+// 서버(9000) 링크가 끊겨 있으면 로그인 자체가 불가능하므로 미리 알려준다.
+new EventSource('/events').onmessage=function(e){
+  const h=document.getElementById('srvHint');
+  if(e.data.startsWith('[server] connected')) h.textContent='서버 연결됨 — 로그인할 수 있습니다.';
+  else if(e.data.startsWith('[server] link down')) h.textContent='⚠ 서버(9000) 연결 끊김 — 서버가 실행 중인지 확인하세요.';
+};
+</script>
+</body></html>""".replace("__THEME_HEAD__", THEME_HEAD).replace("__THEME_JS__", THEME_JS))
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    # 로그인 없이도 열어두는 경로. /login은 게이트 그 자체, /server/login은 거기서
+    # 쓰는 API, /logout은 없는 세션을 지우는 것도 안전해야 하고, /events는 로그인
+    # 화면이 서버 링크 상태를 보여주는 데 쓴다 (SSE는 관리자 창 로그 피드라
+    # 민감정보가 아니며, 비밀번호는 마스킹된다).
+    PUBLIC_PATHS = ("/login", "/server/login", "/logout", "/events")
+    COOKIE_NAME = "rp_admin"
+
+    def _session_token(self):
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        try:
+            jar = SimpleCookie()
+            jar.load(raw)
+        except CookieError:
+            return None
+        morsel = jar.get(self.COOKIE_NAME)
+        return morsel.value if morsel else None
+
+    def _current_user(self):
+        """이 요청을 보낸 브라우저의 로그인 계정 (없으면 None)."""
+        return rp_core.session_user(self._session_token())
+
+    def _gate(self):
+        """로그인 안 됐으면 /login으로 돌려보내고 True를 반환 (호출부는 즉시 return)."""
+        if urlparse(self.path).path in self.PUBLIC_PATHS:
+            return False
+        if self._current_user() is not None:
+            return False
+        if self.command == "POST":
+            # API 호출은 리다이렉트 대신 401 - fetch가 로그인 HTML을 받아
+            # 성공으로 오해하는 일이 없게 한다.
+            self._send_json({"ok": False, "reason": "로그인이 필요합니다."}, 401)
+        else:
+            nxt = quote(self.path, safe="")
+            self.send_response(302)
+            self.send_header("Location", f"/login?next={nxt}")
+            self.end_headers()
+        return True
+
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
+        if self._gate():
+            return
         path = urlparse(self.path).path
-        if path in ("/", "/robot", "/logs"):
+        if path == "/login":
+            # 이미 로그인돼 있으면 로그인 화면을 다시 보여줄 이유가 없다.
+            if self._current_user() is not None:
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.end_headers()
+                return
+            body = LOGIN_PAGE.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif path in ("/", "/robot", "/logs"):
             page, active = {"/": (cctv.PAGE, "camera"),
                             "/robot": (ROBOT_PAGE, "robot"),
                             "/logs": (LOGS_PAGE, "logs")}[path]
             # 탭 바만 body 시작 지점에 주입 (기존 페이지 내용은 건드리지 않음)
-            body = page.replace("<body>", "<body>" + tabbar(active), 1).encode()
+            bar = tabbar(active, self._current_user())
+            body = page.replace("<body>", "<body>" + bar, 1).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -473,6 +656,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        if self._gate():
+            return
         if self.path == "/cmd":
             length = int(self.headers.get("Content-Length", 0))
             cmd = self.rfile.read(length).decode().strip()
@@ -486,6 +671,55 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cmd = self.rfile.read(length).decode().strip()
             ok = server_send("CMD", {"cmd": cmd})
             self.send_response(200 if ok else 503)
+            self.end_headers()
+        elif self.path == "/server/login":
+            # 사용자 로그인을 ADMIN 연결로 서버에 전달하고 응답까지 기다린다.
+            # 서버는 이 role에 LOGIN_OK/LOGIN_FAIL을 돌려주고, 성공 시 캘리브레이션
+            # 저장 대상 계정(currentUser_)이 이 사용자로 바뀐다
+            # (../src/router.cpp handleLogin). 성공하면 rp_core가 게이트를 연다.
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                self._send_json({"ok": False, "reason": "잘못된 요청 형식"}, 400)
+                return
+            uid, pw = data.get("id", ""), data.get("pw", "")
+            if not uid or not pw:
+                self._send_json({"ok": False, "reason": "아이디와 비밀번호를 입력하세요."}, 400)
+                return
+            # 응답이 도착하기 전에 대기를 걸어둔다 (빠른 응답을 놓치지 않도록).
+            rp_core.begin_login()
+            # 로그 피드는 관리자 페이지를 연 누구나 보므로 비밀번호는 가린다.
+            if not server_send("LOGIN", {"id": uid, "pw": pw},
+                               log_payload={"id": uid, "pw": "***"}):
+                self._send_json({"ok": False,
+                                 "reason": "서버(9000)에 연결되어 있지 않습니다."}, 503)
+                return
+            ok, reason = rp_core.wait_login()
+            if not ok:
+                self._send_json({"ok": False, "reason": reason})
+                return
+            # 이 브라우저 전용 세션 발급. Max-Age를 주지 않아 세션 쿠키가 되므로
+            # 브라우저를 닫으면 사라진다(= 다시 열면 재로그인).
+            token = rp_core.create_session(uid)
+            body = json.dumps({"ok": True}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie",
+                             f"{self.COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/logout":
+            # 세션을 지우고 쿠키를 만료시킨 뒤 로그인 화면으로. 세션이 없어도
+            # (이미 로그아웃/만료) 그냥 성공으로 처리한다.
+            rp_core.drop_session(self._session_token())
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.send_header("Set-Cookie",
+                             f"{self.COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; "
+                             "Expires=Thu, 01 Jan 1970 00:00:00 GMT")
             self.end_headers()
         elif self.path == "/robot/path":
             # Forward a test PATH ({"segments":[...]}) to the robot via server.

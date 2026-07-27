@@ -60,6 +60,10 @@ void Router::fromAdmin(const json& msg) {
     } else if (type == "H_MATRIX") {
         // 관리자 창(카메라 캘리 도구)이 계산 결과를 서버로 올림 - CCTV와 동일 처리
         handleHMatrix(msg);
+    } else if (type == "LOGIN") {
+        // 캘리 결과는 currentUser_에게 저장되므로, QT가 없는 설치 현장에서
+        // 관리자 창이 직접 로그인해 저장 대상 계정을 정할 수 있게 한다.
+        handleLogin(payload, "ADMIN");
     } else {
         logf("[WARN] ADMIN으로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -77,22 +81,7 @@ void Router::fromQt(const json& msg) {
                                   ok ? json{{"id", id}} : json{{"reason", err}}));
         logf("[INFO] REGISTER %s: %s", id.c_str(), ok ? "성공" : err.c_str());
     } else if (type == "LOGIN") {
-        std::string id = payload.value("id", "");
-        if (users_.login(id, payload.value("pw", ""))) {
-            currentUser_ = id;
-            json stored = users_.getCalib(id);
-            Calib c;
-            if (!stored.is_null() && calibFromJson(stored, c))
-                calib_ = c;  // 저장된 캘리브레이션을 현재 세션에 복원
-            srv_.sendTo("QT", makeMsg("LOGIN_OK",
-                {{"id", id}, {"calib", stored}, {"cam_ip", users_.getCamIp(id)}}));
-            logf("[INFO] LOGIN %s 성공 (캘리브레이션 %s)", id.c_str(),
-                 stored.is_null() ? "없음 - 캘리브레이션 필요" : "전달");
-        } else {
-            srv_.sendTo("QT", makeMsg("LOGIN_FAIL",
-                                      {{"reason", "id 또는 비밀번호 불일치"}}));
-            logf("[WARN] LOGIN %s 실패", id.c_str());
-        }
+        handleLogin(payload, "QT");
     } else if (type == "SET_CAM_IP") {
         // Qt 설정란에서 카메라 IP 교체. REGISTER 때와 동일하게 형식 검증은 하지
         // 않고 저장만 한다 (Qt가 이 값으로 RTSP URL을 조립).
@@ -324,6 +313,29 @@ void Router::fromCctv(const json& msg) {
     } else {
         logf("[WARN] CCTV로부터 알 수 없는 type: %s", type.c_str());
     }
+}
+
+// 로그인 처리 (QT/ADMIN 공용). 성공하면 서버가 기억하는 로그인 사용자(currentUser_)를
+// 갱신하고 그 계정에 저장돼 있던 캘리브레이션을 현재 세션에 복원한다.
+// 캘리브레이션(H_MATRIX)은 "그 시점의 currentUser_"에게 영속 저장되므로, QT가 아직
+// 붙지 않은 설치 현장에서도 관리자 창이 먼저 로그인해두면 캘리 결과가 계정에 남는다.
+void Router::handleLogin(const json& payload, const std::string& replyRole) {
+    std::string id = payload.value("id", "");
+    if (!users_.login(id, payload.value("pw", ""))) {
+        srv_.sendTo(replyRole,
+                    makeMsg("LOGIN_FAIL", {{"reason", "id 또는 비밀번호 불일치"}}));
+        logf("[WARN] LOGIN %s 실패 (%s 요청)", id.c_str(), replyRole.c_str());
+        return;
+    }
+    currentUser_ = id;
+    json stored = users_.getCalib(id);
+    Calib c;
+    if (!stored.is_null() && calibFromJson(stored, c))
+        calib_ = c;  // 저장된 캘리브레이션을 현재 세션에 복원
+    srv_.sendTo(replyRole, makeMsg("LOGIN_OK",
+        {{"id", id}, {"calib", stored}, {"cam_ip", users_.getCamIp(id)}}));
+    logf("[INFO] LOGIN %s 성공 (%s 요청, 캘리브레이션 %s)", id.c_str(),
+         replyRole.c_str(), stored.is_null() ? "없음 - 캘리브레이션 필요" : "전달");
 }
 
 // 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용).

@@ -2,6 +2,9 @@
 // 라우팅 레이어: "누가(role) 무엇을(type) 보냈나"에 따라 중계/저장/판단.
 //   QT    -> REGISTER/LOGIN -> 사용자 등록/검증, 저장된 캘리브레이션 + cam_ip 회신
 //               (cam_ip는 REGISTER 때 같이 등록, LOGIN_OK에 그대로 회신 - 검증 없음)
+//   ADMIN -> LOGIN     -> QT와 동일 처리 (응답만 ADMIN으로). 캘리브레이션은
+//               "현재 로그인된 사용자"에게 저장되므로, QT 없이 관리자 창만으로
+//               캘리를 계정에 남기려면 여기서 먼저 로그인해둔다.
 //   QT    -> SET_CAM_IP -> 로그인 사용자의 카메라 IP 교체 (Qt 설정란)
 //   QT    -> CMD       -> ROBOT (CALIB_START이면 CCTV에도)
 //   QT    -> BLUEPRINT -> 저장만 한다 (경로는 START_DRAW 때 생성)
@@ -46,6 +49,9 @@ private:
     void fromRobot(const json& msg);
     void fromCctv(const json& msg);
     void fromAdmin(const json& msg);  // 관리자 창 -> 로봇 제어(CMD/PATH) + 캘리(H_MATRIX)
+    // 로그인 처리 (QT/ADMIN 공용): currentUser_ 갱신 + 저장된 캘리 복원 + 결과 회신.
+    // replyRole = LOGIN_OK/LOGIN_FAIL을 돌려줄 role ("QT" 또는 "ADMIN").
+    void handleLogin(const json& payload, const std::string& replyRole);
     // 캘리브레이션 번들 수신 처리 (CCTV/ADMIN 공용): 저장 + Qt 중계
     void handleHMatrix(const json& msg);
     // Qt의 START_DRAW 수신 시 1단계(시작점 접근) 경로를 로봇에 전송.
