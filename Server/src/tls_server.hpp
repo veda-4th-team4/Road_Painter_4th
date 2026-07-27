@@ -30,6 +30,10 @@ public:
     // 특정 role 클라이언트에 msg 전송. 미접속이면 false.
     bool sendTo(const std::string& role, const json& msg);
     std::vector<std::string> connectedRoles();
+    // 서버 내부 로그(logf) 한 줄을 ADMIN(관리자 창)에 LOG 메시지로 중계.
+    // logSink()에 연결해 쓴다 - 재귀 방지를 위해 내부에서 logf를 부르지 않고,
+    // 전송 실패도 조용히 무시한다. ADMIN 미접속이면 no-op.
+    void relayLogToAdmin(const std::string& line);
 
 private:
     struct Client {

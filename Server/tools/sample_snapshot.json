@@ -1,0 +1,5 @@
+{
+  "_note": "path_test 예시 스냅샷(단위 검증용 단순 H, mm 기준). 실제 CCTV 자료는 cctv_snapshot.json 참고. H는 pixel->world mm (서버가 입구에서 mm->m 환산). corners 순서 = detectMarkers c0..c3(TL,TR,BR,BL) = 서버 해석 [전좌,전우,후우,후좌].",
+  "H": [[10, 0, 0], [0, 10, 0], [0, 0, 1]],
+  "corners": [[100, 200], [200, 200], [200, 100], [100, 100]]
+}

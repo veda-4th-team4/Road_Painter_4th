@@ -276,6 +276,24 @@ void TlsServer::tapToAdmin(const char* dir, const std::string& peer,
         SSL_write(admin->ssl, data.data(), (int)data.size());
 }
 
+// 서버 내부 로그 한 줄을 ADMIN에 LOG로 중계 (웹 로그 모니터가 서버 로그도 보게).
+// ⚠️ 여기서는 절대 logf를 부르지 않는다 - logf -> logSink -> 이 함수 -> logf ...
+// 무한 재귀를 막기 위함. 전송 실패는 조용히 버린다.
+void TlsServer::relayLogToAdmin(const std::string& line) {
+    ClientPtr admin;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = clients_.find("ADMIN");
+        if (it != clients_.end()) admin = it->second;
+    }
+    if (!admin) return;
+    json m = makeMsg("LOG", {{"line", line}});
+    std::string data = m.dump() + "\n";
+    std::lock_guard<std::mutex> lk(admin->sslMtx);
+    if (!admin->dead && admin->ssl)
+        SSL_write(admin->ssl, data.data(), (int)data.size());
+}
+
 std::vector<std::string> TlsServer::connectedRoles() {
     std::lock_guard<std::mutex> lk(mtx_);
     std::vector<std::string> v;

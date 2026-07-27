@@ -14,6 +14,10 @@ server: $(SRCS) src/*.hpp
 qt_sim: tools/qt_sim.cpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
 
+# 최초 1회 경로생성 테스트기 (CCTV 스냅샷 주입 -> (0,0) approach PATH 생성 검증)
+path_test: tools/path_test.cpp
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
+
 clean:
-	rm -f server qt_sim
+	rm -f server qt_sim path_test
 .PHONY: clean

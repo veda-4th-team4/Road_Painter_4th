@@ -110,6 +110,38 @@ openssl s_client -quiet -connect 127.0.0.1:9000
 - [ ] `blueprint` + POS가 모두 있을 때 ROBOT에 `PATH {segments}`가 옴
 - [ ] 서버 콘솔에 `[INFO] 경로 생성 완료` 로그
 
+## 6. 최초 1회 경로생성 테스트 (path_test) — 서버 RPi ↔ 로봇 RPi 중점
+
+CCTV가 딱 한 번 만들어 저장해둔 자료(호모그래피 + 로봇 시작 4코너)를 읽어 서버에
+주입하고, 서버가 로봇을 **(0,0)으로 보내는 approach PATH(TURN/MOVE)** 를 한 번
+생성하는지 검증한다. 실시간 피드백(DRIFT/이탈 재계획)은 자연히 빠진다(POS 1회 +
+approach 단계는 재계획 안 함). **경로생성(각도·거리 계산) 로직은 서버 원본 그대로**이고,
+도구는 입력 주입 + 응답 로깅만 한다 — CCTV/QT 대역을 한 프로세스가 대신 물려준다.
+
+```bash
+make path_test
+./path_test <서버IP> [server.crt경로] [스냅샷.json]
+#  기본 crt    = ../certs/server.crt (Server/에서 실행 시 certs/server.crt 지정)
+#  기본 스냅샷 = tools/sample_snapshot.json  (실측은 tools/cctv_snapshot.json)
+```
+
+- **스냅샷 파일**(`tools/cctv_snapshot.json`) = CCTV가 준 자료를 담는 곳:
+  `H`(pixel→world **mm** 호모그래피) + `corners`(로봇 마커 4코너 원본 픽셀).
+  CCTV 출력 포맷이 바뀌면 도구의 `loadSnapshot()` **한 함수만** 고치면 된다.
+- **단위**: H는 **mm 기준**으로 그대로 담는다. **mm→m 환산은 서버가 입구에서
+  수행**(`normalizeBundleMmToM`)하므로 도구는 원본 mm를 손대지 않고 올린다(여기서
+  또 환산하면 이중 스케일). `BLUEPRINT.points`와 도구가 주입하는 도착 `POS{x,y}`는
+  서버 내부 단위인 **미터**로 보낸다(도구의 `kTargetPointsMm`은 mm로 적고 전송 시 ÷1000).
+- ⚠️ **로봇은 role당 1개**: 서버는 ROBOT 재접속 시 기존 세션을 교체한다. 실제 로봇
+  RPi로 테스트할 땐 다른 로봇 대역을 띄우지 말 것.
+- **2단계 진행**: 접근(→ points[0]) 후 로봇이 멈추면 도구 콘솔에서 **Enter** → 도구가
+  도착 POS 주입 + START_DRAW 전송 → 도색 PATH(→ points[1..]) 진행. (실시간 CCTV가
+  없어 서버가 도착을 모르므로, 알려진 접근점을 POS로 주입해 2단계 경로를 맞춘다.)
+
+기대 결과: 서버 콘솔 `[INFO] 1단계 접근 경로 전송 (N 세그먼트)`, 로봇 RPi 콘솔에
+`PATH received`(approach). path_test 콘솔엔 QT 대역이 받은 `POSE{x,y,theta_deg}`가
+찍힌다(로봇 미접속이면 `DRAW_FAIL{robot_offline}`).
+
 ---
 
 # 📱 Qt 쪽 가이드

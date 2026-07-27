@@ -54,7 +54,7 @@ void UserStore::save() {
 }
 
 bool UserStore::registerUser(const std::string& id, const std::string& pw,
-                             std::string& err) {
+                             const std::string& camIp, std::string& err) {
     if (id.empty() || pw.empty()) {
         err = "id/비밀번호는 비울 수 없음";
         return false;
@@ -67,7 +67,8 @@ bool UserStore::registerUser(const std::string& id, const std::string& pw,
     unsigned char salt[16];
     RAND_bytes(salt, sizeof(salt));
     std::string saltHex = toHex(salt, sizeof(salt));
-    users_[id] = {{"salt", saltHex}, {"hash", hashPw(pw, saltHex)}, {"calib", nullptr}};
+    users_[id] = {{"salt", saltHex}, {"hash", hashPw(pw, saltHex)}, {"calib", nullptr},
+                  {"cam_ip", camIp.empty() ? json() : json(camIp)}};
     save();
     return true;
 }
@@ -94,4 +95,10 @@ bool UserStore::setCalib(const std::string& id, const json& calib) {
     users_[id].erase("H");  // 구버전 키 정리
     save();
     return true;
+}
+
+json UserStore::getCamIp(const std::string& id) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!users_.contains(id)) return nullptr;
+    return users_[id].value("cam_ip", json());
 }

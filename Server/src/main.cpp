@@ -46,6 +46,13 @@ int main() {
         gpServer->setPeerHandler([&](const std::string& role, bool connected) {
             router.onPeerChange(role, connected);
         });
+        // 서버 내부 로그(logf)를 관리자 창(ADMIN)에도 흘려보낸다 - 웹 로그
+        // 모니터가 tap뿐 아니라 서버 처리 로그(도면 수신/send 실패 등)까지
+        // 보게 한다. 스레드 시작 전에 등록해 데이터 레이스를 피한다.
+        // (싱크는 relayLogToAdmin만 호출하며 logf를 다시 부르지 않음 - 재귀 방지)
+        logSink() = [](const std::string& line) {
+            if (gpServer) gpServer->relayLogToAdmin(line);
+        };
 
         // 네트워크 스레드 시작 (srv.run()은 블로킹)
         std::thread netThread([&] { gpServer->run(); });
