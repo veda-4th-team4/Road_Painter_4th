@@ -3,35 +3,34 @@
 // 목적:
 //   CCTV가 딱 한 번 만들어 폴더에 넣어둔 자료(호모그래피 + 로봇 시작 네 꼭짓점)를
 //   읽어서, 서버에 CCTV+QT 역할로 흘려넣는다. 그러면 서버의 "기존 경로생성 로직"이
-//   그대로 돌아 로봇을 (0,0)으로 보내는 approach PATH(TURN/MOVE 시퀀스)를 딱 한 번
-//   생성해 로봇에 전송한다. 실시간 피드백(DRIFT/이탈 재계획)은 자연히 빠진다
-//   (POS를 한 번만 주고, approach 단계는 서버가 재계획을 하지 않음).
+//   그대로 돌아 로봇이 "지금 서 있는 그 자리"에서 한 변 10cm짜리 정사각형을 그리는
+//   PATH(TURN/MOVE 시퀀스)를 로봇에 전송한다. 접근(approach) 단계는 의도적으로
+//   건너뛴다: BLUEPRINT의 시작점(points[0])을 로봇의 현재 pose와 동일하게 잡아,
+//   서버가 "이미 시작점에 서 있음"으로 판단해 곧바로 도색 PATH만 보내게 한다.
+//   실시간 피드백(DRIFT/이탈 재계획)은 자연히 빠진다(POS를 한 번만 주입하므로).
 //
 //   ※ 이 도구는 좌표/각도 계산을 전혀 하지 않는다. undistort->H_marker->pose 계산과
 //     TURN/MOVE 시퀀스 생성은 전부 서버(src/path_planner.hpp, src/router.cpp)가 한다.
-//     도구는 "입력 주입 + 응답 로깅"만 담당한다.
+//     다만 "지금 서 있는 자리"를 시작점으로 잡으려면 도구도 서버와 같은 방식으로
+//     스냅샷(H+corners)에서 pose를 미리 한 번 계산해야 한다(poseFromSnapshot 참고,
+//     서버의 poseFromPos와 동일한 공식) - BLUEPRINT 좌표를 만들기 위해서일 뿐, 서버가
+//     실제로 쓰는 값은 여전히 서버가 CCTV POS로 자체 계산한 pose_다.
 //
-// 흐름 (2026-07-27 변경: 접근->도색 전환이 로봇의 PATH_DONE 보고로 자동화됨):
+// 흐름 (2026-07-27 변경: 접근 생략 + 제자리 정사각형):
 //   1) QT 역할로 접속 + HELLO           (POSE/DRAW_DONE/DRAW_FAIL 등 서버 응답 관찰)
 //   2) CCTV 역할로 접속 + HELLO
 //   3) CCTV -> H_MATRIX(calib)          (서버가 호모그래피 번들 적재)
 //   4) CCTV -> POS(corners)             (서버가 pose 계산 -> QT에 POSE 전송)
-//   5) QT   -> BLUEPRINT(kTargetPoints)  (서버는 저장만 함 - 아직 로봇 안 움직임)
-//   6) QT   -> CMD{START_DRAW}          (서버가 1단계 approach PATH 생성 -> ROBOT)
-//   7) (실제 로봇이 접근을 마치면 로봇이 서버에 PATH_DONE{approach}을 보내고, 서버가
-//      곧바로 2단계 도색 PATH를 ROBOT에 전송한다 - 이 도구는 관여하지 않는다.)
-//      단, 이 도구는 CCTV POS를 한 번만 주입했으므로 서버의 pose_는 여전히 접근 전
-//      스냅샷 위치다. 도색이 시작된 게 보이면(로봇 RPi 콘솔/서버 로그) Enter를 눌러
-//      "도착 pose"를 갱신해두면, 이후 이탈 재계획이 stale pose 기준으로 오발동하는
-//      걸 막을 수 있다 (이미 나간 도색 PATH의 시작점 자체를 되돌리진 못한다).
-//   -> 결과는 로봇 RPi 콘솔(PATH 수신)과 서버 콘솔([INFO] 접근/도색 경로 전송,
+//      (도구도 같은 H+corners로 로컬 pose를 계산해 정사각형 좌표를 만든다)
+//   5) QT   -> BLUEPRINT(제자리 사각형)  (서버는 저장만 함 - 아직 로봇 안 움직임)
+//   6) QT   -> CMD{START_DRAW}          (points[0]==현재 pose이므로 서버가 접근을
+//      건너뛰고 곧바로 도색 PATH(10cm 이동 + 90도 회전 x4)를 ROBOT에 전송)
+//   -> 결과는 로봇 RPi 콘솔(PATH 수신)과 서버 콘솔([INFO] 도색 경로 전송,
 //      도색 완료)에서 확인. QT 대역(이 도구)에는 최종적으로 DRAW_DONE이 온다.
 //
 // ⚠️ 알려진 한계: 실제 CCTV처럼 지속적으로 POS를 보내는 게 아니라 딱 1회만 주입하므로,
-//   도색(draw) 단계 PATH는 "실제 로봇의 도착 위치"가 아니라 "이 도구가 애초에 주입한
-//   스냅샷 위치"를 시작점으로 계산된다. 접근 경로 생성 검증이 이 도구의 핵심 목적이고,
-//   도색 단계 이어짐은 프로토콜 배선(PATH_DONE 자동 전환)만 확인하는 용도다.
-//   정확한 도색 경로까지 검증하려면 실제 CCTV 연동이 필요하다.
+//   실시간 이탈 재계획은 검증되지 않는다. 접근을 생략하고 곧장 도색 PATH가 나가는지,
+//   그리고 사각형 좌표/각도 계산(TURN/MOVE 시퀀스)이 맞는지 확인하는 용도다.
 //
 // 빌드: make path_test   (Server/ 디렉토리에서)
 // 사용: ./path_test <서버IP> [server.crt경로] [스냅샷.json]
@@ -71,20 +70,61 @@
 
 using json = nlohmann::json;
 
-// ── 목표 도면 (mm 기준 - CCTV와 동일 단위로 통일) ─────────────────────────────
-// 서버 2단계 흐름:
-//   points[0] = 접근 목표 (approach). 로봇이 여기까지 이동 후 대기.
-//   points[1..] = 그 다음 이동/도색 구간. START_DRAW를 받으면 여기로 진행.
-// 여기 값은 mm로 적는다 (CCTV와 같은 단위). 서버/로봇으로 나갈 땐 도구가 미터로
-// 환산(÷1000)해 보낸다 - 로봇 전송 단위는 m 유지.
-static const json kTargetPointsMm = json::array({{60.0, 60.0}, {300.0, 60.0}});
+// ── 목표 도면: 로봇이 "지금 서 있는 자리"에서 접근 없이 곧바로 그리는 정사각형 ──
+// points[0] = 로봇 현재 pose(그대로 approach 목표로 넣어 이동거리 0으로 만듦
+//   -> 서버가 접근 단계를 건너뛰고 곧장 도색 PATH를 전송).
+// points[1..4] = 현재 heading 기준 10cm 전진 + 90도 좌회전을 3번 반복해 사각형을
+//   닫는다 (TURN 90 + MOVE 0.1m 세그먼트 x4, 서버 buildSegments가 계산).
+// 서버 내부 단위는 미터이므로 좌표는 처음부터 미터로 만든다.
 static constexpr double kMmToM = 0.001;
+static constexpr double kSquareSideM = 0.10;   // 10cm
+static constexpr double kTurnDeg = 90.0;       // 코너마다 좌회전 90도
 
-// mm 좌표 목록 -> 미터 좌표 목록 (BLUEPRINT 전송용)
-static json targetPointsInMeters() {
+struct PoseM { double x = 0, y = 0, theta = 0; };  // 미터, 라디안
+
+// H(3x3, mm 기준 raw) 픽셀 -> 바닥 mm 좌표. 서버 calib.hpp의 applyH와 동일한
+// 동차좌표 계산이나, mm->m 스케일을 서버처럼 행렬에 미리 곱해두지 않고 결과를
+// 마지막에 ÷1000 한다(수학적으로 동일 - scaleMat3Rows01은 0,1행 전체를 스케일해도
+// 결과는 그대로 s배가 되므로).
+static std::array<double, 2> applyHmm(const json& H, double u, double v) {
+    double r0 = H[0][0].get<double>() * u + H[0][1].get<double>() * v + H[0][2].get<double>();
+    double r1 = H[1][0].get<double>() * u + H[1][1].get<double>() * v + H[1][2].get<double>();
+    double r2 = H[2][0].get<double>() * u + H[2][1].get<double>() * v + H[2][2].get<double>();
+    return {r0 / r2, r1 / r2};
+}
+
+// calib 번들 + corners(원본 픽셀) -> 로봇 현재 pose(미터). 서버 path_planner.hpp의
+// poseFromPos와 동일한 공식(중심 = 4코너 평균, heading = 앞변 중점 -> 뒷변 중점).
+// undistort는 생략(이 도구가 다루는 스냅샷은 K/D 없음 전제 - loadSnapshot 참고).
+static PoseM poseFromSnapshot(const json& calib, const json& corners) {
+    json H = calib.contains("H_marker") ? calib["H_marker"] : calib;
+    std::array<double, 2> c[4];
+    for (int i = 0; i < 4; ++i) {
+        auto mm = applyHmm(H, corners[i][0].get<double>(), corners[i][1].get<double>());
+        c[i] = {mm[0] * kMmToM, mm[1] * kMmToM};
+    }
+    PoseM p;
+    p.x = (c[0][0] + c[1][0] + c[2][0] + c[3][0]) / 4;
+    p.y = (c[0][1] + c[1][1] + c[2][1] + c[3][1]) / 4;
+    double fx = (c[0][0] + c[1][0]) / 2, fy = (c[0][1] + c[1][1]) / 2;
+    double bx = (c[2][0] + c[3][0]) / 2, by = (c[2][1] + c[3][1]) / 2;
+    p.theta = std::atan2(fy - by, fx - bx);
+    return p;
+}
+
+// 현재 pose에서 시작해 10cm 전진 -> 90도 좌회전을 4번 반복하는 제자리 정사각형
+// BLUEPRINT(미터). pts[0]==pose이므로 approach 이동거리가 0이 되어 서버가 접근을
+// 생략하고(있는 그대로) 곧장 도색 PATH를 전송한다.
+static json squareBlueprint(const PoseM& pose) {
     json pts = json::array();
-    for (const auto& p : kTargetPointsMm)
-        pts.push_back({p[0].get<double>() * kMmToM, p[1].get<double>() * kMmToM});
+    double x = pose.x, y = pose.y, th = pose.theta;
+    pts.push_back({x, y});
+    for (int i = 0; i < 4; ++i) {
+        x += kSquareSideM * std::cos(th);
+        y += kSquareSideM * std::sin(th);
+        pts.push_back({x, y});
+        th += kTurnDeg * M_PI / 180.0;
+    }
     return pts;
 }
 
@@ -237,6 +277,15 @@ int main(int argc, char** argv) {
     logf("TEST", "스냅샷 로드 완료: %s (corners=%s)", snapPath.c_str(),
          corners.dump().c_str());
 
+    // 서버가 CCTV POS로 계산할 pose를 도구도 미리 계산해, "지금 서 있는 자리"를
+    // 시작점 삼는 정사각형 BLUEPRINT를 만든다 (squareBlueprint 주석 참고).
+    PoseM startPose = poseFromSnapshot(calib, corners);
+    json blueprintM = squareBlueprint(startPose);
+    logf("TEST", "시작 pose 추정: x=%.3f y=%.3f theta=%.1f도 - 이 자리에서 10cm"
+                 " 정사각형 BLUEPRINT %s",
+         startPose.x, startPose.y, startPose.theta * 180.0 / M_PI,
+         blueprintM.dump().c_str());
+
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     if (SSL_CTX_load_verify_locations(ctx, caFile.c_str(), nullptr) != 1) {
@@ -266,44 +315,25 @@ int main(int argc, char** argv) {
     logf("TEST", "POS(corners) 전송 - QT 쪽 'POSE' 수신 로그를 확인하세요");
     pause_ms(500);
 
-    // 5) 목표 도면 주입 -> 서버는 저장만 한다 (2026-07-27부터: 여기선 로봇이 안 움직임).
-    //    mm로 적힌 목표를 미터로 환산해 보낸다 (로봇 전송 단위 m 유지).
-    json targetM = targetPointsInMeters();
-    qt.send(makeMsg("BLUEPRINT", {{"points", targetM}}));
-    logf("TEST", "BLUEPRINT 전송 - 목표 %s mm (= %s m), 저장만 됨 (아직 PATH 없음)",
-         kTargetPointsMm.dump().c_str(), targetM.dump().c_str());
+    // 5) 목표 도면 주입 -> 서버는 저장만 한다 (points[0]==현재 pose).
+    qt.send(makeMsg("BLUEPRINT", {{"points", blueprintM}}));
+    logf("TEST", "BLUEPRINT 전송 - 제자리 정사각형 %s m, 저장만 됨 (아직 PATH 없음)",
+         blueprintM.dump().c_str());
     pause_ms(300);
 
-    // 6) "그림그리기 시작" (Qt 버튼 대역) -> 서버가 1단계 approach PATH를 로봇에 전송.
+    // 6) "그림그리기 시작" (Qt 버튼 대역) -> points[0]이 현재 pose와 같아 서버가
+    //    접근(approach) 단계를 건너뛰고 곧바로 도색 PATH(10cm 이동 + 90도 회전 x4)를
+    //    ROBOT에 전송한다.
     qt.send(makeMsg("CMD", {{"cmd", "START_DRAW"}}));
-    logf("TEST", "CMD START_DRAW 전송 - 서버가 1단계 접근 PATH를 로봇에 전송");
+    logf("TEST", "CMD START_DRAW 전송 - 서버가 접근을 생략하고 곧장 도색 PATH를 전송");
 
     // 결과 관찰: PATH는 로봇에게만 가므로 여기선 안 보인다. 로봇 RPi 콘솔의
-    // 'PATH received'와 서버 콘솔의 '[INFO] 1단계 접근 경로 전송'을 확인할 것.
-    // 로봇 미접속/도면 없음/위치 미확인이면 서버가 QT에 DRAW_FAIL을 보내와 여기 찍힌다.
+    // 'PATH received'와 서버 콘솔의 '[INFO] 접근 불필요 ... 곧바로 도색 경로 전송' /
+    // '[INFO] 2단계 도색 경로 전송'을 확인할 것. 로봇 미접속/도면 없음/위치 미확인이면
+    // 서버가 QT에 DRAW_FAIL을 보내와 여기 찍힌다.
     pause_ms(1000);
 
-    // 7) 여기서부터는 이 도구가 더 할 일이 없다. 접근 완료 -> 도색 시작은 실제 로봇이
-    //    서버에 보내는 PATH_DONE{phase:"approach"}로 자동 트리거되고, 도색 완료도
-    //    로봇의 PATH_DONE{phase:"draw"}로 서버가 판단해 QT(이 도구)에 DRAW_DONE을 보낸다.
-    //    이 도구는 CCTV처럼 계속 POS를 흘려주지 않으므로(1회 주입뿐), 도색 단계 PATH의
-    //    시작점은 "실제 도착 위치"가 아니라 "처음 주입한 스냅샷 위치"로 계산된다(파일
-    //    상단 "알려진 한계" 참고) - 그래도 이탈 재계획이 완전히 엉뚱한 값으로 튀는 걸
-    //    막고 싶으면, 로봇이 접근을 마치고 도색을 시작한 게 보일 때 Enter를 눌러 서버의
-    //    pose_만이라도 갱신해두자 (이미 나간 도색 PATH 자체를 되돌리진 못한다).
-    logf("TEST", "로봇이 접근을 마치고 도색을 '시작한 게 보이면' Enter -> pose_ 갱신용 POS"
-                 " 주입 (건너뛰려면 Ctrl+C, 또는 그냥 기다려도 DRAW_DONE 관찰은 됨)");
-    std::string dummy;
-    std::getline(std::cin, dummy);
-
-    double ax = targetM[0][0].get<double>(), ay = targetM[0][1].get<double>();
-    double adeg = std::atan2(targetM[1][1].get<double>() - ay,
-                             targetM[1][0].get<double>() - ax) * 180.0 / M_PI;
-    cctv.send(makeMsg("POS", {{"x", ax}, {"y", ay}, {"theta_deg", adeg}}));
-    logf("TEST", "POS(x=%.3f, y=%.3f, theta=%.1f°) 주입 - 서버 pose_ 갱신 (재계획 오발동 방지용)",
-         ax, ay, adeg);
-
-    // 8) 도색 완료(DRAW_DONE) 또는 실패(DRAW_FAIL)를 기다린다. 실제 로봇이 도색을
+    // 7) 도색 완료(DRAW_DONE) 또는 실패(DRAW_FAIL)를 기다린다. 실제 로봇이 도색을
     //    끝내고 PATH_DONE{draw}를 보내야 도착하므로 넉넉히 기다린다.
     logf("TEST", "DRAW_DONE/DRAW_FAIL 대기 중 (최대 10초)...");
     pause_ms(10000);
