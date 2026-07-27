@@ -192,8 +192,8 @@
  * @brief ★노가다★ 슬립 보정 K_slip [milli]. 1000=1.00, 1010=1.01, 990=0.99.
  * @note IR로 90° 돌리고 덜/더 돌면 ±10씩 조정. 이론 2012는 건드리지 말 것.
  */
-#define ROBOT_TURN_K_SLIP_MILLI_LEFT  2010U
-#define ROBOT_TURN_K_SLIP_MILLI_RIGHT 2010U
+#define ROBOT_TURN_K_SLIP_MILLI_LEFT  1010U
+#define ROBOT_TURN_K_SLIP_MILLI_RIGHT 1010U
 
 /** @brief 90° 실명령 펄스 = theory × K / 1000 (반올림). */
 #define ROBOT_TURN_CAL_PULSES_LEFT                                         \

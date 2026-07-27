@@ -15,6 +15,7 @@ set(SOURCES
     src/SerialManager.cpp
     src/NetworkManager.cpp
     src/PathFollower.cpp
+    src/ImuManager.cpp
 )
 add_executable(robot_exec ${SOURCES})
 target_link_libraries(robot_exec wiringPi OpenSSL::SSL OpenSSL::Crypto pthread)

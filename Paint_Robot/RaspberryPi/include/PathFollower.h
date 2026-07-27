@@ -43,6 +43,48 @@ public:
     void SetDriftOffset(float offset_deg);
 
     /**
+     * @brief Calculates required motor step count for turn angle (supports 0.1 deg resolution).
+     */
+    uint32_t CalculateTurnSteps(float angle_deg) const;
+
+    /**
+     * @brief Starts turn segment tracking.
+     */
+    void StartTurn(float angle_deg, int32_t start_left_steps, int32_t start_right_steps);
+
+    /**
+     * @brief Updates turn execution based on latest step counts.
+     * @return true if target turn angle is reached.
+     */
+    bool UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed);
+
+    /**
+     * @brief Checks if a turn is currently in progress.
+     */
+    bool IsTurning() const { return is_turning; }
+
+    /**
+     * @brief Calculates required motor step count for linear distance (in meters).
+     */
+    uint32_t CalculateMoveSteps(float dist_m) const;
+
+    /**
+     * @brief Starts straight move segment tracking.
+     */
+    void StartMove(float dist_m, int32_t start_left_steps, int32_t start_right_steps);
+
+    /**
+     * @brief Updates straight move execution based on latest step counts and IMU yaw heading.
+     * @return true if target distance is reached.
+     */
+    bool UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on, float imu_yaw_deg = 0.0f);
+
+    /**
+     * @brief Checks if a straight move is currently in progress.
+     */
+    bool IsMovingStraight() const { return is_moving_straight; }
+
+    /**
      * @brief Computes guidance error calculations and outputs left/right motor target speed (sps).
      * @param current_pose Current absolute coordinate of the robot.
      * @param out_speed Output struct to store speed commands.
@@ -54,6 +96,19 @@ private:
     std::vector<Segment_t> path;
     size_t current_waypoint_idx;
     float drift_offset_deg;
+
+    // Turn tracking state
+    bool is_turning;
+    float turn_target_angle_deg;
+    uint32_t turn_target_steps;
+    int32_t turn_start_left_steps;
+    int32_t turn_start_right_steps;
+
+    // Straight move tracking state
+    bool is_moving_straight;
+    uint32_t move_target_steps;
+    int32_t move_start_left_steps;
+    int32_t move_start_right_steps;
 
     // Robot physical constants
     float wheel_diameter_m;
