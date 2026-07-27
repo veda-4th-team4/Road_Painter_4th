@@ -60,6 +60,10 @@ void Router::fromAdmin(const json& msg) {
     } else if (type == "H_MATRIX") {
         // 관리자 창(카메라 캘리 도구)이 계산 결과를 서버로 올림 - CCTV와 동일 처리
         handleHMatrix(msg);
+    } else if (type == "LOGIN") {
+        // 캘리 결과는 currentUser_에게 저장되므로, QT가 없는 설치 현장에서
+        // 관리자 창이 직접 로그인해 저장 대상 계정을 정할 수 있게 한다.
+        handleLogin(payload, "ADMIN");
     } else {
         logf("[WARN] ADMIN으로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -77,28 +81,31 @@ void Router::fromQt(const json& msg) {
                                   ok ? json{{"id", id}} : json{{"reason", err}}));
         logf("[INFO] REGISTER %s: %s", id.c_str(), ok ? "성공" : err.c_str());
     } else if (type == "LOGIN") {
-        std::string id = payload.value("id", "");
-        if (users_.login(id, payload.value("pw", ""))) {
-            currentUser_ = id;
-            json stored = users_.getCalib(id);
-            Calib c;
-            if (!stored.is_null() && calibFromJson(stored, c))
-                calib_ = c;  // 저장된 캘리브레이션을 현재 세션에 복원
-            srv_.sendTo("QT", makeMsg("LOGIN_OK",
-                {{"id", id}, {"calib", stored}, {"cam_ip", users_.getCamIp(id)}}));
-            logf("[INFO] LOGIN %s 성공 (캘리브레이션 %s)", id.c_str(),
-                 stored.is_null() ? "없음 - 캘리브레이션 필요" : "전달");
+        handleLogin(payload, "QT");
+    } else if (type == "SET_CAM_IP") {
+        // Qt 설정란에서 카메라 IP 교체. REGISTER 때와 동일하게 형식 검증은 하지
+        // 않고 저장만 한다 (Qt가 이 값으로 RTSP URL을 조립).
+        std::string ip = payload.value("cam_ip", "");
+        if (currentUser_.empty()) {
+            srv_.sendTo("QT", makeMsg("SET_CAM_IP_FAIL", {{"reason", "로그인 필요"}}));
+            logf("[WARN] SET_CAM_IP 수신 - 로그인 사용자 없음");
+        } else if (!users_.setCamIp(currentUser_, ip)) {
+            srv_.sendTo("QT", makeMsg("SET_CAM_IP_FAIL", {{"reason", "저장 실패"}}));
+            logf("[WARN] SET_CAM_IP 저장 실패 - 사용자 '%s'", currentUser_.c_str());
         } else {
-            srv_.sendTo("QT", makeMsg("LOGIN_FAIL",
-                                      {{"reason", "id 또는 비밀번호 불일치"}}));
-            logf("[WARN] LOGIN %s 실패", id.c_str());
+            srv_.sendTo("QT", makeMsg("SET_CAM_IP_OK",
+                                      {{"cam_ip", users_.getCamIp(currentUser_)}}));
+            logf("[INFO] SET_CAM_IP - 사용자 '%s' 카메라 IP 변경: '%s'",
+                 currentUser_.c_str(), ip.c_str());
         }
     } else if (type == "CMD") {
         std::string cmd = payload.value("cmd", "");
         // START_DRAW: Qt "그림그리기 시작" 버튼. 로봇에 중계하지 않고 서버가
-        // 2단계(도색) 경로를 만들어 PATH로 전송한다 (로봇은 PATH 수신 = 시작 신호).
+        // 1단계(접근) 경로를 만들어 PATH로 전송한다. 이후 접근 완료(PATH_DONE) ->
+        // 2단계(도색) 전송 -> 도색 완료(PATH_DONE) -> DRAW_DONE까지 전부 자동이라
+        // Qt가 중간에 더 눌러야 하는 버튼은 없다.
         if (cmd == "START_DRAW") {
-            sendDrawPath();
+            startApproach();
             return;
         }
         bool manualCmd = (cmd == "FORWARD" || cmd == "BACKWARD" ||
@@ -129,7 +136,8 @@ void Router::fromQt(const json& msg) {
         blueprint_ = payload;
         planPts_.clear();
         planActive_ = false;
-        awaitingStart_ = false;
+        awaitingArrival_ = false;
+        drawRequested_ = false;  // 이전 도면에 걸려 있던 시작 요청은 무효
         manualMode_ = false;  // 새 도면 = 자동 모드 복귀
         for (auto& p : payload.value("points", json::array())) {
             // 점 하나라도 형식이 어긋나면 도면 전체를 버린다 - 파싱이 중간에
@@ -149,8 +157,9 @@ void Router::fromQt(const json& msg) {
             sendDrawFail("plan", "bad_points", "도면 점이 2개 미만");
             return;
         }
-        logf("[INFO] 도면 수신 (%zu점) - 경로 생성 시도", planPts_.size());
-        tryPlanAndSend();
+        // 도면은 저장만 한다. 경로 생성/전송은 Qt가 "그림그리기 시작"(START_DRAW)을
+        // 누른 뒤에 시작한다 - 도면을 올려놓고 로봇이 제멋대로 출발하지 않게.
+        logf("[INFO] 도면 수신 (%zu점) - START_DRAW 대기", planPts_.size());
     } else {
         logf("[WARN] QT로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -200,6 +209,30 @@ void Router::fromRobot(const json& msg) {
             logf("[INFO] READY(seg=%d) 오차 %.1f도 - GO%s", seg, err,
                  alignTries_ >= kAlignMaxTries ? " (ALIGN 반복 초과)" : "");
         }
+    } else if (type == "PATH_DONE") {
+        // 받은 PATH를 끝까지 수행했다는 로봇의 통지. 어느 단계였는지는 서버 상태로
+        // 판단하고, payload.phase는 어긋났을 때 경고를 남기는 용도로만 쓴다
+        // (로봇이 phase를 안 실어도 동작하게 - 서버가 단계의 주인).
+        std::string phase = payload.value("phase", "");
+        if (awaitingArrival_) {
+            if (!phase.empty() && phase != "approach")
+                logf("[WARN] PATH_DONE phase=%s - 서버는 접근 대기 중이라 접근 완료로 처리",
+                     phase.c_str());
+            // 접근 완료는 Qt에 알리지 않는다 (Qt 입장에선 "그리는 중"이 계속됨).
+            logf("[INFO] 로봇 접근 완료 - 2단계 도색 경로로 이어감");
+            sendDrawPath();
+        } else if (planActive_) {
+            if (!phase.empty() && phase != "draw")
+                logf("[WARN] PATH_DONE phase=%s - 서버는 도색 중이라 도색 완료로 처리",
+                     phase.c_str());
+            planActive_ = false;
+            activeSegs_ = json::array();
+            alignSegIdx_ = -1, alignTries_ = 0;
+            srv_.sendTo("QT", makeMsg("DRAW_DONE", json::object()));
+            logf("[INFO] 도색 완료 - QT에 DRAW_DONE 통지");
+        } else {
+            logf("[WARN] PATH_DONE 수신 - 진행 중인 경로 없음 (무시)");
+        }
     } else {
         logf("[WARN] ROBOT으로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -214,8 +247,9 @@ void Router::fromCctv(const json& msg) {
         // 여기(서버)서만 수행 - CCTV는 캘리브레이션 데이터를 가질 필요 없음.
         // 로봇에는 중계하지 않는다 - v0.3 설계에서 로봇은 좌표를 모르며,
         // 위치 보정은 서버가 각도로 변환해 ALIGN/DRIFT로만 내려준다.
+        // 원본 POS는 QT에 중계하지 않는다: Qt가 쓰는 건 아래 POSE(미터 좌표)뿐이고,
+        // 원본 픽셀은 Qt에서 해석할 방법이 없다 (캘리브레이션은 서버만 갖고 있음).
         lastPos_ = payload;
-        srv_.sendTo("QT", msg);  // 모니터링용 (원본 그대로)
 
         Pose p;
         if (poseFromPos(payload, calib_, p)) {
@@ -228,14 +262,16 @@ void Router::fromCctv(const json& msg) {
                  {"theta_deg", std::round(p.theta * 180.0 / M_PI * 10) / 10}}));
         } else {
             if (!calib_.valid)
-                logf("[WARN] POS 수신했으나 캘리브레이션 없음 - pose 계산 불가 (중계만 함)");
-            return;  // pose를 못 구하면 중계만 하고 끝
+                logf("[WARN] POS 수신했으나 캘리브레이션 없음 - pose 계산 불가");
+            return;  // pose를 못 구하면 여기서 끝 (QT로 나가는 건 POSE뿐)
         }
 
         // 수동 조작 중엔 자동 경로/재계획을 하지 않는다 (POSE 모니터링은 위에서 이미 전송).
         if (manualMode_) return;
         if (!planActive_) {
-            tryPlanAndSend();  // 도면이 먼저 와 있었으면 이제 1단계(접근) 경로 전송
+            // START_DRAW를 눌렀는데 그때 pose가 없어 미뤄둔 경우에만 접근을 시작한다.
+            // (도면만 올라와 있는 상태에서는 로봇을 움직이지 않는다)
+            if (drawRequested_) startApproach();
             return;
         }
 
@@ -256,7 +292,7 @@ void Router::fromCctv(const json& msg) {
 
         // 1단계(접근) 중엔 이탈 재계획을 하지 않는다 - 로봇이 도면 폴리라인에서
         // 떨어져 있는 게 정상이라 오탐이 나기 때문. (READY/ALIGN + DRIFT로 충분)
-        if (awaitingStart_) return;
+        if (awaitingArrival_) return;
 
         // ----- 이탈 감시: 계획 경로에서 임계값 이상 벗어나면 재계획 -----
         double dev = distToPolyline({pose_.x, pose_.y}, planPts_);
@@ -277,6 +313,29 @@ void Router::fromCctv(const json& msg) {
     } else {
         logf("[WARN] CCTV로부터 알 수 없는 type: %s", type.c_str());
     }
+}
+
+// 로그인 처리 (QT/ADMIN 공용). 성공하면 서버가 기억하는 로그인 사용자(currentUser_)를
+// 갱신하고 그 계정에 저장돼 있던 캘리브레이션을 현재 세션에 복원한다.
+// 캘리브레이션(H_MATRIX)은 "그 시점의 currentUser_"에게 영속 저장되므로, QT가 아직
+// 붙지 않은 설치 현장에서도 관리자 창이 먼저 로그인해두면 캘리 결과가 계정에 남는다.
+void Router::handleLogin(const json& payload, const std::string& replyRole) {
+    std::string id = payload.value("id", "");
+    if (!users_.login(id, payload.value("pw", ""))) {
+        srv_.sendTo(replyRole,
+                    makeMsg("LOGIN_FAIL", {{"reason", "id 또는 비밀번호 불일치"}}));
+        logf("[WARN] LOGIN %s 실패 (%s 요청)", id.c_str(), replyRole.c_str());
+        return;
+    }
+    currentUser_ = id;
+    json stored = users_.getCalib(id);
+    Calib c;
+    if (!stored.is_null() && calibFromJson(stored, c))
+        calib_ = c;  // 저장된 캘리브레이션을 현재 세션에 복원
+    srv_.sendTo(replyRole, makeMsg("LOGIN_OK",
+        {{"id", id}, {"calib", stored}, {"cam_ip", users_.getCamIp(id)}}));
+    logf("[INFO] LOGIN %s 성공 (%s 요청, 캘리브레이션 %s)", id.c_str(),
+         replyRole.c_str(), stored.is_null() ? "없음 - 캘리브레이션 필요" : "전달");
 }
 
 // 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용).
@@ -311,14 +370,26 @@ void Router::handleHMatrix(const json& msg) {
         logf("[WARN] 캘리브레이션 수신 (mm->m 정규화) - 로그인 사용자 없음, 세션에만 유지");
 }
 
-// 1단계: 로봇 현재 위치 -> 도면 시작점(planPts_[0])까지 접근 경로.
-// 시작점 도착 후 첫 도색 방향으로 미리 회전까지 시켜두고 로봇은 대기,
-// 이후 Qt의 START_DRAW를 기다린다.
-void Router::tryPlanAndSend() {
-    if (planPts_.size() < 2) return;  // 도면 없음
+// 1단계: Qt "그림그리기 시작" -> 로봇 현재 위치에서 도면 시작점(planPts_[0])까지
+// 접근 경로를 만들어 전송. 시작점 도착 후 첫 도색 방향으로 미리 회전까지 시켜두고,
+// 로봇이 PATH_DONE으로 도착을 알리면 서버가 곧바로 2단계(도색)로 이어간다.
+void Router::startApproach() {
+    if (planPts_.size() < 2) {
+        logf("[WARN] START_DRAW 수신 - 도면 없음 (무시)");
+        sendDrawFail("draw", "no_blueprint", "도면 없음 - 먼저 도면을 전송할 것");
+        drawRequested_ = false;
+        return;
+    }
+    if (planActive_) {  // 이미 접근/도색 진행 중 - 중복 시작 방지
+        logf("[WARN] START_DRAW 수신 - 이미 경로 실행 중 (무시)");
+        sendDrawFail("draw", "busy", "이미 경로 실행 중 - 완료 또는 새 도면 전송 후 시작할 것");
+        return;
+    }
     if (!poseValid_) {
-        logf("[INFO] 로봇 위치 미확인 - CCTV POS 수신 후 PATH 전송 예정");
-        sendDrawFail("plan", "no_pose", "로봇 위치 미확인 - CCTV POS 수신 후 자동 전송 예정");
+        // 실패가 아니라 대기다. CCTV로 pose가 잡히는 순간 POS 핸들러가 재호출한다.
+        drawRequested_ = true;
+        logf("[INFO] START_DRAW 수신 - 로봇 위치 미확인, CCTV POS 수신 후 전송 예정");
+        sendDrawFail("draw", "no_pose", "로봇 위치 미확인 - CCTV POS 수신 후 자동 전송 예정");
         return;
     }
     json segs = buildSegments(pose_, {planPts_[0]});  // 시작점까지 (paint=false)
@@ -337,41 +408,63 @@ void Router::tryPlanAndSend() {
                         {"heading_deg", std::round(first * 10) / 10}});
     // (마지막 TURN에도 heading_deg를 실어 로봇이 READY로 정렬 확인 가능)
 
-    if (segs.empty()) return;  // 이미 시작점 위 - 접근 불필요 (드문 경계 케이스)
+    if (segs.empty()) {
+        // 로봇이 이미 시작점에 첫 도색 방향으로 서 있는 경계 케이스. 접근할 게
+        // 없으므로 도착 통지를 기다리지 않고 곧바로 2단계로 넘어간다.
+        logf("[INFO] 접근 불필요 (이미 시작점) - 곧바로 도색 경로 전송");
+        drawRequested_ = false;
+        awaitingArrival_ = true;  // sendDrawPath의 단계 가드 통과용
+        sendDrawPath();
+        return;
+    }
     if (srv_.sendTo("ROBOT", makePathMsg(segs, "approach"))) {
         planActive_ = true;
-        awaitingStart_ = true;
+        awaitingArrival_ = true;
+        drawRequested_ = false;
         activeSegs_ = segs;
         alignSegIdx_ = -1, alignTries_ = 0;  // 새 경로 = 정렬 상태 리셋
         lastPlanMs_ = nowMs();
-        logf("[INFO] 1단계 접근 경로 전송 (%zu 세그먼트) - START_DRAW 대기",
+        logf("[INFO] 1단계 접근 경로 전송 (%zu 세그먼트) - 로봇 도착(PATH_DONE) 대기",
              segs.size());
     } else {
         logf("[WARN] 1단계 접근 경로 전송 실패 - 로봇 미접속");
-        sendDrawFail("plan", "robot_offline", "로봇 미접속 - 경로 전송 실패");
+        sendDrawFail("draw", "robot_offline", "로봇 미접속 - 경로 전송 실패");
+        drawRequested_ = false;
     }
 }
 
-// 2단계: Qt "그림그리기 시작" -> 시작점에 서 있는 로봇에게 도색 경로 전송.
+// 2단계: 로봇 접근 완료(PATH_DONE) -> 시작점에 서 있는 로봇에게 도색 경로 전송.
 // 로봇은 이 PATH(phase=draw)를 받으면 IMU 현재 방향을 0도로 세팅하고 주행 시작.
 void Router::sendDrawPath() {
-    if (!awaitingStart_) {
-        logf("[WARN] START_DRAW 수신 - 접근 완료 대기 상태가 아님 (무시)");
+    // 아래 실패 경로들은 전부 "접근은 끝났는데 도색을 못 시작한" 상황이다.
+    // 상태를 접어두지 않으면 planActive_/awaitingArrival_가 켜진 채로 남아
+    // Qt가 START_DRAW로 다시 시도할 수도, 완료 통지를 받을 수도 없게 된다.
+    if (!awaitingArrival_) {  // 내부 오류 (정상 흐름에서는 도달하지 않음)
+        logf("[WARN] 도색 경로 전송 요청 - 접근 완료 대기 상태가 아님 (무시)");
         sendDrawFail("draw", "not_ready", "로봇이 시작점 접근 완료 대기 상태가 아님");
         return;
     }
     if (!poseValid_ || planPts_.size() < 2) {
-        logf("[WARN] START_DRAW 수신 - pose/도면 없음 (무시)");
+        logf("[WARN] 도색 경로 생성 불가 - pose/도면 없음");
         sendDrawFail("draw", !poseValid_ ? "no_pose" : "no_blueprint",
                      !poseValid_ ? "로봇 위치 미확인" : "도면 없음");
+        awaitingArrival_ = false;
+        planActive_ = false;
         return;
     }
     // 시작점에 서 있으므로 남은 경로 = 두번째 점부터. 모든 MOVE가 도색 구간.
     std::vector<Pt> rest(planPts_.begin() + 1, planPts_.end());
     json segs = buildSegments(pose_, rest, /*firstPaint=*/true);
-    if (segs.empty()) return;  // 도색할 구간 없음 (드문 경계 케이스)
+    if (segs.empty()) {  // 도색할 구간 없음 (드문 경계 케이스) - 그린 것으로 친다
+        logf("[INFO] 도색할 구간 없음 - 곧바로 완료 처리");
+        awaitingArrival_ = false;
+        planActive_ = false;
+        activeSegs_ = json::array();
+        srv_.sendTo("QT", makeMsg("DRAW_DONE", json::object()));
+        return;
+    }
     if (srv_.sendTo("ROBOT", makePathMsg(segs, "draw"))) {
-        awaitingStart_ = false;
+        awaitingArrival_ = false;
         planActive_ = true;
         activeSegs_ = segs;
         alignSegIdx_ = -1, alignTries_ = 0;
@@ -380,6 +473,8 @@ void Router::sendDrawPath() {
     } else {
         logf("[WARN] 2단계 도색 경로 전송 실패 - 로봇 미접속");
         sendDrawFail("draw", "robot_offline", "로봇 미접속 - 경로 전송 실패");
+        awaitingArrival_ = false;
+        planActive_ = false;
     }
 }
 

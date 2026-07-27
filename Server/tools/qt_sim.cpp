@@ -13,9 +13,12 @@
 // 콘솔 명령:
 //   register <id> <pw>
 //   login <id> <pw>
-//   cmd estop|resume|calib
-//   blueprint              (하드코딩 테스트 도면 전송: [0,0]->[2,0]->[2,1])
+//   cmd estop|resume|calib|start_draw
+//   blueprint              (하드코딩 테스트 도면 전송: [0,0]->[2,0]->[2,1], 저장만 됨)
 //   quit
+//
+// 2026-07-27: blueprint는 저장만 하고 로봇을 움직이지 않는다. 접근 PATH를 보려면
+// blueprint 다음에 반드시 `cmd start_draw`를 입력할 것.
 #include <nlohmann/json.hpp>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -137,7 +140,7 @@ int main(int argc, char** argv) {
     std::atomic<bool> alive{true};
     std::thread rx(recvLoop, ssl, std::ref(alive));
 
-    logf("명령어: register <id> <pw> / login <id> <pw> / cmd estop|resume|calib / blueprint / quit");
+    logf("명령어: register <id> <pw> / login <id> <pw> / cmd estop|resume|calib|start_draw / blueprint / quit");
     std::string lineIn;
     while (alive && std::getline(std::cin, lineIn)) {
         std::istringstream iss(lineIn);
@@ -156,12 +159,13 @@ int main(int argc, char** argv) {
         } else if (cmd == "cmd") {
             std::string sub;
             iss >> sub;
-            std::string c = sub == "estop"   ? "ESTOP"
-                            : sub == "resume" ? "RESUME"
-                            : sub == "calib"  ? "CALIB_START"
-                                              : "";
+            std::string c = sub == "estop"      ? "ESTOP"
+                            : sub == "resume"    ? "RESUME"
+                            : sub == "calib"     ? "CALIB_START"
+                            : sub == "start_draw" ? "START_DRAW"
+                                                  : "";
             if (c.empty()) {
-                logf("사용법: cmd estop|resume|calib");
+                logf("사용법: cmd estop|resume|calib|start_draw");
                 continue;
             }
             sslSendLine(ssl, wmtx, makeMsg("CMD", {{"cmd", c}}));

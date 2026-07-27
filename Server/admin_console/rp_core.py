@@ -8,13 +8,16 @@ web_gui.py(HTTP·로봇·로그 UI)와 cctv.py(카메라·캘리브레이션)가
 이 모듈은 cctv/web_gui를 절대 import하지 않는다 (순환 방지).
 """
 import json
+import logging
 import os
+import secrets
 import socket
 import ssl
 import sys
 import threading
 import time
 from collections import deque
+from logging.handlers import RotatingFileHandler
 
 
 TCP_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 6000
@@ -27,13 +30,41 @@ subs_lock = threading.Lock()
 # 재생해줘서, 창을 열자마자 그동안의 이벤트가 보인다 (예전엔 연 시점부터의
 # 로그만 받아서, 창에 들어가 있어야만 쌓이는 것처럼 보였다).
 # subs_lock으로 broadcast()의 append와 /events의 재생을 직렬화해 중복/누락 방지.
-# maxlen: POS 등 tap이 고주기로 흐르면 오래된 이벤트가 밀려나므로 넉넉히 잡음.
-LOG_HISTORY_MAX = 2000
+#
+# 이 값은 "페이지를 열 때 브라우저로 한꺼번에 밀어넣는 줄 수"이기도 하다. POS tap이
+# 15~30Hz로 흐르는 상황에서 크게 잡으면 창을 열 때마다 수천 줄이 DOM에 쏟아져
+# 페이지가 눈에 띄게 버벅인다. 최근 맥락을 보여주기에 충분한 선에서 작게 잡는다.
+LOG_HISTORY_MAX = 300
 log_history = deque(maxlen=LOG_HISTORY_MAX)
+
+# ---------------------------------------------------------------------------
+# 디스크 로그(gui.log): 크기 상한을 두고 회전시킨다.
+#
+# 예전엔 start.sh가 stdout을 gui.log로 `>>` 리다이렉트하기만 해서 파일이 무한정
+# 커졌다(실측 8.4MB / 13만 줄). Pi의 SD카드를 갉아먹으므로 여기서 직접 회전시키고,
+# start.sh는 더 이상 stdout을 이 파일로 보내지 않는다(이중 기록·회전 깨짐 방지).
+# 총 사용량 상한 = LOG_FILE_MAX_BYTES * (LOG_FILE_BACKUPS + 1) ≈ 8MB.
+# ---------------------------------------------------------------------------
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui.log")
+LOG_FILE_MAX_BYTES = 2 * 1024 * 1024   # 2MB마다 회전
+LOG_FILE_BACKUPS = 3                    # gui.log.1 ~ gui.log.3 보관
+
+_file_log = logging.getLogger("rp_admin")
+_file_log.setLevel(logging.INFO)
+_file_log.propagate = False
+try:
+    _handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_FILE_MAX_BYTES,
+                                   backupCount=LOG_FILE_BACKUPS, encoding="utf-8")
+    # 콘솔 출력과 같은 원문 그대로 (줄 자체에 이미 [tap]/[srv] 같은 접두어가 있음)
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    _file_log.addHandler(_handler)
+except OSError as e:  # 디스크 풀/권한 등 - 파일 로그만 포기하고 계속 동작
+    print(f"[!] gui.log 열기 실패({e}) - 파일 로그 없이 계속합니다", flush=True)
 
 
 def broadcast(line):
-    print(line, flush=True)
+    print(line, flush=True)          # 콘솔(직접 실행 시) - start.sh는 /dev/null로 보냄
+    _file_log.info(line)             # gui.log (크기 상한 + 회전)
     with subs_lock:
         log_history.append(line)  # 창을 안 열고 있어도 이벤트가 쌓이도록 보관
         for q in subscribers:
@@ -57,6 +88,85 @@ _server_lock = threading.Lock()
 _server_sock = None   # ssl socket while connected, else None
 _server_seq = 0
 
+# ---------------------------------------------------------------------------
+# Login gate: the whole admin console is locked behind a server LOGIN until
+# this is set. Tracked here (not just in the browser) because the HTTP
+# handlers (web_gui.py do_GET/do_POST) must decide server-side whether to
+# serve real pages or the login form - relying on client-side JS state would
+# let anyone who edits the page's JS bypass the gate.
+# ---------------------------------------------------------------------------
+_login_lock = threading.Lock()
+_logged_in_user = None   # 중앙 서버가 현재 로그인으로 아는 계정 (표시/참고용)
+_login_result = None     # (ok, reason) of the in-flight attempt
+_login_event = threading.Event()
+
+# 브라우저 세션: 로그인 성공 시 발급한 토큰 -> 계정 id.
+# 프로세스 전역 플래그 하나로 게이트를 열면 "한 번 로그인하면 같은 네트워크의 아무
+# 브라우저나 다 들어오고, 창을 닫아도 계속 열린 상태"가 된다. 브라우저마다 토큰을
+# 따로 쥐게 해서 로그아웃/창 닫기가 실제로 로그아웃이 되게 한다.
+# (쿠키는 Max-Age 없이 내려 세션 쿠키로 만들므로 브라우저를 닫으면 사라진다)
+_sessions = {}
+
+
+def get_logged_in_user():
+    """중앙 서버 기준 현재 로그인 계정 (게이트 판정용이 아님 - session_user 사용)."""
+    with _login_lock:
+        return _logged_in_user
+
+
+def create_session(user_id):
+    token = secrets.token_urlsafe(32)
+    with _login_lock:
+        _sessions[token] = user_id
+    return token
+
+
+def session_user(token):
+    """유효한 세션이면 계정 id, 아니면 None."""
+    if not token:
+        return None
+    with _login_lock:
+        return _sessions.get(token)
+
+
+def drop_session(token):
+    with _login_lock:
+        _sessions.pop(token, None)
+
+
+def clear_login():
+    """Re-lock the gate (server link dropped): 모든 브라우저 세션을 무효화."""
+    global _logged_in_user
+    with _login_lock:
+        _logged_in_user = None
+        _sessions.clear()
+
+
+def begin_login():
+    """Arm the waiter BEFORE sending LOGIN, so a fast reply can't be missed."""
+    global _login_result
+    with _login_lock:
+        _login_result = None
+    _login_event.clear()
+
+
+def finish_login(ok, reason=None, user_id=None):
+    """Called from the server link thread when LOGIN_OK/LOGIN_FAIL arrives."""
+    global _login_result, _logged_in_user
+    with _login_lock:
+        _login_result = (ok, reason)
+        if ok:
+            _logged_in_user = user_id
+    _login_event.set()
+
+
+def wait_login(timeout=5.0):
+    """Block until the relay server answers the LOGIN. -> (ok, reason)."""
+    if not _login_event.wait(timeout):
+        return False, "서버 응답 없음 (시간 초과)"
+    with _login_lock:
+        return _login_result or (False, "알 수 없는 오류")
+
 
 def _server_send_raw(obj):
     with _server_lock:
@@ -72,13 +182,19 @@ def _server_send_raw(obj):
         return False
 
 
-def server_send(mtype, payload):
-    """Send a {type, seq, payload} message to the relay server (as ADMIN)."""
+def server_send(mtype, payload, log_payload=None):
+    """Send a {type, seq, payload} message to the relay server (as ADMIN).
+
+    log_payload: what to show in the dashboard log instead of the real payload.
+    Use it when the payload holds a secret (LOGIN pw) — the log feed is visible
+    to anyone with the admin page open, so the password must not land there.
+    """
     global _server_seq
     _server_seq += 1
     ok = _server_send_raw({"type": mtype, "seq": _server_seq, "payload": payload})
     if ok:
-        broadcast(f"[server] >> {mtype} {json.dumps(payload, ensure_ascii=False)}")
+        shown = payload if log_payload is None else log_payload
+        broadcast(f"[server] >> {mtype} {json.dumps(shown, ensure_ascii=False)}")
     return ok
 
 
@@ -144,9 +260,23 @@ def server_link_loop():
                     else:
                         broadcast(f"[server] << {mtype} "
                                   f"{json.dumps(msg.get('payload', {}), ensure_ascii=False)}")
+                        payload = msg.get("payload") or {}
+                        if mtype == "LOGIN_OK":
+                            finish_login(True, user_id=payload.get("id"))
+                        elif mtype == "LOGIN_FAIL":
+                            # 실패해도 기존 로그인은 풀지 않는다 (이미 들어와 있는
+                            # 사용자가 오타 한 번에 쫓겨나면 곤란하므로).
+                            finish_login(False, payload.get("reason", "로그인 실패"))
         except OSError as e:
             broadcast(f"[server] link down ({e}); retry in 3s")
         finally:
             with _server_lock:
                 _server_sock = None
+            # 링크가 끊기면 게이트도 다시 잠근다. 서버는 로그인 사용자를
+            # 재연결과 무관하게 기억하지만(currentUser_), 그 상태를 물어보는
+            # 프로토콜이 없어서 이쪽에서 확인할 방법이 없다 - 안전하게 재로그인을
+            # 요구하는 쪽을 기본값으로 삼는다.
+            clear_login()
+            # 응답을 기다리던 로그인 요청이 있으면 영원히 매달리지 않게 깨운다.
+            finish_login(False, "서버 연결이 끊겼습니다")
         time.sleep(3)

@@ -2,16 +2,26 @@
 // 라우팅 레이어: "누가(role) 무엇을(type) 보냈나"에 따라 중계/저장/판단.
 //   QT    -> REGISTER/LOGIN -> 사용자 등록/검증, 저장된 캘리브레이션 + cam_ip 회신
 //               (cam_ip는 REGISTER 때 같이 등록, LOGIN_OK에 그대로 회신 - 검증 없음)
+//   ADMIN -> LOGIN     -> QT와 동일 처리 (응답만 ADMIN으로). 캘리브레이션은
+//               "현재 로그인된 사용자"에게 저장되므로, QT 없이 관리자 창만으로
+//               캘리를 계정에 남기려면 여기서 먼저 로그인해둔다.
+//   QT    -> SET_CAM_IP -> 로그인 사용자의 카메라 IP 교체 (Qt 설정란)
 //   QT    -> CMD       -> ROBOT (CALIB_START이면 CCTV에도)
-//   QT    -> BLUEPRINT -> 저장 + 로봇 위치 알면 경로 생성해 PATH 전송
+//   QT    -> BLUEPRINT -> 저장만 한다 (경로는 START_DRAW 때 생성)
 //               (points는 Qt가 top-view 픽셀 -> 바닥 미터 변환을 마친 좌표)
+//   QT    -> CMD START_DRAW -> 1단계(접근) PATH 생성·전송. 이후는 전부 자동:
+//               로봇 PATH_DONE(접근) -> 서버가 2단계(도색) PATH 자동 전송 ->
+//               로봇 PATH_DONE(도색) -> QT에 DRAW_DONE 통지.
 //               실패/대기 시 QT에 DRAW_FAIL{stage,reason,msg} 통지
 //   ROBOT -> STATUS    -> QT 중계
 //   ROBOT -> READY     -> MOVE 출발 직전 정렬 확인 요청. 서버가 CCTV pose의
 //               실제 각도와 목표 heading을 비교해 ALIGN(미세회전) 또는 GO 응답
+//   ROBOT -> PATH_DONE -> 받은 PATH를 끝까지 수행했다는 통지. 접근 완료면 서버가
+//               곧바로 도색 PATH를 이어 보내고(QT에는 알리지 않음), 도색 완료면
+//               QT에 DRAW_DONE을 통지하고 경로 상태를 정리한다.
 //   CCTV  -> POS       -> 원본 픽셀 4코너 수신. 서버가 undistort -> H_marker로
-//               pose 계산 (좌표 변환은 전부 서버 담당) + QT 중계 +
-//               계산된 POSE를 QT로 전송 + 이탈 시 재계획
+//               pose 계산 (좌표 변환은 전부 서버 담당) + 계산된 POSE를 QT로 전송
+//               + 이탈 시 재계획. POS 원본은 QT에 중계하지 않는다 (POSE만 사용)
 //               (로봇은 좌표를 받지 않음 - 각도 피드백 ALIGN/DRIFT로만 보정)
 //   CCTV  -> H_MATRIX  -> 캘리브레이션 번들(K,D,H_floor,H_marker) 수신,
 //               로그인 사용자에 영속 저장 + QT 중계
@@ -39,11 +49,15 @@ private:
     void fromRobot(const json& msg);
     void fromCctv(const json& msg);
     void fromAdmin(const json& msg);  // 관리자 창 -> 로봇 제어(CMD/PATH) + 캘리(H_MATRIX)
+    // 로그인 처리 (QT/ADMIN 공용): currentUser_ 갱신 + 저장된 캘리 복원 + 결과 회신.
+    // replyRole = LOGIN_OK/LOGIN_FAIL을 돌려줄 role ("QT" 또는 "ADMIN").
+    void handleLogin(const json& payload, const std::string& replyRole);
     // 캘리브레이션 번들 수신 처리 (CCTV/ADMIN 공용): 저장 + Qt 중계
     void handleHMatrix(const json& msg);
-    // 도면+pose가 준비됐으면 1단계(시작점 접근) 경로를 로봇에 전송
-    void tryPlanAndSend();
-    // Qt의 START_DRAW 수신 시 2단계(도색) 경로를 로봇에 전송
+    // Qt의 START_DRAW 수신 시 1단계(시작점 접근) 경로를 로봇에 전송.
+    // pose를 아직 모르면 drawRequested_만 세워두고 첫 POS 수신 때 재시도한다.
+    void startApproach();
+    // 로봇의 접근 완료(PATH_DONE) 수신 시 2단계(도색) 경로를 로봇에 전송
     void sendDrawPath();
     // 경로 생성/전송 실패(또는 대기) 시 Qt에 DRAW_FAIL로 통지
     void sendDrawFail(const char* stage, const char* reason, const std::string& msg);
@@ -69,7 +83,10 @@ private:
 
     std::vector<Pt> planPts_;  // 도면 폴리라인 (바닥 미터)
     bool planActive_ = false;  // PATH를 로봇에 보낸 상태인지
-    bool awaitingStart_ = false;  // 1단계(접근) 완료 대기 중 - Qt START_DRAW 오면 2단계 전송
+    bool drawRequested_ = false;  // START_DRAW를 받았지만 pose가 없어 접근 전송을 못 한 상태.
+                                  // 첫 POS로 pose가 잡히면 자동으로 접근 경로를 보낸다.
+    bool awaitingArrival_ = false;  // 1단계(접근) PATH 전송 후 로봇 PATH_DONE 대기 중.
+                                    // 도착 통지가 오면 서버가 곧바로 2단계(도색)를 전송한다.
     json activeSegs_;          // 마지막으로 로봇에 보낸 segments (READY 정렬 판정용)
     int alignSegIdx_ = -1;     // 현재 정렬 중/실행 중인 세그먼트 index
     int alignTries_ = 0;       // 그 세그먼트에서 ALIGN을 보낸 횟수

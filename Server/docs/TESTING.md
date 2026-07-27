@@ -57,6 +57,30 @@ make            # server 빌드
 
 `[INFO] Road-Painter TLS 서버 시작 0.0.0.0:9000` 이 뜨면 대기 상태.
 
+## 2-1. 테스트 계정 만들기 (seed_user.py)
+
+`config/users.json`은 비밀번호 해시가 들어있어 git에 올라가지 않습니다. 테스트 계정은 스크립트로 만드세요.
+
+```bash
+python3 tools/seed_user.py
+```
+
+기본값으로 **`test` / `1234`** 계정이 만들어집니다. 예시 호모그래피(캘리브레이션)와 **카메라 IP `192.168.0.9`** 가 함께 들어가서, 로그인하면 `LOGIN_OK`로 `calib`과 `cam_ip`가 바로 내려옵니다(top-view + RTSP 영상 둘 다 테스트 가능).
+
+```bash
+python3 tools/seed_user.py --id u2 --pw pw2 --no-calib   # 캘리 없는 계정
+python3 tools/seed_user.py --id test --pw 1234 --force   # 기존 계정 덮어쓰기
+python3 tools/seed_user.py --cam-ip 192.168.0.31         # 카메라 IP 바꿔서
+python3 tools/seed_user.py --h-json '[[...],[...],[...]]' # 직접 준 H(mm) 사용
+```
+
+만든 계정으로 **관리자 창(`http://<서버IP>:8083`)에 로그인**하면 카메라 캘리브레이션·로봇 제어·로그 모니터가 열립니다. 로그인 전에는 전부 `/login`으로 리다이렉트됩니다 — 캘리 결과가 로그인된 계정에 저장되는 구조라 순서를 강제한 것입니다.
+
+- 기존 계정은 보존됩니다(같은 id는 `--force` 없이는 안 덮어씀).
+- ⚠️ `path_test`를 로그인 상태로 돌리면 스냅샷의 H가 **그 계정의 캘리브레이션을 덮어씁니다**. 실측 H로 되돌리려면 `--force`로 다시 시드하세요.
+- ⚠️ **`--h-json`에 넣는 H는 CCTV가 주는 그대로의 mm 기준**입니다. 스크립트가 `÷1000`해서 미터로 저장합니다 — 로그인 경로(`getCalib`)에는 서버의 mm→m 정규화가 없어서, 파일에는 이미 미터인 값이 들어있어야 하기 때문입니다.
+- ⚠️ **서버가 실행 중이면 재시작해야 반영됩니다** (`UserStore`는 기동 시 파일을 1회만 읽음).
+
 ## 3. Qt 없이 서버 단독 검증 (qt_sim)
 
 Qt 앱이 없어도 **QT 역할 대역**으로 전체 흐름을 검증할 수 있습니다. 서버를 켠 채로 **새 터미널**에서:
@@ -97,18 +121,23 @@ openssl s_client -quiet -connect 127.0.0.1:9000
 {"type":"STATUS","seq":2,"payload":{"state":"IDLE","painting":false}}
 ```
 
-**터미널 C — qt_sim** (3번에서 쓴 것): `login` 후 `blueprint` 전송.
+**터미널 C — qt_sim** (3번에서 쓴 것): `login` 후 `blueprint` 전송, 그 다음 **`cmd start_draw`** 전송 (2026-07-27부터: `blueprint`만으로는 로봇이 안 움직임 — 저장만 됨).
 
-기대 동작: 서버가 CCTV의 POS로 로봇 pose를 계산 → qt_sim에 `POSE` 전송, 도면 + pose를 조합 → ROBOT(터미널 B)에 `PATH` 전송. 각 콘솔에 찍히면 **end-to-end 정상**.
+기대 동작: 서버가 CCTV의 POS로 로봇 pose를 계산 → qt_sim에 `POSE` 전송. `blueprint`는 저장만 되고, **`cmd start_draw`를 보내야** 도면 + pose를 조합해 ROBOT(터미널 B)에 접근 `PATH`가 전송된다. 각 콘솔에 찍히면 **end-to-end 정상**.
 
 > `openssl s_client`는 자체서명 인증서라 접속 시 verify 경고를 찍지만 통신은 정상입니다.
+
+> 터미널 B(ROBOT 역할)가 `PATH_DONE`을 보내지 않는 단순 openssl 세션이라면, 접근 PATH 전송까지만 확인되고 도색 단계로는 자동 진행되지 않습니다(정상 — 실제 로봇이 `PATH_DONE`을 보내야 서버가 이어서 도색 PATH를 보냅니다). 도색까지 보려면 터미널 B에서 접근 PATH를 받은 뒤 `{"type":"PATH_DONE","seq":3,"payload":{"phase":"approach"}}`를 직접 붙여넣으세요.
 
 ## 5. 확인 포인트 체크리스트
 
 - [ ] qt_sim이 `LOGIN_OK` 받음
 - [ ] CCTV `POS` 전송 시 qt_sim에 `POSE {x,y,theta_deg}`가 옴 (서버가 변환한 것)
-- [ ] `blueprint` + POS가 모두 있을 때 ROBOT에 `PATH {segments}`가 옴
-- [ ] 서버 콘솔에 `[INFO] 경로 생성 완료` 로그
+- [ ] `blueprint` 전송만으로는 ROBOT에 아무것도 안 옴 (저장만 됨 확인)
+- [ ] `blueprint` 후 `cmd start_draw`를 보내면 ROBOT에 `PATH {phase:"approach", segments}`가 옴
+- [ ] 서버 콘솔에 `[INFO] 1단계 접근 경로 전송` 로그
+- [ ] (선택) ROBOT 역할에서 `PATH_DONE{phase:"approach"}`를 보내면 ROBOT에 `PATH {phase:"draw"}`가 이어서 옴 + 서버 콘솔에 `[INFO] 2단계 도색 경로 전송`
+- [ ] (선택) 이어서 `PATH_DONE{phase:"draw"}`를 보내면 qt_sim에 `DRAW_DONE`이 옴
 
 ## 6. 최초 1회 경로생성 테스트 (path_test) — 서버 RPi ↔ 로봇 RPi 중점
 

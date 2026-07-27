@@ -83,21 +83,30 @@
 
 - **PATH가 오면 진행 중이던 기존 경로를 즉시 폐기하고 새 경로로 교체** (서버의 이탈 감지 → 재계획 대응. 한 TCP 연결이라 순서는 보장됨)
 
-### 2단계 경로 실행 흐름 (approach → 대기 → draw)
+### 2단계 경로 실행 흐름 (approach → draw → 완료)
 
-로봇을 시작점에 보내놓고, 사용자가 Qt에서 **"그림그리기 시작"** 버튼을 눌러야 도색이 시작된다.
+사용자가 Qt에서 **"그림그리기 시작"** 버튼을 한 번 누르면, 접근부터 도색 완료까지 서버가 자동으로 이어서 진행한다. **중간에 사용자가 더 눌러야 하는 버튼은 없다.**
 
 ```
-[1단계 접근] 도면 수신 + 로봇 위치 확보
-  → 서버가 PATH(phase="approach") 전송: 시작점까지 회전+직진(전부 paint=false)
-    + 마지막에 첫 도색 방향으로 TURN까지 포함 (이 TURN에도 heading_deg 있음)
-  → 로봇: 세그먼트마다 READY/ALIGN/GO 수행하며 이동, 마지막 TURN 정렬까지 끝나면
-    그 자리에서 대기 (자동으로 도색 시작하지 않음!)
+[시작] Qt "그림그리기 시작" 버튼 → CMD {"cmd":"START_DRAW"}
+  (도면 BLUEPRINT는 이보다 먼저 올라와 있어야 함 — 서버는 도면만 받아서는
+   로봇을 움직이지 않는다)
 
-[2단계 도색] Qt "그림그리기 시작" 버튼 → CMD {"cmd":"START_DRAW"}
-  → 서버가 PATH(phase="draw") 전송: 도색 전체 경로 (전부 paint=true)
+[1단계 접근] 서버가 PATH(phase="approach") 전송
+  : 시작점까지 회전+직진(전부 paint=false)
+    + 마지막에 첫 도색 방향으로 TURN까지 포함 (이 TURN에도 heading_deg 있음)
+  → 로봇: 세그먼트마다 READY/ALIGN/GO 수행하며 이동 (= 출발 전 미세조정)
+  → 로봇: 마지막 세그먼트까지 끝나면 서버에 PATH_DONE {"phase":"approach"} 전송
+    ※ 이 접근 완료는 Qt에 통지하지 않는다 (Qt 입장에선 계속 "그리는 중")
+
+[2단계 도색] 서버가 곧바로 PATH(phase="draw") 전송 (Qt 개입 없음)
+  : 도색 전체 경로 (전부 paint=true)
   → 로봇: 이 PATH를 받는 순간 IMU 현재 방향을 0도로 세팅하고 주행 시작
   → 직진 중에는 서버가 DRIFT로 각도 피드백 지속 전송 (아래 참고)
+  → 경로에서 0.3m 넘게 벗어나면 서버가 새 PATH(phase="draw")로 재계획
+
+[완료] 로봇 → 서버: PATH_DONE {"phase":"draw"}
+  → 서버가 경로 상태를 정리하고 QT에 DRAW_DONE {} 통지
 ```
 
 ### 주행 중 각도 피드백: DRIFT (서버 → 로봇)
@@ -164,6 +173,24 @@
 - 서버는 로봇에게서 **10초간 무수신이면 연결 끊김으로 간주하고 세션 종료** (로봇은 재접속 + HELLO 재등록)
 - 서버는 STATUS를 QT로 중계함
 
+### 송신: PATH_DONE (로봇 → 서버) — 경로 수행 완료 (2026-07-27 추가)
+
+받은 `PATH`의 **마지막 세그먼트까지 수행을 마쳤을 때 1회** 보낸다. 서버가 다음 단계로 넘어가는 트리거라 **빠뜨리면 그 자리에서 멈춘 채 진행되지 않는다.**
+
+```json
+{"type":"PATH_DONE","seq":30,"payload":{"phase":"approach"}}
+```
+
+| 필드 | 설명 |
+|---|---|
+| `phase` | 방금 끝낸 `PATH`의 `phase`를 그대로 되돌려준다 (`"approach"` \| `"draw"`) |
+
+- `phase="approach"` → 서버가 **곧바로 도색 `PATH`를 이어 보낸다** (Qt 개입 없음)
+- `phase="draw"` → 서버가 경로 상태를 정리하고 **QT에 `DRAW_DONE`을 통지**한다
+- 서버는 자기 상태로 단계를 판단하므로 `phase`가 없거나 어긋나도 동작한다 (어긋나면 서버 로그에 WARN만 남음). 그래도 **되돌려주는 쪽을 권장** — 어긋남이 로그로 드러나야 디버깅이 된다.
+- ⚠️ **이탈 재계획으로 `PATH`가 교체된 경우**: 새 `PATH`가 오면 기존 경로는 폐기되므로, **"마지막으로 받은 `PATH`"를 끝냈을 때** 보내면 된다. 폐기된 경로에 대해서는 보내지 않는다.
+- 진행 중인 경로가 없는데 `PATH_DONE`이 오면 서버는 WARN 로그만 남기고 무시한다.
+
 ---
 
 ## QT
@@ -190,13 +217,35 @@
 - Qt는 `calib.H_floor`(+`K`,`D`)로 top-view를 생성한다: 프레임 왜곡 보정 → `warpPerspective(S·H_floor)` (S = 렌더링 축척 px/m)
 - `calib`이 `null`이면(캘리브레이션 미완료) Qt는 관리자 창(`admin_console`, 현 서버 `http://<서버IP>:8083` — `admin_console/config.sh`에서 설정) 접속 링크를 안내해 사용자가 캘리브레이션을 진행하게 한다. 이 URL은 Qt 쪽에 고정값으로 둔다 (서버가 내려주지 않음).
 
+### 송신: SET_CAM_IP (QT → 서버) — 카메라 IP 변경 (2026-07-27 추가)
+
+Qt 설정란에서 등록해둔 CCTV 카메라 IP를 바꿀 때 쓴다. **로그인 상태에서만 동작**한다 (현재 로그인된 사용자의 값을 바꾼다).
+
+```json
+{"type":"SET_CAM_IP","seq":6,"payload":{"cam_ip":"192.168.0.44"}}
+```
+
+서버 응답:
+
+| 응답 | payload |
+|---|---|
+| `SET_CAM_IP_OK` | `{"cam_ip":"192.168.0.44"}` — 저장된 값을 그대로 회신 (지웠으면 `null`) |
+| `SET_CAM_IP_FAIL` | `{"reason":"로그인 필요"}` \| `{"reason":"저장 실패"}` |
+
+- `REGISTER`의 `cam_ip`와 동일하게 **서버는 형식 검증을 하지 않고 저장만 한다.** IP 형식 확인은 Qt 몫.
+- 빈 문자열(`""`)을 보내면 등록을 지운다 (이후 `LOGIN_OK.cam_ip`가 `null`).
+- 저장 즉시 파일에 반영되므로 다음 로그인부터 `LOGIN_OK.cam_ip`로 새 값이 내려온다.
+
 ### 송신: CMD (QT → 서버)
 
 `{"cmd": ...}` — 서버가 ROBOT에 중계
 
 - 이벤트: `"ESTOP"` | `"RESUME"`
 - ⚠️ **캘리브레이션 시작(`CALIB_START`)은 QT가 보내지 않는다** (2026-07-23 변경). 카메라 설치/캘리브레이션은 **관리자 창(admin_console)에서 시작**한다 — 관리자 창이 ADMIN role로 `CALIB_START`를 보내면 서버가 ROBOT+CCTV에 중계한다. (서버는 하위호환으로 QT가 보낸 `CALIB_START`도 여전히 중계하지만, QT 쪽 캘리 시작 UI는 두지 않는다.) QT는 캘리 **결과**만 받는다: 로그인 시 `LOGIN_OK.calib`, 갱신 시 `H_MATRIX` 중계 → top-view 렌더링용.
-- **그리기 시작: `"START_DRAW"`** — "그림그리기 시작" 버튼. 로봇이 접근(1단계)을 마치고 시작점에 대기 중일 때 누르면, 서버가 도색 경로(PATH phase="draw")를 로봇에 전송한다. 이 명령은 로봇에 중계되지 않음 (로봇은 PATH 수신이 곧 시작 신호). 접근 미완료 상태면 서버가 무시하고 경고 로그만 남김.
+- **그리기 시작: `"START_DRAW"`** — "그림그리기 시작" 버튼. **도면(BLUEPRINT)이 올라와 있는 상태에서 이걸 누르면 접근부터 도색 완료까지 전부 자동으로 진행된다** (서버가 1단계 접근 PATH 전송 → 로봇 `PATH_DONE` → 서버가 2단계 도색 PATH 전송 → 로봇 `PATH_DONE` → Qt에 `DRAW_DONE`). 이 명령은 로봇에 중계되지 않음 (로봇은 PATH 수신이 곧 시작 신호).
+  - 도면이 없으면 `DRAW_FAIL{stage:"draw", reason:"no_blueprint"}`
+  - 이미 실행 중이면 `DRAW_FAIL{stage:"draw", reason:"busy"}` (중복 시작 방지)
+  - 로봇 위치를 아직 모르면 `DRAW_FAIL{stage:"draw", reason:"no_pose"}` — **실패가 아니라 대기**이며, CCTV `POS`로 위치가 잡히는 즉시 서버가 자동으로 접근을 시작한다.
 - 수동 조작(조이스틱): `"FORWARD"` | `"BACKWARD"` | `"TURN_LEFT"` | `"TURN_RIGHT"` | `"STOP"`
   - 버튼 누름 → 방향 명령, 뗌 → `STOP`. 이동량은 안 실음 (로봇 고정 속도).
 - ⚠️ **경로 실행 중에는 수동 조작이 차단된다** (2026-07-21 추가): 서버가 PATH를 보내
@@ -216,13 +265,15 @@
 ```
 - `points`: **바닥 평면 미터 좌표** 폴리라인 (그릴 선)
 - **Qt가 변환을 마친 값이어야 한다**: top-view 위 드로잉 픽셀 → `÷ S` → 미터. 서버는 재변환하지 않는다.
-- 서버 동작: 로봇 위치(CCTV POS)를 알고 있으면 즉시 경로를 생성해 로봇에 PATH 전송, 모르면 저장해뒀다가 첫 POS 수신 시 전송
+- **서버 동작: 저장만 한다** (2026-07-27 변경). 도면을 올렸다고 로봇이 움직이지 않으며, 실제 출발은 `CMD{"cmd":"START_DRAW"}`부터다.
+- 새 도면을 보내면 진행 중이던 경로 상태와 수동 모드가 모두 초기화된다.
+- 점 형식이 잘못됐거나 2개 미만이면 `DRAW_FAIL{stage:"plan", reason:"bad_points"}`
 
 ### 수신 (서버 → QT)
 
 - `STATUS`: 로봇 상태 중계 (지속 모니터링용)
-- `POS`: CCTV 마커 검출 결과(원본 픽셀) 중계
-- `POSE`: 서버가 POS를 변환해 계산한 로봇 pose — **top-view 위 로봇 표시용은 이걸 사용**
+- `POSE`: 서버가 POS를 변환해 계산한 로봇 pose — **top-view 위 로봇 표시용**
+  > ⚠️ 2026-07-27부터 **CCTV `POS` 원본(픽셀)은 QT로 중계하지 않는다.** Qt에는 캘리브레이션이 없어 픽셀을 해석할 방법이 없기 때문. 로봇 위치는 `POSE`만 쓰면 된다.
 
   ```json
   {"type":"POSE","seq":15,"payload":{"x":1.234,"y":0.567,"theta_deg":90.0}}
@@ -238,11 +289,20 @@
     현재 상태 스냅샷을 1회 보내준다 (그때그때 물어볼 필요 없음).
   - STATUS/POSE가 한동안 안 온다고 "로봇이 없나?" 유추하지 말고, 이 메시지를
     직접 신뢰할 것 (예: 로봇이 접속만 하고 아직 STATUS 첫 전송 전인 순간도 있음).
+- `DRAW_DONE`: **도색 완료 통지** (2026-07-27 추가)
+
+  ```json
+  {"type":"DRAW_DONE","seq":40,"payload":{}}
+  ```
+  - 로봇이 도색 경로를 끝까지 마쳤을 때(`PATH_DONE{phase:"draw"}`) 1회 전송된다.
+    Qt는 이걸 받으면 "그리는 중" 표시를 끝내면 된다.
+  - **접근 완료는 따로 알리지 않는다** — Qt 입장에선 `START_DRAW`부터 `DRAW_DONE`까지가
+    한 덩어리의 "그리는 중"이다. 세부 진행은 `POSE`/`STATUS`로 보면 된다.
 - `DRAW_FAIL`: **경로 생성/전송 실패 또는 대기 통지** (2026-07-23 추가)
 
   ```json
   {"type":"DRAW_FAIL","seq":25,"payload":{
-    "stage": "plan",
+    "stage": "draw",
     "reason": "no_pose",
     "msg": "로봇 위치 미확인 - CCTV POS 수신 후 자동 전송 예정"
   }}
@@ -250,13 +310,13 @@
 
   | 필드 | 설명 |
   |---|---|
-  | `stage` | `"plan"` = BLUEPRINT 처리 중 문제 \| `"draw"` = START_DRAW 처리 중 문제 |
-  | `reason` | 코드. `plan`: `bad_points`(도면 형식 오류) / `no_pose`(로봇 위치 미확인 — 대기 성격, POS 오면 자동 재시도) / `robot_offline`(로봇 미접속). `draw`: `not_ready`(접근 완료 대기 상태 아님) / `no_pose` / `no_blueprint` / `robot_offline` |
+  | `stage` | `"plan"` = BLUEPRINT 처리 중 문제 \| `"draw"` = START_DRAW 이후 처리 중 문제 |
+  | `reason` | 코드. `plan`: `bad_points`(도면 형식 오류). `draw`: `no_blueprint`(도면 없음) / `busy`(이미 실행 중) / `no_pose`(로봇 위치 미확인 — 대기 성격, POS 오면 자동 재시도) / `robot_offline`(로봇 미접속) / `not_ready`(서버 내부 오류 — 정상 흐름에선 안 나옴) |
   | `msg` | 사람이 읽을 한글 설명 (UI 표시용) |
 
-  - `reason=no_pose`(stage=plan)는 완전한 실패가 아니라 "로봇 위치 확보되면 자동으로
+  - `reason=no_pose`는 완전한 실패가 아니라 "로봇 위치 확보되면 자동으로
     PATH가 나갈 예정"이라는 대기 안내에 가깝다. Qt는 reason으로 구분해 표시 문구를
-    조정할 것.
+    조정할 것 (여기서 "그리는 중" 표시를 끄면 안 된다 — 곧 자동으로 출발한다).
 
 ---
 
@@ -304,9 +364,10 @@
 - ⚠️ **CCTV는 어떤 좌표 변환도 하지 말 것** (undistort 포함). 서브픽셀 코너 검출(`CORNER_REFINE_APRILTAG` 권장)까지만 하고 원본을 보낸다. 변환은 전부 서버 담당 — 원본이 있어야 solvePnP 보조 검증도 가능하다.
 - 테스트용으로 `{"x","y","theta_deg"}`(바닥 미터 좌표)도 허용
 - 서버 동작:
-  1. QT(모니터링용)로 원본 그대로 중계 — **로봇에는 중계하지 않음** (로봇은 좌표를 모름. 위치 보정은 서버가 각도로 변환해 `ALIGN`/`DRIFT`로만 전달)
-  2. undistort → `H_marker`로 바닥 좌표 변환해 로봇 pose(중심·방향) 계산 → `POSE`로 QT 전송
-  3. 계획 경로에서 **0.3 m 초과 이탈** 시 가장 가까운 꼭짓점부터 재계획한 PATH를 로봇에 재전송 (최소 3초 간격) — 임계값은 러프 디폴트, 현장 튜닝 예정
+  1. undistort → `H_marker`로 바닥 좌표 변환해 로봇 pose(중심·방향) 계산 → `POSE`로 QT 전송
+  2. 계획 경로에서 **0.3 m 초과 이탈** 시 가장 가까운 꼭짓점부터 재계획한 PATH를 로봇에 재전송 (최소 3초 간격) — 임계값은 러프 디폴트, 현장 튜닝 예정
+  3. `START_DRAW`를 받아뒀는데 그때 로봇 위치를 몰랐다면, 첫 `POS`로 위치가 잡히는 즉시 접근 경로를 자동 전송
+- ⚠️ **`POS` 원본은 어디에도 중계되지 않는다** (2026-07-27 변경): 로봇은 좌표를 모르고(위치 보정은 `ALIGN`/`DRIFT` 각도로만 전달), QT도 캘리브레이션이 없어 픽셀을 해석할 수 없어 `POSE`만 받는다. **CCTV가 보내는 방식은 그대로** — 서버 내부 처리만 달라진 것.
 
 ---
 
@@ -336,13 +397,31 @@
 
 - ADMIN 자신과 오간 메시지는 tap하지 않는다 (무한 루프 방지)
 
-### 송신: CMD / PATH / H_MATRIX (ADMIN → 서버)
+### 송신: CMD / PATH / H_MATRIX / LOGIN (ADMIN → 서버)
 
 - `CMD {"cmd":...}` → ROBOT 전달 (`CALIB_START`는 CCTV에도). **관리자는 점검·설치용이라
   경로 실행 중이어도 차단 없이 항상 전달된다** (QT의 수동조작 차단과 다름 — 관리자 책임 하 조작).
 - `PATH {"segments":[...]}` → ROBOT 전달 (테스트 경로)
 - `H_MATRIX` → CCTV가 보낸 것과 동일하게 처리 (저장 + QT 중계). 관리자 창의 캘리브레이션
   도구가 카메라 대신 캘리 결과를 올릴 때 사용
+- `LOGIN {"id":..,"pw":..}` → **QT의 LOGIN과 동일 처리, 응답만 ADMIN에게** (2026-07-27 추가).
+  응답: `LOGIN_OK {"id","calib","cam_ip"}` | `LOGIN_FAIL {"reason"}`
+
+  > ⚠️ **왜 필요한가**: 캘리브레이션은 **"그 시점에 로그인된 사용자"의 계정에 저장**된다
+  > (서버는 로그인 사용자를 `currentUser_` 하나로만 기억). 그래서 QT가 아직 붙지 않은
+  > 설치 현장에서 관리자 창만으로 캘리를 하면 **세션에만 남고 서버 재시작 시 사라진다**
+  > (`[WARN] 캘리브레이션 수신 - 로그인 사용자 없음, 세션에만 유지`). 관리자 창에서
+  > 먼저 로그인해두면 캘리 결과가 그 계정에 영속 저장된다.
+  >
+  > 로그인 사용자는 전역 1명이므로, ADMIN이 로그인한 뒤 QT가 다른 계정으로 로그인하면
+  > 이후 캘리 저장 대상은 QT 쪽 계정으로 바뀐다.
+
+  **관리자 창은 이 LOGIN이 통과하기 전까지 어떤 화면·API도 열지 않는다** (로그인 게이트,
+  2026-07-27). 캘리를 먼저 하고 로그인해도 소급 저장이 안 되므로, 순서를 사람이 기억하는
+  대신 구조로 강제한 것. 관리자 창은 로그인 성공 시 브라우저별 세션 쿠키를 발급하므로
+  다른 PC는 각자 로그인해야 하고, 브라우저를 닫으면 재로그인이 필요하다. 서버 링크가
+  끊기면 모든 세션이 무효화된다 (서버에 "지금 누가 로그인돼 있나"를 물어보는 프로토콜이
+  없어 확인할 방법이 없기 때문).
 
 ### 카메라 통역 (과도기 구조 — 2026-07-23 종료됨)
 
@@ -370,16 +449,16 @@
 **QT팀**
 1. `LOGIN_OK`의 `"H"` 필드가 `"calib"` 번들로 변경 — top-view는 `calib.H_floor` 사용
 2. `BLUEPRINT.points`는 **바닥 미터 좌표** 확정 — top-view 픽셀을 `÷ S`로 변환해서 보낼 것
-3. 신규 수신 메시지 `POSE` — top-view 위 로봇 표시는 원본 `POS` 대신 이걸 사용
+3. 신규 수신 메시지 `POSE` — top-view 위 로봇 표시는 원본 `POS` 대신 이걸 사용 (2026-07-27부터 `POS`는 QT로 아예 오지 않음)
 4. **수동 조작 UI(조이스틱)**: 전/후진·좌/우 각도 버튼 → 누르면 `CMD {"cmd":"FORWARD"|"BACKWARD"|"TURN_LEFT"|"TURN_RIGHT"}`, **떼면 `CMD {"cmd":"STOP"}`** 전송. 이동량은 안 실음
-5. **"그림그리기 시작" 버튼** (신규): 로봇이 시작점 접근을 마친 뒤 사용자가 누르면 `CMD {"cmd":"START_DRAW"}` 전송 → 서버가 도색 경로를 로봇에 보냄
+5. **"그림그리기 시작" 버튼** (신규): 도면을 올린 뒤 사용자가 누르면 `CMD {"cmd":"START_DRAW"}` 전송 → 서버가 접근부터 도색 완료까지 자동 진행 (2026-07-27 변경)
 
 **로봇팀**
 1. `CMD` 처리에 **수동 조작 명령 분기 추가**: `FORWARD`/`BACKWARD`/`TURN_LEFT`/`TURN_RIGHT` = 고정 속도로 해당 방향 구동, `STOP` = 정지 (조이스틱: 명령 올 때까지 계속 이동)
 2. **데드맨 권장**: 수동 이동 중 일정 시간(예: 300ms) 명령 무수신 시 자동 정지 — 연결 끊김 시 폭주 방지
 3. STATUS는 동일
 4. **출발 전 정렬 핸드셰이크 구현** (신규): MOVE 시작 전마다 정지 상태로 `READY {"seg":k}` 전송 → `ALIGN {"angle_deg":d}` 받으면 d만큼 제자리 회전 후 다시 READY → `GO {}` 받으면 직진 시작. ("로봇 (ROBOT)" 장의 핸드셰이크 절 참고)
-5. **PATH `phase` 처리** (신규): `"approach"` = 시작점까지 이동 후 그 자리에서 **대기** (도색 시작 금지), `"draw"` = **수신 즉시 IMU 현재 방향을 0도로 세팅**하고 도색 주행 시작
+5. **PATH `phase` 처리** (신규): `"approach"` = 시작점까지 이동 후 그 자리에서 **대기** (도색 시작 금지 — 서버가 도색 PATH를 이어서 보내준다), `"draw"` = **수신 즉시 IMU 현재 방향을 0도로 세팅**하고 도색 주행 시작
 6. **DRIFT 수신 처리** (신규): 직진 중 서버가 보내는 각도 피드백 (`angle_deg` 양수 = 시계방향으로 틀어짐 = 그만큼 좌회전 보정). IMU와 융합해 방향 유지에 사용, 정지 중에 오는 건 무시
 
 ---
@@ -417,6 +496,44 @@
 
 ---
 
+## v0.3 추가 변경 (2026-07-27)
+
+1. **`POS` 원본의 QT 중계 중단** — 서버는 이제 CCTV `POS`를 QT로 넘기지 않고 `POSE`(바닥
+   미터 좌표)만 보낸다. Qt에는 캘리브레이션이 없어 원본 픽셀을 해석할 방법이 없었기
+   때문. **CCTV 송신 방식은 그대로**이고, QT는 `POS` 수신 분기를 지우면 된다.
+   ("QT" 장 수신 목록 + "CCTV" 장 POS 절 참고)
+
+2. **카메라 IP 변경 `SET_CAM_IP` 신설** — 회원가입 때만 정할 수 있던 `cam_ip`를 로그인 후
+   언제든 바꿀 수 있다. Qt 설정란용. 응답은 `SET_CAM_IP_OK`/`SET_CAM_IP_FAIL`.
+   ("QT" 장 SET_CAM_IP 절 참고)
+
+3. **🔴 그리기 흐름 변경: 접근~도색이 버튼 한 번으로 자동 진행** — 팀별 반영 필요.
+
+   | | 이전 | 변경 후 |
+   |---|---|---|
+   | `BLUEPRINT` 수신 | 서버가 **즉시 접근 PATH 전송** | **저장만** 함 (로봇 안 움직임) |
+   | 접근 시작 트리거 | 도면 수신 (자동) | **`START_DRAW`** (Qt 버튼) |
+   | 도색 시작 트리거 | **`START_DRAW`** (Qt 버튼) | 로봇 **`PATH_DONE`**(접근) → 서버가 자동 전송 |
+   | 완료 통지 | 없음 | 로봇 `PATH_DONE`(도색) → QT에 **`DRAW_DONE`** |
+
+   - **QT팀**: "그림그리기 시작" 버튼을 누르는 시점이 바뀐다 — 도면을 올린 **직후**에 누르면
+     되고(로봇 접근 완료를 기다릴 필요 없음), 이후 `DRAW_DONE`이 올 때까지 "그리는 중"으로
+     두면 된다. **접근 완료는 통지되지 않는다** (의도된 설계 — 한 덩어리로 취급).
+     `DRAW_FAIL`의 `stage`는 대부분 `"draw"`로 오고, `busy`/`no_blueprint` 코드가 추가됐다.
+   - **로봇팀**: **`PATH_DONE` 전송을 구현해야 한다** (신규). 받은 `PATH`의 마지막
+     세그먼트를 끝내면 `{"type":"PATH_DONE","payload":{"phase":"<받은 phase>"}}`를 1회 보낸다.
+     **이걸 안 보내면 접근 후 도색으로 넘어가지 않는다.** ("로봇 (ROBOT)" 장 PATH_DONE 절 참고)
+   - **CCTV팀**: 변경 없음.
+
+4. **관리자 창 로그인 `LOGIN` (ADMIN → 서버) + 로그인 게이트** — 캘리브레이션이 "로그인된
+   사용자"에게 저장되는 구조라, QT가 없는 설치 현장에서 캘리 결과가 파일에 안 남는 문제가
+   있었다. ADMIN도 `LOGIN`을 보낼 수 있게 하고(서버 처리는 QT와 동일, 응답만 ADMIN으로),
+   **관리자 창 전체를 로그인 뒤로 옮겼다** — 로그인 전에는 `/login` 화면만 뜨고 카메라
+   캘리브레이션·로봇 제어·로그 모니터와 모든 POST API가 차단된다.
+   ("ADMIN (관리자 창)" 장 참고)
+
+---
+
 ## 프로토콜 기반 전체 사용 시나리오
 
 이 장에서는 앞서 정의한 프로토콜 메시지들이 실제 시스템 운용 시나리오에서 어떻게 오가는지 Phase별로 나누어 설명한다.
@@ -433,10 +550,13 @@
 | **`LOGIN_OK`** | 서버 → QT | **사용자 인증 승인 및 캘리브레이션 획득**: 로그인이 성공하면 서버는 해당 사용자가 관리하는 현장에 마지막으로 저장된 **캘리브레이션 번들 (`calib`)**을 반환한다. QT는 이를 사용하여 즉시 top-view 영상을 보정하여 렌더링한다. |
 | **`CMD`** | QT/관리자창 → 서버 → 로봇/CCTV | **이벤트 기반 제어 명령**: 비상 정지(`ESTOP`), 재개(`RESUME`) 등을 QT가, **캘리브레이션 시작(`CALIB_START`)은 관리자 창(ADMIN)이** 보내면 서버가 단방향(Fire-and-forget)으로 중계한다. |
 | **`H_MATRIX`** | CCTV → 서버 → QT | **캘리브레이션 프로필 등록 및 갱신**: 캘리브레이션 완료 시점에 CCTV가 계산한 렌즈 파라미터(K, D) 및 두 기하학적 평면 변환 행렬(H_floor, H_marker)을 보고한다. 서버는 이를 데이터베이스에 영속화하고, 실시간 화면 갱신을 위해 QT에 중계한다. |
-| **`BLUEPRINT`** | QT → 서버 | **작업 도면 전송**: 작업자가 top-view 화면에 드로잉한 점들을 바닥 평면의 **실제 미터 좌표(x, y)**로 변환하여 서버에 보낸다. 서버는 이 데이터를 바탕으로 실제 로봇의 동작 경로를 기하학적으로 설계한다. |
-| **`POS`** | CCTV → 서버 | **실시간 마커 코너 보고**: CCTV가 매 프레임 검출한 로봇의 4개 마커 꼭짓점의 **원본 픽셀 좌표**를 고주기(15~30Hz)로 전송한다. 연산 리소스 경량화를 위해 CCTV는 렌즈 왜곡이나 호모그래피 보정을 거치지 않은 날것 그대로를 보낸다. |
+| **`BLUEPRINT`** | QT → 서버 | **작업 도면 전송**: 작업자가 top-view 화면에 드로잉한 점들을 바닥 평면의 **실제 미터 좌표(x, y)**로 변환하여 서버에 보낸다. 서버는 저장만 하며, 실제 경로 생성은 `START_DRAW`를 받아야 시작된다(2026-07-27 변경). |
+| **`SET_CAM_IP`** | QT → 서버 | **카메라 IP 변경**: 로그인 후 사용자가 등록해둔 CCTV IP를 교체한다(2026-07-27 신설). 형식 검증 없이 저장만 하며 `SET_CAM_IP_OK`/`FAIL`로 응답한다. |
+| **`POS`** | CCTV → 서버 | **실시간 마커 코너 보고**: CCTV가 매 프레임 검출한 로봇의 4개 마커 꼭짓점의 **원본 픽셀 좌표**를 고주기(15~30Hz)로 전송한다. 연산 리소스 경량화를 위해 CCTV는 렌즈 왜곡이나 호모그래피 보정을 거치지 않은 날것 그대로를 보낸다. 서버 내부 pose 계산에만 쓰이고 어디로도 재중계되지 않는다(2026-07-27 변경). |
 | **`POSE`** | 서버 → QT | **로봇 바닥 기준 위치 중계**: 서버가 수신한 `POS` 원본 픽셀을 undistort → H_marker로 변환하여 실제 바닥 위의 미터 좌표 `(x, y)` 및 방향각 `(theta)`으로 계산해 전송한다(순수 2D SE(2) 계산 — solvePnP/3D 아님). QT는 이를 사용해 지도 위에 로봇 궤적을 렌더링한다. |
-| **`PATH`** | 서버 → 로봇 | **로봇 구동 동작 시퀀스**: 도면 정보(`BLUEPRINT`)와 로봇 위치(`POS`)를 결합해 생성한 실시간 직진(`MOVE`), 회전(`TURN`) 명령 리스트이다. `phase="approach"`(시작점 접근 후 대기)와 `phase="draw"`(START_DRAW 후 도색 경로, 로봇은 수신 시 IMU 0도 세팅) 2단계로 나뉘어 전송된다. 로봇은 이 경로를 저장하며 추종하다가, 주행 이탈 감지로 인해 새 PATH가 전송되면 기존 경로는 즉시 폐기하고 이를 덮어쓴다. |
+| **`PATH`** | 서버 → 로봇 | **로봇 구동 동작 시퀀스**: 도면 정보(`BLUEPRINT`)와 로봇 위치(`POS`)를 결합해 생성한 실시간 직진(`MOVE`), 회전(`TURN`) 명령 리스트이다. `phase="approach"`(시작점 접근, `START_DRAW`로 트리거)와 `phase="draw"`(로봇의 접근 완료 `PATH_DONE`으로 트리거, 로봇은 수신 시 IMU 0도 세팅) 2단계로 나뉘어 전송된다. 로봇은 이 경로를 저장하며 추종하다가, 주행 이탈 감지로 인해 새 PATH가 전송되면 기존 경로는 즉시 폐기하고 이를 덮어쓴다. |
+| **`PATH_DONE`** | 로봇 → 서버 | **경로 수행 완료 보고**(2026-07-27 신설): 받은 `PATH`의 마지막 세그먼트까지 마쳤을 때 1회 전송. `phase="approach"`면 서버가 곧바로 도색 `PATH`를 이어 보내고, `phase="draw"`면 서버가 QT에 `DRAW_DONE`을 통지한다. |
+| **`DRAW_DONE`** | 서버 → QT | **도색 완료 통지**(2026-07-27 신설): 로봇의 도색 `PATH_DONE`을 받으면 QT에 전달한다. 접근 완료는 별도로 통지하지 않는다 — `START_DRAW`~`DRAW_DONE`이 Qt 입장의 한 덩어리 "그리는 중"이다. |
 | **`STATUS`** | 로봇 → 서버 → QT | **로봇 상태 보고 및 하트비트**: 로봇이 주행 상태(`state`) 및 노즐 도색 중 여부(`painting`)를 2초 이내 간격으로 서버에 전송한다. 하트비트 겸용으로 사용되며, 서버가 10초간 무수신 시 로봇 연결 단절로 처리한다. |
 | **`READY`** | 로봇 → 서버 | **출발 전 정렬 확인 요청**: TURN을 마치고 MOVE를 시작하기 직전, 정지 상태에서 곧 실행할 MOVE의 인덱스(`seg`)를 담아 전송한다. 서버는 CCTV 피드백으로 실제 각도를 확인해 응답할 때까지 로봇은 대기한다. |
 | **`ALIGN`** | 서버 → 로봇 | **출발 전 미세 각도 보정**: READY 시점의 실제 각도와 목표 `heading_deg`의 오차가 허용치(2°)를 넘으면 보정할 회전량(`angle_deg`, 양수=좌회전)을 보낸다. 로봇은 그만큼 회전 후 다시 READY를 보낸다. |
@@ -476,6 +596,8 @@ sequenceDiagram
 ### Phase 2. 설치 위치 캘리브레이션 (Calibration Phase)
 카메라 설치 기사가 캘리브레이션을 시작하는 흐름이다. **캘리브레이션 시작은 관리자 창(admin_console)에서** 한다(2026-07-23 변경 — 이전엔 QT가 시작). 관리자 창이 ADMIN role로 `CALIB_START`를 보내면 서버가 CCTV와 ROBOT에 중계하고, CCTV는 연산을 마친 뒤 `H_MATRIX`를 통해 캘리브레이션 번들을 전송한다. 서버는 이를 저장하고 QT에 중계해 top-view를 갱신한다.
 
+⚠️ **선행 조건(2026-07-27)**: 관리자 창 자체가 **로그인 게이트** 뒤에 있어, 기사가 먼저 계정으로 로그인해야 위 `CMD(CALIB_START)` 버튼을 포함한 어떤 화면도 열린다("ADMIN (관리자 창)" 장 참고). 캘리브레이션이 "그 시점에 로그인된 계정"에 저장되는 구조라, 순서(로그인 → 캘리)를 게이트로 강제한 것이다.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -495,8 +617,25 @@ sequenceDiagram
     Server->>QT: H_MATRIX (새 번들 즉시 중계)
 ```
 
-### Phase 3. 로그인 및 작업 준비 (Login & Blueprint Setup)
-작업자가 로그인을 하면 저장된 캘리브레이션 번들을 획득하여 top-view를 생성한다. 이후 사용자가 그린 도면 데이터를 바닥 미터 좌표계로 변환하여 서버에 `BLUEPRINT`로 송신하며, 서버는 최초 로봇 위치 검출 시점에 경로(`PATH`)를 계획하여 로봇에 전달한다.
+### Phase 3. 로그인 및 도면 준비 (Login & Blueprint Setup)
+작업자가 로그인을 하면 저장된 캘리브레이션 번들을 획득하여 top-view를 생성한다. 이후 사용자가 그린 도면 데이터를 바닥 미터 좌표계로 변환하여 서버에 `BLUEPRINT`로 송신한다. **서버는 이 시점에는 저장만 하고 로봇을 움직이지 않는다** (2026-07-27 변경) — 실행은 Phase 4의 `START_DRAW`부터.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant QT as QT Client
+    participant Server as 비전 서버
+
+    QT->>Server: LOGIN
+    Server-->>QT: LOGIN_OK
+
+    Note over QT: calib.H_floor 기반으로,<br/>top-view 생성 후 도면 작도
+    QT->>Server: BLUEPRINT
+    Note over Server: 도면 저장만 함,<br/>PATH는 아직 안 보냄
+```
+
+### Phase 4. 그리기 시작 — 접근·미세조정·도색 자동 진행 (Start Draw)
+사용자가 "그림그리기 시작" 버튼(`CMD START_DRAW`)을 누르면, 서버가 로봇 위치를 확보해 1단계 접근 `PATH`를 전송한다. 로봇은 각 MOVE 출발 전 `READY`→`ALIGN`/`GO` 핸드셰이크로 미세조정하며 접근을 마치고, **접근 완료를 `PATH_DONE`으로 서버에 보고한다 (Qt에는 통지 안 함)**. 서버는 이를 받는 즉시 2단계 도색 `PATH`를 이어 보내고, 도색이 끝나면 로봇이 다시 `PATH_DONE`을 보내 서버가 QT에 `DRAW_DONE`을 통지한다. 이 전체 과정에서 Qt가 추가로 눌러야 하는 버튼은 없다.
 
 ```mermaid
 sequenceDiagram
@@ -506,23 +645,39 @@ sequenceDiagram
     participant CCTV as AI CCTV
     participant ROBOT as 로봇 제어기
 
-    QT->>Server: LOGIN
-    Server-->>QT: LOGIN_OK
+    QT->>Server: CMD (START_DRAW)
 
-    Note over QT: calib.H_floor 기반으로,<br/>top-view 생성 후 도면 작도
-    QT->>Server: BLUEPRINT
+    alt 로봇 위치 미확인
+        Server-->>QT: DRAW_FAIL (reason: no_pose, 대기 성격)
+        CCTV->>Server: POS (최초 검출)
+        Note over Server: 위치 확보되는 즉시 아래 접근 단계 자동 진행
+    end
 
-    Note over CCTV,Server: CCTV는 마커 검출 시,<br/>POS 전송 시작
-    CCTV->>Server: POS
-    
-    Note over Server: POS 픽셀 → H_marker 적용하여,<br/>로봇 초기 위치 파악
-    Note over Server: 로봇 위치와 BLUEPRINT를 조합하여,<br/>MOVE/TURN 시퀀스(PATH) 생성
-    
-    Server->>ROBOT: PATH
+    Note over Server: 로봇 위치 + BLUEPRINT로<br/>접근 MOVE/TURN 시퀀스 생성
+    Server->>ROBOT: PATH (phase: approach)
+
+    loop MOVE 세그먼트마다 (접근 중 미세조정)
+        ROBOT->>Server: READY (seg)
+        Server-->>ROBOT: ALIGN 또는 GO
+    end
+
+    Note over ROBOT: 시작점 도착,<br/>첫 도색 방향으로 정렬 완료
+    ROBOT->>Server: PATH_DONE (phase: approach)
+    Note over Server: Qt에는 알리지 않음<br/>(접근/도색을 한 덩어리로 취급)
+
+    Note over Server: 시작점 기준 남은 도면으로<br/>도색 MOVE/TURN 시퀀스 생성
+    Server->>ROBOT: PATH (phase: draw)
+    Note over ROBOT: IMU 현재 방향을 0도로 세팅,<br/>주행+도색 시작
+
+    Note over ROBOT,Server: 이하 실시간 제어는 Phase 5 참고<br/>(DRIFT/이탈 재계획 등)
+
+    Note over ROBOT: 도색 경로 마지막 세그먼트 완료
+    ROBOT->>Server: PATH_DONE (phase: draw)
+    Server->>QT: DRAW_DONE
 ```
 
-### Phase 4. 실시간 제어 및 궤적 모니터링 (Runtime Control & Monitoring)
-로봇이 주행을 시작하면, CCTV는 마커 원본 픽셀 좌표(`POS`)를 고주기(15~30Hz)로 서버에 송신한다. 서버는 이를 바닥 미터 좌표(`POSE`)로 변환하여 QT에 전달하며, 동시에 로봇의 이탈 여부를 감시한다. 이탈량이 0.3m를 초과할 경우 경로를 재계획하여 새로운 `PATH`를 전송한다.
+### Phase 5. 실시간 제어 및 궤적 모니터링 (Runtime Control & Monitoring)
+로봇이 주행하는 동안(접근·도색 공통), CCTV는 마커 원본 픽셀 좌표(`POS`)를 고주기(15~30Hz)로 서버에 송신한다. 서버는 이를 바닥 미터 좌표(`POSE`)로 변환하여 QT에 전달하며, 동시에(도색 단계에서만) 로봇의 이탈 여부를 감시한다. 이탈량이 0.3m를 초과할 경우 경로를 재계획하여 새로운 `PATH`를 전송한다.
 
 ```mermaid
 sequenceDiagram
@@ -550,7 +705,7 @@ sequenceDiagram
     end
 ```
 
-### Phase 5. 긴급 정지 및 제어 (Emergency Stop Scenario)
+### Phase 6. 긴급 정지 및 제어 (Emergency Stop Scenario)
 비상 상황 발생 시 QT에서 긴급 정지를 명령하면 서버가 이를 로봇에 중계하며, 로봇은 주행 및 도색을 즉시 중단하고 `ESTOPPED` 상태를 보고한다.
 
 ```mermaid

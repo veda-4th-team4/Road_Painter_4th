@@ -9,4 +9,7 @@ cd "$(dirname "$0")" || exit 1
 set -a
 [ -f config.sh ] && source config.sh
 set +a
-exec python3 -u web_gui.py "${TCP_PORT:-6000}" "${HTTP_PORT:-8081}" "${SNAPSHOT_PORT:-6001}" >> gui.log 2>&1
+# gui.log는 rp_core가 크기 상한(2MB×4)을 두고 직접 회전시키며 쓴다. 여기서 stdout까지
+# 같은 파일로 리다이렉트하면 같은 줄이 두 번 들어가고 회전도 깨지므로 버린다.
+# stderr(파이썬 트레이스백 등 크래시 흔적)만 별도 파일에 남긴다.
+exec python3 -u web_gui.py "${TCP_PORT:-6000}" "${HTTP_PORT:-8081}" "${SNAPSHOT_PORT:-6001}" >/dev/null 2>>gui_err.log
