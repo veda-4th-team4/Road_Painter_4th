@@ -71,7 +71,8 @@ make
 시리얼 통신 개방 및 하드웨어 GPIO / I2C 제어 권한 확보를 위해 실행합니다.
 ```bash
 cd ~/Painter_Robot/build
-./robot_exec <서버_IP_주소>
+./robot_exec
+# (필요 시 선택 사항: 다른 서버 IP 접속 시 ./robot_exec 192.168.0.10)
 ```
 *   **주요 구동 기능**:
     1.  **초기화**: STM32 부팅 비상정지 래치(`0x16`) 해제 및 MPU6050 자가 캘리브레이션
