@@ -52,6 +52,7 @@ int main(int argc, char **argv) {
 
   bool manual_override = false;
   Msg_SetSpeed_t manual_speed = {0, 0};
+  uint8_t manual_nozzle = 0;
 
   while (true) {
       // 1. Run network loop to check sockets and reconnect if needed
@@ -65,6 +66,8 @@ int main(int argc, char **argv) {
               robot_comm.SendEmergencyStop(0x01);
               manual_override = true;
               manual_speed = {0, 0};
+              manual_nozzle = 0;
+              robot_comm.SendControlNozzle(0);
           } else if (cmd == "RESUME") {
               robot_comm.SendClearEStop();
               manual_override = false;
@@ -83,6 +86,14 @@ int main(int argc, char **argv) {
           } else if (cmd == "STOP") {
               manual_override = true;
               manual_speed = {0, 0};
+              manual_nozzle = 0;
+              robot_comm.SendControlNozzle(0);
+          } else if (cmd == "NOZZLE_DOWN" || cmd == "PAINT_ON") {
+              manual_nozzle = 1;
+              robot_comm.SendControlNozzle(1);
+          } else if (cmd == "NOZZLE_UP" || cmd == "PAINT_OFF") {
+              manual_nozzle = 0;
+              robot_comm.SendControlNozzle(0);
           }
       }
 
@@ -93,6 +104,7 @@ int main(int argc, char **argv) {
           waiting_for_go = false;
           ready_seg_sent = 0xFFFFFFFF;
           manual_override = false; // Reset manual override upon receiving autonomous path
+          manual_nozzle = 0;
           std::string phase = net_manager.GetPathPhase();
           std::cout << "[MAIN] New PATH received with phase=" << phase << std::endl;
           if (phase == "draw") {
@@ -108,7 +120,7 @@ int main(int argc, char **argv) {
 
       // 5. Segment Execution Handshake State Machine
       Msg_SetSpeed_t target_speed = {0, 0};
-      uint8_t nozzle_on = 0;
+      uint8_t nozzle_on = manual_nozzle;
 
       if (manual_override) {
           target_speed = manual_speed;
@@ -212,8 +224,8 @@ int main(int argc, char **argv) {
           }
           net_manager.SendStatus(status);
           if (stm32_ready) {
-              std::cout << "[MAIN] STATUS sent to Server -> L: " << status.left_steps 
-                        << " | R: " << status.right_steps 
+              std::cout << "[MAIN] STATUS sent to Server -> L: " << static_cast<int32_t>(status.left_steps) 
+                        << " | R: " << static_cast<int32_t>(status.right_steps) 
                         << " | Flags: 0x" << std::hex << (int)status.flags << std::dec << std::endl;
           }
       }
