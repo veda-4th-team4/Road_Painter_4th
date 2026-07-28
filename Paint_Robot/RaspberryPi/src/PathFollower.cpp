@@ -169,6 +169,42 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps, M
     return false;
 }
 
+void PathFollower::StartOffsetMove(float dist_m, int32_t start_left_steps, int32_t start_right_steps) {
+    is_moving_straight = true;
+    move_target_steps = CalculateMoveSteps(dist_m);
+    move_start_left_steps = start_left_steps;
+    move_start_right_steps = start_right_steps;
+    std::cout << "[PathFollower Offset] StartOffsetMove: dist=" << dist_m 
+              << " m | target_steps=" << move_target_steps << std::endl;
+}
+
+bool PathFollower::UpdateOffsetMove(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on) {
+    if (!is_moving_straight) return true;
+
+    int32_t diff_left = cur_left_steps - move_start_left_steps;
+    int32_t diff_right = cur_right_steps - move_start_right_steps;
+    uint32_t delta_left = static_cast<uint32_t>(std::abs(diff_left));
+    uint32_t delta_right = static_cast<uint32_t>(std::abs(diff_right));
+    uint32_t progress_steps = (delta_left + delta_right) / 2;
+
+    if (progress_steps >= move_target_steps) {
+        out_speed.left_sps = 0;
+        out_speed.right_sps = 0;
+        out_nozzle_on = 0;
+        is_moving_straight = false;
+        std::cout << "[PathFollower Offset] Offset move completed! Reached " << progress_steps 
+                  << "/" << move_target_steps << " steps." << std::endl;
+        return true;
+    }
+
+    // Determine direction (+0.05m/s forward or -0.05m/s backward)
+    float target_v = 0.05f; // 5 cm/s
+    out_speed = velocity_to_sps(target_v, 0.0f);
+    out_nozzle_on = 0; // Spray OFF during offset positioning
+
+    return false;
+}
+
 void PathFollower::Update(const Pose_t& current_pose, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on) {
     if (path.empty() || current_waypoint_idx >= path.size()) {
         // No path active, send stop command
