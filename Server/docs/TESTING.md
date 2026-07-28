@@ -1,7 +1,7 @@
 # Road-Painter 서버 테스트 가이드
 
 서버(TLS 릴레이 + 경로생성)를 실제 클라이언트 없이 검증하고, Qt 팀이 서버에 붙이기 위한 안내입니다.
-메시지 규격 전체는 **[PROTOCOL.md](PROTOCOL.md)** 참고.
+메시지 규격 전체는 **[server_PROTOCOL.md](../server_PROTOCOL.md)** 참고.
 
 - 전송: **TCP + TLS, 포트 9000**
 - 프레이밍: JSON 한 줄 + `\n` (JSON Lines)
@@ -179,7 +179,7 @@ make path_test
 
 1. 서버 담당에게 **`server.crt`** 파일 (앱에 동봉)
 2. **서버 IP** (예: `192.168.0.8`), **포트 9000**
-3. **[PROTOCOL.md](PROTOCOL.md)** — 메시지 규격 전체
+3. **[server_PROTOCOL.md](../server_PROTOCOL.md)** — 메시지 규격 전체
 
 ## 1. 접속 골격 (QSslSocket)
 

@@ -135,6 +135,10 @@ void Router::fromQt(const json& msg) {
         // (top-view 위에 그린 점은 정의상 바닥 평면 위라 높이 보정 불필요)
         blueprint_ = payload;
         planPts_.clear();
+        planPaint_.clear();
+        planProgram_ = json::array();
+        penOffsetM_ = 0.0;
+        planCursor_ = 0;
         planActive_ = false;
         awaitingArrival_ = false;
         drawRequested_ = false;  // 이전 도면에 걸려 있던 시작 요청은 무효
@@ -157,9 +161,45 @@ void Router::fromQt(const json& msg) {
             sendDrawFail("plan", "bad_points", "도면 점이 2개 미만");
             return;
         }
+        // ----- 선택 필드 (없으면 종전과 100% 동일하게 동작) -----
+        // paint[i] = points[i-1] -> points[i] 구간 도색 여부. paint[0]은 대응하는
+        // 구간이 없어 무시된다. 길이가 어긋나면 도면을 버리지는 않고 이 필드만
+        // 무시한다 (전 구간 도색으로 되돌아감) - 도형은 살리는 쪽이 안전.
+        json paintJson = payload.value("paint", json::array());
+        if (paintJson.is_array() && !paintJson.empty()) {
+            if (paintJson.size() != planPts_.size()) {
+                logf("[WARN] BLUEPRINT paint 길이 불일치 (%zu, points %zu) - "
+                     "무시하고 전 구간 도색", paintJson.size(), planPts_.size());
+            } else {
+                for (auto& b : paintJson)
+                    planPaint_.push_back(b.is_boolean() && !b.get<bool>() ? 0 : 1);
+            }
+        }
+        // program: Qt가 만든 동작 시퀀스. 있으면 서버는 도색 경로를 생성하지 않고
+        // 그대로 중계한다 (펜 오프셋 보정이 들어있어 서버가 다시 만들면 어긋남).
+        json programJson = payload.value("program", json::array());
+        if (programJson.is_array() && !programJson.empty()) {
+            bool ok = true;
+            for (auto& op : programJson)
+                if (!op.is_object() || !op.contains("op")) { ok = false; break; }
+            if (ok) planProgram_ = programJson;
+            else logf("[WARN] BLUEPRINT program 형식 오류 - 무시하고 서버가 직접 생성");
+        }
+        if (payload.contains("pen_offset_m") && payload["pen_offset_m"].is_number())
+            penOffsetM_ = payload["pen_offset_m"].get<double>();
+
         // 도면은 저장만 한다. 경로 생성/전송은 Qt가 "그림그리기 시작"(START_DRAW)을
         // 누른 뒤에 시작한다 - 도면을 올려놓고 로봇이 제멋대로 출발하지 않게.
-        logf("[INFO] 도면 수신 (%zu점) - START_DRAW 대기", planPts_.size());
+        logf("[INFO] 도면 수신 (%zu점, paint %s, program %zu동작, 펜오프셋 %.3fm) "
+             "- START_DRAW 대기",
+             planPts_.size(), planPaint_.empty() ? "없음" : "있음",
+             planProgram_.size(), penOffsetM_);
+        // Qt가 보낸 것과 서버가 받은 것을 즉시 대조할 수 있게 요약을 회신한다.
+        srv_.sendTo("QT", makeMsg("BLUEPRINT_OK",
+            {{"points", planPts_.size()},
+             {"paint", !planPaint_.empty()},
+             {"program", planProgram_.size()},
+             {"pen_offset_m", penOffsetM_}}));
     } else {
         logf("[WARN] QT로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -184,6 +224,18 @@ void Router::fromRobot(const json& msg) {
         if (seg != alignSegIdx_) {  // 새 세그먼트 정렬 시작
             alignSegIdx_ = seg;
             alignTries_ = 0;
+        }
+        // 🔴 꼭짓점 동작(pivot) 구간에서는 정렬을 하지 않고 곧바로 GO를 준다.
+        // 이 구간은 "노즐 올림 -> 후진 d -> 회전 -> 전진 d"로 펜을 꼭짓점에
+        // 되돌려놓는 수 cm짜리 미세 동작이고, 성립 조건이 "후진량 = 재전진량 = d"다.
+        // 여기서 ALIGN으로 로봇을 몇 도 돌려버리면 후진 방향이 바뀌어 펜이
+        // 꼭짓점으로 못 돌아오고, 꼭짓점마다 최대 kAlignMaxTries회 왕복까지 붙는다.
+        // 방향 정렬은 이 동작이 끝난 뒤 다음 직진 MOVE에서 하면 된다.
+        if (seg >= 0 && seg < (int)activeSegs_.size() &&
+            activeSegs_[seg].value("pivot", false)) {
+            srv_.sendTo("ROBOT", makeMsg("GO", json::object()));
+            logf("[INFO] READY(seg=%d) 꼭짓점 동작 구간 - 정렬 생략하고 GO", seg);
+            return;
         }
         // heading_deg가 있는 세그먼트(MOVE 전부 + 접근 경로 마지막 TURN)만 판정 가능
         double target = 1e9;
@@ -228,6 +280,7 @@ void Router::fromRobot(const json& msg) {
             planActive_ = false;
             activeSegs_ = json::array();
             alignSegIdx_ = -1, alignTries_ = 0;
+            planCursor_ = 0;
             srv_.sendTo("QT", makeMsg("DRAW_DONE", json::object()));
             logf("[INFO] 도색 완료 - QT에 DRAW_DONE 통지");
         } else {
@@ -281,8 +334,12 @@ void Router::fromCctv(const json& msg) {
         // (값 자체가 "좌회전으로 보정해야 할 양"과 같음 - ALIGN과 동일 규약)
         if (alignSegIdx_ >= 0 && alignSegIdx_ < (int)activeSegs_.size() &&
             nowMs() - lastDriftMs_ >= kDriftPeriodMs) {
-            double target = activeSegs_[alignSegIdx_].value("heading_deg", 1e9);
-            if (target < 1e8) {
+            const json& seg = activeSegs_[alignSegIdx_];
+            double target = seg.value("heading_deg", 1e9);
+            // 꼭짓점 동작(pivot) 중에는 각도 피드백을 보내지 않는다 - 펜을 제자리에
+            // 돌려놓기 위한 수 cm짜리 후진/재전진이라, 여기서 방향을 보정하면
+            // "후진량 = 재전진량"이 깨져 펜이 꼭짓점으로 못 돌아온다.
+            if (target < 1e8 && !seg.value("pivot", false)) {
                 double drift = normDeg(target - pose_.theta * 180.0 / M_PI);
                 srv_.sendTo("ROBOT", makeMsg("DRIFT",
                     {{"angle_deg", std::round(drift * 10) / 10}}));
@@ -294,18 +351,22 @@ void Router::fromCctv(const json& msg) {
         // 떨어져 있는 게 정상이라 오탐이 나기 때문. (READY/ALIGN + DRIFT로 충분)
         if (awaitingArrival_) return;
 
-        // ----- 이탈 감시: 계획 경로에서 임계값 이상 벗어나면 재계획 -----
-        double dev = distToPolyline({pose_.x, pose_.y}, planPts_);
+        // ----- 이탈 감시: "지금 달리는 구간"에서 임계값 이상 벗어나면 재계획 -----
+        // 도면 전체와 비교하면 옆줄 위에 올라타도 "경로 위"로 판정돼 이탈을 못 잡고,
+        // 재시작 지점도 옆줄로 튄다 (path_planner.hpp 진행 커서 주석 참고).
+        advanceCursor({pose_.x, pose_.y}, planPts_, planCursor_, kVertexReachM);
+        double dev = distToActiveSegment({pose_.x, pose_.y}, planPts_, planCursor_);
         if (dev > kDevThresholdM && nowMs() - lastPlanMs_ > kReplanCooldownMs) {
-            size_t k = nearestVertex({pose_.x, pose_.y}, planPts_);
-            std::vector<Pt> rest(planPts_.begin() + k, planPts_.end());
-            json segs = buildSegments(pose_, rest);
+            // 원래 향하던 꼭짓점으로 복귀시킨다 (전체 최근접이 아니라)
+            size_t k = std::min(planCursor_ + 1, planPts_.size() - 1);
+            json segs = buildRecovery(k);
             if (!segs.empty() && srv_.sendTo("ROBOT", makePathMsg(segs, "draw"))) {
                 activeSegs_ = segs;
                 alignSegIdx_ = -1, alignTries_ = 0;  // 새 경로 = 정렬 상태 리셋
                 lastPlanMs_ = nowMs();
-                logf("[WARN] 경로 이탈 %.2fm - 재계획 PATH 전송 (%zu번 꼭짓점부터, %zu 세그먼트)",
-                     dev, k, segs.size());
+                logf("[WARN] 경로 이탈 %.2fm (구간 %zu) - 복귀 PATH 전송 "
+                     "(%zu번 꼭짓점으로, %zu 동작)",
+                     dev, planCursor_, k, segs.size());
             }
         }
     } else if (type == "H_MATRIX") {
@@ -392,7 +453,13 @@ void Router::startApproach() {
         sendDrawFail("draw", "no_pose", "로봇 위치 미확인 - CCTV POS 수신 후 자동 전송 예정");
         return;
     }
-    json segs = buildSegments(pose_, {planPts_[0]});  // 시작점까지 (paint=false)
+    planCursor_ = 0;
+    // 시작점까지 (paint=false). 접근 목표는 planPts_[0] "그대로"다 - 로봇 중심을
+    // 도면 시작점에 세우기만 하면 되고, 펜 오프셋 보정은 Qt 시퀀스 맨 앞의
+    // lead-in(MOVE +d)이 담당한다. 여기서 pts[0] + d를 겨냥하면 이중 적용된다.
+    // 접근 구간은 서버 생성이지만 MOVE/TURN만 쓴다(NOZZLE을 끼우지 않는다) -
+    // 전부 paint=false라 도색되지 않고, 로봇의 신규 op 지원 여부와 무관해진다.
+    json segs = buildSegments(pose_, {planPts_[0]});
 
     // 도착 직후 방향: 접근 MOVE의 heading, 이동이 없었다면 현재 각도
     double arrival = pose_.theta * 180.0 / M_PI;
@@ -452,9 +519,25 @@ void Router::sendDrawPath() {
         planActive_ = false;
         return;
     }
-    // 시작점에 서 있으므로 남은 경로 = 두번째 점부터. 모든 MOVE가 도색 구간.
-    std::vector<Pt> rest(planPts_.begin() + 1, planPts_.end());
-    json segs = buildSegments(pose_, rest, /*firstPaint=*/true);
+    planCursor_ = 0;  // 도색 시작 = 첫 구간부터
+    json segs;
+    if (planProgram_.is_array() && !planProgram_.empty()) {
+        // Qt가 만든 동작 시퀀스를 손대지 않고 그대로 넘긴다. 펜 오프셋 보정
+        // (시작 lead-in + 꼭짓점마다 후진/회전/재전진)이 이미 들어 있어서,
+        // 서버가 다시 만들면 펜 자취가 어긋나고 Qt 미리보기와도 달라진다.
+        segs = planProgram_;
+        logf("[INFO] Qt 동작 시퀀스 사용 (%zu 동작, 펜오프셋 %.3fm)",
+             segs.size(), penOffsetM_);
+    } else {
+        // 하위호환: program이 없으면 종전대로 서버가 도면에서 직접 생성.
+        // 시작점에 서 있으므로 남은 경로 = 두번째 점부터.
+        std::vector<Pt> rest(planPts_.begin() + 1, planPts_.end());
+        std::vector<char> restPaint;
+        if (planPaint_.size() == planPts_.size())
+            restPaint.assign(planPaint_.begin() + 1, planPaint_.end());
+        segs = buildSegments(pose_, rest, /*firstPaint=*/true,
+                             restPaint.empty() ? nullptr : &restPaint);
+    }
     if (segs.empty()) {  // 도색할 구간 없음 (드문 경계 케이스) - 그린 것으로 친다
         logf("[INFO] 도색할 구간 없음 - 곧바로 완료 처리");
         awaitingArrival_ = false;
@@ -476,6 +559,92 @@ void Router::sendDrawPath() {
         awaitingArrival_ = false;
         planActive_ = false;
     }
+}
+
+// 이탈 복귀 경로: 로봇을 planPts_[k]로 되돌린 뒤 원래 하던 일을 이어가게 한다.
+//
+// ⚠️ Qt program이 있으면 절대 다시 만들지 않는다. 재생성하면 꼭짓점 동작
+// (노즐 올림 -> 후진 d -> 회전 -> 전진 d)이 사라져 펜이 꼭짓점을 지나지 않고,
+// Qt 화면의 미리보기와도 달라져 조작자가 동선을 검증할 수 없게 된다.
+// 대신 "복귀 구간만 새로 만들고 원본을 잘라 이어 붙인다".
+//
+//   [NOZZLE 올림]            복귀 주행 중에는 칠하지 않는다
+//   [현재 pose -> planPts_[k]]  로봇 "중심"을 꼭짓점에 (buildSegments)
+//   [TURN -> 재개 방위]
+//   [MOVE +d]                펜 정렬 - 중심이 꼭짓점이면 펜은 d 뒤에 있다
+//   [원본 program의 재개 지점부터 끝까지]
+json Router::buildRecovery(size_t k) {
+    if (planPts_.size() < 2 || k >= planPts_.size()) return json::array();
+
+    // ----- 하위호환: program이 없으면 남은 도면으로 직접 생성 (종전 동작) -----
+    if (!planProgram_.is_array() || planProgram_.empty()) {
+        std::vector<Pt> rest(planPts_.begin() + k, planPts_.end());
+        std::vector<char> restPaint;
+        if (planPaint_.size() == planPts_.size()) {
+            restPaint.assign(planPaint_.begin() + k, planPaint_.end());
+            restPaint[0] = 0;  // 복귀 구간(현재 위치 -> pts[k])은 칠하지 않는다
+        }
+        return buildSegments(pose_, rest, /*firstPaint=*/false,
+                             restPaint.empty() ? nullptr : &restPaint);
+    }
+
+    // ----- 재개 지점 찾기 -----
+    // "꼭짓점 k 이후를 담당하면서 꼭짓점 동작이 아닌" 첫 op. pivot을 건너뛰는
+    // 이유: 아래 복귀 주행이 이미 로봇을 "재개 방위로, 펜이 planPts_[k]에 놓이는
+    // 자리"에 세워주므로 후진/회전/재전진을 또 할 필요가 없다.
+    size_t start = planProgram_.size();
+    for (size_t i = 0; i < planProgram_.size(); ++i) {
+        const json& op = planProgram_[i];
+        if (op.value("v", -1) < (int)k) continue;
+        if (op.value("pivot", false)) continue;
+        start = i;
+        break;
+    }
+    if (start >= planProgram_.size()) {
+        logf("[WARN] 복귀 경로: program에 %zu번 꼭짓점 이후 재개할 동작이 없음", k);
+        return json::array();
+    }
+
+    // 재개 동작이 바라볼 방위. NOZZLE처럼 방위가 없는 op면 뒤에서 찾는다.
+    double heading = 1e9;
+    for (size_t i = start; i < planProgram_.size() && heading > 1e8; ++i)
+        heading = planProgram_[i].value("heading_deg", 1e9);
+    if (heading > 1e8) heading = pose_.theta * 180.0 / M_PI;
+
+    json segs = json::array();
+    segs.push_back({{"op", "NOZZLE"}, {"down", false}});
+
+    // 로봇 중심을 꼭짓점으로 (펜 오프셋 보정은 아래 MOVE +d가 담당)
+    std::vector<Pt> to{planPts_[k]};
+    std::vector<char> noPaint{0};
+    json back = buildSegments(pose_, to, /*firstPaint=*/false, &noPaint);
+    double arrival = pose_.theta * 180.0 / M_PI;
+    for (auto& s : back) {
+        if (s.value("op", "") == "MOVE") arrival = s.value("heading_deg", arrival);
+        segs.push_back(s);
+    }
+
+    double turn = normDeg(heading - arrival);
+    if (std::fabs(turn) > 2.0)
+        segs.push_back({{"op", "TURN"},
+                        {"angle_deg", std::round(turn * 10) / 10},
+                        {"heading_deg", std::round(heading * 10) / 10},
+                        {"pivot", true}});
+    if (penOffsetM_ > 0.001)
+        segs.push_back({{"op", "MOVE"},
+                        {"dist_m", std::round(penOffsetM_ * 1000) / 1000},
+                        {"paint", false},
+                        {"heading_deg", std::round(heading * 10) / 10},
+                        {"pivot", true}});
+    // 재개 지점이 곧바로 도색 MOVE면 노즐을 내려준다 (위에서 올려놨으므로).
+    // program이 NOZZLE로 시작하는 정상 경우엔 중복되지 않는다.
+    if (planProgram_[start].value("op", "") == "MOVE" &&
+        planProgram_[start].value("paint", false))
+        segs.push_back({{"op", "NOZZLE"}, {"down", true}});
+
+    for (size_t i = start; i < planProgram_.size(); ++i)
+        segs.push_back(planProgram_[i]);
+    return segs;
 }
 
 // 경로 생성/전송 실패(또는 대기) 시 Qt에 통지. reason 코드로 상황 구분.
