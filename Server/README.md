@@ -6,9 +6,9 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 
 - **TLS 릴레이**: 클라이언트가 role(QT / ROBOT / CCTV / ADMIN)로 등록하면, 메시지를 규칙에 따라 상대에게 중계
 - **로그인 / 캘리브레이션 저장**: 사용자(id/비번)별로 캘리브레이션 번들(K, D, H행렬)을 저장했다가 재로그인 시 Qt에 돌려줌
-- **경로 생성 (2단계)**: Qt 도면 + CCTV 마커로 파악한 로봇 위치를 조합해 동작 시퀀스(직진/회전)를 생성. 1단계 접근(approach) → Qt "그림그리기 시작" → 2단계 도색(draw)
-- **출발 전 정렬 / 주행 피드백**: MOVE 시작 전 READY/ALIGN/GO 핸드셰이크로 각도 미세조정, 직진 중 DRIFT로 각도 이탈 피드백
-- **이탈 감시·재계획**: 로봇이 계획 경로에서 0.3 m 이상 벗어나면 현재 위치 기준으로 경로를 다시 짜서 재전송
+- **경로 생성 (2단계)**: 1단계 접근(approach)은 **서버**가 CCTV로 파악한 로봇 위치에서 도면 시작점까지 만든다. 2단계 도색(draw)은 **Qt가 만들어 보낸 동작 시퀀스(`BLUEPRINT.program`)를 서버가 그대로 중계**한다 (2026-07-28 변경 — 꼭짓점 펜 오프셋 보정 때문. `program`이 없으면 종전대로 서버가 직접 생성)
+- **출발 전 정렬 / 주행 피드백**: MOVE 시작 전 READY/ALIGN/GO 핸드셰이크로 각도 미세조정, 직진 중 DRIFT로 각도 이탈 피드백. 단 **꼭짓점 동작(`pivot`) 구간에서는 둘 다 차단** (각도를 건드리면 펜이 꼭짓점으로 못 돌아옴)
+- **이탈 감시·재계획**: **지금 달리는 구간**에서 0.3 m 이상 벗어나면 원래 향하던 꼭짓점으로 복귀시킨다 (도면 전체 기준이면 나란한 줄 사이에서 옆줄로 튄다)
 - **하트비트**: 로봇이 10초간 무응답이면 연결 끊김으로 처리
 - **관리자 창 지원(ADMIN)**: 서버가 중계하는 모든 메시지 사본을 TAP으로 관리자 창에 전달(로그 모니터), 관리자 창에서 온 로봇 명령/캘리 결과를 처리
 
@@ -16,11 +16,9 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 
 | 문서 | 내용 |
 |---|---|
-| **[PROTOCOL.md](PROTOCOL.md)** | 통신 규격 전체 (각 팀이 봐야 할 문서) |
+| **[server_PROTOCOL.md](server_PROTOCOL.md)** | 통신 규격 전체 (각 팀이 봐야 할 문서). CCTV/Qt/로봇 연동 스펙도 여기로 통합됨 |
 | [docs/TESTING.md](docs/TESTING.md) | 서버/Qt 테스트 가이드 |
-| [docs/CCTV_CAMERA_SPEC.md](docs/CCTV_CAMERA_SPEC.md) | 카메라 앱을 서버(9000)에 직접 붙이기 위한 CCTV팀 전달용 스펙 |
-| [docs/QT_CLIENT_SPEC.md](docs/QT_CLIENT_SPEC.md) | Qt 관제 클라이언트를 서버(9000)에 붙이기 위한 Qt팀 전달용 스펙 |
-| [docs/ROBOT_INTEGRATION_TODO.md](docs/ROBOT_INTEGRATION_TODO.md) | 로봇 RPi 코드의 v0.3 프로토콜 반영 갭 리스트 (로봇팀 전달용) |
+| [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) | 로봇 주행 통합 테스트 계획 (단계 A~D, 합격 기준) |
 | [docs/REFACTOR_SUMMARY.md](docs/REFACTOR_SUMMARY.md) | graceful shutdown 개선 기록 |
 | [admin_console/PLAN.md](admin_console/PLAN.md) | 관리자 창 설계/진행 상황 |
 
@@ -29,12 +27,12 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 ```
 Server/
 ├── Makefile            빌드 스크립트
-├── PROTOCOL.md         통신 프로토콜 문서 (로봇/QT/CCTV 팀용)
+├── server_PROTOCOL.md  통신 프로토콜 문서 (로봇/QT/CCTV 팀용, 단일 창구)
 ├── start.sh            통합 실행 (관리자 창 자동 시작 + 서버 실행)
 ├── gen_cert.sh         TLS 자체서명 인증서 생성 (최초 1회)
 ├── certs/              server.crt(공개) / server.key(비밀, git 제외)
 ├── config/             users.json (서버가 자동 생성, git 제외)
-├── docs/               부속 문서 (테스트 가이드, CCTV 스펙, 리팩터 기록)
+├── docs/               부속 문서 (테스트 가이드, 주행 테스트 계획, 리팩터 기록)
 ├── src/
 │   ├── main.cpp            시작점 + 테스트용 콘솔 + graceful shutdown
 │   ├── tls_server.hpp/cpp  TLS 네트워크 층 (접속, role 등록, 세션 스레드, ADMIN tap)
@@ -122,7 +120,7 @@ make
 
 테스트 계정은 `python3 tools/seed_user.py`로 만들 수 있습니다 (기본 `test`/`1234`, [docs/TESTING.md](docs/TESTING.md) §2-1).
 
-**카메라가 서버(9000)에 role=CCTV로 직접 붙게 되면** (`docs/CCTV_CAMERA_SPEC.md` 완료 후),
+**카메라가 서버(9000)에 role=CCTV로 직접 붙게 되면** ([server_PROTOCOL.md](server_PROTOCOL.md)의 CCTV 연동 규격대로 전환 후),
 web_gui의 CAM_POSE→POS 통역 다리를 꺼야 합니다 (안 끄면 카메라와 이 다리가 같은 role로
 동시에 붙으려 해 서버가 재접속을 반복시킵니다):
 
@@ -177,6 +175,8 @@ openssl s_client -connect 127.0.0.1:9000 -CAfile certs/server.crt -quiet
 
 ## 아직 러프한 부분 (팀 협의 후 확정)
 
-- BLUEPRINT `points` 포맷 — Qt팀과 확정 필요
 - POS 마커 `corners` 순서 — CCTV팀과 확정 필요
-- 이탈 임계값 0.3 m / 재계획 간격 3초 — 현장 튜닝 예정
+- 이탈 임계값 0.3 m / 재계획 간격 3초 / 커서 도달 반경 0.15 m — 현장 튜닝 예정
+  (커서 반경은 이탈 임계값보다 확실히 작아야 한다 — 너무 크면 꼭짓점 직전의 정상 주행이 오탐된다)
+- **펜 오프셋 `d`의 출처** — 지금은 Qt 설정값(기본 40 mm, 임시)을 `BLUEPRINT.pen_offset_m`으로 받는다. 기구값이므로 최종적으로 서버가 내려주는 형태가 맞는지 Qt팀과 협의 필요
+- **마커 중심 = 로봇 회전중심 가정** — 서버 pose는 마커 4코너 평균이라, ArUco 판이 회전중심 위에 있지 않으면 펜 오프셋과 별개인 또 하나의 오프셋이 생긴다. 기구팀 확인 필요
