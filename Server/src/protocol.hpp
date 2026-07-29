@@ -39,7 +39,9 @@
 //              {"op":"TURN","angle_deg":-90},            // 제자리 회전 (+: 좌회전, -: 우회전)
 //              {"op":"MOVE","dist_m":2.0,"paint":true,   // 직진 (paint: 도색 구간 표시)
 //               "heading_deg":35.0},                     // 이 직진의 목표 절대각도 (정렬용, 로봇은 무시 가능)
-//              {"op":"NOZZLE","down":true} ]}            // 노즐 내림/올림 (노즐 제어는 이 op만)
+//              {"op":"NOZZLE","down":true},               // 노즐 내림/올림 (노즐 제어는 이 op만)
+//              {"op":"ARC","dist_m":0.628,"radius_m":0.20, // 곡선(원호) 주행 (2026-07-29 추가)
+//               "angle_deg":180,"direction":"right"} ]}    // radius_m: 도면 곡선 반지름, direction: 회전 방향
 //     - 로봇은 좌표를 모르므로 경로는 동작 명령 시퀀스로 전달.
 //     - PATH가 오면 기존 경로 즉시 폐기하고 새 경로로 교체 (TCP가 순서 보장).
 //     - phase="approach": 도면 시작점까지 이동(전부 paint=false) + 첫 도색 방향으로
@@ -135,6 +137,13 @@
 //     TURN   {"angle_deg":deg, "heading_deg":deg, "v":꼭짓점idx}
 //       (양수 = 좌회전, 종전과 동일)
 //     NOZZLE {"down":bool, "v":꼭짓점idx}
+//     ARC    {"dist_m":m, "radius_m":m, "angle_deg":deg, "direction":"left"|"right",
+//             "paint":bool, "heading_deg":deg, "v":꼭짓점idx}   (2026-07-29 신설)
+//       - 곡선(원호) 주행. 알파벳 'D'/'O', 도로 곡선 표지 도색용.
+//       - dist_m = 호 길이(S = R·θ_rad), radius_m = 도면 상의 곡선 반지름(양수).
+//       - 로봇은 155mm 후방 노즐 오프셋을 자기 피타고라스 공식
+//         (R_robot = sqrt(radius_m² + 0.155²))으로 자율 보정한다 - TURN과
+//         동일하게 Qt/서버는 도면 그대로의 값만 주고 관여하지 않는다.
 //     공통 v     : 필수. 이 op가 "출발하는" 도면 꼭짓점 index.
 //       서버 buildRecovery가 "꼭짓점 k로 복귀 후 재개할 op"을 v >= k 인 첫 op으로
 //       찾으므로, 도착 꼭짓점이 아니라 출발 꼭짓점이어야 복귀 지점에서 떠나는
@@ -154,6 +163,14 @@
 //     - 서버가 program 없이 직접 만드는 경로(하위호환)에도 서버가 NOZZLE을
 //       끼워 넣는다 (path_planner.hpp withNozzleOps). 예전에는 이 경로에
 //       NOZZLE이 없어, NOZZLE만 보는 로봇은 노즐을 영영 못 내렸다.
+//     - 🔴 NOZZLE은 반드시 down/up이 번갈아 나온다 (2026-07-29 확정). 같은
+//       상태가 연속으로 두 번 오지 않는다 - down 다음은 무조건 up, up 다음은
+//       무조건 down. 예: ㄷ자로 세로 획 두 개를 그릴 때, 첫 획 끝나고 NOZZLE up
+//       한 번 -> (도색 없는 이동+회전) -> 다음 획 시작 직전 NOZZLE down 한 번.
+//       이동 구간에서 "이미 올라가 있다"고 NOZZLE up을 또 보내지 않는다.
+//       Qt program도, 서버가 만드는 폴백(withNozzleOps)도 이 규칙을 지킨다 -
+//       withNozzleOps는 애초에 상태가 실제로 바뀔 때만 op을 끼워 넣으므로
+//       자동으로 성립한다.
 //
 //     여기 없는 것: pivot 필드, 펜 보정 서브스텝(후진/전진), 속도(speed_mps/
 //     speed_dps). 전부 Qt도 서버도 모르거나 관여하지 않는 값이라 program에

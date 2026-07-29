@@ -28,6 +28,7 @@ from rp_core import (
     SNAPSHOT_PORT,
     SERVER_HOST,
     SERVER_PORT,
+    LOG_SUBJECT_JS,
 )
 
 WATCHDOG_S = 2.0
@@ -328,7 +329,7 @@ def cctv_link_loop():
 # Bridge: push completed calibration to the relay server as H_MATRIX.
 #
 # The camera reports intrinsics (CALIB_K_RESULT: fx/fy/cx/cy/dist) and the
-# pixel->world homography (CALIB_RESULT / HG_CHARUCO_RESULT / HG_SET: H, a flat
+# pixel->world homography (CALIB_RESULT / HG_SET: H, a flat
 # 9-list, row-major) at separate times. We cache the latest of each and, once an
 # H exists, send the combined {K,D,H_floor} bundle so the server persists it
 # (user_store) and relays it to Qt. See ../src/calib.hpp for the bundle format.
@@ -547,20 +548,11 @@ def print_msg(msg, last_seq):
         else:
             broadcast(f"[hg-coord] FAILED: {msg.get('reason')}")
         return last_seq
-    if mtype == "HG_CHARUCO_ACK":
-        broadcast("[hg-charuco] 보드 대기 중 — 18개 이상 코너가 보이면 17개 피팅 + 나머지 검증")
-        return last_seq
-    if mtype == "HG_CHARUCO_PROGRESS":
-        broadcast(f"[hg-charuco] corners={msg.get('corners')}/{msg.get('need')} — 보드가 더 보이게 하세요")
-        return last_seq
-    if mtype == "HG_CHARUCO_RESULT":
-        if msg.get("ok"):
-            broadcast(f"[hg-charuco] SUCCESS fit={msg.get('fit')} validation={msg.get('validation')} "
-                      f"rmse={msg.get('rmse_mm')}mm max={msg.get('max_error_mm')}mm H={msg.get('H')}")
-            calib_cache_h(msg.get("H"))  # 서버로 H_MATRIX 전송
-        else:
-            broadcast(f"[hg-charuco] FAILED: {msg.get('reason')}")
-        return last_seq
+    # HG_CHARUCO_* (ChArUco 보드로 H 계산)는 관리자 창에서 제거했다 — 앵커 기반
+    # CALIB_START와 목적이 겹치는 두 번째 H 경로였고, 어느 쪽으로 구한 H인지가
+    # 화면에 드러나지 않아 앵커로 맞춘 H를 조용히 덮어쓸 수 있었다.
+    # 카메라의 HG_CHARUCO_START 명령 자체는 살아 있으므로, 진단이 필요하면
+    # 셸/직접 명령으로 쓸 수 있다. 여기서 받지 않으면 로그에만 남는다.
     if mtype == "CALIB_K_ACK":
         broadcast(f"[calib-K] session started target={msg.get('target')} "
                   f"board={msg.get('squares_x')}x{msg.get('squares_y')} "
@@ -1126,6 +1118,23 @@ PAGE = """<!doctype html>
             align-items:flex-start; gap:12px; flex:0 1 580px; min-width:0;
             overflow-y:auto; padding-right:4px; margin:0; }
 
+  /* 터미널(오른쪽 로그) 접기 — 헤더의 [터미널] 버튼이 토글한다. 로그를 숨기면 왼쪽
+     작업영역이 전체 폭을 쓴다. 좌표표·배치도처럼 넓게 봐야 하는 화면에서 필요하다.
+     탭 pane 을 새로 만들면 아래 선택자에도 반드시 추가할 것 — 빠지면 그 탭만
+     접기가 안 먹는다. */
+  #content.log-collapsed > #main { display:none; }
+  #content.log-collapsed > #groups,
+  #content.log-collapsed > #homographyPane,
+  #content.log-collapsed > #shellPane,
+  #content.log-collapsed > #rawPane { flex:1 1 auto; }
+
+  /* 앵커·검증점 배치도(그리드): 작업영역 평면 위에 점을 드래그로 배치한다.
+     파랑=계산 앵커, 주황=검증 기준점 — 오버레이 범례와 색을 맞춘다.
+     touch-action:none 은 터치에서 드래그가 스크롤로 먹히지 않게 하려는 것. */
+  .hg-map { width:100%; max-width:520px; height:auto; display:block;
+            border:1px solid var(--line); border-radius:10px;
+            background:var(--field); touch-action:none; margin-top:4px; }
+
   /* Cards */
   .group { background:var(--card); border-radius:18px; padding:18px 20px;
            align-self:flex-start; box-shadow:var(--shadow); }
@@ -1339,6 +1348,8 @@ PAGE = """<!doctype html>
     <button type="button" id="tabShell" class="tab" onclick="showTab('shell')">셸</button>
   </div>
   <div id="cmdbox">
+    <button type="button" id="logBtn" class="helpbtn on" onclick="toggleLogPanel()"
+            title="오른쪽 로그(터미널) 패널 접기/펴기">터미널</button>
     <button type="button" id="themeBtn" class="helpbtn" onclick="toggleTheme()">테마</button>
     <button type="button" id="helpBtn" class="helpbtn" onclick="toggleHelp()">도움말</button>
     <label class="toggle"><input type="checkbox" id="hideLost"> MARKER LOST 로그 숨기기</label>
@@ -1468,55 +1479,6 @@ PAGE = """<!doctype html>
   </div>
 
   <div class="group wide">
-    <h2>검출 영역 (ROI)</h2>
-    <p class="sub">검출 비용은 화소 수에 비례합니다. 영역을 좁히면 그만큼 빨라집니다.</p>
-    <div class="row">
-      <button onclick="send('ROI_SET 0 0 0 0')">전체 화면<span class="cmd">ROI_SET 0 0 0 0</span></button>
-      <button onclick="send('ROI_SET 960 0 960 1080')">오른쪽 절반<span class="cmd">960,0 960x1080</span></button>
-      <button onclick="send('ROI_SET 0 0 960 1080')">왼쪽 절반<span class="cmd">0,0 960x1080</span></button>
-      <button onclick="send('ROI_SET ' + [roiX,roiY,roiW,roiH].map(i=>document.getElementById(i).value||0).join(' '))">직접 지정<span class="cmd">ROI_SET</span></button>
-      <label>x <input type="number" id="roiX" value="960" style="width:5em"></label>
-      <label>y <input type="number" id="roiY" value="0" style="width:5em"></label>
-      <label>w <input type="number" id="roiW" value="960" style="width:5em"></label>
-      <label>h <input type="number" id="roiH" value="1080" style="width:5em"></label>
-    </div>
-    <details class="fold panel" id="foldRoi">
-      <summary>다운스케일과 다른 점, 그리고 주의할 것</summary>
-      <div class="foldbody hint">
-        해상도를 낮추는 방식은 화소를 줄이는 대신 <b>마커도 같이 작아져</b> 못 찾을 위험이
-        생긴다. ROI는 해상도를 그대로 두고 <b>보는 범위만</b> 좁히므로 마커 크기가 유지된다.
-        카메라가 고정이고 작업 구역이 화면의 일정 자리에만 잡히기 때문에 쓸 수 있는 방법이다.<br>
-        <b>주의</b>: 마커가 이 사각형을 <b>완전히</b> 벗어나거나 걸치면 검출되지 않는다 —
-        에러가 아니라 <code>MARKER LOST</code>로 보인다. 작업 구역 둘레로 <b>마커 한 변
-        이상의 여유</b>를 두고 잡을 것.<br>
-        보고되는 코너 좌표는 <b>항상 전체 화면 기준</b>이다(카메라가 ROI 원점을 더해서 보냄).
-        따라서 호모그래피나 서버 계산은 ROI를 몰라도 된다.
-      </div>
-    </details>
-  </div>
-
-  <div class="group wide">
-    <h2>검출 파라미터 — 이진화 스캔 횟수</h2>
-    <p class="sub">검출 속도와 강건성의 트레이드오프를 실기에서 비교합니다.</p>
-    <div class="row">
-      <button onclick="send('ARUCO_SCAN 3')">3회 (기본)<span class="cmd">ARUCO_SCAN 3</span></button>
-      <button onclick="send('ARUCO_SCAN 2')">2회<span class="cmd">ARUCO_SCAN 2</span></button>
-      <button onclick="send('ARUCO_SCAN 1 ' + (document.getElementById('scanWin').value || 13))">1회<span class="cmd">ARUCO_SCAN 1</span></button>
-      <label>1회일 때 창 크기 <input type="number" id="scanWin" value="13" min="3" step="2" style="width:5em"></label>
-    </div>
-    <details class="fold panel" id="foldScan">
-      <summary>무엇을 바꾸고, 무엇을 비교해야 하나</summary>
-      <div class="foldbody hint">
-        <code>detectMarkers</code>는 창 크기를 바꿔가며 <b>화면 전체를 여러 번 이진화</b>한 뒤
-        윤곽을 찾는다. 기본값은 창 3·13·23으로 <b>3번</b> 훑는데, 이 스캔이
-        <code>proc</code>의 사실상 100%다. 횟수를 줄이면 그만큼 빨라진다.<br>
-        대가는 <b>강건성</b>이다. 창 3이나 23에서만 잡히던 마커는 13만 훑으면
-        <b>조용히 놓친다</b> — 에러가 아니라 그냥 <code>MARKER LOST</code>로 보인다.<br>
-        <b>비교할 세 가지</b>: (1) <code>det</code> 중앙값(속도) (2) 검출률(전체 프레임 중
-        <code>id=</code>가 있는 비율) (3) 마커를 <b>고정</b>해두고 잰 코너 좌표의 흔들림.
-        (2)(3)이 유지되면서 (1)만 줄면 성공이다. 화면 중앙과 가장자리에서 각각 볼 것.
-      </div>
-    </details>
     <div class="row"><button id="rawBtn" onclick="toggleRaw()">좌표 보기 시작</button>
       <span class="desc">인식된 마커의 네 꼭짓점 raw 픽셀 좌표를 실시간 표시. 검출/좌표전송엔 영향 없음(표시만).</span></div>
     <div class="row"><label class="toggle"><input type="checkbox" id="undistChk" checked onchange="toggleUndist()">
@@ -1590,27 +1552,60 @@ PAGE = """<!doctype html>
   <details class="group wide fold panel" id="foldHgAnchors" data-hg-section="compute">
     <summary>1. H 만들기 — 앵커 마커 8개 <span class="brief">권장</span></summary>
     <div class="foldbody">
-      <p class="sub">바닥 계산 anchor id 10~17이 모두 보이게 한 뒤 계산합니다. 검증 마커 id 20~23은 계산에 넣지 마세요.</p>
+      <p class="sub">등록된 계산 anchor가 <b>모두</b> 보이게 한 뒤 계산합니다. 검증 마커를 등록했다면 계산에 넣지 마세요.</p>
       <div class="tip" style="padding:11px 13px">
         <b>계산 방식</b><br>
-        1) 각 프레임에서 id 10~17의 <b>마커 중심 픽셀 좌표</b>를 찾습니다.<br>
-        2) 8개가 모두 보인 프레임 30장을 모아, ID별 픽셀 중심을 평균냅니다. 일부라도 안 보인 프레임은 버립니다.<br>
-        3) 평균 픽셀 좌표와 해당 ID에 등록된 <b>실측 바닥 좌표(mm)</b>를 8쌍으로 대응시켜, <code>픽셀 → mm</code> 3×3 H를 RANSAC(20 px 임계값)으로 계산합니다.<br>
-        4) 8점 중 최소 6점이 일치점이어야 성공하며, 최대 300프레임(약 60초) 안에 30장을 못 모으면 실패합니다.<br>
-        아래는 카메라의 기본 설정값입니다. 8개 슬롯의 마커 ID와 X/Y를 현장 배치에 맞게 바꿀 수 있으며, ID는 서로 달라야 합니다.
+        1) 각 프레임에서 등록된 앵커 id의 <b>마커 중심 픽셀 좌표</b>를 찾습니다.<br>
+        2) 앵커가 <b>하나도 빠짐없이</b> 보인 프레임 30장을 모아, ID별 픽셀 중심을 평균냅니다. 일부라도 안 보인 프레임은 버립니다.<br>
+        3) 평균 픽셀 좌표와 해당 ID에 등록된 <b>실측 바닥 좌표(mm)</b>를 대응시켜, <code>픽셀 → mm</code> 3×3 H를 RANSAC(20 px 임계값)으로 계산합니다.<br>
+        4) 최대 300프레임(약 60초) 안에 30장을 못 모으면 실패합니다.<br>
+        앵커는 <b>4~16개</b>를 등록할 수 있습니다. 위 프리셋으로 채우거나 표에서 직접 고치세요 — ID는 서로 달라야 합니다.
       </div>
+      <div class="qbox"><div class="qtitle">배치 프리셋 — 폼보드 배치를 고르면 표가 채워집니다</div>
+        <div class="row">
+          <label class="kparam" style="width:auto">배치
+            <select id="hgPreset" style="min-width:230px">
+              <option value="">— 직접 입력 —</option>
+              <option value="1x1">폼보드 1장 (900×600) — 앵커 4</option>
+              <option value="2x2">폼보드 2×2 (1800×1200) — 앵커 16</option>
+            </select></label>
+          <button type="button" onclick="applyHgPreset()">표에 채우기</button>
+          <span id="hgPresetStatus" class="desc"></span>
+        </div>
+        <div class="hint">
+          <b>채우기만 하고 전송하지 않습니다.</b> 값을 확인한 뒤 아래 <b>[입력값 모두 적용]</b>을
+          눌러야 카메라에 반영됩니다.<br>
+          좌표는 실측 기준입니다 — 다이소 폼보드 900×600 mm에 마커(검정 100 / 흰색 포함 120 mm)를
+          네 모서리에 딱 맞게 붙이면, 호모그래피가 쓰는 <b>검정 사각형 중심</b>은 판 모서리에서
+          <b>흰색/2 = 60 mm</b> 안쪽에 온다. 가운데가 120 mm로 붙는 건 인접한 두 판이 각각
+          60 mm씩이라 60+60.<br>
+          <b>ID는 역할이 아니라 위치가 정한다</b>: <code>id = 행 × 전체열수 + 열</code>,
+          행 0 = 아래, 열 0 = 왼쪽.
+        </div>
+      </div>
+
+      <div class="qbox"><div class="qtitle">배치도 — 점을 드래그해서 바닥 좌표를 정합니다</div>
+        <svg class="hg-map" viewBox="0 0 480 360" role="img"
+             aria-label="앵커·검증 기준점 배치도"></svg>
+        <div class="hint"><span style="color:#3b82f6;font-weight:600">● 앵커(계산)</span> ·
+          <span style="color:#f59e0b;font-weight:600">● 검증 기준점</span> —
+          점을 끌어 옮기면 <b>아래 표</b>의 X/Y(mm)가 실시간으로 바뀝니다. 표에 숫자를 직접
+          입력해도 배치도에 반영됩니다. <b>세로축은 위가 +Y</b>입니다(월드 좌표계와 동일).
+          드래그는 1 mm 단위이며, 옮긴 뒤 <b>[입력값 모두 적용]</b>을 눌러야 카메라에 반영됩니다.</div>
+      </div>
+
       <div class="qbox"><div class="qtitle">앵커 바닥 좌표 편집 (X, Y mm)</div>
         <div id="hgAnchorRows"></div>
         <div class="row"><button type="button" onclick="addHgAnchorRow()">앵커 추가</button>
           <button type="button" onclick="queryHgAnchors()">현재 값 조회<span class="cmd">ANCHOR_QUERY</span></button>
-          <button type="button" onclick="applyHgAnchors()">입력값 모두 적용<span class="cmd">ANCHOR_SET_SLOT × 8</span></button></div>
+          <button type="button" onclick="applyHgAnchors()">입력값 모두 적용<span class="cmd">ANCHOR_SET_ALL</span></button></div>
         <div class="hint">카메라에 즉시 적용됩니다. 캘리브레이션 중에는 수정할 수 없으며, ID/X/Y 자체는 카메라 재시작 뒤 기본값으로 돌아갑니다. H 계산 결과는 별도의 <b>현재 H 저장</b>으로 보존하세요.</div>
         <div id="hgAnchorEditStatus" class="hint"></div>
       </div>
       <div class="cmdflow">
-        <div class="row go"><button id="hgCalibStartBtn" onclick="send('CALIB_START')">앵커 8개로 H 계산<span class="cmd">CALIB_START</span></button></div>
+        <div class="row go"><button id="hgCalibStartBtn" onclick="send('CALIB_START')">앵커로 H 계산<span class="cmd">CALIB_START</span></button></div>
       </div>
-      <div id="hgStatus" class="qbox"><span class="none">캘리브 시작으로 계산 anchor 8점 호모그래피를 계산하세요</span></div>
+      <div id="hgStatus" class="qbox"><span class="none">캘리브 시작으로 등록 앵커(최소 4점)로 호모그래피를 계산하세요</span></div>
     </div>
   </details>
 
@@ -1632,7 +1627,7 @@ PAGE = """<!doctype html>
   </div>
 
   <div class="group wide" data-hg-section="validate">
-    <h2>등록 기준점 검증 — id 20~23</h2>
+    <h2>등록 기준점 검증</h2>
     <div>
       <p class="sub">이 목록의 마커는 H 계산에 넣지 않고, 실측 등록 좌표와 결과를 비교합니다.</p>
       <div class="qbox"><div class="qtitle">검증 기준점 편집 (ID / X, Y mm)</div>
@@ -1654,7 +1649,7 @@ PAGE = """<!doctype html>
     <p class="sub">기준영상 1장 위에 anchor 작업영역과 실시간 마커를 겹쳐 그립니다.</p>
     <div class="cmdflow">
       <div class="row go"><button onclick="hgSnapshot()">기준영상 스냅샷<span class="cmd">HG_SNAPSHOT</span></button>
-        <span class="desc">카메라가 현재 프레임 1장을 JPEG로 보내 배경으로 깝니다. 계산 anchor(id 10~17)가 다 보일 때 누르세요.</span></div>
+        <span class="desc">카메라가 현재 프레임 1장을 JPEG로 보내 배경으로 깝니다. 등록된 계산 anchor가 다 보일 때 누르세요.</span></div>
       <div class="row"><button id="hgOverlayBtn" onclick="toggleHgOverlay()">오버레이 보기 시작</button>
         <span class="desc">실시간 마커 사각형·중심·id·월드좌표와 anchor 작업영역(내부 초록/외부 빨강)을 배경 위에 그립니다.</span></div>
     </div>
@@ -1670,15 +1665,6 @@ PAGE = """<!doctype html>
       <p class="sub">검증 결과가 만족스러울 때만 현재 적용 H를 저장하세요. 저장 전에도 H는 즉시 좌표 변환에 사용됩니다.</p>
       <div class="row go"><button onclick="send('HG_SAVE')">현재 H 저장<span class="cmd">HG_SAVE</span></button>
         <span class="desc">카메라 /mnt(PERSIST_DIR)에 기록합니다. 저장해야 재부팅 뒤에도 유지됩니다.</span></div>
-    </div>
-  </details>
-
-  <details class="group wide fold panel" id="foldHgCharuco" data-hg-section="compute">
-    <summary>대체 방식 — ChArUco 보드로 H 계산 및 검증</summary>
-    <div class="foldbody">
-      보드를 바닥에 평평하게 고정한 뒤 실행합니다. 현재 ChArUco 보드 규격의 코너 좌표(mm)로 17점을 피팅하고, 나머지 검출 코너로 독립 검증합니다. <b>성공하면 계산된 H가 즉시 현재 H로 적용됩니다.</b>
-      <div class="row go"><button onclick="send('HG_CHARUCO_START')">ChArUco 17점 H 계산<span class="cmd">HG_CHARUCO_START</span></button></div>
-      <div id="hgCharucoStatus" class="qbox"><span class="none">최소 18개 코너가 필요합니다.</span></div>
     </div>
   </details>
 
@@ -1787,6 +1773,7 @@ PAGE = """<!doctype html>
 </div>
 </div>
 <script>
+__LOG_SUBJECT_JS__
 function send(cmd) {
   return fetch('/cmd', {method:'POST', body: cmd});
 }
@@ -2050,6 +2037,19 @@ if (localStorage.getItem('showHelp') === '1') {
   document.getElementById('helpBtn').classList.add('on');
 }
 
+// 터미널(오른쪽 로그) 패널 토글: 접으면 왼쪽 작업영역이 전체 폭을 차지한다.
+// 버튼 .on = 패널 보이는 상태(기본). 상태는 localStorage에 저장해 새로고침에도 유지.
+// 로그 자체는 계속 흐른다 — 화면에서 감출 뿐이라 펼치면 그동안의 내용이 그대로 있다.
+function toggleLogPanel() {
+  const collapsed = document.getElementById('content').classList.toggle('log-collapsed');
+  document.getElementById('logBtn').classList.toggle('on', !collapsed);
+  localStorage.setItem('logCollapsed', collapsed ? '1' : '0');
+}
+if (localStorage.getItem('logCollapsed') === '1') {
+  document.getElementById('content').classList.add('log-collapsed');
+  document.getElementById('logBtn').classList.remove('on');
+}
+
 function toggleRaw() {
   rawOn = !rawOn;
   rawBtn.textContent = rawOn ? '좌표 보기 정지' : '좌표 보기 시작';
@@ -2305,12 +2305,13 @@ function renderHgAnchorRows(anchors) {
   let html = '<table><tr><td>ID</td><td>X mm</td><td>Y mm</td></tr>';
   for (let slot = 0; slot < list.length; slot++) {
     const a = list[slot];
-    html += `<tr><td><input id="hgAnchorId${slot}" type="number" min="0" step="1" value="${Number(a.id)}" style="width:58px"></td>` +
-      `<td><input id="hgAnchorX${slot}" type="number" step="0.1" value="${Number(a.wx)}" style="width:92px"></td>` +
-      `<td><input id="hgAnchorY${slot}" type="number" step="0.1" value="${Number(a.wy)}" style="width:92px"></td>` +
+    html += `<tr><td><input id="hgAnchorId${slot}" type="number" min="0" step="1" value="${Number(a.id)}" style="width:58px" oninput="syncHgTablesToMap()"></td>` +
+      `<td><input id="hgAnchorX${slot}" type="number" step="0.1" value="${Number(a.wx)}" style="width:92px" oninput="syncHgTablesToMap()"></td>` +
+      `<td><input id="hgAnchorY${slot}" type="number" step="0.1" value="${Number(a.wy)}" style="width:92px" oninput="syncHgTablesToMap()"></td>` +
       `<td><button type="button" onclick="removeHgAnchorRow(${slot})">삭제</button></td></tr>`;
   }
   hgAnchorRows.innerHTML = html + '</table>';
+  renderHgLayoutMap();
   const b = document.getElementById('hgCalibStartBtn');
   if (b) b.innerHTML = `앵커 ${list.length}개로 H 계산<span class="cmd">CALIB_START</span>`;
 }
@@ -2336,6 +2337,65 @@ function removeHgAnchorRow(slot) {
   if (hgAnchorEntries.length <= 4) { hgAnchorEditStatus.textContent = '호모그래피 계산에는 앵커가 최소 4개 필요합니다.'; return; }
   hgAnchorEntries.splice(slot, 1); renderHgAnchorRows();
 }
+// 배치 프리셋. 좌표는 실측이며 ID는 위치가 정한다 (id = 행 × 전체열수 + 열,
+// 행 0 = 아래, 열 0 = 왼쪽). 폼보드 nc×nr 이면 마커 격자는 2nc × 2nr.
+//
+// 마커 중심이 판 모서리에서 60 mm 안쪽인 이유: 마커를 네 모서리에 딱 맞게(흰 테두리
+// 바깥이 모서리에 정렬) 붙이는데, 호모그래피가 쓰는 기준은 검정 사각형 중심이라
+// 흰색/2 = 60 mm 만큼 들어온다. 가운데 열·행이 120 mm 간격인 것도 같은 이유로
+// 인접 판이 각각 60 mm씩이라 60+60 이다.
+const HG_PRESETS = {
+  '1x1': {
+    label: '폼보드 1장 (900×600)',
+    anchors: [
+      {id: 0, wx: 60, wy: 60}, {id: 1, wx: 840, wy: 60},
+      {id: 2, wx: 60, wy: 540}, {id: 3, wx: 840, wy: 540},
+    ],
+    validation: [],
+  },
+  '2x2': {
+    // 16점 전량을 앵커로 쓴다. 가운데 4점(5·6·9·10)은 영상 중앙부라 렌즈 왜곡 잔차가
+    // 가장 크게 드러나는 위치이므로, 피팅에 넣어야 화면 중앙 정확도가 올라간다.
+    // 그 대신 피팅 밖 검증점이 없어지므로, 일반화 오차가 필요하면 앵커를 일부만
+    // 남긴 hold-out 을 따로 돌려야 한다.
+    label: '폼보드 2×2 (1800×1200)',
+    anchors: [
+      {id: 0,  wx: 60,   wy: 60},   {id: 1,  wx: 840,  wy: 60},
+      {id: 2,  wx: 960,  wy: 60},   {id: 3,  wx: 1740, wy: 60},
+      {id: 4,  wx: 60,   wy: 540},  {id: 5,  wx: 840,  wy: 540},
+      {id: 6,  wx: 960,  wy: 540},  {id: 7,  wx: 1740, wy: 540},
+      {id: 8,  wx: 60,   wy: 660},  {id: 9,  wx: 840,  wy: 660},
+      {id: 10, wx: 960,  wy: 660},  {id: 11, wx: 1740, wy: 660},
+      {id: 12, wx: 60,   wy: 1140}, {id: 13, wx: 840,  wy: 1140},
+      {id: 14, wx: 960,  wy: 1140}, {id: 15, wx: 1740, wy: 1140},
+    ],
+    validation: [],
+  },
+};
+
+// 표를 채우기만 한다. 카메라로는 아무것도 보내지 않는다 — 조작자가 눈으로 확인한 뒤
+// [입력값 모두 적용]을 눌러야 반영된다. 잘못된 배치를 고른 채 자동 전송되면 다음
+// CALIB_START 가 조용히 엉뚱한 좌표로 피팅한다.
+function applyHgPreset() {
+  const key = document.getElementById('hgPreset').value;
+  const st = document.getElementById('hgPresetStatus');
+  const p = HG_PRESETS[key];
+  if (!p) { if (st) st.textContent = '배치를 고르세요.'; return; }
+
+  // 두 배열을 먼저 다 바꾼 뒤 그린다. 렌더 함수들은 목록이 비면 조기 반환하면서
+  // 배치도 갱신도 건너뛰므로, 배치도는 마지막에 한 번 직접 다시 그린다 —
+  // 그러지 않으면 검증점을 비우는 프리셋에서 옛 주황 점이 그림에 남는다.
+  hgAnchorEntries = p.anchors.map(a => ({...a}));
+  hgValidationEntries = p.validation.map(a => ({...a}));
+  renderHgAnchorRows();
+  renderHgValidationRows();
+  renderHgLayoutMap();
+
+  if (st) st.innerHTML =
+    `<b>${p.label}</b> — 앵커 ${p.anchors.length} / 검증 ${p.validation.length}. ` +
+    '표만 채웠습니다. <b>[입력값 모두 적용]</b>을 눌러야 카메라에 반영됩니다.';
+}
+
 function applyHgAnchors() {
   const values = readHgAnchorRows();
   for (const a of values) {
@@ -2345,15 +2405,22 @@ function applyHgAnchors() {
       return;
     }
   }
+  if (values.length < 4 || values.length > 16) {
+    hgAnchorEditStatus.textContent = `앵커는 4~16개여야 합니다 (현재 ${values.length}개).`;
+    return;
+  }
   if (new Set(values.map(a => a.id)).size !== values.length) {
-    hgAnchorEditStatus.textContent = '앵커 ID 8개는 모두 달라야 합니다.';
+    hgAnchorEditStatus.textContent = '앵커 ID는 모두 달라야 합니다.';
     return;
   }
   if (!confirm(`입력한 ${values.length}개 앵커를 카메라에 적용할까요? 진행 중인 앵커 캘리브레이션은 먼저 끝내야 합니다.`)) return;
   hgAnchorEntries = values;
-  hgAnchorEditStatus.textContent = '8개 앵커 좌표를 카메라에 적용하는 중…';
-  // The camera answers each command with its complete authoritative table.
-  values.forEach((a, i) => setTimeout(() => send(`ANCHOR_SET_SLOT ${a.slot} ${a.id} ${a.wx} ${a.wy}`), i * 120));
+  hgAnchorEditStatus.textContent = `${values.length}개 앵커 좌표를 카메라에 적용하는 중…`;
+  // ANCHOR_SET_ALL 로 한 번에 교체한다. 슬롯 단위(ANCHOR_SET_SLOT)는 0..7 여덟 칸
+  // 고정이라 16점 배치를 넣을 수 없고, 여러 명령으로 쪼개면 중간에 하나가 실패했을 때
+  // 표와 카메라가 어긋난 채로 남는다 - 그 상태로 CALIB_START 하면 조용히 틀린 H가 나온다.
+  // 카메라는 이 명령 하나에 대해 완성된 앵커 표를 되돌려준다.
+  send('ANCHOR_SET_ALL ' + values.map(a => `${a.id} ${a.wx} ${a.wy}`).join(' '));
 }
 function handleHgAnchors(line) {
   const m = line.match(/^\\[calib\\] ANCHORS (\\[.*\\])$/);
@@ -2382,12 +2449,13 @@ function renderHgValidationRows() {
   }
   let html = '<table><tr><td>ID</td><td>X mm</td><td>Y mm</td><td></td></tr>';
   hgValidationEntries.forEach((a, i) => {
-    html += `<tr><td><input id="hgValId${i}" type="number" min="0" step="1" value="${Number(a.id)}" style="width:58px"></td>` +
-      `<td><input id="hgValX${i}" type="number" step="0.1" value="${Number(a.wx)}" style="width:92px"></td>` +
-      `<td><input id="hgValY${i}" type="number" step="0.1" value="${Number(a.wy)}" style="width:92px"></td>` +
+    html += `<tr><td><input id="hgValId${i}" type="number" min="0" step="1" value="${Number(a.id)}" style="width:58px" oninput="syncHgTablesToMap()"></td>` +
+      `<td><input id="hgValX${i}" type="number" step="0.1" value="${Number(a.wx)}" style="width:92px" oninput="syncHgTablesToMap()"></td>` +
+      `<td><input id="hgValY${i}" type="number" step="0.1" value="${Number(a.wy)}" style="width:92px" oninput="syncHgTablesToMap()"></td>` +
       `<td><button type="button" onclick="removeHgValidationRow(${i})">삭제</button></td></tr>`;
   });
   hgValidationRows.innerHTML = html + '</table>';
+  renderHgLayoutMap();
 }
 function readHgValidationRows() {
   return hgValidationEntries.map((_, i) => ({
@@ -2449,6 +2517,123 @@ function handleHgValidationConfig(line) {
   } catch (_) { /* keep editable values on a malformed reply */ }
 }
 renderHgValidationRows();
+
+// ===== 앵커·검증점 배치도 (드래그로 바닥 좌표 편집) =====
+// hgAnchorEntries(파랑)·hgValidationEntries(주황)를 하나의 작업영역 평면에 그린다.
+// 점을 끌면 해당 항목의 wx/wy와 표 입력값이 함께 갱신되고, 표를 직접 고치면
+// oninput→syncHgTablesToMap로 배치도가 다시 그려진다.
+//
+// 표의 숫자만으로는 배치가 맞는지 알 수 없다 — 폼보드를 뒤집어 깔았거나 두 판의
+// 좌우가 바뀌었을 때, 좌표는 그럴듯한데 실제 바닥과 어긋난다. 그림으로 보면 바로 잡힌다.
+const HG_VBW = 480, HG_VBH = 360, HG_MARGIN = 40;
+let hgDragBounds = null;   // 드래그 중에는 축척을 고정해 지도가 출렁이지 않게 한다
+let hgDrag = null;         // {svg, kind:'a'|'v', idx}
+
+function hgNiceStep(range) {
+  const raw = Math.max(range, 1) / 5;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const n = raw / mag;
+  return (n < 1.5 ? 1 : n < 3 ? 2 : n < 7 ? 5 : 10) * mag;
+}
+function hgMapBounds() {
+  const pts = hgAnchorEntries.concat(hgValidationEntries);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    minX = Math.min(minX, p.wx); maxX = Math.max(maxX, p.wx);
+    minY = Math.min(minY, p.wy); maxY = Math.max(maxY, p.wy);
+  }
+  if (!isFinite(minX)) { minX = 0; maxX = 1000; minY = 0; maxY = 1000; }
+  if (minX === maxX) { minX -= 500; maxX += 500; }
+  if (minY === maxY) { minY -= 500; maxY += 500; }
+  const padX = (maxX - minX) * 0.12, padY = (maxY - minY) * 0.12;
+  return {minX: minX - padX, maxX: maxX + padX, minY: minY - padY, maxY: maxY + padY};
+}
+// 월드 mm -> SVG 좌표. y를 뒤집는다: 월드는 위가 +Y, 화면은 아래가 +y.
+function hgW2S(wx, wy, b) {
+  return [
+    HG_MARGIN + (wx - b.minX) / (b.maxX - b.minX) * (HG_VBW - 2 * HG_MARGIN),
+    (HG_VBH - HG_MARGIN) - (wy - b.minY) / (b.maxY - b.minY) * (HG_VBH - 2 * HG_MARGIN),
+  ];
+}
+function hgS2W(sx, sy, b) {
+  return [
+    b.minX + (sx - HG_MARGIN) / (HG_VBW - 2 * HG_MARGIN) * (b.maxX - b.minX),
+    b.minY + ((HG_VBH - HG_MARGIN) - sy) / (HG_VBH - 2 * HG_MARGIN) * (b.maxY - b.minY),
+  ];
+}
+function renderHgLayoutMap() {
+  if (!window.__hgMapReady) return;   // 배열 초기화 전 렌더 방지 (TDZ 회피)
+  const maps = document.querySelectorAll('.hg-map');
+  if (!maps.length) return;
+  const b = hgDragBounds || hgMapBounds();
+  let g = '';
+  const stepX = hgNiceStep(b.maxX - b.minX), stepY = hgNiceStep(b.maxY - b.minY);
+  for (let x = Math.ceil(b.minX / stepX) * stepX; x <= b.maxX; x += stepX) {
+    const top = hgW2S(x, b.maxY, b), bot = hgW2S(x, b.minY, b);
+    g += `<line x1="${bot[0].toFixed(1)}" y1="${bot[1].toFixed(1)}" x2="${top[0].toFixed(1)}" y2="${top[1].toFixed(1)}" stroke="#8888" stroke-width="0.5"/>`;
+    g += `<text x="${bot[0].toFixed(1)}" y="${(HG_VBH - HG_MARGIN + 14).toFixed(1)}" font-size="9" fill="#999" text-anchor="middle">${Math.round(x)}</text>`;
+  }
+  for (let y = Math.ceil(b.minY / stepY) * stepY; y <= b.maxY; y += stepY) {
+    const l = hgW2S(b.minX, y, b), r = hgW2S(b.maxX, y, b);
+    g += `<line x1="${l[0].toFixed(1)}" y1="${l[1].toFixed(1)}" x2="${r[0].toFixed(1)}" y2="${r[1].toFixed(1)}" stroke="#8888" stroke-width="0.5"/>`;
+    g += `<text x="${(HG_MARGIN - 6).toFixed(1)}" y="${(l[1] + 3).toFixed(1)}" font-size="9" fill="#999" text-anchor="end">${Math.round(y)}</text>`;
+  }
+  if (hgAnchorEntries.length >= 3) {
+    const poly = hgAnchorEntries.map(a => hgW2S(a.wx, a.wy, b).map(v => v.toFixed(1)).join(',')).join(' ');
+    g += `<polygon points="${poly}" fill="rgba(59,130,246,0.08)" stroke="rgba(59,130,246,0.5)" stroke-width="1"/>`;
+  }
+  const dot = (a, i, kind, r, fill, fs) => {
+    const [px, py] = hgW2S(a.wx, a.wy, b);
+    return `<g class="hg-pt" data-kind="${kind}" data-idx="${i}" style="cursor:grab">` +
+      `<circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="${r}" fill="${fill}" stroke="#fff" stroke-width="1.5"/>` +
+      `<text x="${px.toFixed(1)}" y="${(py + 3).toFixed(1)}" font-size="${fs}" font-weight="700" fill="#fff" text-anchor="middle" pointer-events="none">${a.id}</text></g>`;
+  };
+  hgAnchorEntries.forEach((a, i) => { g += dot(a, i, 'a', 8, '#3b82f6', 9); });
+  hgValidationEntries.forEach((a, i) => { g += dot(a, i, 'v', 7, '#f59e0b', 8.5); });
+  maps.forEach(svg => { svg.innerHTML = g; });
+}
+function syncHgTablesToMap() {
+  if (document.getElementById('hgAnchorId0')) hgAnchorEntries = readHgAnchorRows();
+  if (document.getElementById('hgValId0')) hgValidationEntries = readHgValidationRows();
+  renderHgLayoutMap();
+}
+function hgMapDown(e) {
+  const pt = e.target.closest('.hg-pt');
+  if (!pt) return;
+  e.preventDefault();
+  hgDragBounds = hgMapBounds();   // 이 드래그 동안 축척 고정
+  hgDrag = {svg: e.currentTarget, kind: pt.dataset.kind, idx: Number(pt.dataset.idx)};
+  window.addEventListener('pointermove', hgMapMove);
+  window.addEventListener('pointerup', hgMapUp);
+}
+function hgMapMove(e) {
+  if (!hgDrag) return;
+  const svg = hgDrag.svg, ctm = svg.getScreenCTM();
+  if (!ctm) return;
+  const p = svg.createSVGPoint(); p.x = e.clientX; p.y = e.clientY;
+  const loc = p.matrixTransform(ctm.inverse());
+  const w = hgS2W(loc.x, loc.y, hgDragBounds);
+  const wx = Math.round(w[0]), wy = Math.round(w[1]);
+  const arr = hgDrag.kind === 'a' ? hgAnchorEntries : hgValidationEntries;
+  const entry = arr[hgDrag.idx];
+  if (!entry) return;
+  entry.wx = wx; entry.wy = wy;
+  const pre = hgDrag.kind === 'a' ? 'hgAnchor' : 'hgVal';
+  const xi = document.getElementById(pre + 'X' + hgDrag.idx);
+  const yi = document.getElementById(pre + 'Y' + hgDrag.idx);
+  if (xi) xi.value = wx;
+  if (yi) yi.value = wy;
+  renderHgLayoutMap();
+}
+function hgMapUp() {
+  hgDrag = null; hgDragBounds = null;
+  window.removeEventListener('pointermove', hgMapMove);
+  window.removeEventListener('pointerup', hgMapUp);
+  renderHgLayoutMap();   // 드래그 종료 후 축척을 다시 맞춘다
+}
+window.__hgMapReady = true;
+document.querySelectorAll('.hg-map').forEach(svg => svg.addEventListener('pointerdown', hgMapDown));
+renderHgLayoutMap();
 
 // Marker recorder: collect every raw detection first; point selection and
 // surveyed world coordinates belong to the later PC analysis, not this UI.
@@ -2597,28 +2782,14 @@ function handleHgMatrix(line) {
 function handleHgStatus(line) {
   const box = document.getElementById('hgStatus');
   if (line.includes('[calib] camera acknowledged')) {
-    box.innerHTML = '<span class="qtitle">캘리브 진행중…</span> 계산 anchor 마커(id 10~17)가 계속 보이게 유지하세요';
-    setHgHealth('앵커 H 계산 중', 'anchor id 10~17이 계속 보이게 유지하세요.', 'busy');
+    box.innerHTML = '<span class="qtitle">캘리브 진행중…</span> 등록된 계산 anchor 마커가 <b>하나도 빠짐없이</b> 계속 보이게 유지하세요';
+    setHgHealth('앵커 H 계산 중', '등록된 anchor가 전부 계속 보이게 유지하세요.', 'busy');
   } else if (line.includes('[calib] SUCCESS')) {
     box.innerHTML = '<span class="qtitle" style="color:var(--green)">캘리브 완료</span> ' + line.replace(/^.*\\[calib\\]\\s*/, '') + ' → 이제 world 좌표가 스트리밍됩니다';
     setHgHealth('앵커 H 적용됨 · 미저장', '2단계에서 검증한 뒤 3단계에서 저장하세요.', 'ok');
   } else if (line.includes('[calib] FAILED')) {
     box.innerHTML = '<span class="qtitle" style="color:var(--red)">캘리브 실패</span> ' + line.replace(/^.*\\[calib\\]\\s*/, '');
     setHgHealth('앵커 H 계산 실패', '아래 원인을 확인하고 다시 시도하세요.', 'warn');
-  }
-}
-function handleHgCharuco(line) {
-  const box = document.getElementById('hgCharucoStatus');
-  if (!box || !line.includes('[hg-charuco]')) return;
-  if (line.includes('SUCCESS')) {
-    box.innerHTML = '<span class="qtitle" style="color:var(--green)">ChArUco H 계산 완료</span> ' + line.replace(/^.*\\[hg-charuco\\]\\s*/, '');
-    setHgHealth('ChArUco H 적용됨 · 미저장', '검증 결과를 확인한 뒤 3단계에서 저장하세요.', 'ok');
-  } else if (line.includes('FAILED')) {
-    box.innerHTML = '<span class="qtitle" style="color:var(--red)">ChArUco H 계산 실패</span> ' + line.replace(/^.*\\[hg-charuco\\]\\s*/, '');
-    setHgHealth('ChArUco H 계산 실패', '보드가 평평한지와 검출 코너 수를 확인하세요.', 'warn');
-  } else {
-    box.textContent = line.replace(/^.*\\[hg-charuco\\]\\s*/, '');
-    setHgHealth('ChArUco 보드 대기 중', '최소 18개 내부 코너가 보일 때까지 기다립니다.', 'busy');
   }
 }
 function handleHgPersistence(line) {
@@ -2720,7 +2891,7 @@ function renderHgValidation() {
             `<td>${signed(dx)}, ${signed(dy)}</td><td>${err.toFixed(1)}</td></tr>`;
   }
   if (!visible) {
-    box.innerHTML = '<span class="none">검증 마커(id 20~23)가 현재 프레임에 없습니다</span>';
+    box.innerHTML = '<span class="none">등록된 검증 마커가 현재 프레임에 없습니다</span>';
     return;
   }
   const rmse = Math.sqrt(sumSq / visible);
@@ -2882,12 +3053,14 @@ es.onmessage = (e) => {
   handleHgStatus(e.data);
   handleHgAnchors(e.data);
   handleHgValidationConfig(e.data);
-  handleHgCharuco(e.data);
   handleHgMatrix(e.data);
   handleHgPersistence(e.data);
   handleHgCoordMode(e.data);
   handleKProfiles(e.data);
   handleShell(e.data);
+  // 이 탭 로그는 카메라 위주로 - 로봇/QT 트래픽은 로봇 탭(/robot)이나
+  // 로그 모니터(/logs)에서 본다 (내부 상태 파싱은 위에서 이미 끝났으니 표시만 거른다).
+  if (logSubject(e.data) === 'robot' || logSubject(e.data) === 'qt') return;
   if (hideLost && e.data.includes('MARKER LOST')) return;
   const stick = isNearBottom();
   log.textContent += e.data + "\\n";
@@ -2923,7 +3096,7 @@ es.onmessage = (e) => {
 es.onerror = () => { log.textContent += "[SSE connection lost, retrying...]\\n"; };
 </script>
 </body>
-</html>"""
+</html>""".replace("__LOG_SUBJECT_JS__", LOG_SUBJECT_JS)
 
 
 # HTTP POST /hg_experiment/{start,stop,result} 처리 (web_gui의 Handler가 호출).

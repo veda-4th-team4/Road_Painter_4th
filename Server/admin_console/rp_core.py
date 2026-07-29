@@ -62,6 +62,37 @@ except OSError as e:  # 디스크 풀/권한 등 - 파일 로그만 포기하고
     print(f"[!] gui.log 열기 실패({e}) - 파일 로그 없이 계속합니다", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# 로그 한 줄이 로봇/카메라/QT 중 어디에 관한 것인지 추정하는 JS 조각.
+# /events는 모든 화면(카메라·로봇·로그 모니터 탭)이 공유하는 단일 스트림이라,
+# 원문 로그 줄 자체에는 발신 주체 태그가 없다([tap] 줄만 peer가 명확하고,
+# [srv]로 중계되는 서버 내부 logf 줄은 그냥 텍스트다). 그래서 키워드 기반
+# 휴리스틱으로 "위주로" 걸러줄 뿐, 완벽한 분류는 아니다 - 전체 로그가 필요하면
+# 로그 모니터 탭(/logs)을 쓴다.
+# cctv.py(카메라 탭)와 web_gui.py(로봇 탭) 양쪽에서 그대로 삽입해 쓰는 공용
+# 코드라 여기 한 곳에 둔다.
+# ---------------------------------------------------------------------------
+LOG_SUBJECT_JS = """
+const ROBOT_LOG_MARKERS = ['ROBOT','STATUS:','painting=','ESTOP','RESUME',
+  'READY(','PATH_DONE','경로 이탈','BLUEPRINT','DRAW_DONE','CALIB_START'];
+const CAMERA_LOG_MARKERS = ['CCTV','MARKER LOST','captured view','BOARD_CONFIG',
+  'session started','params updated','SUCCESS rms','COMPUTING with',
+  '[calib-K]','HG_','CALIB_K','SET_CAM_IP'];
+function logSubject(l) {
+  if (l.startsWith('[tap]')) {
+    if (l.includes('ROBOT')) return 'robot';
+    if (l.includes('QT')) return 'qt';
+    if (l.includes('CCTV')) return 'camera';
+    return 'other';
+  }
+  if (ROBOT_LOG_MARKERS.some(k => l.includes(k))) return 'robot';
+  if (l.includes('QT')) return 'qt';
+  if (CAMERA_LOG_MARKERS.some(k => l.includes(k))) return 'camera';
+  return 'other';
+}
+"""
+
+
 def broadcast(line):
     print(line, flush=True)          # 콘솔(직접 실행 시) - start.sh는 /dev/null로 보냄
     _file_log.info(line)             # gui.log (크기 상한 + 회전)

@@ -191,8 +191,8 @@ void Router::fromQt(const json& msg) {
                     reason = "op 필드 없음"; break;
                 }
                 std::string o = op.value("op", "");
-                if (o != "MOVE" && o != "TURN" && o != "NOZZLE") {
-                    reason = "지원하지 않는 op (MOVE/TURN/NOZZLE만 가능)"; break;
+                if (o != "MOVE" && o != "TURN" && o != "NOZZLE" && o != "ARC") {
+                    reason = "지원하지 않는 op (MOVE/TURN/NOZZLE/ARC만 가능)"; break;
                 }
                 if (!op.contains("v") || !op["v"].is_number_integer()) {
                     reason = "v(출발 꼭짓점 index) 없음"; break;
