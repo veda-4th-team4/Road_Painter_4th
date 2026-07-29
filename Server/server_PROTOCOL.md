@@ -727,10 +727,13 @@ DRIFT를 쏴 도색 첫 MOVE의 각도오차가 -40.4°까지 벌어지는 걸 �
   접수 확인 가능.
   🔴 **도색 구간 앞뒤에 `NOZZLE` op을 직접 넣을 것** — `MOVE.paint:true`만 두면
   노즐이 내려가지 않는다 (노즐 제어의 단일 결정권은 `NOZZLE` op, 위 "수신: PATH" 절).
-- **로봇팀**: 신규 처리 4개 — `NOZZLE {down}` op, `MOVE.dist_m` **음수 = 후진**,
-  `CMD SET_SPEED {travel_mps,paint_mps,turn_dps}`(속도는 op별이 아니라 이걸로
-  전역 설정), **`TURN` 실행 중엔 들어오는 `DRIFT`를 무시**(항상, pivot 여부와
-  무관 —애초에 pivot이 없다).
+- **로봇팀**: 신규 처리 3개 — `NOZZLE {down}` op, `MOVE.dist_m` **음수 = 후진**,
+  **`TURN` 실행 중엔 들어오는 `DRIFT`를 무시**(항상, pivot 여부와 무관 — 애초에
+  pivot이 없다).
+  📌 **속도는 프로토콜에 없다** — 주행/도색/회전 속도는 전부 **로봇 펌웨어 고정값**을
+  쓴다. op별 `speed_mps`/`speed_dps`도, 이를 바꾸는 `CMD`도 만들지 않기로 확정했다
+  (2026-07-28). 도색/이동 속도를 구분해야 하면 `MOVE.paint` 표시를 보고 로봇이
+  자기 상수 중에서 고르면 된다.
   🔴 **노즐은 `NOZZLE` op으로만 움직일 것** — `MOVE.paint`로 노즐을 제어하면 안 된다
   (`paint`는 표시용). 서버가 직접 만드는 하위호환 경로에도 이제 `NOZZLE`이 들어가므로
   `NOZZLE` 한 갈래만 구현하면 두 경로가 다 커버된다.
