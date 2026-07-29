@@ -193,7 +193,8 @@ int main(int argc, char **argv) {
                           int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
 
                           if (move_sub_seq == MoveSubSeq::APPROACH_ALIGN) {
-                              // Sub-step 1: Forward +15.5cm (unpainted) so rear nozzle lands on line start
+                              // Sub-step 1: Forward +15.5cm (unpainted - force nozzle UP) so rear nozzle lands on line start
+                              auto_nozzle = 0;
                               if (!path_follower.IsMovingStraight()) {
                                   path_follower.StartOffsetMove(-PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
                               }
@@ -202,7 +203,7 @@ int main(int argc, char **argv) {
                                   // Lower nozzle + 1.0s delay
                                   auto_nozzle = 1;
                                   robot_comm.SendControlNozzle(1);
-                                  std::cout << "[MAIN MOVE] Sub-step 1: Approach align (+155mm) complete -> Lowered nozzle (1.0s delay)." << std::endl;
+                                  std::cout << "[MAIN MOVE] Sub-step 1: Approach align (+155mm) complete -> Lowering nozzle (1.0s delay)..." << std::endl;
 
                                   auto start_wait = std::chrono::steady_clock::now();
                                   while (std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -214,7 +215,8 @@ int main(int argc, char **argv) {
                                   move_sub_seq = MoveSubSeq::MAIN_PAINT_MOVE;
                               }
                           } else if (move_sub_seq == MoveSubSeq::MAIN_PAINT_MOVE) {
-                              // Sub-step 2: Paint main line distance L
+                              // Sub-step 2: Paint main line distance L (force nozzle DOWN)
+                              auto_nozzle = 1;
                               if (!path_follower.IsMovingStraight()) {
                                   path_follower.StartMove(current_seg.dist_m, l_steps, r_steps);
                               }
@@ -224,7 +226,7 @@ int main(int argc, char **argv) {
                                   auto_nozzle = 0;
                                   robot_comm.SendControlNozzle(0);
                                   std::cout << "[MAIN MOVE] Sub-step 2: Main paint move (" << current_seg.dist_m 
-                                            << "m) complete -> Raised nozzle (1.0s delay)." << std::endl;
+                                            << "m) complete -> Raising nozzle (1.0s delay)..." << std::endl;
 
                                   auto start_wait = std::chrono::steady_clock::now();
                                   while (std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -236,7 +238,8 @@ int main(int argc, char **argv) {
                                   move_sub_seq = MoveSubSeq::CORNER_REVERSE;
                               }
                           } else if (move_sub_seq == MoveSubSeq::CORNER_REVERSE) {
-                              // Sub-step 3: Reverse -15.5cm (unpainted) so wheel center lands on corner vertex
+                              // Sub-step 3: Reverse -15.5cm (unpainted - force nozzle UP) so wheel center lands on corner vertex
+                              auto_nozzle = 0;
                               if (!path_follower.IsMovingStraight()) {
                                   path_follower.StartOffsetMove(PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
                               }
@@ -250,7 +253,8 @@ int main(int argc, char **argv) {
                       }
                   }
               } else if (current_seg.op == "TURN") {
-                  // Sub-step 4: In-place turn on the corner vertex
+                  // Sub-step 4: In-place turn on the corner vertex (force nozzle UP)
+                  auto_nozzle = 0;
                   Msg_Status_t status_snap{};
                   if (robot_comm.GetLatestStatus(status_snap)) {
                       int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
@@ -267,22 +271,10 @@ int main(int argc, char **argv) {
                       }
                   }
               } else if (current_seg.op == "NOZZLE") {
-                  // Protocol v0.3: NOZZLE op explicitly controls nozzle down/up state
+                  // Protocol v0.3: NOZZLE op sets intent; APPROACH_ALIGN will perform 1.0s delay during move
                   auto_nozzle = current_seg.paint ? 1 : 0;
                   robot_comm.SendControlNozzle(auto_nozzle);
-                  std::cout << "[MAIN] Executed NOZZLE op (down=" << (auto_nozzle ? "true" : "false") 
-                            << ") -> Waiting 1.0s for nozzle actuator movement..." << std::endl;
-
-                  // 1.0-second delay with active UART heartbeat so STM32 watchdog stays happy
-                  auto start_wait = std::chrono::steady_clock::now();
-                  while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - start_wait).count() < 1000) {
-                      robot_comm.SendSetSpeed(0, 0);
-                      robot_comm.SendControlNozzle(auto_nozzle);
-                      std::this_thread::sleep_for(std::chrono::milliseconds(80));
-                  }
-
-                  std::cout << "[MAIN] Nozzle movement delay complete -> Advancing segment." << std::endl;
+                  std::cout << "[MAIN] NOZZLE op set (down=" << (auto_nozzle ? "true" : "false") << ")" << std::endl;
                   path_follower.AdvanceSegment();
               }
           }
