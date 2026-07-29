@@ -47,6 +47,7 @@ Server/
 │   ├── tls_client.hpp      테스트 도구 공용 TLS 클라이언트 뼈대
 │   ├── robot_sim.cpp       ★ ROBOT+CCTV 대역 시뮬 (PATH 실행 → 결과를 POS로 되돌림, 펜 자취 계산)
 │   ├── draw_test.cpp       ★ QT 대역 (사각형 도면 + 동작 시퀀스 생성 → START_DRAW)
+│   ├── drive_test.cpp      ★ 로봇 주행 단독 (ADMIN으로 PATH 직접 중계 - 접근·CCTV·도면 없이 제자리 사각형)
 │   ├── qt_sim.cpp          Qt 대역 테스트 클라이언트 (Qt 네트워킹 나오기 전 검증용)
 │   ├── path_test.cpp       최초 1회 경로생성 테스트기 (CCTV 스냅샷 주입 → 접근 PATH 검증)
 │   ├── seed_user.py        테스트 계정 생성 (기본 test/1234 + 예시 캘리브레이션)
@@ -153,6 +154,29 @@ make sim
 이탈 복귀까지 보려면 `robot_sim`에 조향 오차를 주입하세요:
 `--drift-dps 15 --ignore-drift`. 자세한 항목은
 [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) 단계 C.
+
+### 로봇 주행만 단독으로 (CCTV·도면 없이)
+
+실제 로봇에 **접근 단계 없이** 제자리 사각형만 그리게 시킵니다. `drive_test`가
+ADMIN role로 붙어 `PATH`를 로봇에 직접 중계시키므로 CCTV도 `BLUEPRINT`도 필요
+없습니다 (서버의 경로생성·pose 판정을 아예 안 탑니다).
+
+```bash
+make drive_test
+```
+
+```bash
+./server
+```
+
+```bash
+./drive_test 127.0.0.1 --side 0.3
+```
+
+한 변 0.3 m 정사각형을 **변마다 노즐을 내렸다 올리며**(획 4개) 그립니다. 첫 시운전은
+`--no-paint`로 동선만 확인하세요. 방향은 로봇 자기 기준(PATH 수신 시점이 0도)이고,
+CCTV가 없어 서버가 정렬 판정을 못 하므로 각도 정확도는 로봇 IMU에 달려 있습니다.
+옵션·합격 기준은 [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) 단계 A-3.
 
 **카메라가 서버(9000)에 role=CCTV로 직접 붙게 되면** ([server_PROTOCOL.md](server_PROTOCOL.md)의 CCTV 연동 규격대로 전환 후),
 web_gui의 CAM_POSE→POS 통역 다리를 꺼야 합니다 (안 끄면 카메라와 이 다리가 같은 role로

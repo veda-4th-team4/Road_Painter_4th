@@ -47,6 +47,7 @@ from rp_core import (
     log_history,
     server_send,
     server_link_loop,
+    LOG_SUBJECT_JS,
     HTTP_PORT,
 )
 
@@ -240,12 +241,13 @@ __THEME_HEAD__
     <p class="hint" style="margin:14px 0 0">※ 방향 버튼을 <b>누르는 동안</b> 이동하고, <b>떼면 정지</b>합니다(STOP). 관리자 명령은 경로 실행 중이어도 차단 없이 로봇에 전달됩니다.</p>
   </div>
   <div class="card">
-    <h2>실시간 로그 (서버 tap · 내부 로그 포함)</h2>
+    <h2>실시간 로그 (로봇 관련 위주)</h2>
     <div id="log" class="console"></div>
   </div>
 </main>
 <script>
 __THEME_JS__
+__LOG_SUBJECT_JS__
 function send(c){
   fetch('/robot/cmd',{method:'POST',body:c})
     .then(r=>{if(!r.ok)add('[!] 전송 실패 (서버 미연결?) '+c);});
@@ -311,9 +313,15 @@ function updateStatus(line){
   }
 }
 const es=new EventSource('/events');
-es.onmessage=e=>{add(e.data);updateStatus(e.data);};
+es.onmessage=e=>{
+  updateStatus(e.data);  // 상태 배너는 필터와 무관하게 항상 갱신
+  // 이 탭 로그는 로봇 위주로 - 카메라 전용 트래픽은 카메라 탭이나
+  // 로그 모니터(/logs)에서 본다.
+  if(logSubject(e.data)!=='camera')add(e.data);
+};
 </script>
-</body></html>""".replace("__THEME_HEAD__", THEME_HEAD).replace("__THEME_JS__", THEME_JS))
+</body></html>""".replace("__THEME_HEAD__", THEME_HEAD).replace("__THEME_JS__", THEME_JS)
+             .replace("__LOG_SUBJECT_JS__", LOG_SUBJECT_JS))
 
 
 # Log monitor: the same /events feed, but focused on server<->client traffic

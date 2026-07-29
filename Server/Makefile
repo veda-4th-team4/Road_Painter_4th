@@ -30,6 +30,11 @@ draw_test: tools/draw_test.cpp tools/tls_client.hpp
 
 sim: robot_sim draw_test
 
+# 로봇 주행 단독 테스트기 (docs/DRIVE_TEST_PLAN.md 단계 A-3).
+# ADMIN role로 PATH를 로봇에 직접 중계 - 접근·CCTV·도면 없이 제자리 사각형만 그린다.
+drive_test: tools/drive_test.cpp tools/tls_client.hpp
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
+
 clean:
-	rm -f server qt_sim path_test robot_sim draw_test
+	rm -f server qt_sim path_test robot_sim draw_test drive_test
 .PHONY: clean sim

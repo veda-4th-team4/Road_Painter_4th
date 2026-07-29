@@ -71,8 +71,10 @@
   "segments": [
     {"op":"NOZZLE","down":true},
     {"op":"MOVE","dist_m":2.0,"paint":true,"heading_deg":35.0},
+    {"op":"NOZZLE","down":false},
     {"op":"TURN","angle_deg":-90},
-    {"op":"MOVE","dist_m":1.0,"paint":true,"heading_deg":-55.0},
+    {"op":"NOZZLE","down":true},
+    {"op":"ARC","dist_m":0.628,"radius_m":0.20,"angle_deg":180,"direction":"right","paint":true,"heading_deg":125.0},
     {"op":"NOZZLE","down":false}
   ]
 }}
@@ -84,6 +86,7 @@
 | `op: "MOVE"` | 직진. `dist_m` = 거리(m), `paint` = **이 구간이 도색 구간인지 나타내는 표시** (생략 시 `false`). ⚠️ 이 값으로 노즐을 움직이지 말 것 — 아래 참고 |
 | `op: "TURN"` | 제자리 회전. `angle_deg` **양수 = 좌회전, 음수 = 우회전** |
 | `op: "NOZZLE"` | 노즐 내림(`down:true`) / 올림(`down:false`) |
+| `op: "ARC"` | 곡선(원호) 주행 (2026-07-29 추가). `dist_m` = 호 길이(m), `radius_m` = 도면 곡선 반지름(m), `angle_deg` = 각도(도), `direction` = `"left"` \| `"right"` |
 | `heading_deg` | 그 동작 후 바라봐야 할 **절대 각도**(월드 기준) — MOVE 전부 + 접근 경로의 마지막 TURN에 실림. 정렬(READY)/주행 피드백(DRIFT) 판정 기준값. 로봇은 무시해도 됨 |
 
 - **PATH가 오면 진행 중이던 기존 경로를 즉시 폐기하고 새 경로로 교체** (서버의 이탈 감지 → 재계획 대응. 한 TCP 연결이라 순서는 보장됨)
@@ -103,6 +106,18 @@
 > - **서버가 `program` 없이 직접 만드는 경로(하위호환)에도 서버가 `NOZZLE`을 끼워
 >   넣는다** (`path_planner.hpp` `withNozzleOps`). 예전에는 이 경로에 `NOZZLE`이 하나도
 >   없어서, `NOZZLE`만 보는 로봇은 노즐을 영영 못 내렸다 (2026-07-28 수정).
+>
+> 🔴 **`NOZZLE`은 반드시 `down`/`up`이 번갈아 나온다** (2026-07-29 확정). **같은 상태가
+> 연속으로 두 번 오지 않는다** — `down` 다음은 무조건 `up`, `up` 다음은 무조건 `down`.
+>
+> 예: ㄷ자로 세로 획 두 개를 그릴 때 — 첫 획 끝나고 `NOZZLE up` 한 번 → (도색 없는
+> 이동+회전, 노즐은 계속 올라간 채) → 다음 획 시작 직전 `NOZZLE down` 한 번. **이동
+> 구간에서 "이미 올라가 있다"고 `NOZZLE up`을 또 보내지 않는다.**
+>
+> Qt `program`도, 서버가 만드는 폴백(`withNozzleOps`)도 이 규칙을 지킨다 —
+> `withNozzleOps`는 애초에 상태가 실제로 바뀔 때만 op을 끼워 넣으므로 자동으로
+> 성립한다. 로봇 실행부가 이 전제로 짜여 있다면(예: 상태 토글), 연속 `down`/`up`이
+> 오는 입력은 정의되지 않은 것으로 봐도 된다.
 
 ### 2단계 경로 실행 흐름 (approach → draw → 완료)
 
@@ -356,6 +371,11 @@ Qt 입력값 그대로, 서버는 손대지 않고 중계한다. **로봇이 그
 | | `paint` | 이 구간이 도색 구간인지 나타내는 **표시** (노즐을 움직이는 값이 아님) |
 | `TURN` | `angle_deg` | 제자리 회전. **양수 = 좌회전** (종전과 동일) |
 | `NOZZLE` | `down` | 노즐 내림(`true`) / 올림(`false`) — **노즐 제어는 이 op만** |
+| `ARC` | `dist_m` | 곡선 호의 주행 거리 (미터, $S = R \cdot \theta_{\text{rad}}$) |
+| | `radius_m` | **도면 상의 곡선 반지름** $R_{\text{paint}}$ (미터, 양수) |
+| | `angle_deg` | 회전 각도 (도 단위, 양수) |
+| | `direction` | 회전 방향 (`"left"`: 좌회전 / `"right"`: 우회전) |
+| | `paint` | 이 구간이 도색 구간인지 나타내는 **표시** (`true`/`false`) |
 | 공통 | `heading_deg` | 이 동작 후 로봇이 **바라보는** 절대 방위 |
 | 공통 | `v` | **필수.** 이 op가 *출발하는* 도면 꼭짓점 index (이탈 복귀 재개 지점 계산용) |
 
@@ -365,13 +385,17 @@ Qt 입력값 그대로, 서버는 손대지 않고 중계한다. **로봇이 그
 > Qt가 `program`을 만들 때, 도색 구간 앞에 `NOZZLE down`을 / 뒤에 `NOZZLE up`을 직접
 > 넣어야 한다. `MOVE.paint:true`만 두면 노즐이 내려가지 않는다.
 
+> 🔵 **`ARC` op 규약 (2026-07-29 신설):** 알파벳 'D', 'O', 도로 곡선 표지 도색을 위한 곡선(원호) 주행 op이다.
+> Qt와 서버는 도면 그대로의 곡선 반지름 `radius_m`($R_{\text{paint}}$)과 호 거리 `dist_m`만 전달한다.
+> 로봇은 $155\text{mm}$ 후방 노즐 오프셋을 내부 피타고라스 공식($R_{\text{robot}} = \sqrt{R_{\text{paint}}^2 + 0.155^2}$)으로 자율 보정하여 매끄럽게 호를 그린다.
+
 **역할 분담 (최종)**
 
 | | 책임 |
 |---|---|
 | Qt | 어디에서 어디까지, 칠할지 말지, 몇 m·몇 도(사용자 입력값) |
 | 서버 | Qt `program`을 그대로 중계. `d`(펜 오프셋)는 이탈 판정·복귀 목표 선정에만 사용 |
-| 로봇 | `TURN` 실행할 때 자기 하드웨어 상수 `d`로 후진/회전/전진 스스로 보정 |
+| 로봇 | `TURN` 및 `ARC` 실행할 때 자기 하드웨어 상수 `d`로 오프셋/피타고라스 반지름 스스로 보정 |
 
 > 🔵 **`program`에 없는 것: `pivot` 필드, 펜 보정 서브스텝(후진/전진), 속도
 > (`speed_mps`/`speed_dps`).** 전부 Qt도 서버도 모르거나 관여 안 하는 값이라
