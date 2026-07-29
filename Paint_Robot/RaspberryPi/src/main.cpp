@@ -51,8 +51,8 @@ int main(int argc, char **argv) {
   uint32_t ready_seg_sent = 0xFFFFFFFF; // Track last segment index READY was sent for
   bool path_done_sent = false;          // Track PATH_DONE transmission per path
 
-  enum class TurnSubSeq { CORNER_REVERSE, IN_PLACE_TURN, CORNER_ADVANCE };
-  TurnSubSeq turn_sub_seq = TurnSubSeq::CORNER_REVERSE;
+  enum class MoveSubSeq { APPROACH_ALIGN, MAIN_PAINT_MOVE, CORNER_REVERSE };
+  MoveSubSeq move_sub_seq = MoveSubSeq::APPROACH_ALIGN;
 
   bool manual_override = false;
   Msg_SetSpeed_t manual_speed = {0, 0};
@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
           waiting_for_go = false;
           ready_seg_sent = 0xFFFFFFFF;
           path_done_sent = false;  // Reset PATH_DONE tracker for new path
-          turn_sub_seq = TurnSubSeq::CORNER_REVERSE; // Reset turn sequence state for rear nozzle
+          move_sub_seq = MoveSubSeq::APPROACH_ALIGN; // Reset move offset sequence state for rear nozzle
           manual_override = false; // Reset manual override upon receiving autonomous path
           manual_nozzle = 0;
           std::string phase = net_manager.GetPathPhase();
@@ -192,53 +192,78 @@ int main(int argc, char **argv) {
                           int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
                           int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
 
-                          if (!path_follower.IsMovingStraight()) {
-                              path_follower.StartMove(current_seg.dist_m, l_steps, r_steps);
-                          }
+                          if (move_sub_seq == MoveSubSeq::APPROACH_ALIGN) {
+                              // Sub-step 1: Forward +15.5cm (unpainted) so rear nozzle lands on line start
+                              if (!path_follower.IsMovingStraight()) {
+                                  path_follower.StartOffsetMove(-PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
+                              }
+                              uint8_t dummy_nozzle = 0;
+                              if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
+                                  // Lower nozzle + 1.0s delay
+                                  auto_nozzle = 1;
+                                  robot_comm.SendControlNozzle(1);
+                                  std::cout << "[MAIN MOVE] Sub-step 1: Approach align (+155mm) complete -> Lowered nozzle (1.0s delay)." << std::endl;
 
-                          float imu_yaw = imu_manager.GetYaw();
-                          if (path_follower.UpdateMove(l_steps, r_steps, target_speed, nozzle_on, imu_yaw)) {
-                              // Move segment completed -> advance to next segment
-                              path_follower.AdvanceSegment();
+                                  auto start_wait = std::chrono::steady_clock::now();
+                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - start_wait).count() < 1000) {
+                                      robot_comm.SendSetSpeed(0, 0);
+                                      robot_comm.SendControlNozzle(1);
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                                  }
+                                  move_sub_seq = MoveSubSeq::MAIN_PAINT_MOVE;
+                              }
+                          } else if (move_sub_seq == MoveSubSeq::MAIN_PAINT_MOVE) {
+                              // Sub-step 2: Paint main line distance L
+                              if (!path_follower.IsMovingStraight()) {
+                                  path_follower.StartMove(current_seg.dist_m, l_steps, r_steps);
+                              }
+                              float imu_yaw = imu_manager.GetYaw();
+                              if (path_follower.UpdateMove(l_steps, r_steps, target_speed, nozzle_on, imu_yaw)) {
+                                  // Raise nozzle + 1.0s delay
+                                  auto_nozzle = 0;
+                                  robot_comm.SendControlNozzle(0);
+                                  std::cout << "[MAIN MOVE] Sub-step 2: Main paint move (" << current_seg.dist_m 
+                                            << "m) complete -> Raised nozzle (1.0s delay)." << std::endl;
+
+                                  auto start_wait = std::chrono::steady_clock::now();
+                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - start_wait).count() < 1000) {
+                                      robot_comm.SendSetSpeed(0, 0);
+                                      robot_comm.SendControlNozzle(0);
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                                  }
+                                  move_sub_seq = MoveSubSeq::CORNER_REVERSE;
+                              }
+                          } else if (move_sub_seq == MoveSubSeq::CORNER_REVERSE) {
+                              // Sub-step 3: Reverse -15.5cm (unpainted) so wheel center lands on corner vertex
+                              if (!path_follower.IsMovingStraight()) {
+                                  path_follower.StartOffsetMove(PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
+                              }
+                              uint8_t dummy_nozzle = 0;
+                              if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
+                                  move_sub_seq = MoveSubSeq::APPROACH_ALIGN; // Reset sub-sequence state for next MOVE
+                                  std::cout << "[MAIN MOVE] Sub-step 3: Corner reverse (-155mm) complete -> Wheel center aligned on vertex." << std::endl;
+                                  path_follower.AdvanceSegment();
+                              }
                           }
                       }
                   }
               } else if (current_seg.op == "TURN") {
-                  // "TURN" segment runs 155mm offset advance -> in-place turn -> 155mm offset reverse sequence
+                  // Sub-step 4: In-place turn on the corner vertex
                   Msg_Status_t status_snap{};
                   if (robot_comm.GetLatestStatus(status_snap)) {
                       int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
                       int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
 
-                      if (turn_sub_seq == TurnSubSeq::CORNER_REVERSE) {
-                          if (!path_follower.IsMovingStraight()) {
-                              // NOZZLE_OFFSET_M is -0.155m (reverse 155mm to bring wheel center to vertex)
-                              path_follower.StartOffsetMove(PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
-                          }
-                          uint8_t dummy_nozzle = 0;
-                          if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
-                              turn_sub_seq = TurnSubSeq::IN_PLACE_TURN;
-                              std::cout << "[MAIN TURN] Step 1: Corner reverse (-155mm) complete -> Step 2: Starting in-place turn." << std::endl;
-                          }
-                      } else if (turn_sub_seq == TurnSubSeq::IN_PLACE_TURN) {
-                          if (!path_follower.IsTurning()) {
-                              path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
-                          }
-                          if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
-                              turn_sub_seq = TurnSubSeq::CORNER_ADVANCE;
-                              std::cout << "[MAIN TURN] Step 2: In-place turn complete -> Step 3: Starting corner advance (+155mm)." << std::endl;
-                          }
-                      } else if (turn_sub_seq == TurnSubSeq::CORNER_ADVANCE) {
-                          if (!path_follower.IsMovingStraight()) {
-                              // -NOZZLE_OFFSET_M is +0.155m (advance 155mm to bring rear nozzle to next line start)
-                              path_follower.StartOffsetMove(-PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
-                          }
-                          uint8_t dummy_nozzle = 0;
-                          if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
-                              turn_sub_seq = TurnSubSeq::CORNER_REVERSE; // Reset sub-sequence state for next turn
-                              std::cout << "[MAIN TURN] Step 3: Corner advance (+155mm) complete -> Turn sequence finished." << std::endl;
-                              path_follower.AdvanceSegment();
-                          }
+                      if (!path_follower.IsTurning()) {
+                          path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
+                      }
+                      
+                      if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
+                          std::cout << "[MAIN TURN] Sub-step 4: In-place turn (" << current_seg.angle_deg 
+                                    << " deg) complete on vertex." << std::endl;
+                          path_follower.AdvanceSegment();
                       }
                   }
               } else if (current_seg.op == "NOZZLE") {
