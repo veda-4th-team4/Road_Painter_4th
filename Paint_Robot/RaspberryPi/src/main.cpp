@@ -51,6 +51,9 @@ int main(int argc, char **argv) {
   uint32_t ready_seg_sent = 0xFFFFFFFF; // Track last segment index READY was sent for
   bool path_done_sent = false;          // Track PATH_DONE transmission per path
 
+  enum class TurnSubSeq { CORNER_ADVANCE, IN_PLACE_TURN, CORNER_REVERSE };
+  TurnSubSeq turn_sub_seq = TurnSubSeq::CORNER_ADVANCE;
+
   bool manual_override = false;
   Msg_SetSpeed_t manual_speed = {0, 0};
   uint8_t manual_nozzle = 0;
@@ -108,6 +111,7 @@ int main(int argc, char **argv) {
           waiting_for_go = false;
           ready_seg_sent = 0xFFFFFFFF;
           path_done_sent = false;  // Reset PATH_DONE tracker for new path
+          turn_sub_seq = TurnSubSeq::CORNER_ADVANCE; // Reset turn sequence state
           manual_override = false; // Reset manual override upon receiving autonomous path
           manual_nozzle = 0;
           std::string phase = net_manager.GetPathPhase();
@@ -200,26 +204,58 @@ int main(int argc, char **argv) {
                       }
                   }
               } else if (current_seg.op == "TURN") {
-                  // "TURN" segment runs step-based precision turning
+                  // "TURN" segment runs 155mm offset advance -> in-place turn -> 155mm offset reverse sequence
                   Msg_Status_t status_snap{};
                   if (robot_comm.GetLatestStatus(status_snap)) {
                       int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
                       int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
 
-                      if (!path_follower.IsTurning()) {
-                          path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
-                      }
-                      
-                      if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
-                          // Turn segment completed -> advance to next segment
-                          path_follower.AdvanceSegment();
+                      if (turn_sub_seq == TurnSubSeq::CORNER_ADVANCE) {
+                          if (!path_follower.IsMovingStraight()) {
+                              path_follower.StartOffsetMove(PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
+                          }
+                          uint8_t dummy_nozzle = 0;
+                          if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
+                              turn_sub_seq = TurnSubSeq::IN_PLACE_TURN;
+                              std::cout << "[MAIN TURN] Corner advance (+155mm) complete -> Starting in-place turn." << std::endl;
+                          }
+                      } else if (turn_sub_seq == TurnSubSeq::IN_PLACE_TURN) {
+                          if (!path_follower.IsTurning()) {
+                              path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
+                          }
+                          if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
+                              turn_sub_seq = TurnSubSeq::CORNER_REVERSE;
+                              std::cout << "[MAIN TURN] In-place turn complete -> Starting corner reverse (-155mm)." << std::endl;
+                          }
+                      } else if (turn_sub_seq == TurnSubSeq::CORNER_REVERSE) {
+                          if (!path_follower.IsMovingStraight()) {
+                              path_follower.StartOffsetMove(-PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
+                          }
+                          uint8_t dummy_nozzle = 0;
+                          if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
+                              turn_sub_seq = TurnSubSeq::CORNER_ADVANCE; // Reset sub-sequence for next turn
+                              std::cout << "[MAIN TURN] Corner reverse (-155mm) complete -> Turn sequence finished." << std::endl;
+                              path_follower.AdvanceSegment();
+                          }
                       }
                   }
               } else if (current_seg.op == "NOZZLE") {
                   // Protocol v0.3: NOZZLE op explicitly controls nozzle down/up state
                   auto_nozzle = current_seg.paint ? 1 : 0;
                   robot_comm.SendControlNozzle(auto_nozzle);
-                  std::cout << "[MAIN] Executed NOZZLE op (down=" << (auto_nozzle ? "true" : "false") << ")" << std::endl;
+                  std::cout << "[MAIN] Executed NOZZLE op (down=" << (auto_nozzle ? "true" : "false") 
+                            << ") -> Waiting 1.0s for nozzle actuator movement..." << std::endl;
+
+                  // 1.0-second delay with active UART heartbeat so STM32 watchdog stays happy
+                  auto start_wait = std::chrono::steady_clock::now();
+                  while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start_wait).count() < 1000) {
+                      robot_comm.SendSetSpeed(0, 0);
+                      robot_comm.SendControlNozzle(auto_nozzle);
+                      std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                  }
+
+                  std::cout << "[MAIN] Nozzle movement delay complete -> Advancing segment." << std::endl;
                   path_follower.AdvanceSegment();
               }
           }

@@ -138,6 +138,7 @@ private:
 
     // Straight move tracking state
     bool is_moving_straight;
+    float offset_move_dist;
     uint32_t move_target_steps;
     int32_t move_start_left_steps;
     int32_t move_start_right_steps;

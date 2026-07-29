@@ -171,7 +171,8 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps, M
 
 void PathFollower::StartOffsetMove(float dist_m, int32_t start_left_steps, int32_t start_right_steps) {
     is_moving_straight = true;
-    move_target_steps = CalculateMoveSteps(dist_m);
+    offset_move_dist = dist_m;
+    move_target_steps = CalculateMoveSteps(std::abs(dist_m));
     move_start_left_steps = start_left_steps;
     move_start_right_steps = start_right_steps;
     std::cout << "[PathFollower Offset] StartOffsetMove: dist=" << dist_m 
@@ -198,7 +199,7 @@ bool PathFollower::UpdateOffsetMove(int32_t cur_left_steps, int32_t cur_right_st
     }
 
     // Determine direction (+0.05m/s forward or -0.05m/s backward)
-    float target_v = 0.05f; // 5 cm/s
+    float target_v = (offset_move_dist >= 0.0f) ? 0.05f : -0.05f;
     out_speed = velocity_to_sps(target_v, 0.0f);
     out_nozzle_on = 0; // Spray OFF during offset positioning
 
