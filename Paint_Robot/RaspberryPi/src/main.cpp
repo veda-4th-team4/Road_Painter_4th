@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
   uint32_t ready_seg_sent = 0xFFFFFFFF; // Track last segment index READY was sent for
   bool path_done_sent = false;          // Track PATH_DONE transmission per path
 
-  enum class TurnSubSeq { CORNER_ADVANCE, IN_PLACE_TURN, CORNER_REVERSE };
+  enum class TurnSubSeq { CORNER_ADVANCE, CORNER_REVERSE, IN_PLACE_TURN };
   TurnSubSeq turn_sub_seq = TurnSubSeq::CORNER_ADVANCE;
 
   bool manual_override = false;
@@ -216,16 +216,8 @@ int main(int argc, char **argv) {
                           }
                           uint8_t dummy_nozzle = 0;
                           if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
-                              turn_sub_seq = TurnSubSeq::IN_PLACE_TURN;
-                              std::cout << "[MAIN TURN] Corner advance (+155mm) complete -> Starting in-place turn." << std::endl;
-                          }
-                      } else if (turn_sub_seq == TurnSubSeq::IN_PLACE_TURN) {
-                          if (!path_follower.IsTurning()) {
-                              path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
-                          }
-                          if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
                               turn_sub_seq = TurnSubSeq::CORNER_REVERSE;
-                              std::cout << "[MAIN TURN] In-place turn complete -> Starting corner reverse (-155mm)." << std::endl;
+                              std::cout << "[MAIN TURN] Step 1: Corner advance (+155mm) complete -> Step 2: Starting corner reverse (-155mm)." << std::endl;
                           }
                       } else if (turn_sub_seq == TurnSubSeq::CORNER_REVERSE) {
                           if (!path_follower.IsMovingStraight()) {
@@ -233,8 +225,16 @@ int main(int argc, char **argv) {
                           }
                           uint8_t dummy_nozzle = 0;
                           if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
-                              turn_sub_seq = TurnSubSeq::CORNER_ADVANCE; // Reset sub-sequence for next turn
-                              std::cout << "[MAIN TURN] Corner reverse (-155mm) complete -> Turn sequence finished." << std::endl;
+                              turn_sub_seq = TurnSubSeq::IN_PLACE_TURN;
+                              std::cout << "[MAIN TURN] Step 2: Corner reverse (-155mm) complete -> Step 3: Starting in-place turn." << std::endl;
+                          }
+                      } else if (turn_sub_seq == TurnSubSeq::IN_PLACE_TURN) {
+                          if (!path_follower.IsTurning()) {
+                              path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
+                          }
+                          if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
+                              turn_sub_seq = TurnSubSeq::CORNER_ADVANCE; // Reset sub-sequence state for next turn
+                              std::cout << "[MAIN TURN] Step 3: In-place turn complete -> Turn sequence finished." << std::endl;
                               path_follower.AdvanceSegment();
                           }
                       }
