@@ -99,6 +99,38 @@ inline json buildSegments(const Pose& start, const std::vector<Pt>& pts,
     return segs;
 }
 
+// MOVE.paint가 바뀌는 자리마다 NOZZLE op을 끼워 넣는다.
+//
+// 🔴 노즐 제어의 단일 결정권은 NOZZLE op이다 (2026-07-28 확정). MOVE.paint는
+// "이 구간이 도색 구간인가"를 나타내는 표시일 뿐이고, 로봇은 그것만 보고
+// 노즐을 움직이지 않는다. 규약이 하나여야 로봇 실행부의 분기가 하나로 끝난다.
+//
+// 왜 필요한가: Qt program은 NOZZLE을 직접 넣어 보내지만, program이 없어
+// 서버가 buildSegments로 직접 만든 경로에는 NOZZLE이 하나도 없었다. 로봇이
+// NOZZLE만 보고 움직이면 그 경로에서는 노즐이 영영 안 내려간다. 그 간극을
+// 이 함수가 메운다 - buildSegments 결과를 로봇에 보내기 전에 반드시 통과시킬 것.
+//
+// startDown: 이 시퀀스가 시작될 때 노즐이 이미 내려가 있는가. 서버가 만드는
+//   경로는 전부 노즐이 올라간 상태에서 시작하므로 기본 false다.
+inline json withNozzleOps(const json& segs, bool startDown = false) {
+    json out = json::array();
+    bool down = startDown;
+    for (const auto& s : segs) {
+        if (s.value("op", "") == "MOVE") {
+            bool paint = s.value("paint", false);
+            if (paint != down) {
+                out.push_back({{"op", "NOZZLE"}, {"down", paint}});
+                down = paint;
+            }
+        }
+        out.push_back(s);
+    }
+    // 경로가 끝나면 노즐은 반드시 올려둔다 - 다음 경로(접근/복귀)가 노즐이
+    // 올라간 상태를 전제로 시작하기 때문. Qt program도 같은 규약으로 끝난다.
+    if (down) out.push_back({{"op", "NOZZLE"}, {"down", false}});
+    return out;
+}
+
 // 점 p와 선분 a-b 사이 최단 거리
 inline double pointSegDist(const Pt& p, const Pt& a, const Pt& b) {
     double vx = b[0] - a[0], vy = b[1] - a[1];
@@ -154,16 +186,34 @@ inline void advanceCursor(const Pt& p, const std::vector<Pt>& pts, size_t& cur,
     }
 }
 
+// 선분 a-b의 "끝"을 진행 방향으로 extM만큼 늘린 뒤 거리를 잰다.
+//
+// 왜 늘리냐: 도면은 펜이 지나갈 자취인데 서버가 보는 pose는 마커 중심이고,
+// 펜은 중심 뒤 d에 달려 있다. 그래서 펜이 꼭짓점 B에 정확히 닿은 순간 마커
+// 중심은 이미 B를 d만큼 지나 있다 - 정상인데 "d만큼 이탈"로 찍힌다.
+// 끝을 d만큼 늘려두면 그 상태가 오차 0이 되고, 거기서 더 간 만큼만 이탈로 센다.
+// (= "B에서 d보다 더 가면 이탈")
+inline double pointSegDistExt(const Pt& p, const Pt& a, const Pt& b,
+                              double extM) {
+    if (extM <= 0) return pointSegDist(p, a, b);
+    double vx = b[0] - a[0], vy = b[1] - a[1];
+    double len = std::hypot(vx, vy);
+    if (len < 1e-9) return pointSegDist(p, a, b);
+    Pt b2{b[0] + vx / len * extM, b[1] + vy / len * extM};
+    return pointSegDist(p, a, b2);
+}
+
 // 지금 달리고 있는 구간과의 거리 = 진짜 이탈량.
 // 커서 전진이 한 박자 늦을 수 있어 다음 구간까지만 같이 본다(꼭짓점 부근에서
 // 정상 주행이 이탈로 오탐되는 것 방지).
+// penOffsetM: 위 pointSegDistExt 참고. 0이면 종전과 동일(중심 기준 그대로).
 inline double distToActiveSegment(const Pt& p, const std::vector<Pt>& pts,
-                                  size_t cur) {
+                                  size_t cur, double penOffsetM = 0.0) {
     if (pts.empty()) return 0.0;
     if (pts.size() == 1) return std::hypot(p[0] - pts[0][0], p[1] - pts[0][1]);
     if (cur + 1 >= pts.size()) cur = pts.size() - 2;
-    double d = pointSegDist(p, pts[cur], pts[cur + 1]);
+    double d = pointSegDistExt(p, pts[cur], pts[cur + 1], penOffsetM);
     if (cur + 2 < pts.size())
-        d = std::min(d, pointSegDist(p, pts[cur + 1], pts[cur + 2]));
+        d = std::min(d, pointSegDistExt(p, pts[cur + 1], pts[cur + 2], penOffsetM));
     return d;
 }

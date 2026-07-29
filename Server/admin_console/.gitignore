@@ -19,3 +19,4 @@ homography_reference.json
 # python
 __pycache__/
 *.pyc
+*.log.*
