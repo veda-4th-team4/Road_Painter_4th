@@ -1,0 +1,269 @@
+#include "serverclient.h"
+
+#include <QJsonDocument>
+#include <QJsonArray>
+#include <QJsonValue>
+#include <QHostAddress>
+#include <QDebug>
+#include <cmath>
+
+ServerClient::ServerClient(QObject *parent)
+    : QObject(parent)
+{
+    m_socket = new QSslSocket(this);
+    // 1차 연동: 자가서명 인증서 검증 생략 (권장 방식은 server.crt 를 신뢰 CA 로 추가)
+    m_socket->setPeerVerifyMode(QSslSocket::VerifyNone);
+
+    connect(m_socket, &QSslSocket::encrypted, this, &ServerClient::onEncrypted);
+    connect(m_socket, &QSslSocket::readyRead, this, &ServerClient::onReadyRead);
+    connect(m_socket, &QSslSocket::disconnected, this, &ServerClient::onDisconnected);
+    connect(m_socket, &QSslSocket::sslErrors, this, &ServerClient::onErrors);
+    connect(m_socket, &QAbstractSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
+        emit socketError(m_socket->errorString());
+    });
+}
+
+ServerClient::~ServerClient()
+{
+    if (m_socket && m_socket->state() != QAbstractSocket::UnconnectedState) {
+        m_socket->abort();
+    }
+}
+
+void ServerClient::connectToServer()
+{
+    if (isConnected()) return;
+    m_seq = 0;
+    m_helloSent = false;
+    m_buffer.clear();
+    // 자가서명 인증서라도 우선 접속을 진행하도록 에러를 무시한다.
+    m_socket->ignoreSslErrors();
+    m_socket->connectToHostEncrypted(m_host, m_port);
+}
+
+void ServerClient::setServer(const QString &host, quint16 port)
+{
+    if (host.isEmpty()) return;
+    m_host = host;
+    m_port = port ? port : 9000;
+}
+
+void ServerClient::disconnectFromServer()
+{
+    if (m_socket) m_socket->disconnectFromHost();
+}
+
+bool ServerClient::isConnected() const
+{
+    return m_socket && m_socket->state() == QAbstractSocket::ConnectedState;
+}
+
+bool ServerClient::isEncrypted() const
+{
+    return m_socket && m_socket->isEncrypted();
+}
+
+void ServerClient::onErrors(const QList<QSslError> &errors)
+{
+    Q_UNUSED(errors);
+    // VerifyNone 이므로 계속 진행. (검증 강화 시 여기서 화이트리스트 처리)
+    m_socket->ignoreSslErrors();
+}
+
+// 접속 직후(암호화 완료) HELLO {role:"QT"} 를 1회 전송한다.
+void ServerClient::onEncrypted()
+{
+    if (!m_helloSent) {
+        QJsonObject payload; payload["role"] = "QT";
+        sendJson("HELLO", payload);
+        m_helloSent = true;
+    }
+    emit connectedToServer();
+}
+
+void ServerClient::onDisconnected()
+{
+    m_helloSent = false;
+    emit disconnectedFromServer();
+}
+
+void ServerClient::sendJson(const QString &type, const QJsonObject &payload)
+{
+    if (!m_socket || m_socket->state() != QAbstractSocket::ConnectedState) return;
+    QJsonObject root;
+    root["type"] = type;
+    root["seq"] = m_seq++;
+    root["payload"] = payload;
+    QByteArray line = QJsonDocument(root).toJson(QJsonDocument::Compact);
+    line.append('\n'); // JSON Lines 프레이밍
+    m_socket->write(line);
+    m_socket->flush();
+}
+
+void ServerClient::sendLogin(const QString &id, const QString &pw)
+{
+    QJsonObject p; p["id"] = id; p["pw"] = pw;
+    sendJson("LOGIN", p);
+}
+
+// cam_ip 는 선택. 서버는 검증 없이 저장만 하고 LOGIN_OK 로 그대로 돌려준다.
+void ServerClient::sendRegister(const QString &id, const QString &pw, const QString &camIp)
+{
+    QJsonObject p; p["id"] = id; p["pw"] = pw;
+    if (!camIp.trimmed().isEmpty())
+        p["cam_ip"] = camIp.trimmed();
+    sendJson("REGISTER", p);
+}
+
+// 바닥 평면 미터 좌표 폴리라인 → BLUEPRINT. (서버는 재변환하지 않음)
+void ServerClient::sendBlueprint(const QList<QPointF> &meterPoints,
+                                 const QList<bool> &paint,
+                                 const QList<motionprogram::Op> &program)
+{
+    QJsonArray pts;
+    for (const QPointF &p : meterPoints) {
+        QJsonArray pair;
+        pair.append(p.x());
+        pair.append(p.y());
+        pts.append(pair);
+    }
+    QJsonObject p; p["points"] = pts;
+    // paint 는 points 와 길이가 같을 때만 싣는다 — 어긋난 배열을 보내면 서버가
+    // 도면 전체를 버리므로(bad_points) 애매한 값은 아예 빼는 편이 안전하다.
+    if (paint.size() == meterPoints.size() && !paint.isEmpty()) {
+        QJsonArray flags;
+        for (bool b : paint) flags.append(b);
+        p["paint"] = flags;
+    }
+    // 동작 시퀀스 — 서버는 이걸 로봇에 그대로 중계하고, CCTV 보정만 담당한다.
+    //
+    // ⚠️ 프로토콜에 **없는 필드는 절대 싣지 않는다** (v0.3 §program op 규약):
+    //    · pen_offset_m — 2026-07-28 폐지. 펜 오프셋 보정은 로봇 전담.
+    //    · pivot        — 폐지. program 은 도면 그대로의 논리 동작만.
+    //    · speed_mps / speed_dps — "속도는 프로토콜에 없다"(로봇 펌웨어 고정값).
+    //      Op::speed 는 화면 미리보기·예상시간 계산용 로컬 값으로만 남는다.
+    if (!program.isEmpty()) {
+        QJsonArray ops;
+        for (const motionprogram::Op &o : program) {
+            QJsonObject j;
+            j["op"] = o.opName();
+            j["v"] = o.vertex;                 // 필수 — 없으면 서버가 program 전체를 거부
+            // heading_deg 는 공통 필드다: "이 동작 후 로봇이 **바라보는** 절대 방위"
+            j["heading_deg"] = std::round(o.heading * 10.0) / 10.0;
+            switch (o.kind) {
+            case motionprogram::Op::Move:
+                j["dist_m"] = std::round(o.dist * 10000.0) / 10000.0;  // 음수 = 후진
+                j["paint"] = o.paint;                                   // 표시용
+                break;
+            case motionprogram::Op::Turn:
+                j["angle_deg"] = std::round(o.angle * 10.0) / 10.0;     // 양수 = 좌회전
+                break;
+            case motionprogram::Op::Arc:
+                j["dist_m"]    = std::round(o.dist * 10000.0) / 10000.0;   // 호 길이 S=R·θ
+                j["radius_m"]  = std::round(o.radius * 10000.0) / 10000.0; // 도면상 반지름
+                j["angle_deg"] = std::round(o.angle * 10.0) / 10.0;        // 양수
+                j["direction"] = o.arcDirection();                         // left / right
+                j["paint"]     = o.paint;                                  // 표시용
+                break;
+            case motionprogram::Op::Nozzle:
+                j["down"] = o.down;            // 노즐 제어의 유일한 수단
+                break;
+            }
+            ops.append(j);
+        }
+        p["program"] = ops;
+    }
+    sendJson("BLUEPRINT", p);
+}
+
+void ServerClient::sendCmd(const QString &cmd)
+{
+    QJsonObject p; p["cmd"] = cmd;
+    sendJson("CMD", p);
+}
+
+
+// 로그인 상태에서만 동작한다. 서버는 IP 형식을 검사하지 않으므로 검증은 Qt 몫.
+void ServerClient::sendSetCamIp(const QString &camIp)
+{
+    QJsonObject p; p["cam_ip"] = camIp.trimmed();
+    sendJson("SET_CAM_IP", p);
+}
+
+// 수신 루프: '\n' 단위로 잘라 JSON 파싱, type 별 분기. 모르는 type 은 조용히 무시.
+void ServerClient::onReadyRead()
+{
+    m_buffer.append(m_socket->readAll());
+    int nl;
+    while ((nl = m_buffer.indexOf('\n')) != -1) {
+        QByteArray line = m_buffer.left(nl);
+        m_buffer.remove(0, nl + 1);
+        if (line.trimmed().isEmpty()) continue;
+
+        QJsonParseError err{};
+        QJsonDocument doc = QJsonDocument::fromJson(line, &err);
+        if (err.error != QJsonParseError::NoError || !doc.isObject()) {
+            qWarning() << "[ServerClient] JSON 파싱 실패:" << err.errorString();
+            continue;
+        }
+        dispatch(doc.object());
+    }
+}
+
+void ServerClient::dispatch(const QJsonObject &msg)
+{
+    const QString type = msg.value("type").toString();
+    const QJsonObject payload = msg.value("payload").toObject();
+
+    if (type == "ACK") {
+        emit serverAck(payload.value("msg").toString());
+    } else if (type == "LOGIN_OK") {
+        // calib 가 null 이면 캘리브레이션 미완료 → 관리자 창 안내 대상
+        const QJsonValue calibVal = payload.value("calib");
+        const bool hasCalib = calibVal.isObject() && !calibVal.toObject().isEmpty();
+        emit loginResult(true, payload.value("id").toString(),
+                         calibVal.toObject(), hasCalib,
+                         payload.value("cam_ip").toString(), QString());
+    } else if (type == "LOGIN_FAIL") {
+        emit loginResult(false, QString(), QJsonObject(), false, QString(),
+                         payload.value("reason").toString());
+    } else if (type == "REGISTER_OK") {
+        emit registerResult(true, payload.value("id").toString(), QString());
+    } else if (type == "REGISTER_FAIL") {
+        emit registerResult(false, QString(), payload.value("reason").toString());
+    } else if (type == "POSE") {
+        emit poseReceived(payload.value("x").toDouble(),
+                          payload.value("y").toDouble(),
+                          payload.value("theta_deg").toDouble());
+    } else if (type == "STATUS") {
+        emit statusReceived(payload.value("state").toString(),
+                            payload.value("painting").toBool());
+    } else if (type == "PEERS") {
+        emit peersReceived(payload.value("robot").toBool(),
+                           payload.value("cctv").toBool());
+    } else if (type == "H_MATRIX") {
+        // v0.3: calib 번들. 레거시 {"H":[[..]x3]} 도 당분간 허용.
+        QJsonObject calib = payload.value("calib").toObject();
+        if (calib.isEmpty() && payload.contains("H")) {
+            calib = QJsonObject{ { "H", payload.value("H") } };
+        }
+        emit hMatrixReceived(calib);
+    } else if (type == "BLUEPRINT_OK") {
+        emit blueprintAck(payload.value("points").toInt(),
+                          payload.value("paint").toBool(),
+                          payload.value("program").toInt());
+    } else if (type == "SET_CAM_IP_OK") {
+        emit camIpResult(true, payload.value("cam_ip").toString(), QString());
+    } else if (type == "SET_CAM_IP_FAIL") {
+        emit camIpResult(false, QString(), payload.value("reason").toString());
+    } else if (type == "DRAW_DONE") {
+        emit drawDone();
+    } else if (type == "DRAW_FAIL") {
+        emit drawFailed(payload.value("stage").toString(),
+                        payload.value("reason").toString(),
+                        payload.value("msg").toString());
+    }
+    // 그 외 모르는 type 은 조용히 무시 (에러로 끊지 않음).
+    // POS(마커 원본 픽셀)는 2026-07-27부터 QT 로 오지 않는다 — 분기 없음이 정상.
+    // 로봇 위치는 POSE 하나로 충분하고, 마커 표시는 로컬 ArUco 검출이 담당한다.
+}
