@@ -221,6 +221,23 @@ int main(int argc, char **argv) {
                           path_follower.AdvanceSegment();
                       }
                   }
+              } else if (current_seg.op == "ARC") {
+                  Msg_Status_t status_snap{};
+                  if (robot_comm.GetLatestStatus(status_snap)) {
+                      int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
+                      int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
+
+                      if (!path_follower.IsMovingStraight()) {
+                          path_follower.StartArc(current_seg.radius_m, current_seg.angle_deg, current_seg.direction, l_steps, r_steps);
+                      }
+                      
+                      if (path_follower.UpdateArc(l_steps, r_steps, target_speed)) {
+                          std::cout << "[MAIN ARC] Arc segment (R=" << current_seg.radius_m 
+                                    << "m, " << current_seg.angle_deg << " deg " << current_seg.direction 
+                                    << ") complete." << std::endl;
+                          path_follower.AdvanceSegment();
+                      }
+                  }
               } else if (current_seg.op == "NOZZLE") {
                   std::string phase = net_manager.GetPathPhase();
                   if (phase == "draw") {

@@ -206,6 +206,50 @@ bool PathFollower::UpdateOffsetMove(int32_t cur_left_steps, int32_t cur_right_st
     return false;
 }
 
+void PathFollower::StartArc(float radius_m, float angle_deg, const std::string& direction, int32_t start_l_steps, int32_t start_r_steps) {
+    is_arc = true;
+    bool is_left = (direction == "left");
+
+    // Pythagorean corrected robot wheel center radius: R_robot = sqrt(R_paint^2 + 0.155^2)
+    float r_robot = std::sqrt(radius_m * radius_m + NOZZLE_OFFSET_M * NOZZLE_OFFSET_M);
+    float r_left = is_left ? (r_robot - wheelbase_m / 2.0f) : (r_robot + wheelbase_m / 2.0f);
+    float r_right = is_left ? (r_robot + wheelbase_m / 2.0f) : (r_robot - wheelbase_m / 2.0f);
+
+    float angle_rad = angle_deg * (M_PI / 180.0f);
+    float pulses_per_m = (steps_per_rev * gear_ratio) / (M_PI * wheel_diameter_m);
+
+    arc_target_l_steps = static_cast<uint32_t>(std::abs(r_left * angle_rad) * pulses_per_m);
+    arc_target_r_steps = static_cast<uint32_t>(std::abs(r_right * angle_rad) * pulses_per_m);
+    arc_start_l_steps = start_l_steps;
+    arc_start_r_steps = start_r_steps;
+
+    float base_sps = 771.65f; // 0.05 m/s base speed
+    arc_sps_l = static_cast<int16_t>(base_sps * (r_left / r_robot));
+    arc_sps_r = static_cast<int16_t>(base_sps * (r_right / r_robot));
+
+    std::cout << "[PathFollower ARC] StartArc: R_paint=" << radius_m << "m -> R_robot=" << r_robot
+              << "m | angle=" << angle_deg << " deg (" << direction << ") | SPS_L=" << arc_sps_l << ", SPS_R=" << arc_sps_r << std::endl;
+}
+
+bool PathFollower::UpdateArc(int32_t cur_l_steps, int32_t cur_r_steps, Msg_SetSpeed_t& out_speed) {
+    if (!is_arc) return true;
+
+    int32_t dl = std::abs(cur_l_steps - arc_start_l_steps);
+    int32_t dr = std::abs(cur_r_steps - arc_start_r_steps);
+
+    if (static_cast<uint32_t>(dl) >= arc_target_l_steps || static_cast<uint32_t>(dr) >= arc_target_r_steps) {
+        out_speed.left_sps = 0;
+        out_speed.right_sps = 0;
+        is_arc = false;
+        std::cout << "[PathFollower ARC] Arc motion completed!" << std::endl;
+        return true;
+    }
+
+    out_speed.left_sps = arc_sps_l;
+    out_speed.right_sps = arc_sps_r;
+    return false;
+}
+
 void PathFollower::Update(const Pose_t& current_pose, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on) {
     if (path.empty() || current_waypoint_idx >= path.size()) {
         // No path active, send stop command
