@@ -172,7 +172,7 @@ make drive_test
 ```
 
 ```bash
-./drive_test 127.0.0.1 --side 0.3
+./tools/drive_test 127.0.0.1 --side 0.3
 ```
 
 로봇이 **지금 서 있는 자리에서** 한 변 0.3 m 정사각형을 그린다. 변마다 노즐을
@@ -204,7 +204,7 @@ make drive_test
 | A-3e | 모서리 | 호로 뭉개지지 않고 각이 살아있다 (펜 오프셋 보정, A-1 §8) |
 
 > 💡 첫 시운전은 `--no-paint`로 동선만 확인한 뒤 페인트를 올리는 걸 권한다.
-> `robot_sim`을 짝으로 띄우면(`./robot_sim 127.0.0.1`) 로봇 없이도 시퀀스가
+> `robot_sim`을 짝으로 띄우면(`./tools/robot_sim 127.0.0.1`) 로봇 없이도 시퀀스가
 > 맞는지 미리 볼 수 있다 — 서버 쪽에서 확인한 결과: 획 4개 × 0.300 m, 총 1.200 m.
 
 ---
@@ -285,12 +285,12 @@ python3 -c "import json;d=json.load(open('config/users.json'));print(d['test'].g
 
 ```
 ./server 9100
-./robot_sim 127.0.0.1 --port 9100
-./draw_test 127.0.0.1 --port 9100 --side 1.0
+./tools/robot_sim 127.0.0.1 --port 9100
+./tools/draw_test 127.0.0.1 --port 9100 --side 1.0
 ```
 
 이탈 복귀까지 보려면 `robot_sim`에 조향 오차를 주입한다:
-`./robot_sim 127.0.0.1 --port 9100 --drift-dps 15 --ignore-drift`
+`./tools/robot_sim 127.0.0.1 --port 9100 --drift-dps 15 --ignore-drift`
 
 `robot_sim`이 펜 자취를 계산하면 **로봇 없이도** "펜이 도면 꼭짓점을 정확히 지나는가"를
 검증할 수 있다 (Qt팀이 `mp_test`로 한 것과 같은 검증을 서버 쪽에서).

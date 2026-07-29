@@ -142,11 +142,11 @@ make sim
 ```
 
 ```bash
-./robot_sim 127.0.0.1 --port 9100
+./tools/robot_sim 127.0.0.1 --port 9100
 ```
 
 ```bash
-./draw_test 127.0.0.1 --port 9100 --side 1.0
+./tools/draw_test 127.0.0.1 --port 9100 --side 1.0
 ```
 
 `robot_sim`이 끝에 **펜 자취 요약**(획별 시작/끝 좌표와 도색 길이)을 찍습니다. 이 좌표가
@@ -170,7 +170,7 @@ make drive_test
 ```
 
 ```bash
-./drive_test 127.0.0.1 --side 0.3
+./tools/drive_test 127.0.0.1 --side 0.3
 ```
 
 한 변 0.3 m 정사각형을 **변마다 노즐을 내렸다 올리며**(획 4개) 그립니다. 첫 시운전은
@@ -207,7 +207,7 @@ RP_CCTV_BRIDGE=0 python3 web_gui.py   # 또는 admin_console/config.sh에 RP_CCT
 
 ```bash
 make qt_sim
-./qt_sim 127.0.0.1 certs/server.crt   # 같은 기기에서 서버 띄운 경우
+./tools/qt_sim 127.0.0.1 certs/server.crt   # 같은 기기에서 서버 띄운 경우
 ```
 
 접속 후 콘솔 명령: `register <id> <pw>` / `login <id> <pw>` / `cmd estop|resume|calib` / `blueprint`(테스트 도면 전송) / `quit`. 서버가 중계해주는 STATUS/POS/H_MATRIX 등은 자동으로 로그에 찍힙니다.
