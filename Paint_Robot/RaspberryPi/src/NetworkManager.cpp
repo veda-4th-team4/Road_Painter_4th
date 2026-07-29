@@ -215,6 +215,20 @@ bool NetworkManager::SendReady(uint32_t seg_index) {
     return ssl_send_line(ready_msg.dump());
 }
 
+bool NetworkManager::SendPathDone(const std::string& phase) {
+    if (!is_connected || !ssl_connection) return false;
+
+    json path_done_payload = {{"phase", phase}};
+    json path_done_msg = {
+        {"type", "PATH_DONE"},
+        {"seq", ++msg_seq},
+        {"payload", path_done_payload}
+    };
+
+    std::cout << "[NetworkManager] Transmitting PATH_DONE for phase=" << phase << std::endl;
+    return ssl_send_line(path_done_msg.dump());
+}
+
 bool NetworkManager::GetAlignCommand(float& out_angle_deg) {
     std::lock_guard<std::mutex> lock(align_mutex);
     if (!has_align_cmd) return false;
@@ -330,6 +344,9 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
                     segment.dist_m = seg.value("dist_m", 0.0f);
                     segment.angle_deg = seg.value("angle_deg", 0.0f);
                     segment.paint = seg.value("paint", false);
+                    if (seg.contains("down")) {
+                        segment.paint = seg.value("down", false);
+                    }
                     segment.heading_deg = seg.value("heading_deg", 0.0f);
                     current_path.push_back(segment);
                 }

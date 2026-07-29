@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
   auto last_status_time = std::chrono::steady_clock::now();
   bool waiting_for_go = false;
   uint32_t ready_seg_sent = 0xFFFFFFFF; // Track last segment index READY was sent for
+  bool path_done_sent = false;          // Track PATH_DONE transmission per path
 
   bool manual_override = false;
   Msg_SetSpeed_t manual_speed = {0, 0};
@@ -71,6 +72,8 @@ int main(int argc, char **argv) {
           } else if (cmd == "RESUME") {
               robot_comm.SendClearEStop();
               manual_override = false;
+              manual_speed = {0, 0};
+              manual_nozzle = 0;
           } else if (cmd == "FORWARD") {
               manual_override = true;
               manual_speed = {500, 500};
@@ -103,6 +106,7 @@ int main(int argc, char **argv) {
           path_follower.SetPath(path);
           waiting_for_go = false;
           ready_seg_sent = 0xFFFFFFFF;
+          path_done_sent = false;  // Reset PATH_DONE tracker for new path
           manual_override = false; // Reset manual override upon receiving autonomous path
           manual_nozzle = 0;
           std::string phase = net_manager.GetPathPhase();
@@ -115,7 +119,12 @@ int main(int argc, char **argv) {
       // 4. Check DRIFT feedback from server (~5Hz)
       float drift_angle = 0.0f;
       if (net_manager.GetDriftCorrection(drift_angle)) {
-          path_follower.SetDriftOffset(drift_angle);
+          // Protocol requirement: Ignore DRIFT feedback while executing TURN segment!
+          if (!path_follower.IsTurning()) {
+              path_follower.SetDriftOffset(drift_angle);
+          } else {
+              std::cout << "[MAIN] [DRIFT IGNORED] Robot is currently turning." << std::endl;
+          }
       }
 
       // 5. Segment Execution Handshake State Machine
@@ -205,8 +214,19 @@ int main(int argc, char **argv) {
                           path_follower.AdvanceSegment();
                       }
                   }
+              } else if (current_seg.op == "NOZZLE") {
+                  // Protocol v0.3: NOZZLE op explicitly controls nozzle down/up state
+                  uint8_t target_nozzle = current_seg.paint ? 1 : 0;
+                  robot_comm.SendControlNozzle(target_nozzle);
+                  std::cout << "[MAIN] Executed NOZZLE op (down=" << (target_nozzle ? "true" : "false") << ")" << std::endl;
+                  path_follower.AdvanceSegment();
               }
           }
+      } else if (path_follower.IsPathFinished() && !path_done_sent) {
+          std::string phase = net_manager.GetPathPhase();
+          net_manager.SendPathDone(phase);
+          path_done_sent = true;
+          std::cout << "[MAIN] All path segments completed! Transmitted PATH_DONE (phase=" << phase << ")" << std::endl;
       }
 
       // 6. Periodic UART heartbeat: Transmit controls to STM32 (every 80ms loop iteration)
