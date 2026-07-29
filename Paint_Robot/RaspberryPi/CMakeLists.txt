@@ -28,4 +28,12 @@ set(MOTOR_TEST_SOURCES
 add_executable(motor_test ${MOTOR_TEST_SOURCES})
 target_link_libraries(motor_test wiringPi pthread)
 
+# 3) Rear Nozzle Offset Arc Motion Test Tool
+set(ARC_TEST_SOURCES
+    src/arc_test.cpp
+    src/SerialManager.cpp
+)
+add_executable(arc_test ${ARC_TEST_SOURCES})
+target_link_libraries(arc_test wiringPi pthread)
+
 
