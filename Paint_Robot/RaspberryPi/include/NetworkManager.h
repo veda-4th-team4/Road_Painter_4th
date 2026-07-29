@@ -52,6 +52,13 @@ public:
     bool SendReady(uint32_t seg_index);
 
     /**
+     * @brief Transmits PATH_DONE completion message to vision server when a path is finished.
+     * @param phase The path phase that was completed ("approach" or "draw").
+     * @return true if successfully sent.
+     */
+    bool SendPathDone(const std::string& phase);
+
+    /**
      * @brief Thread-safely fetches the latest received ALIGN angle correction.
      * @param out_angle_deg Output float to store the micro-rotation angle (deg).
      * @return true if an ALIGN command is available.
