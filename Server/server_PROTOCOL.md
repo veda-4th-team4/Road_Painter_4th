@@ -71,8 +71,10 @@
   "segments": [
     {"op":"NOZZLE","down":true},
     {"op":"MOVE","dist_m":2.0,"paint":true,"heading_deg":35.0},
+    {"op":"NOZZLE","down":false},
     {"op":"TURN","angle_deg":-90},
-    {"op":"MOVE","dist_m":1.0,"paint":true,"heading_deg":-55.0},
+    {"op":"NOZZLE","down":true},
+    {"op":"ARC","dist_m":0.628,"radius_m":0.20,"angle_deg":180,"direction":"right","paint":true,"heading_deg":125.0},
     {"op":"NOZZLE","down":false}
   ]
 }}
@@ -84,6 +86,7 @@
 | `op: "MOVE"` | 직진. `dist_m` = 거리(m), `paint` = **이 구간이 도색 구간인지 나타내는 표시** (생략 시 `false`). ⚠️ 이 값으로 노즐을 움직이지 말 것 — 아래 참고 |
 | `op: "TURN"` | 제자리 회전. `angle_deg` **양수 = 좌회전, 음수 = 우회전** |
 | `op: "NOZZLE"` | 노즐 내림(`down:true`) / 올림(`down:false`) |
+| `op: "ARC"` | 곡선(원호) 주행 (2026-07-29 추가). `dist_m` = 호 길이(m), `radius_m` = 도면 곡선 반지름(m), `angle_deg` = 각도(도), `direction` = `"left"` \| `"right"` |
 | `heading_deg` | 그 동작 후 바라봐야 할 **절대 각도**(월드 기준) — MOVE 전부 + 접근 경로의 마지막 TURN에 실림. 정렬(READY)/주행 피드백(DRIFT) 판정 기준값. 로봇은 무시해도 됨 |
 
 - **PATH가 오면 진행 중이던 기존 경로를 즉시 폐기하고 새 경로로 교체** (서버의 이탈 감지 → 재계획 대응. 한 TCP 연결이라 순서는 보장됨)
