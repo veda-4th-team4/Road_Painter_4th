@@ -54,6 +54,7 @@ int main(int argc, char **argv) {
   bool manual_override = false;
   Msg_SetSpeed_t manual_speed = {0, 0};
   uint8_t manual_nozzle = 0;
+  uint8_t auto_nozzle = 0;
 
   while (true) {
       // 1. Run network loop to check sockets and reconnect if needed
@@ -129,7 +130,7 @@ int main(int argc, char **argv) {
 
       // 5. Segment Execution Handshake State Machine
       Msg_SetSpeed_t target_speed = {0, 0};
-      uint8_t nozzle_on = manual_nozzle;
+      uint8_t nozzle_on = manual_override ? manual_nozzle : auto_nozzle;
 
       if (manual_override) {
           target_speed = manual_speed;
@@ -216,9 +217,9 @@ int main(int argc, char **argv) {
                   }
               } else if (current_seg.op == "NOZZLE") {
                   // Protocol v0.3: NOZZLE op explicitly controls nozzle down/up state
-                  uint8_t target_nozzle = current_seg.paint ? 1 : 0;
-                  robot_comm.SendControlNozzle(target_nozzle);
-                  std::cout << "[MAIN] Executed NOZZLE op (down=" << (target_nozzle ? "true" : "false") << ")" << std::endl;
+                  auto_nozzle = current_seg.paint ? 1 : 0;
+                  robot_comm.SendControlNozzle(auto_nozzle);
+                  std::cout << "[MAIN] Executed NOZZLE op (down=" << (auto_nozzle ? "true" : "false") << ")" << std::endl;
                   path_follower.AdvanceSegment();
               }
           }
