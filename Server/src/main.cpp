@@ -31,14 +31,21 @@ static void signalHandler(int sig) {
     if (gpServer) gpServer->shutdown();
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         // 종료 신호 등록
         std::signal(SIGINT, signalHandler);   // Ctrl+C
         std::signal(SIGTERM, signalHandler);  // kill -TERM
 
-        logf("[INFO] Road-Painter TLS 서버 시작");
-        gpServer = std::make_unique<TlsServer>(9000, "certs/server.crt", "certs/server.key");
+        // 포트는 인자로 덮어쓸 수 있다(기본 9000). 운영 중인 서버를 건드리지 않고
+        // robot_sim/draw_test 드라이런을 옆 포트에 따로 띄우기 위한 것.
+        int port = argc > 1 ? std::atoi(argv[1]) : 9000;
+        if (port <= 0 || port > 65535) {
+            logf("[WARN] 잘못된 포트 '%s' - 기본 9000 사용", argv[1]);
+            port = 9000;
+        }
+        logf("[INFO] Road-Painter TLS 서버 시작 (포트 %d)", port);
+        gpServer = std::make_unique<TlsServer>(port, "certs/server.crt", "certs/server.key");
         Router router(*gpServer);
         gpServer->setHandler([&](const std::string& role, const json& msg) {
             router.onMessage(role, msg);

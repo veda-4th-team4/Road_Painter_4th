@@ -27,3 +27,7 @@ server.log
 
 #테스트 코드
 path_test
+
+#테스트 시뮬 (docs/DRIVE_TEST_PLAN.md 단계 C)
+robot_sim
+draw_test

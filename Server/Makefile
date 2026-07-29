@@ -18,6 +18,18 @@ qt_sim: tools/qt_sim.cpp
 path_test: tools/path_test.cpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
 
+# 서버 알고리즘 드라이런 한 쌍 (docs/DRIVE_TEST_PLAN.md 단계 C).
+#   robot_sim : ROBOT+CCTV 대역. PATH를 실행하고 그 결과 위치를 POS로 되돌린다
+#   draw_test : QT 대역. 사각형 도면 + 동작 시퀀스를 만들어 START_DRAW까지
+# 둘을 같이 띄우면 로봇도 Qt도 없이 접근->도색->피드백->완료가 전부 돈다.
+robot_sim: tools/robot_sim.cpp tools/tls_client.hpp
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
+
+draw_test: tools/draw_test.cpp tools/tls_client.hpp
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
+
+sim: robot_sim draw_test
+
 clean:
-	rm -f server qt_sim path_test
-.PHONY: clean
+	rm -f server qt_sim path_test robot_sim draw_test
+.PHONY: clean sim

@@ -6,9 +6,10 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 
 - **TLS 릴레이**: 클라이언트가 role(QT / ROBOT / CCTV / ADMIN)로 등록하면, 메시지를 규칙에 따라 상대에게 중계
 - **로그인 / 캘리브레이션 저장**: 사용자(id/비번)별로 캘리브레이션 번들(K, D, H행렬)을 저장했다가 재로그인 시 Qt에 돌려줌
-- **경로 생성 (2단계)**: 1단계 접근(approach)은 **서버**가 CCTV로 파악한 로봇 위치에서 도면 시작점까지 만든다. 2단계 도색(draw)은 **Qt가 만들어 보낸 동작 시퀀스(`BLUEPRINT.program`)를 서버가 그대로 중계**한다 (2026-07-28 변경 — 꼭짓점 펜 오프셋 보정 때문. `program`이 없으면 종전대로 서버가 직접 생성)
-- **출발 전 정렬 / 주행 피드백**: MOVE 시작 전 READY/ALIGN/GO 핸드셰이크로 각도 미세조정, 직진 중 DRIFT로 각도 이탈 피드백. 단 **꼭짓점 동작(`pivot`) 구간에서는 둘 다 차단** (각도를 건드리면 펜이 꼭짓점으로 못 돌아옴)
-- **이탈 감시·재계획**: **지금 달리는 구간**에서 0.3 m 이상 벗어나면 원래 향하던 꼭짓점으로 복귀시킨다 (도면 전체 기준이면 나란한 줄 사이에서 옆줄로 튄다)
+- **경로 생성 (2단계)**: 1단계 접근(approach)은 **서버**가 CCTV로 파악한 로봇 위치에서 도면 시작점까지 만든다. 2단계 도색(draw)은 **Qt가 만들어 보낸 동작 시퀀스(`BLUEPRINT.program`)를 서버가 그대로 중계**한다 (2026-07-28 변경. `program`이 없으면 종전대로 서버가 직접 생성). **펜 오프셋(회전중심-펜 간 155mm) 보정은 서버/Qt 둘 다 관여하지 않고 로봇이 전담**한다 — `program`은 도면 그대로의 논리 동작(MOVE/TURN/NOZZLE)만 담는다
+- **출발 전 정렬 / 주행 피드백**: MOVE 시작 전 READY/ALIGN/GO 핸드셰이크로 각도 미세조정, 직진 중 DRIFT로 각도 이탈 피드백. **로봇이 `TURN`을 실행하는 동안엔 로봇이 스스로 DRIFT를 무시한다** (서버는 로봇이 회전 중인지 모른 채 직전 목표각 기준으로 계속 보내므로 — 프로토콜 변경 없이 로봇 쪽에서 필터링하기로 확정, 2026-07-28)
+- **노즐 제어**: **`NOZZLE` op이 단일 결정권**이다 (2026-07-28 확정). `MOVE.paint`는 "이 구간이 도색 구간"이라는 표시일 뿐 노즐을 움직이지 않는다. 서버가 `program` 없이 직접 만드는 하위호환 경로에도 서버가 `NOZZLE`을 끼워 넣으므로(`path_planner.hpp` `withNozzleOps`), 로봇은 `NOZZLE` 한 갈래만 구현하면 된다
+- **이탈 감시·재계획**: **지금 달리는 구간**에서 0.3 m 이상 벗어나면 원래 향하던 꼭짓점으로 복귀시킨다 (도면 전체 기준이면 나란한 줄 사이에서 옆줄로 튄다). 도면은 *펜* 자취인데 pose는 *마커 중심*이라 정상 주행에도 상시 `d`(155 mm)가 벌어지므로, 구간 끝을 `d`만큼 늘려 그만큼은 오차로 안 센다
 - **하트비트**: 로봇이 10초간 무응답이면 연결 끊김으로 처리
 - **관리자 창 지원(ADMIN)**: 서버가 중계하는 모든 메시지 사본을 TAP으로 관리자 창에 전달(로그 모니터), 관리자 창에서 온 로봇 명령/캘리 결과를 처리
 
@@ -18,7 +19,7 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 |---|---|
 | **[server_PROTOCOL.md](server_PROTOCOL.md)** | 통신 규격 전체 (각 팀이 봐야 할 문서). CCTV/Qt/로봇 연동 스펙도 여기로 통합됨 |
 | [docs/TESTING.md](docs/TESTING.md) | 서버/Qt 테스트 가이드 |
-| [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) | 로봇 주행 통합 테스트 계획 (단계 A~D, 합격 기준) |
+| [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) | 로봇 주행 통합 테스트 계획 (단계 A~D, 합격 기준, 드라이런 결과) |
 | [docs/REFACTOR_SUMMARY.md](docs/REFACTOR_SUMMARY.md) | graceful shutdown 개선 기록 |
 | [admin_console/PLAN.md](admin_console/PLAN.md) | 관리자 창 설계/진행 상황 |
 
@@ -43,6 +44,9 @@ Server/
 │   ├── protocol.hpp        메시지 스펙 주석 + 생성 헬퍼
 │   └── log.hpp             타임스탬프 로그
 ├── tools/
+│   ├── tls_client.hpp      테스트 도구 공용 TLS 클라이언트 뼈대
+│   ├── robot_sim.cpp       ★ ROBOT+CCTV 대역 시뮬 (PATH 실행 → 결과를 POS로 되돌림, 펜 자취 계산)
+│   ├── draw_test.cpp       ★ QT 대역 (사각형 도면 + 동작 시퀀스 생성 → START_DRAW)
 │   ├── qt_sim.cpp          Qt 대역 테스트 클라이언트 (Qt 네트워킹 나오기 전 검증용)
 │   ├── path_test.cpp       최초 1회 경로생성 테스트기 (CCTV 스냅샷 주입 → 접근 PATH 검증)
 │   ├── seed_user.py        테스트 계정 생성 (기본 test/1234 + 예시 캘리브레이션)
@@ -120,6 +124,36 @@ make
 
 테스트 계정은 `python3 tools/seed_user.py`로 만들 수 있습니다 (기본 `test`/`1234`, [docs/TESTING.md](docs/TESTING.md) §2-1).
 
+### 로봇·Qt 없이 주행 알고리즘 돌려보기
+
+`robot_sim`(로봇+CCTV 대역)과 `draw_test`(Qt 대역)를 같이 띄우면 접근 → 도색 →
+실시간 피드백 → 이탈 복귀 → 완료가 전부 돕니다. **운영 중인 9000 서버를 건드리지
+않도록 옆 포트에 테스트 인스턴스를 띄우세요.**
+
+```bash
+make sim
+```
+
+터미널 3개에서:
+
+```bash
+./server 9100
+```
+
+```bash
+./robot_sim 127.0.0.1 --port 9100
+```
+
+```bash
+./draw_test 127.0.0.1 --port 9100 --side 1.0
+```
+
+`robot_sim`이 끝에 **펜 자취 요약**(획별 시작/끝 좌표와 도색 길이)을 찍습니다. 이 좌표가
+`draw_test`가 출력한 도면 꼭짓점과 맞으면 "펜이 꼭짓점을 지난다"가 검증된 것입니다.
+이탈 복귀까지 보려면 `robot_sim`에 조향 오차를 주입하세요:
+`--drift-dps 15 --ignore-drift`. 자세한 항목은
+[docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) 단계 C.
+
 **카메라가 서버(9000)에 role=CCTV로 직접 붙게 되면** ([server_PROTOCOL.md](server_PROTOCOL.md)의 CCTV 연동 규격대로 전환 후),
 web_gui의 CAM_POSE→POS 통역 다리를 꺼야 합니다 (안 끄면 카메라와 이 다리가 같은 role로
 동시에 붙으려 해 서버가 재접속을 반복시킵니다):
@@ -176,7 +210,13 @@ openssl s_client -connect 127.0.0.1:9000 -CAfile certs/server.crt -quiet
 ## 아직 러프한 부분 (팀 협의 후 확정)
 
 - POS 마커 `corners` 순서 — CCTV팀과 확정 필요
-- 이탈 임계값 0.3 m / 재계획 간격 3초 / 커서 도달 반경 0.15 m — 현장 튜닝 예정
-  (커서 반경은 이탈 임계값보다 확실히 작아야 한다 — 너무 크면 꼭짓점 직전의 정상 주행이 오탐된다)
-- **펜 오프셋 `d`의 출처** — 지금은 Qt 설정값(기본 40 mm, 임시)을 `BLUEPRINT.pen_offset_m`으로 받는다. 기구값이므로 최종적으로 서버가 내려주는 형태가 맞는지 Qt팀과 협의 필요
+- 이탈 임계값 0.3 m / 재계획 간격 3초 / 커서 도달 반경 0.20 m — 현장 튜닝 예정
+  (커서 반경은 펜 오프셋 155mm보다 크고 이탈 임계값보다는 작아야 한다 — router.hpp `kVertexReachM` 주석 참고)
+- **펜 오프셋 `d`는 서버 상수로 확정** — 실측 **155 mm** (로봇 `NOZZLE_OFFSET_M`).
+  `BLUEPRINT.pen_offset_m` 필드는 폐지됐고, 보정 자체를 로봇이 전담하기로 확정됐다
+  (2026-07-28). 서버는 `router.hpp`의 `kPenOffsetM` 상수를 이탈 판정 여유값에만
+  쓴다 — **로봇의 실제 오프셋이 바뀌면 이 상수도 손으로 같이 고쳐야 한다** (자동 동기화 없음)
+- **회전 중 `DRIFT` 억제 = 로봇 담당으로 확정** — 로봇이 `TURN` 실행 중엔 스스로
+  무시한다. 서버가 "지금 TURN 중"임을 알려주는 신호는 만들지 않는다 (이탈 감시는
+  pose 기반이라 영향 없음). [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) C-3
 - **마커 중심 = 로봇 회전중심 가정** — 서버 pose는 마커 4코너 평균이라, ArUco 판이 회전중심 위에 있지 않으면 펜 오프셋과 별개인 또 하나의 오프셋이 생긴다. 기구팀 확인 필요
