@@ -80,7 +80,8 @@ public:
     void setOverlayPaths(const QList<QList<QPointF>> &originalPx, const QList<bool> &closed);
     void setOverlayBands(const QList<QPolygonF> &originalPx);
     QList<QPointF> metersToOriginal(const QList<QPointF> &meters) const;
-    double pxPerMeter() const { return m_tvPxPerM; }
+    // ⚠️ pxPerMeter() 는 지웠다 — 호출부 0. 축척이 필요한 곳은 전부 mmPerPx() 를
+    //    쓴다(화면 라벨·눈금자가 mm 단위라). m_tvPxPerM 은 클래스 안에서 직접 쓴다.
     double mmPerPx() const { return (m_tvPxPerM > 1e-9) ? 1000.0 / m_tvPxPerM : 0.0; }
     double screenPxPerMm() const;
     int zoomPercent() const;
@@ -94,11 +95,14 @@ public:
     bool zoomTool() const { return m_zoomTool; }
     void setZoomTool(bool on);
     QString calibSummary() const { return m_calibSummary; }
+    // H 출력 단위 검산 결과 한 줄. 선언값과 실제가 다르면 경고 문구가 담긴다.
+    QString calibUnitNote() const { return m_calibUnitNote; }
 
     void setEditPathsMeters(const QList<QList<QPointF>> &metersPaths, const QList<bool> &closed);
-    void setMarkerCorners(const QVariantList &cornersPx);
     void setArucoMarkers(const QList<int> &ids, const QList<QPolygonF> &cornersPx);
     void setArucoVisible(bool on);
+    // 로봇 아이콘 표시 on/off. 끄면 섀시·펜 점·연결선이 모두 사라진다 (위치 수신은 계속).
+    void setRobotVisible(bool on);
 
     // 커밋된 미션 경로 (ghost + progress fill) / 로봇 POSE
     void setMissionPathsMeters(const QList<QList<QPointF>> &metersPaths, const QList<bool> &closed);
@@ -156,7 +160,6 @@ public slots:
     Q_INVOKABLE void flipActive(bool horizontal);
     Q_INVOKABLE void scaleActive(double factor);
     Q_INVOKABLE void selectAllActive();
-    Q_INVOKABLE void clearSelection();
     Q_INVOKABLE void deleteSelection();
 
 signals:
@@ -203,7 +206,6 @@ private:
     void paintRobot(QPainter *p, double sx, double sy, double ox, double oy);
     void paintPenMarker(QPainter *p, double sx, double sy, double ox, double oy);
     void paintGrid(QPainter *p, double sx, double sy, double ox, double oy);
-    void paintMarker(QPainter *p, double sx, double sy, double ox, double oy);
     void paintAruco(QPainter *p, double sx, double sy, double ox, double oy);
     void paintDonePaths(QPainter *p, double sx, double sy, double ox, double oy);
     void paintPathGuides(QPainter *p, const QVector<QPointF> &pts, bool closed,
@@ -226,15 +228,13 @@ private:
     int mergeClosePoints();
     void stashActive();
     bool activateDoneAt(const QPointF &img, double thr);
-    // 글자 렌더 → 세선화 → 스켈레톤 추적 (이미지 px 폴리라인)
+    // 글자 → 획 폴리라인 (strokefont 의 선·호 정의를 이미지 px 로 옮긴다)
     QList<QVector<QPointF>> textStrokePolylines(const QString &text, double targetHpx) const;
     // 변환 대상 인덱스 (선택 없으면 전체)
     QList<int> transformTargets() const;
-    QPointF transformPivot() const;
 
     // ── 선택 (활성 + 완성 도형을 함께 다룬다) ────────────────────────
     int selectedPointCount() const;
-    bool hasMultiShapeSelection() const;   // 완성 도형에도 선택이 걸려 있는가
     void clearDoneSelection();
     void syncDoneSelSize();
     // 선택을 활성·완성 도형 **양쪽에서** 지운다. 지운 게 있으면 true.
@@ -336,6 +336,9 @@ private:
     // 도형·점을 다시 클릭하면 켜진다. 데이터에는 영향이 없다(표시 전용).
     bool m_focused = true;
 
+    // H 출력 단위 검산 결과 (사람이 읽는 한 줄). 선언값과 실제가 다르면 경고가 담긴다.
+    QString m_calibUnitNote;
+
     // 표시 옵션
     bool m_showLabels = true;
     double m_strokeMm = 50.0;   // 로봇 도장 폭 — 고정값
@@ -346,12 +349,12 @@ private:
     // H 가 왜곡 보정된 픽셀을 받는가 (번들의 coord_mode == "undistort").
     // 참이면 원본 영상에 얹을 때 정방향 왜곡을 한 번 더 태워야 한다.
     bool m_hCoordUndistort = false;
-    QList<QPointF> m_markerPx;
 
     // ArUco 검출 결과 (원본 px)
     QList<int> m_arucoIds;
     QList<QPolygonF> m_arucoPolys;
     bool m_arucoVisible = true;
+    bool m_robotVisible = true;
 
     // 호모그래피(원본 px → topview px) / 월드 mm ↔ topview
     bool m_tvBuilt = false;
