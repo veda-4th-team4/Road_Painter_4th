@@ -178,6 +178,33 @@ make drive_test
 CCTV가 없어 서버가 정렬 판정을 못 하므로 각도 정확도는 로봇 IMU에 달려 있습니다.
 옵션·합격 기준은 [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) 단계 A-3.
 
+### 실시간 CCTV 없이 접근 → 도색 돌려보기 (cctv_pose)
+
+실시간 POS가 아직 안 나올 때, **로봇 시작 위치만 한 번** 넣어주면 접근 → 도색 흐름이
+개루프로 끝까지 돕니다. 서버는 pose가 한 번이라도 잡히면 `START_DRAW`를 진행하고,
+그 pose는 만료되지 않습니다(`poseValid_`는 켜지기만 함). `DRIFT`·이탈 재계획은
+`POS` 핸들러 안에만 있어 POS가 더 안 오면 자연히 멈춥니다.
+
+```bash
+make cctv_pose
+```
+
+```bash
+./tools/cctv_pose 127.0.0.1
+```
+
+좌표는 [tools/cctv_pose.json](tools/cctv_pose.json)에서 읽습니다 — 값을 고치고 도구 콘솔에서
+**Enter**를 치면 파일을 다시 읽어 재전송하므로, 재시작 없이 여러 번 시험할 수 있습니다
+(`--repeat <초>`로 자동 반복도 가능). `corners`(CCTV 원본 픽셀 4점) 대신 `x`/`y`/`theta_deg`를
+넣으면 캘리브레이션 없이도 좌표를 직접 지정할 수 있습니다.
+
+⚠️ **Qt 로그인 후에 쏘세요.** 서버는 캘리브레이션을 로그인 시점에 계정에서 불러오므로,
+그 전에 보낸 `POS`는 `pose 계산 불가`로 버려집니다.
+
+🔴 **이 방식은 Qt가 `program`을 실어 보낸다는 전제입니다.** `program`이 없으면 서버가
+도색 경로를 **낡은 출발 위치** 기준으로 만들어(`sendDrawPath` 폴백), 이미 시작점에 가 있는
+로봇과 어긋납니다.
+
 **카메라가 서버(9000)에 role=CCTV로 직접 붙게 되면** ([server_PROTOCOL.md](server_PROTOCOL.md)의 CCTV 연동 규격대로 전환 후),
 web_gui의 CAM_POSE→POS 통역 다리를 꺼야 합니다 (안 끄면 카메라와 이 다리가 같은 role로
 동시에 붙으려 해 서버가 재접속을 반복시킵니다):

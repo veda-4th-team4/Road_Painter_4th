@@ -43,6 +43,11 @@ drive_test: tools/drive_test.cpp tools/tls_client.hpp
 tap_dump: tools/tap_dump.cpp tools/tls_client.hpp
 	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
 
+# CCTV 대역 pose 주입기 - 로봇 시작 위치를 파일에서 읽어 POS로 한 번 쏜다.
+# 실시간 CCTV가 아직 없을 때 접근->도색 흐름을 개루프로 돌려보는 용도.
+cctv_pose: tools/cctv_pose.cpp tools/tls_client.hpp
+	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
+
 clean:
-	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump
+	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose
 .PHONY: clean sim
