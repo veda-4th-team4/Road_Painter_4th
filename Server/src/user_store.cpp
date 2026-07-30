@@ -32,7 +32,12 @@ UserStore::UserStore(const std::string& file) : file_(file) {
     // 저장 디렉토리 보장 (예: config/users.json -> config/)
     auto pos = file_.find_last_of('/');
     if (pos != std::string::npos) mkdir(file_.substr(0, pos).c_str(), 0755);
+    // 전역 캘리는 users.json과 같은 폴더에 둔다. 계정 파일과 분리하는 이유는
+    // users.json이 비번 해시 때문에 .gitignore 대상이고 백업·교체 주기가 다르기 때문.
+    calibFile_ = (pos == std::string::npos ? std::string()
+                                           : file_.substr(0, pos + 1)) + "calib_latest.json";
     load();
+    loadGlobalCalib();
 }
 
 void UserStore::load() {
@@ -80,11 +85,44 @@ bool UserStore::login(const std::string& id, const std::string& pw) {
     return hashPw(pw, u.value("salt", "")) == u.value("hash", "");
 }
 
+void UserStore::loadGlobalCalib() {
+    globalCalib_ = nullptr;
+    std::ifstream f(calibFile_);
+    if (!f) return;  // 아직 캘리를 한 번도 안 올렸으면 파일 없음 - 정상
+    json j = json::parse(f, nullptr, false);
+    if (j.is_object() || j.is_array()) globalCalib_ = j;
+    else logf("[WARN] 전역 캘리브레이션 파싱 실패, 무시: %s", calibFile_.c_str());
+}
+
+void UserStore::saveGlobalCalib() {
+    std::ofstream f(calibFile_);
+    if (!f) {
+        logf("[ERROR] 전역 캘리브레이션 저장 실패: %s", calibFile_.c_str());
+        return;
+    }
+    f << globalCalib_.dump(2) << "\n";
+}
+
+bool UserStore::setGlobalCalib(const json& calib) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    globalCalib_ = calib;
+    saveGlobalCalib();
+    return true;
+}
+
+json UserStore::getGlobalCalib() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return globalCalib_;
+}
+
 json UserStore::getCalib(const std::string& id) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (!users_.contains(id)) return nullptr;
     json c = users_[id].value("calib", json());
     if (c.is_null()) c = users_[id].value("H", json());  // 구버전 파일 호환
+    // 계정에 자기 캘리가 없으면 전역 슬롯으로 대체 (R-1). 계정 값이 있으면 그게
+    // 이긴다 - 사용자가 특정 번들을 자기 계정에 고정해둔 경우를 덮지 않기 위해.
+    if (c.is_null()) c = globalCalib_;
     return c;
 }
 

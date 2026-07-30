@@ -406,17 +406,27 @@ void Router::handleLogin(const json& payload, const std::string& replyRole) {
          replyRole.c_str(), stored.is_null() ? "없음 - 캘리브레이션 필요" : "전달");
 }
 
-// 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용).
-//   신규: payload.calib = {K, D, H_floor, H_marker, marker_height_m, version}
-//   레거시: payload.H = [[...]x3] (왜곡 보정 없이 바닥/마커 공용으로 사용)
+// 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용). 세 형태를 받는다:
+//   중첩:   payload.calib = {K, D, H_floor, H_marker, marker_height_m, version}
+//   평면:   payload 자체가 번들 = {calib_id, K, D, H, H_marker, canvas_mm, ...}
+//           (QT-REQ-CCTV-001 rev.2 — 바닥 H를 H_floor가 아니라 H로 부른다)
+//   레거시: payload.H = [[...]x3] 뿐 (왜곡 보정 없이 바닥/마커 공용으로 사용)
 // CCTV는 mm 기준(pixel->world mm) 호모그래피를 보낸다. 서버 입구에서 미터로 정규화한 뒤
 // 저장/중계하므로, 이후 pose/POSE/BLUEPRINT/PATH와 QT top-view는 전부 미터로 통일된다.
 void Router::handleHMatrix(const json& msg) {
     json payload = msg.value("payload", json::object());
-    bool legacyH = !payload.contains("calib") && payload.contains("H");
-    json bundle =
-        payload.contains("calib") ? payload["calib"] : payload.value("H", json());
+    // 평면 번들과 레거시는 둘 다 최상위 "H"를 갖는다. 예전엔 "calib이 없고 H가 있으면
+    // 레거시"로 단정해 payload["H"] 행렬 하나만 떼어냈고, 그래서 평면 번들이 오면
+    // K/D/H_marker가 통째로 버려져 왜곡 보정과 시차 보정이 조용히 꺼졌다 - 좌표는
+    // 그럴듯하게 나오고 렌즈 왜곡만큼 틀린다. 캘리 내용 필드가 H와 같이 왔으면
+    // 평면 번들로 본다.
+    const bool nested = payload.contains("calib");
+    const bool legacyH = !nested && payload.contains("H") &&
+                         !payload.contains("K") && !payload.contains("D") &&
+                         !payload.contains("H_floor") && !payload.contains("H_marker");
+    json bundle = nested ? payload["calib"] : (legacyH ? payload["H"] : payload);
     normalizeBundleMmToM(bundle);  // mm -> m (÷1000). 이후 번들은 미터 기준.
+    aliasFloorKey(bundle);  // 평면 스키마의 "H"에 "H_floor" 별칭 (QT는 H_floor만 봄)
     Calib c;
     if (!calibFromJson(bundle, c)) {
         logf("[WARN] H_MATRIX 파싱 실패 - calib/H 형식 확인 필요: %s",
@@ -426,16 +436,27 @@ void Router::handleHMatrix(const json& msg) {
     calib_ = c;
     // 정규화된(미터) 번들로 다시 싸서 QT에 중계 + 영속 저장 - QT는 미터 H_floor로 top-view.
     json outMsg = msg;
-    if (legacyH) outMsg["payload"]["H"] = bundle;
-    else outMsg["payload"]["calib"] = bundle;
+    if (nested) outMsg["payload"]["calib"] = bundle;
+    else if (legacyH) outMsg["payload"]["H"] = bundle;
+    else outMsg["payload"] = bundle;  // 평면 번들은 payload 자체가 번들
     srv_.sendTo("QT", outMsg);
+    // 어느 스키마로 읽혔는지 남긴다 - 평면 번들을 보냈는데 "레거시"로 찍히면
+    // K/D가 빠졌다는 뜻이라, 로그만 보고 바로 알 수 있어야 한다.
+    const char* schema = nested ? "중첩 calib" : (legacyH ? "레거시 H" : "평면 번들");
+    // 로그인 상태와 무관하게 전역 슬롯에 먼저 남긴다 (QT-REQ-SRV-001 R-1).
+    // 캘리브레이션은 현장 속성이라, 아무도 로그인하지 않은 채 올려도 서버 재시작 후
+    // 살아남아야 한다 - 예전엔 이 경우 메모리에만 남아 그대로 유실됐다.
+    users_.setGlobalCalib(bundle);
+    const char* detail_marker =
+        c.hasMarker ? "H_marker 포함" : "H_marker 없음 - 시차 보정 생략됨";
+    const char* detail_kd = c.hasKD ? ", K/D 포함" : ", K/D 없음 - 왜곡 보정 생략됨";
     if (!currentUser_.empty() && users_.setCalib(currentUser_, bundle))
-        logf("[INFO] 캘리브레이션 수신 (mm->m 정규화, %s%s) - 사용자 '%s'에 영속 저장",
-             c.hasMarker ? "H_marker 포함" : "H_marker 없음 - 시차 보정 생략됨",
-             c.hasKD ? ", K/D 포함" : ", K/D 없음 - 왜곡 보정 생략됨",
-             currentUser_.c_str());
+        logf("[INFO] 캘리브레이션 수신 (%s, mm->m 정규화, %s%s) - 사용자 '%s' + 전역 슬롯에 영속 저장",
+             schema, detail_marker, detail_kd, currentUser_.c_str());
     else
-        logf("[WARN] 캘리브레이션 수신 (mm->m 정규화) - 로그인 사용자 없음, 세션에만 유지");
+        logf("[INFO] 캘리브레이션 수신 (%s, mm->m 정규화, %s%s) - 로그인 사용자 없음, "
+             "전역 슬롯에 영속 저장 (다음 로그인 때 전달됨)",
+             schema, detail_marker, detail_kd);
 }
 
 // 1단계: Qt "그림그리기 시작" -> 로봇 현재 위치에서 도면 시작점(planPts_[0])까지

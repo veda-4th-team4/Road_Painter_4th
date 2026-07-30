@@ -222,7 +222,12 @@
 //     - H_floor  : 왜곡 보정된 픽셀 -> 바닥 평면 미터 (Qt top-view 용)
 //     - H_marker : 왜곡 보정된 픽셀 -> 마커 장착 높이 평면 미터 (로봇 측위용,
 //                  마커가 바닥에서 떠 있어 생기는 시차를 흡수)
-//     - 레거시 {"H":[[...]x3]}도 허용 (왜곡/시차 보정 없이 동작)
+//     - 평면 스키마(QT-REQ-CCTV-001 rev.2)도 허용: payload 자체가 번들이고
+//       바닥 H의 이름이 "H"다 -> {"calib_id","created_at","image_size",
+//       "coord_mode","unit","K","D","H","H_marker","origin_mm","canvas_mm","axis"}.
+//       H를 H_floor로 읽고 K/D/H_marker까지 그대로 쓴다(보정 동작은 중첩과 동일).
+//       설치 메타데이터는 손대지 않고 저장·중계하되, "unit"만 정규화 후 "m"으로 고친다.
+//     - 레거시 {"H":[[...]x3]}만 온 경우도 허용 (왜곡/시차 보정 없이 동작)
 //   POS      payload: {"corners":[[u,v]x4]}  로봇 마커 4점 = "원본 CCTV 픽셀" 좌표
 //     순서 = [전좌, 전우, 후우, 후좌]
 //     - CCTV는 절대 좌표 변환하지 말 것 (undistort도 하지 말 것).

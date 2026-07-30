@@ -10,6 +10,8 @@ certs/*.key
 
 # 캘리브레이션 결과는 현장에서 생성 (원하면 버전관리로 바꿔도 됨)
 config/*.yaml
+# 전역 캘리브레이션 슬롯 (계정과 분리된 최신 번들 - user_store.cpp)
+config/calib_latest.json
 
 # 사용자 계정 데이터 (비번 해시 포함) - 절대 커밋 금지
 # users.json* : 뒤에 * 필요 - 백업본(users.json.bak-*)도 해시가 그대로라 같이 걸러야 함
@@ -33,3 +35,4 @@ robot_sim
 draw_test
 drive_test
 tap_dump
+cctv_pose
