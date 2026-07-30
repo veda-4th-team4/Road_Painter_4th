@@ -180,7 +180,8 @@ inline const char *jamoDef(int idx, int kind)   // kind 0=초성 1=중성 2=종�
 // 호는 여기서 10° 간격으로 잘게 나눠 넣는다. 정확한 원 위의 점이므로
 // motionprogram 의 원호 검출이 반지름 오차 없이 ARC 로 되돌린다.
 // arcStepDeg: 호를 몇 도 간격으로 점 찍을지.
-//   너무 촘촘하면(5°) ARC 를 끄고 폴리라인으로 보낼 때 op 이 폭발한다
+//   촘촘할수록 호 검출은 안정적이지만, 검출에 실패한 구간이 그대로 MOVE 로
+//   풀리기 때문에 무작정 촘촘하게 둘 수 없다
 //   (실측: 'STOP' 이 437동작). 15° 면 반지름 150mm 기준 현 길이 39mm 로
 //   붓 폭(50mm)보다 작아 눈에 각이 안 보이고, ARC 검출도 그대로 걸린다.
 inline Glyph parse(const QString &def, double arcStepDeg = 15.0)

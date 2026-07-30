@@ -37,25 +37,11 @@ struct Model {
         return k1 != 0.0 || k2 != 0.0 || p1 != 0.0 || p2 != 0.0 || k3 != 0.0;
     }
 
-    // 원본(왜곡된) 픽셀 → 왜곡 보정 픽셀. cv::undistortPoints(..., P=K) 와 같은 결과.
-    // 왜곡 식은 정방향(보정→왜곡)만 닫힌 형태라, 역방향은 고정점 반복으로 푼다.
-    // 20회면 이 렌즈 계수 범위에서 픽셀 이하로 수렴한다.
-    QPointF undistort(const QPointF &raw) const {
-        if (!valid || !hasDistortion()) return raw;
-        const double x0 = (raw.x() - cx) / fx;
-        const double y0 = (raw.y() - cy) / fy;
-        double x = x0, y = y0;
-        for (int i = 0; i < 20; ++i) {
-            const double r2  = x * x + y * y;
-            const double rad = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2;
-            if (std::abs(rad) < 1e-12) break;
-            const double dx = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
-            const double dy = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
-            x = (x0 - dx) / rad;
-            y = (y0 - dy) / rad;
-        }
-        return QPointF(fx * x + cx, fy * y + cy);
-    }
+    // ⚠️ 여기 있던 undistort(원본 픽셀 → 보정 픽셀, 고정점 반복 20회)는 지웠다.
+    //    호출부가 0 이다. TopView 배경 보정은 OpenCV 의 remap 이 하고, 좌표 변환은
+    //    아래 distort 로 **반대 방향**만 쓴다:
+    //        TopView px → (m_tvHinv) → 보정 픽셀 → (distort) → 원본 RTSP px
+    //    보정 픽셀에서 출발하므로 역변환이 필요한 자리가 없다.
 
     // 왜곡 보정 픽셀 → 원본(왜곡된) 픽셀. 정방향이라 반복 없이 한 번에 끝난다.
     // 월드 좌표를 원본 영상 위에 그릴 때 쓴다.

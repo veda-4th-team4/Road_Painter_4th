@@ -194,11 +194,12 @@ inline double tangentDeg(const Circle &c, const QPointF &p, bool left)
 // pts   : 펜이 지나갈 월드 좌표(미터). BLUEPRINT.points 와 같은 값.
 // paint : paint[i] = pts[i-1]→pts[i] 구간을 칠하는가. paint[0] 은 미사용.
 // spd   : 미리보기/예상시간 계산용 (전송하지 않음)
-// arcOn : 원호 검출을 쓸지. 끄면 전부 MOVE/TURN.
 //
 // ⚠️ 펜 오프셋 인자는 없다. 도면 그대로만 만든다 — 파일 머리 주석 참고.
+// ⚠️ arcOn 인자도 없앴다 — 곡선은 **항상 ARC op** 으로 낸다. 끄는 쪽은 같은 곡선을
+//    잘게 쪼갠 MOVE/TURN 으로 바꿔 동작 수만 4~10배 늘렸다(O: 4 → 49).
 inline QList<Op> build(const QList<QPointF> &pts, const QList<bool> &paint,
-                       const Speeds &spd = Speeds(), bool arcOn = true)
+                       const Speeds &spd = Speeds())
 {
     QList<Op> out;
     const int n = pts.size();
@@ -250,7 +251,7 @@ inline QList<Op> build(const QList<QPointF> &pts, const QList<bool> &paint,
     int i = 1;
     while (i < n) {
         // ── 원호로 묶을 수 있는지 먼저 본다 ──
-        if (arcOn && i + 3 < n) {
+        if (i + 3 < n) {
             detail::Circle best; double bestSweep = 0.0; bool bestLeft = true;
             int bestEnd = -1;
             // 최소 4세그먼트부터 시작해 최대한 길게 늘린다

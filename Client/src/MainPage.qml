@@ -707,37 +707,43 @@ Item {
                        + "호모그래피만으로는 가운데는 맞아도 끝쪽이 휩니다.\n" + Backend.lensSummary)
                     : "K·왜곡계수가 없습니다. 설정 → 캘리브에서 CCTV 캘리브레이션 JSON을 넣으세요."
             },
-            // 곡선을 ARC op 으로 보낼지. 로봇이 ARC 를 구현하기 전에는 꺼둬야 한다.
+            // 로봇 아이콘 켜고 끄기. 265mm 기체를 실축으로 그리면 900×600 도면의 1/4 을
+            // 덮어서, 로봇이 도면 한가운데 서 있으면 그리던 선이 통째로 가려진다.
+            // 표시만 끈다 — 위치 수신·진행률은 계속 돈다.
             Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
-                width: arcLabel.implicitWidth + 18
+                width: robotVisLabel.implicitWidth + 18
                 height: 20
                 radius: 10
-                color: Backend.arcEnabled ? Theme.accentSoft : "transparent"
+                color: Backend.robotVisible ? Theme.accentSoft : "transparent"
                 border.width: 1
-                border.color: Backend.arcEnabled ? Theme.accent : Theme.stroke
+                border.color: Backend.robotVisible ? Theme.accent : Theme.stroke
                 Text {
-                    id: arcLabel
+                    id: robotVisLabel
                     anchors.centerIn: parent
-                    text: "곡선ARC " + (Backend.arcEnabled ? "ON" : "OFF")
-                    color: Backend.arcEnabled ? Theme.accentDim : Theme.muted
+                    text: "로봇표시 " + (Backend.robotVisible ? "ON" : "OFF")
+                    color: Backend.robotVisible ? Theme.accentDim : Theme.muted
                     font.pixelSize: 10
-                    font.bold: Backend.arcEnabled
+                    font.bold: Backend.robotVisible
                     font.family: Theme.fontFamily
                 }
                 MouseArea {
-                    id: arcMouse
+                    id: robotVisMouse
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: Backend.arcEnabled = !Backend.arcEnabled
+                    onClicked: Backend.setRobotVisible(!Backend.robotVisible)
                 }
-                ToolTip.visible: arcMouse.containsMouse
-                ToolTip.text: "ON = 곡선을 ARC op 으로 보냅니다 (프로토콜 v0.3).\n"
-                    + "⚠️ 로봇 PathFollower 에 아직 MOVE/TURN 분기밖에 없어서\n"
-                    + "   ARC 를 보내면 그 자리에서 멈춥니다. 로봇이 구현한 뒤 켜세요.\n"
-                    + "OFF = 곡선도 잘게 쪼갠 MOVE/TURN 으로 내보냅니다 (지금 안전한 쪽)."
-            }
+                ToolTip.visible: robotVisMouse.containsMouse
+                ToolTip.text: "TopView 위 로봇 아이콘을 숨깁니다.\n"
+                    + "작도할 때 로봇이 도면을 가리면 끄세요.\n"
+                    + "표시만 꺼지고 위치 수신·진행률 계산은 그대로 돕니다."
+            },
+            // ⚠️ 여기 있던 `곡선ARC ON/OFF` 칩은 지웠다.
+            //    곡선은 **항상 ARC op** 으로 보낸다 (프로토콜 v0.3). 끌 이유가 없다:
+            //    동작 수가 4~10배 줄고, 로봇에는 arc_test.cpp 로 검증된 원호 주행
+            //    코드가 이미 있다(피타고라스 보정 + 좌우 바퀴 차동 속도).
+            //    남은 건 main.cpp 의 op 분기에 ARC 를 연결하는 일뿐이다.
         ]
 
         Item {

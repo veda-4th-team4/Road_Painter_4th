@@ -104,14 +104,10 @@ class Backend : public QObject
     // 위 속도로 계산한 이번 도면의 예상 소요 시간
     Q_PROPERTY(QString planTimeText READ planTimeText NOTIFY jobChanged)
     // 테스트 모드 시뮬레이션 — 동작 시퀀스를 실제 속도로 재생한다
-    // 곡선을 ARC op 으로 보낼지. 프로토콜 v0.3(2026-07-29)에 ARC 가 있고 서버도
-    // 받아주지만, **로봇 PathFollower 에는 아직 MOVE/TURN 분기밖에 없다.**
-    // (PathFollower.cpp: `if op=="MOVE" ... else if op=="TURN"` — else 가 없어
-    //  ARC 세그먼트를 만나면 속도 0 으로 그 자리에 영구 정지한다)
-    // 로봇이 ARC 를 구현하기 전까지는 끄고 폴리라인(MOVE/TURN)으로 내보낸다.
-    Q_PROPERTY(bool arcEnabled READ arcEnabled WRITE setArcEnabled NOTIFY arcChanged)
     Q_PROPERTY(bool lensCorrection READ lensCorrection WRITE setLensCorrection NOTIFY lensChanged)
     Q_PROPERTY(bool lensReady READ lensReady NOTIFY lensChanged)
+    // TopView 위 로봇 아이콘 표시 — 작도할 때 도면을 가려서 끌 수 있어야 한다
+    Q_PROPERTY(bool robotVisible READ robotVisible WRITE setRobotVisible NOTIFY robotVisibleChanged)
     Q_PROPERTY(QString lensSummary READ lensSummary NOTIFY lensChanged)
     Q_PROPERTY(double simSpeedFactor READ simSpeedFactor WRITE setSimSpeedFactor NOTIFY simChanged)
     Q_PROPERTY(bool simRunning READ simRunning NOTIFY simChanged)
@@ -205,10 +201,12 @@ public:
     QString planTimeText() const;
     // TopView 배경에 렌즈 보정을 적용할지. 끄면 예전 동작(호모그래피만) 그대로라
     // 켜고 끄며 어느 쪽이 잘 펴지는지 눈으로 비교할 수 있다.
-    bool arcEnabled() const { return m_arcEnabled; }
-    Q_INVOKABLE void setArcEnabled(bool on);
     bool lensCorrection() const { return m_lensOn; }
     Q_INVOKABLE void setLensCorrection(bool on);
+    // 로봇 아이콘 표시. 265mm 기체를 900×600 도면에 실축으로 그리면 캔버스의 1/4 라
+    // 로봇이 도면 위에 서 있으면 그리던 선이 통째로 가려진다. 그래서 끌 수 있게 뒀다.
+    bool robotVisible() const { return m_robotVisible; }
+    Q_INVOKABLE void setRobotVisible(bool on);
     // 렌즈 파라미터가 실제로 들어와 있는지 (없으면 켜도 아무 일이 없다)
     bool lensReady() const { return m_cam.valid && m_cam.hasDistortion(); }
     QString lensSummary() const { return camcalib::describe(m_cam); }
@@ -259,7 +257,6 @@ public:
     Q_INVOKABLE void addWorldPointMm(double xMm, double yMm);
     Q_INVOKABLE void addRectWorldMm(double widthMm, double heightMm);
     Q_INVOKABLE void addTextWorldMm(const QString &text, double heightMm, bool outline = false);
-    Q_INVOKABLE int pathShapeCount() const;
     Q_INVOKABLE void simplifyPaths(double toleranceMm);
     // 도형 변환 (선택된 점이 있으면 그것만)
     Q_INVOKABLE void rotateShape(double deg);
@@ -281,7 +278,6 @@ public:
 signals:
     void sessionChanged();
     void drawingChanged();
-    void drawingCommitted();
     void robotStatusChanged();
     void robotLogChanged();
     void keyboardControlChanged();
@@ -302,7 +298,7 @@ signals:
     void speedChanged();
     void simChanged();
     void lensChanged();
-    void arcChanged();
+    void robotVisibleChanged();
     void historyChanged();
 
 private:
@@ -331,6 +327,10 @@ private:
     void beginPainting();
     void finishJob(const QString &reason);
     void onPose(double x, double y, double thetaDeg);
+    // 수신 POSE(=ArUco 마커)를 탑뷰 두 겹(섀시·노즐)으로 나눠 넘긴다. 정의부 주석 참고.
+    void pushPoseToView(bool valid);
+    // 테스트 재생용 — 위와 거울 관계(재생기 좌표가 노즐이라 섀시를 앞으로 민다).
+    void pushSimPoseToView(const QPointF &nozzleM, double headingDeg, bool down);
     void onStatus(const QString &state, bool painting);
     double progressAlongPath(const QPointF &pose) const;
     // 미션 전체를 주행 순서대로 이어붙인 폴리라인 (닫힌 도형은 시작점 복귀 포함)
@@ -342,6 +342,8 @@ private:
     void stopTestProgressSim();
     void refreshJobMetrics();
     void refreshCalibStatus();
+    // H 단위 검산 결과를 로그에 남긴다 (즉시 적용·지연 적용 두 경로 공용)
+    void logCalibUnit(VideoView *v);
     // 캘리브레이션 번들은 세 곳에서 들어온다 — 설정창 수동 붙여넣기, LOGIN_OK, H_MATRIX.
     // 셋 다 **같은 경로**를 타야 서버 연동을 켜는 순간 바로 동작한다.
     //   normalizeCalibObject : 표기 흔들림(H_floor, {"calib":{}}, c0..c3) 흡수
@@ -404,14 +406,23 @@ private:
     bool m_serverConnected = false;
     QString m_serverLabel = "대기";
     bool m_robotOnline = false;
+    bool m_robotVisible = true;
     bool m_cctvOnline = false;
     double m_cctvFps = 0.0;
     double m_cctvLatencyMs = 0.0;
+    // 로봇 **접속** 신호 — PEERS(robot>0) 와 STATUS 만 갱신한다. POSE 는 아니다.
     QElapsedTimer m_lastRobotBeat;
     bool m_hasRobotBeat = false;
+    // 로봇 **위치 수신** 신호 — POSE 전용. 접속과 별개다(마커만 보여도 POSE 는 온다).
+    QElapsedTimer m_lastPoseBeat;
+    bool m_hasPoseBeat = false;
+    bool m_poseEverSeen = false;    // 이번 세션에서 POSE 를 한 번이라도 받았는가
+    bool m_poseWaitWarned = false;  // "POSE 미수신" 경고를 이미 남겼는가 (작업당 1회)
 
     double m_poseX = 0, m_poseY = 0, m_poseTheta = 0;
     bool m_poseValid = false;
+    // PEERS 마지막 값 — 바뀔 때만 로그에 남기기 위한 비교용 (-1 = 아직 못 받음)
+    int m_peerRobot = -1, m_peerCctv = -1;
 
     bool m_jobActive = false;      // START_DRAW ~ DRAW_DONE 사이 (접근+도색 전체)
     bool m_blueprintSent = false;  // 도면이 서버에 저장돼 있는가
@@ -452,8 +463,6 @@ private:
     // ⚠️ 여기 있던 m_lensK1/m_lensK2(옛 2계수 경로)는 지웠다 — 같은 일을 하는 길이
     //    둘이라 어느 쪽이 켜졌는지에 따라 좌표가 달라졌다.
     camcalib::Model m_cam;
-    // 기본값 false — 로봇이 ARC 를 구현하기 전까지는 폴리라인으로 나간다.
-    bool m_arcEnabled = false;
     bool m_lensOn = false;
     // 마지막으로 받은 프레임 크기. 캘리브 해상도와 맞는지 확인하는 데만 쓴다.
     int m_frameW = 0, m_frameH = 0;
