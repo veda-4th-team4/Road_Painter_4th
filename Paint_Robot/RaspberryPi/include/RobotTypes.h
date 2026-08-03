@@ -76,10 +76,12 @@ typedef struct {
  * @brief Segment structure containing path operation sequence (v0.3).
  */
 typedef struct {
-    std::string op;       // "MOVE" or "TURN"
-    float dist_m;         // for MOVE
-    float angle_deg;      // for TURN
-    bool paint;           // for MOVE
+    std::string op;       // "MOVE", "TURN", "NOZZLE", or "ARC"
+    float dist_m;         // for MOVE or ARC (arc length)
+    float angle_deg;      // for TURN or ARC
+    float radius_m;       // for ARC (curve radius R_paint)
+    std::string direction;// for ARC ("left" or "right")
+    bool paint;           // for MOVE or ARC
     float heading_deg;    // Target heading orientation (v0.3)
 } Segment_t;
 
