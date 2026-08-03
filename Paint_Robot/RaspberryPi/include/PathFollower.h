@@ -18,6 +18,20 @@ public:
     void SetPath(const std::vector<Segment_t>& new_path);
 
     /**
+     * @brief Discards the loaded path entirely (server CMD "ABORT_DRAW").
+     *
+     * Unlike SetPath() this does not swap in a new path -- it leaves the
+     * follower with nothing to drive. ESTOP alone is a PAUSE: it stops the
+     * motors but the segment cursor survives, so RESUME picks the paint job up
+     * exactly where it stopped. ABORT_DRAW must not do that, hence this.
+     *
+     * NOTE: an empty path makes IsPathFinished() true, so the caller must also
+     * suppress the PATH_DONE it would normally send on completion -- the path
+     * was thrown away, not finished (protocol v0.4).
+     */
+    void ClearPath();
+
+    /**
      * @brief Gets current active segment index (0-based).
      */
     size_t GetCurrentSegmentIndex() const { return current_waypoint_idx; }

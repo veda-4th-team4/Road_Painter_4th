@@ -36,6 +36,19 @@ void PathFollower::SetPath(const std::vector<Segment_t>& new_path) {
     std::cout << "[PathFollower] Path loaded with " << path.size() << " segments." << std::endl;
 }
 
+void PathFollower::ClearPath() {
+    path.clear();
+    current_waypoint_idx = 0;
+    drift_offset_deg = 0.0f;
+    is_turning = false;
+    is_moving_straight = false;
+    // The nozzle-offset sub-move is tracked separately from is_moving_straight's
+    // target; leaving a stale distance here would make the next StartOffsetMove
+    // compare against the aborted run.
+    offset_move_dist = 0.0f;
+    std::cout << "[PathFollower] Path discarded (ABORT_DRAW)." << std::endl;
+}
+
 bool PathFollower::GetCurrentSegment(Segment_t& out_seg) const {
     if (path.empty() || current_waypoint_idx >= path.size()) return false;
     out_seg = path[current_waypoint_idx];

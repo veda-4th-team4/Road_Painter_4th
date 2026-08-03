@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
       // 1. Run network loop to check sockets and reconnect if needed
       net_manager.Process();
 
-      // 2. Handle incoming CMD (ESTOP / RESUME / Manual Controls) relay to STM32
+      // 2. Handle incoming CMD (ESTOP / RESUME / ABORT_DRAW / Manual) relay to STM32
       std::string cmd;
       if (net_manager.GetLatestCommand(cmd)) {
           std::cout << "[MAIN] Relaying command to STM32: " << cmd << std::endl;
@@ -73,6 +73,32 @@ int main(int argc, char **argv) {
               manual_speed = {0, 0};
               manual_nozzle = 0;
               robot_comm.SendControlNozzle(0);
+          } else if (cmd == "ABORT_DRAW") {
+              // Protocol v0.4: cancel the job outright.
+              //
+              // Same stop + emergency latch as ESTOP, but it also THROWS THE
+              // PATH AWAY. That difference is the whole point: with ESTOP the
+              // segment cursor survives, so a single RESUME used to bring the
+              // paint job back to life exactly where it stopped -- there was no
+              // way to actually cancel a started job.
+              robot_comm.SendEmergencyStop(0x01);
+              manual_override = true;
+              manual_speed = {0, 0};
+              manual_nozzle = 0;
+              auto_nozzle = 0;
+              robot_comm.SendControlNozzle(0);
+
+              path_follower.ClearPath();
+              waiting_for_go = false;
+              ready_seg_sent = 0xFFFFFFFF;
+              nozzle_sub_seq = NozzleSubSeq::OFFSET_MOVE;
+              // Do NOT send PATH_DONE -- the path was discarded, not completed.
+              // Clearing the path makes IsPathFinished() true, which would
+              // otherwise trip the completion branch below on the next tick and
+              // tell the server the paint job finished successfully.
+              path_done_sent = true;
+              std::cout << "[MAIN] ABORT_DRAW: path discarded, ESTOP latched "
+                           "(RESUME will not restart painting)." << std::endl;
           } else if (cmd == "RESUME") {
               robot_comm.SendClearEStop();
               manual_override = false;
