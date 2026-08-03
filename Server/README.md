@@ -22,6 +22,7 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 | [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) | 로봇 주행 통합 테스트 계획 (단계 A~D, 합격 기준, 드라이런 결과) |
 | [docs/REFACTOR_SUMMARY.md](docs/REFACTOR_SUMMARY.md) | graceful shutdown 개선 기록 |
 | [admin_console/PLAN.md](admin_console/PLAN.md) | 관리자 창 설계/진행 상황 |
+| [relay/README.md](relay/README.md) | RTSP 4채널 패스스루 중계 (카메라 → 서버 → Qt 영상 경로) |
 
 ## 파일 구성
 
@@ -52,6 +53,13 @@ Server/
 │   ├── path_test.cpp       최초 1회 경로생성 테스트기 (CCTV 스냅샷 주입 → 접근 PATH 검증)
 │   ├── seed_user.py        테스트 계정 생성 (기본 test/1234 + 예시 캘리브레이션)
 │   └── *_snapshot.json     path_test용 CCTV 스냅샷 (호모그래피 + 마커 4코너)
+├── relay/                  RTSP 4채널 패스스루 중계 (카메라 영상 → Qt, 재인코딩 없음)
+│   ├── mediamtx.yml           중계 설정 (카메라 주소·계정 없음 — 커밋 안전)
+│   ├── cameras.env.example    카메라 접속 정보 템플릿 (cameras.env로 복사, git 제외)
+│   ├── probe_onvif.py         ★ ONVIF로 채널별 RTSP 주소 조회 (경로 짐작 금지 — 계정 잠김)
+│   ├── install.sh             MediaMTX 바이너리 설치 (bin/은 git 제외)
+│   ├── start.sh               중계 기동 (-d 로 백그라운드)
+│   └── README.md              구성·문제 해결
 └── admin_console/          관리자 창 (Python 웹 GUI - 카메라 캘리 도구 + 서버 로그/로봇 제어)
     ├── web_gui.py              진입점: HTTP 라우팅 + 로봇 제어( /robot )·로그 모니터( /logs ) + main()
     ├── cctv.py                 ★ CCTV 파트 (카메라 CAM_POSE·캘리브레이션·스냅샷 + 대시보드 UI) — CCTV팀 작업 파일

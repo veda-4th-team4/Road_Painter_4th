@@ -1,0 +1,96 @@
+# PNM-C16083RVQ 4채널 RTSP 패스스루 중계 설정.
+#
+# 이 파일에는 카메라 주소도 계정도 없다 — 전부 cameras.env 에서 환경변수로 주입한다
+# (MediaMTX 는 MTX_PATHS_<경로이름>_<파라미터> 형태의 환경변수로 아래 값을 덮어쓴다).
+# 그래서 이 파일은 그대로 커밋해도 되고, 비밀은 gitignore 된 cameras.env 에만 남는다.
+#
+# ⚠️ 여기서는 절대 트랜스코딩하지 않는다. MediaMTX 는 받은 스트림을 디코드 없이
+#    그대로 재발행한다 (ffmpeg -c copy 와 같은 의미). 서버가 라즈베리파이라
+#    4채널 4MP H.265 를 재인코딩하는 건 애초에 불가능하다 — 화질 손실이 없는
+#    대신, 중계 자체로 늘어나는 지연(수십 ms)은 감수하는 구성이다.
+
+logLevel: info
+
+# 카메라가 끊기거나 응답이 늦을 때 10초 안에 실패로 떨어뜨린다.
+readTimeout: 10s
+writeTimeout: 10s
+
+# 한 스트림당 대기 큐. 4MP 급 키프레임 한 장이 큐를 통째로 먹는 일이 있어서
+# 기본값 512 로는 "write queue is full" 로 리더가 끊긴다. 4채널 메인스트림
+# 기준으로 올려 잡는다. 더 키우면 끊김 대신 지연으로 나타나므로 무작정 올리지 말 것.
+writeQueueSize: 2048
+
+###############################################################################
+# 인증
+###############################################################################
+authMethod: internal
+authInternalUsers:
+  # 읽기(=Qt 시청)는 열어둔다. 현장 폐쇄망 전제이며, 계정을 걸고 싶으면 아래
+  # user/pass 를 채우고 Qt 쪽 RTSP URL 에도 같은 계정을 넣으면 된다.
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: read
+      - action: playback
+  # 발행(publish)·API 는 서버 자신에게만 허용한다. 외부에서 임의로 ch1 을
+  # 가로채 다른 영상을 밀어넣는 것을 막는다.
+  - user: any
+    pass:
+    ips: [127.0.0.1, ::1]
+    permissions:
+      - action: publish
+      - action: api
+
+###############################################################################
+# 프로토콜 — RTSP 와 관리 API 만 켠다
+###############################################################################
+rtsp: true
+# ⚠️ TCP 고정. UDP 를 남겨두면 협상이 UDP 로 먼저 붙었다가 실패하고 30초쯤
+#    까먹는다 (Qt 쪽 video_worker.cpp 에 같은 이유의 주석이 있다).
+rtspTransports: [tcp]
+rtspAddress: :8554
+
+api: true
+apiAddress: 127.0.0.1:9997
+
+# 안 쓰는 것들은 전부 끈다 — 파이의 CPU 와 포트를 아낀다.
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+moq: false
+metrics: false
+pprof: false
+playback: false
+
+###############################################################################
+# 채널 경로
+###############################################################################
+# source 는 cameras.env 의 MTX_PATHS_CH1_SOURCE ... CH4_SOURCE 가 덮어쓴다.
+# 여기 적힌 publisher 는 "환경변수를 안 넣었을 때 조용히 대기" 하는 기본값일 뿐이다.
+#
+# sourceOnDemand: 보는 사람이 있을 때만 카메라에서 당겨온다. Qt 를 닫아두면
+# 카메라→서버 트래픽이 0 이 된다. 이 서버는 무선 인터페이스 하나로 수신과
+# 송신을 같이 하므로, 안 볼 때 안 당기는 것이 중요하다.
+paths:
+  ch1:
+    source: publisher
+    sourceOnDemand: true
+    sourceOnDemandStartTimeout: 10s
+    sourceOnDemandCloseAfter: 10s
+  ch2:
+    source: publisher
+    sourceOnDemand: true
+    sourceOnDemandStartTimeout: 10s
+    sourceOnDemandCloseAfter: 10s
+  ch3:
+    source: publisher
+    sourceOnDemand: true
+    sourceOnDemandStartTimeout: 10s
+    sourceOnDemandCloseAfter: 10s
+  ch4:
+    source: publisher
+    sourceOnDemand: true
+    sourceOnDemandStartTimeout: 10s
+    sourceOnDemandCloseAfter: 10s
