@@ -154,8 +154,16 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps, M
 
     // Straight move in progress with server DRIFT + IMU Yaw fusion correction
     float target_v = 0.05f; // 5 cm/s
-    float total_heading_error = drift_offset_deg + imu_yaw_deg;
-    float target_w = -total_heading_error * 0.05f; 
+    
+    // Clamp server DRIFT offset to safe maximum range [-10.0 deg, +10.0 deg]
+    float clamped_drift_deg = std::clamp(drift_offset_deg, -10.0f, 10.0f);
+    
+    // Server DRIFT: Positive = facing right -> turn CCW (left) (+w)
+    // IMU Yaw: Positive = facing left -> turn CW (right) (-w)
+    float drift_w = clamped_drift_deg * 0.015f;
+    float imu_w = -imu_yaw_deg * 0.02f;
+    float target_w = std::clamp(drift_w + imu_w, -0.08f, 0.08f); // Clamp max angular velocity to prevent wheel reversal
+
     out_speed = velocity_to_sps(target_v, target_w);
     out_nozzle_on = current_seg.paint ? 1 : 0;
 
@@ -163,7 +171,7 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps, M
     if (++move_log_count % 10 == 0) {
         std::cout << "[PathFollower MOVE] Progress: " << progress_steps << "/" << move_target_steps
                   << " steps | IMU Yaw: " << imu_yaw_deg << " deg | Server Drift: " << drift_offset_deg
-                  << " deg -> Target SPS (L: " << out_speed.left_sps << ", R: " << out_speed.right_sps << ")" << std::endl;
+                  << " deg (clamped: " << clamped_drift_deg << ") -> Target SPS (L: " << out_speed.left_sps << ", R: " << out_speed.right_sps << ")" << std::endl;
     }
 
     return false;

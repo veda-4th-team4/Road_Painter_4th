@@ -143,7 +143,7 @@ int main(int argc, char **argv) {
           if (path_follower.GetCurrentSegment(current_seg)) {
               if (current_seg.op == "MOVE") {
                   uint32_t seg_idx = static_cast<uint32_t>(path_follower.GetCurrentSegmentIndex());
-                  bool bypass_server_go = true; // Set to true to bypass server GO/ALIGN wait for continuous drive
+                  bool bypass_server_go = false; // Wait for server GO/ALIGN handshake before starting MOVE
                   
                   if (ready_seg_sent != seg_idx) {
                       // Send READY to server for logging, then proceed directly if bypass enabled
