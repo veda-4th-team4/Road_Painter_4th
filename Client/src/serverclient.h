@@ -62,6 +62,9 @@ public:
                        const QList<bool> &paint = QList<bool>(),
                        const QList<motionprogram::Op> &program = {});
     void sendCmd(const QString &cmd);
+    // 작업 완전 중지 (프로토콜 v0.4). ESTOP 과 달리 서버·로봇이 받아둔 경로를
+    // 버리므로, RESUME 해도 도색이 재개되지 않는다. 도면은 서버에 남는다.
+    void sendAbortDraw();
     // ⚠️ sendSpeeds 는 없앴다 — 프로토콜에 속도 CMD 가 없고(2026-07-28 확정),
     //    로봇에도 SET_SPEED 분기가 없어 보내봐야 버려진다.
     // 로그인 후 카메라 IP 변경 (빈 문자열이면 등록 해제)
@@ -88,8 +91,11 @@ signals:
     void blueprintAck(int points, bool paint, int program);
     // 카메라 IP 변경 결과
     void camIpResult(bool ok, const QString &camIp, const QString &reason);
-    // 도색 완료 — START_DRAW 이후 유일한 "끝" 신호
+    // 도색 완료 — START_DRAW 이후 정상적인 "끝" 신호
     void drawDone();
+    // 작업 취소 확인 (ABORT_DRAW 응답). wasActive=false 면 진행 중인 작업이
+    // 없었다는 뜻 — 어느 쪽이든 UI 는 "그리는 중" 표시를 끄면 된다.
+    void drawAborted(bool wasActive);
     // 경로 생성/전송 실패 또는 대기 통지
     void drawFailed(const QString &stage, const QString &reason, const QString &msg);
 

@@ -234,7 +234,9 @@ public:
     Q_INVOKABLE int  pathPointCount() const;
     Q_INVOKABLE void commitDrawing();     // BLUEPRINT 전송 → 로봇 접근 단계
     Q_INVOKABLE void startPainting();     // CMD START_DRAW → 도색 시작
-    Q_INVOKABLE void cancelJob();         // 진행 중 작업 중단 (ESTOP + 로컬 정리)
+    // 진행 중 작업 취소 (CMD ABORT_DRAW). ESTOP 과 달리 서버·로봇이 경로를 버리므로
+    // ESTOP 해제를 해도 도색이 재개되지 않는다. 도면은 서버에 남는다.
+    Q_INVOKABLE void cancelJob();
     Q_INVOKABLE void editMission();       // 전송한 경로를 다시 편집 상태로
     Q_INVOKABLE void finishDrawing();
     Q_INVOKABLE void cancelDrawing();

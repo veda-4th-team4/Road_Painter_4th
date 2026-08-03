@@ -164,6 +164,25 @@ Backend::Backend(QObject *parent)
         setNotice(QStringLiteral("도색이 완료되었습니다."), QStringLiteral("info"));
         finishJob(QStringLiteral("DRAW_DONE — 도색 완료"));
     });
+    // 작업 취소 확인. cancelJob() 이 이미 UI 를 정리했으므로 보통은 로그만 남는다.
+    // 관리자 창(ADMIN)이 취소한 경우엔 여기가 유일한 통지라 상태를 여기서 접는다.
+    connect(m_client, &ServerClient::drawAborted, this, [this](bool wasActive) {
+        appendLog(QStringLiteral("DRAW_ABORTED — 서버 경로 폐기 (진행 중이던 작업 %1)")
+                      .arg(wasActive ? QStringLiteral("있음") : QStringLiteral("없음")));
+        if (!m_jobActive) return;   // cancelJob() 이 이미 정리한 정상 경로
+        stopTestProgressSim();
+        m_jobActive = false;
+        m_paintingSeen = false;
+        m_jobElapsedValid = false;
+        m_jobProgress = 0.0;
+        if (m_topView) m_topView->setMissionProgress(0.0);
+        if (m_originalView) m_originalView->setMissionProgress(0.0);
+        updateJobRecord(m_currentJobId, QStringLiteral("중단"), m_jobProgress);
+        setNotice(QStringLiteral("다른 곳(관리자 창)에서 작업이 취소되었습니다."),
+                  QStringLiteral("warn"));
+        emit jobChanged();
+        updatePhase();
+    });
     connect(m_client, &ServerClient::drawFailed, this,
             [this](const QString &stage, const QString &reason, const QString &msg) {
         const QString text = msg.isEmpty()
@@ -946,14 +965,34 @@ void Backend::startPainting()
         startTestProgressSim();
 }
 
-// 진행 중인 작업 중단. 경로 실행 중에는 서버가 수동 STOP 을 무시하므로 ESTOP 을 쓴다.
+// 진행 중인 작업을 **취소**한다 (프로토콜 v0.4 CMD ABORT_DRAW).
+//
+// ⚠️ 예전에는 여기서 ESTOP 만 보냈는데, 그건 일시정지였다. 로컬 상태만 정리되고
+//    서버의 경로 상태(planActive_)와 로봇의 세그먼트 커서는 그대로 남아서:
+//      · [ESTOP 해제]를 누르면 로봇이 멈춘 지점부터 도색을 이어서 재개했고
+//      · 서버는 계속 "실행 중"이라 다음 START_DRAW 를 DRAW_FAIL{busy} 로 거절했다
+//    ABORT_DRAW 는 서버와 로봇이 받아둔 경로를 버리게 하므로 실제로 취소가 된다.
+//    (정지·비상정지 래치까지 이 한 명령이 다 한다 — ESTOP 을 따로 보내지 않는다)
 void Backend::cancelJob()
 {
     if (!m_jobActive) return;
     const double doneSoFar = m_jobProgress;   // 이력에는 중단 시점 진행률을 남긴다
     stopTestProgressSim();
 
-    sendRobotCmd("ESTOP", "작업 중단");
+    // 로봇 상태 표시는 ESTOP 과 같다 — 서버가 로봇에 비상정지 래치를 걸어준다.
+    m_robotStatus = QStringLiteral("작업 취소");
+    m_robotState = QStringLiteral("ESTOPPED");
+    m_estopActive = true;
+    emit robotStatusChanged();
+    if (m_client && !m_testMode) {
+        m_client->sendAbortDraw();
+        appendLog(QStringLiteral("CMD ABORT_DRAW — 서버·로봇의 경로를 폐기"));
+    } else {
+        appendLog(QStringLiteral("[테스트] CMD ABORT_DRAW"));
+    }
+
+    // 서버의 DRAW_ABORTED 를 기다리지 않고 UI 를 먼저 정리한다. 취소는 사용자가
+    // 급할 때 누르는 버튼이라, 서버 왕복 동안 화면이 멈춰 있으면 안 된다.
     m_jobActive = false;
     m_paintingSeen = false;
     m_jobElapsedValid = false;
@@ -963,10 +1002,11 @@ void Backend::cancelJob()
     if (m_originalView) m_originalView->setMissionProgress(0.0);
     updateJobRecord(m_currentJobId, QStringLiteral("중단"), doneSoFar);
     emit jobChanged();
-    setNotice(QStringLiteral("작업을 중단했습니다. 로봇은 비상정지 상태입니다 — "
-                             "다시 움직이려면 ESTOP 해제를 누르세요."),
+    setNotice(QStringLiteral("작업을 취소했습니다. 경로는 폐기되어 ESTOP 해제를 해도 "
+                             "이어서 그리지 않습니다 — 다시 그리려면 [그림그리기 시작]을 "
+                             "누르세요. 로봇을 움직이려면 먼저 ESTOP 해제."),
               QStringLiteral("warn"), QStringLiteral("estop"));
-    appendLog("작업 중단 (ESTOP)");
+    appendLog(QStringLiteral("작업 취소 — 경로 폐기 + 비상정지 래치"));
     updatePhase();
 }
 

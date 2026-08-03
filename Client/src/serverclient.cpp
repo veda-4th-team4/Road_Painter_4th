@@ -182,6 +182,14 @@ void ServerClient::sendCmd(const QString &cmd)
     sendJson("CMD", p);
 }
 
+// ESTOP 만 보내던 예전 "작업 중단"은 사실 일시정지였다 — 서버의 경로 상태도
+// 로봇의 세그먼트 커서도 남아서, RESUME 한 번이면 도색이 멈춘 지점부터 재개됐다.
+// 이 명령을 받으면 서버와 로봇이 받아둔 경로를 버린다 (프로토콜 v0.4).
+void ServerClient::sendAbortDraw()
+{
+    sendCmd(QStringLiteral("ABORT_DRAW"));
+}
+
 
 // 로그인 상태에서만 동작한다. 서버는 IP 형식을 검사하지 않으므로 검증은 Qt 몫.
 void ServerClient::sendSetCamIp(const QString &camIp)
@@ -258,6 +266,8 @@ void ServerClient::dispatch(const QJsonObject &msg)
         emit camIpResult(false, QString(), payload.value("reason").toString());
     } else if (type == "DRAW_DONE") {
         emit drawDone();
+    } else if (type == "DRAW_ABORTED") {
+        emit drawAborted(payload.value("was_active").toBool());
     } else if (type == "DRAW_FAIL") {
         emit drawFailed(payload.value("stage").toString(),
                         payload.value("reason").toString(),

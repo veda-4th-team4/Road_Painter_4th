@@ -1899,8 +1899,11 @@ Item {
                         height: 38
                         danger: true
                         outline: true
-                        text: "작업 중단"
+                        text: "작업 취소"
                         visible: Backend.jobActive
+                        ToolTip.visible: hovered
+                        // ESTOP 과 뭐가 다른지가 이 버튼의 존재 이유다 — 툴팁으로 못박는다
+                        ToolTip.text: "경로를 폐기하고 로봇을 세웁니다 (ESTOP 은 일시정지라 해제하면 이어서 그립니다)"
                         onClicked: cancelConfirmPopup.open()
                     }
                     AppButton {
@@ -1912,7 +1915,7 @@ Item {
                         enabled: Backend.canEditMission && !Backend.jobActive
                         ToolTip.visible: hovered
                         ToolTip.text: Backend.jobActive
-                            ? "먼저 작업을 중단하세요"
+                            ? "먼저 작업을 취소하세요"
                             : "보냈던 경로를 다시 불러와 고칩니다"
                         onClicked: Backend.editMission()
                     }
@@ -2037,7 +2040,7 @@ Item {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 text: "누르는 즉시 로봇이 시작점으로 이동하고, 도착하면 이어서 도색까지 "
-                    + "자동으로 진행됩니다. 중간에 멈추려면 [작업 중단] 또는 ESTOP 을 쓰세요."
+                    + "자동으로 진행됩니다. 잠깐 세우려면 ESTOP, 아예 그만두려면 [작업 취소]."
                 color: Theme.sub
                 font.pixelSize: 13
                 font.family: Theme.fontFamily
@@ -2094,14 +2097,25 @@ Item {
         contentItem: Column {
             width: 340
             spacing: 14
-            Text { text: "작업 중단"; color: Theme.text; font.pixelSize: 16; font.bold: true; font.family: Theme.fontFamily }
+            Text { text: "작업 취소"; color: Theme.text; font.pixelSize: 16; font.bold: true; font.family: Theme.fontFamily }
             Text {
                 width: parent.width
                 wrapMode: Text.WordWrap
-                text: "진행 중인 작업을 중단합니다. 경로 실행 중에는 일반 정지가 통하지 않으므로 "
-                    + "비상정지(ESTOP)로 세웁니다. 이후 [ESTOP 해제]를 눌러야 다시 움직입니다."
+                text: "진행 중인 작업을 취소하고 로봇을 세웁니다. 경로가 폐기되므로 "
+                    + "[ESTOP 해제]를 눌러도 이어서 그리지 않습니다."
                 color: Theme.sub
                 font.pixelSize: 13
+                font.family: Theme.fontFamily
+            }
+            Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                // 도면은 서버에 남는다 (프로토콜 v0.4 ABORT_DRAW) — 다시 그릴 때
+                // [경로 전송]부터 할 필요가 없다는 것을 알려준다.
+                text: "도면은 서버에 그대로 남습니다. 다시 그리려면 [ESTOP 해제] 후 "
+                    + "[그림그리기 시작]을 누르면 처음부터 다시 진행됩니다."
+                color: Theme.muted
+                font.pixelSize: 12
                 font.family: Theme.fontFamily
             }
             Row {
@@ -2110,7 +2124,7 @@ Item {
                 AppButton { text: "계속 진행"; onClicked: cancelConfirmPopup.close() }
                 AppButton {
                     danger: true
-                    text: "중단"
+                    text: "작업 취소"
                     onClicked: { cancelConfirmPopup.close(); Backend.cancelJob() }
                 }
             }
