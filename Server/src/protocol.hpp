@@ -1,5 +1,5 @@
 #pragma once
-// ===== Road-Painter 메시지 프로토콜 (v0.3) =====
+// ===== Road-Painter 메시지 프로토콜 (v0.4) =====
 // 공통 형식: {"type": "...", "seq": n, "payload": {...}} + 개행(\n)  [TLS 위 JSON Lines]
 //
 // 좌표계 규약 (v0.3 핵심):
@@ -8,6 +8,19 @@
 //   - QT는 "바닥 미터 좌표"로 변환을 마친 도면을 보낸다.
 //     (top-view 위에 그린 점 = 바닥 평면 위의 점이라 스케일 나눗셈이 전부)
 //   - 서버 내부 월드 좌표계: 바닥 평면, 단위 미터.
+//
+// 채널 규약 (v0.4 핵심 - 다채널 카메라 PNM-C16083RVQ):
+//   - "ch" = 채널 번호, 1부터 시작 (카메라 웹UI의 CH1~CH4와 같은 번호).
+//   - 채널마다 렌즈 방향이 달라 캘리브레이션 번들(K/D/H)이 완전히 다르다.
+//     그래서 서버는 캘리브레이션을 채널별 맵으로 들고 있다.
+//   - 붙는 곳: H_MATRIX.payload.ch / POS.payload.ch (CCTV -> 서버),
+//     CMD{"cmd":"SELECT_CHANNEL","ch":n} (QT -> 서버 -> CCTV),
+//     CHANNEL_OK.payload.ch / LOGIN_OK.payload.calibs (서버 -> QT).
+//   - 🔴 ch는 전부 선택 필드다. 없으면 서버가 1로 본다 - 단일 채널 카메라(PNO)와
+//     기존 클라이언트는 한 줄도 안 고쳐도 v0.3과 100% 동일하게 동작한다.
+//   - 서버는 "활성 채널" 1개를 기억한다(기본 1, SELECT_CHANNEL로 변경).
+//     활성 채널과 다른 ch의 POS는 무시한다 - 다른 채널이 우연히 로봇 마커를
+//     잡았을 때 pose가 두 채널 사이에서 튀는 것을 막기 위함.
 //
 // [클라이언트 -> 서버, 접속 직후 1회]
 //   HELLO  payload: {"role":"QT"|"ROBOT"|"CCTV"|"ADMIN"}
@@ -56,11 +69,29 @@
 //     - 가려는 방향이 0도 기준. 시계방향(오른쪽)으로 틀어져 있으면 양수,
 //       반시계(왼쪽)면 음수. 값 = 좌회전으로 보정해야 할 양 (ALIGN과 동일 규약).
 //   CMD    payload: {"cmd": ...}  (응답 불필요, fire-and-forget)
-//     - 이벤트: "ESTOP" | "RESUME" | "CALIB_START"
+//     - 이벤트: "ESTOP" | "RESUME" | "CALIB_START" | "ABORT_DRAW"
 //     - 수동 조작(조이스틱, 누르는 동안 이동 / STOP=뗌, 이동량 없음):
 //         "FORWARD" | "BACKWARD" | "TURN_LEFT" | "TURN_RIGHT" | "STOP"
 //       수동 CMD가 오면 서버는 자동 경로추종/재계획을 멈춘다(충돌 방지).
 //       자동 모드 복귀는 새 BLUEPRINT 수신 시.
+//
+//   🔴 [ABORT_DRAW = 작업 완전 중지] (2026-08-03 신설, 로봇팀 신규 구현 대상)
+//     ESTOP과 다른 점은 딱 하나 - "받아둔 PATH를 버린다".
+//                        ESTOP            ABORT_DRAW
+//       모터/노즐 정지     O                O
+//       비상정지 래치      O (RESUME 필요)  O (RESUME 필요)
+//       받아둔 경로        유지 -> RESUME   폐기 -> RESUME 해도
+//                          하면 멈춘 데서   아무 데도 안 감
+//                          이어서 달림
+//     즉 ESTOP은 일시정지, ABORT_DRAW는 취소다. 로봇이 할 일:
+//       1) 정지 + 노즐 올림 + 비상정지 래치 (ESTOP과 동일)
+//       2) 경로 버퍼를 비운다 - 세그먼트 커서, PATH_DONE 전송 대기,
+//          노즐 오프셋 서브시퀀스 상태까지 전부. RESUME 후에 자동 주행이
+//          되살아나면 안 된다.
+//       3) PATH_DONE을 보내지 않는다 (끝낸 게 아니라 버린 것).
+//     다음 작업은 서버가 새 PATH를 보내는 것으로 시작한다.
+//     ⚠️ ESTOP + ABORT_DRAW를 따로 보내지 않는다 - 두 개로 나누면 순서가
+//     뒤바뀌거나 하나가 누락됐을 때 "섰는데 경로가 살아있는" 상태가 생긴다.
 //
 // [로봇 -> 서버]
 //   STATUS payload: {"state":"IDLE"|"MOVING"|"ESTOPPED"|"ERROR", "painting":true}
@@ -88,10 +119,15 @@
 //     -> 응답 REGISTER_OK {"id":...} | REGISTER_FAIL {"reason":...}
 //        (cam_ip는 선택 - 카메라 IP. 서버는 검증 없이 저장만 함)
 //   LOGIN    payload: {"id":"user1","pw":"..."}
-//     -> 응답 LOGIN_OK {"id":..., "calib":{...}|null, "cam_ip":"..."|null}
+//     -> 응답 LOGIN_OK {"id":..., "calib":{...}|null, "calibs":{"1":{...},"2":null},
+//                       "active_ch":1, "cam_ip":"..."|null}
 //        | LOGIN_FAIL {"reason":...}
-//        (calib는 저장된 캘리브레이션 번들, null이면 캘리브레이션 필요.
-//         cam_ip는 REGISTER 때 등록한 카메라 IP, 없으면 null)
+//        (calib  = 활성 채널의 번들. null이면 그 채널은 캘리브레이션 필요.
+//                  v0.3과 의미가 같아 옛 클라이언트도 그대로 동작한다.
+//         calibs = 채널별 번들 맵 (2026-08-03 신설). 키는 채널 번호 문자열.
+//                  4채널 UI가 "어느 채널이 캘리 됐는지" 표시하는 데 쓴다.
+//         active_ch = 서버가 기억하는 활성 채널 (기본 1)
+//         cam_ip = REGISTER 때 등록한 카메라 IP, 없으면 null)
 //   SET_CAM_IP payload: {"cam_ip":"192.168.0.31"}   (2026-07-27 추가)
 //     -> 응답 SET_CAM_IP_OK {"cam_ip":"..."|null} | SET_CAM_IP_FAIL {"reason":...}
 //        (로그인 상태에서만 가능. REGISTER와 마찬가지로 형식 검증 없이 저장만 하고,
@@ -102,6 +138,22 @@
 //     + START_DRAW ("그림그리기 시작" 버튼): 서버가 1단계(접근) 경로부터
 //       생성·전송하고, 이후 접근 완료 -> 도색 -> 완료까지 자동 진행한다.
 //       로봇 중계는 안 함.
+//     + ABORT_DRAW ("작업 중단" 버튼, 2026-08-03 신설): 진행 중인 작업을 취소.
+//       서버가 경로 실행 상태(planActive_/awaitingArrival_/drawRequested_/
+//       activeSegs_/planCursor_)를 전부 버리고 같은 명령을 ROBOT에 중계해
+//       로봇도 받아둔 PATH를 버리게 한다(위 [ABORT_DRAW] 절).
+//       -> 응답 DRAW_ABORTED {"was_active":bool}
+//       - 도면(BLUEPRINT)은 지우지 않는다. 다시 START_DRAW를 누르면 같은
+//         도면으로 처음부터 시작한다.
+//       - 로봇은 비상정지 래치가 걸린 채 남으므로 RESUME이 필요하다. 다만
+//         경로는 이미 버려졌으므로 RESUME으로 도색이 재개되지는 않는다.
+//     + SELECT_CHANNEL {"cmd":"SELECT_CHANNEL","ch":n} (2026-08-03 신설):
+//       작업 채널 전환. 서버가 활성 채널을 바꾸고 CCTV에 중계한다(로봇에는
+//       안 보냄 - 로봇과 무관). -> 응답 CHANNEL_OK {"ch":n,"calib":{...}|null}
+//       | CHANNEL_FAIL {"reason":"bad_channel"}
+//       - calib이 null이면 그 채널은 아직 캘리브레이션이 안 된 것이다.
+//       - ⚠️ 경로 실행 중에는 바꾸지 말 것. 서버는 막지 않지만 지금 로봇을
+//         보고 있는 채널을 바꾸면 pose 공급이 끊긴다 (QT가 UI로 잠근다).
 //     ※ CALIB_START는 QT가 안 보냄(2026-07-23) - 캘리 시작은 관리자 창(ADMIN)
 //       담당. 서버는 하위호환으로 QT의 CALIB_START도 여전히 CCTV까지 중계함.
 //   BLUEPRINT payload: {"points":[[x,y],...],          // 필수
@@ -204,6 +256,17 @@
 //       서버가 받은 것이 같은지"를 그 자리에서 대조할 수 있게 한다.
 //       (예전엔 응답이 없어, 실패를 START_DRAW 때 DRAW_FAIL로 뒤늦게 알았다)
 //     - paint/program이 형식 오류로 무시됐으면 여기에 false/0으로 나타난다.
+//   CHANNEL_OK   payload: {"ch":2,"calib":{...}|null}     (2026-08-03 추가)
+//   CHANNEL_FAIL payload: {"reason":"bad_channel"}
+//     - CMD SELECT_CHANNEL에 대한 응답. calib은 그 채널의 번들이며 null이면
+//       그 채널은 아직 캘리브레이션이 안 된 것이다.
+//     - QT는 이 calib으로 top-view를 다시 만든다 - H_MATRIX를 받았을 때와
+//       같은 경로를 타야 한다(K/D 반영, coord_mode 판정까지).
+//   DRAW_ABORTED payload: {"was_active":true}              (2026-08-03 추가)
+//     - CMD ABORT_DRAW를 받아 서버가 경로 상태를 버린 직후 1회 전송.
+//     - was_active=false면 진행 중인 작업이 없었다는 뜻(버튼 연타 등).
+//     - ⚠️ QT는 이 응답을 기다리지 말고 UI를 먼저 정리해도 된다. 취소는
+//       사용자가 급할 때 누르는 버튼이라 서버 왕복을 기다리면 안 된다.
 //   DRAW_DONE payload: {}   (2026-07-27 추가)
 //     - 도색 경로를 끝까지 마쳤을 때 1회 통지 (로봇 PATH_DONE(draw)이 트리거).
 //       접근 완료는 Qt에 알리지 않는다 - Qt 입장에선 START_DRAW부터 여기까지가
@@ -215,10 +278,24 @@
 //     - stage=draw: START_DRAW 이후 처리 중
 //       (reason: no_blueprint/busy/no_pose/robot_offline/not_ready)
 //
+// [서버 -> CCTV]
+//   CMD payload: {"cmd":"CALIB_START"}          캘리브레이션 시작
+//   CMD payload: {"cmd":"SELECT_CHANNEL","ch":2}  작업 채널 전환 (2026-08-03 신설)
+//     - 다채널 카메라에서 "지금 로봇을 봐야 할 채널"이 바뀌었음을 알린다. 카메라
+//       앱은 그 채널 영상으로 검출 대상을 바꾸고 이후 POS에 그 ch를 싣는다.
+//     - 단일 채널 카메라(PNO)는 무시해도 된다. 서버는 응답을 기대하지 않는다.
+//     - ⚠️ 현재 카메라 앱(CCTV/src/central_tls_sender.cpp)의 수신 파서는
+//       "cmd":"CALIB_START" 문자열 하나만 인식한다 - 파서를 고쳐야 받을 수 있다.
+//
 // [CCTV -> 서버]
-//   H_MATRIX payload: {"calib":{"version":1, "K":[[...]x3], "D":[k1,k2,p1,p2,k3],
+//   H_MATRIX payload: {"ch":2, "calib":{"version":1, "K":[[...]x3], "D":[k1,k2,p1,p2,k3],
 //                      "H_floor":[[...]x3], "H_marker":[[...]x3], "marker_height_m":0.25}}
 //     - 캘리브레이션 1회 수행 후 전송. 로그인 사용자에 영속 저장 + QT 중계.
+//     - ch(2026-08-03 추가): 이 번들이 어느 채널의 것인지. payload 최상위에
+//       붙는다 - calib "안"이 아니다. 생략하면 채널 1.
+//       ⚠️ 안 실으면 4채널이 전부 채널 1에 덮어써져 같은 번들 하나를 공유한다.
+//       평면 스키마는 payload 자체가 번들이라 ch가 번들 안에 남는데, 서버는
+//       그것을 calib_id처럼 손대지 않는 메타데이터로 보존한다.
 //     - H_floor  : 왜곡 보정된 픽셀 -> 바닥 평면 미터 (Qt top-view 용)
 //     - H_marker : 왜곡 보정된 픽셀 -> 마커 장착 높이 평면 미터 (로봇 측위용,
 //                  마커가 바닥에서 떠 있어 생기는 시차를 흡수)
@@ -228,8 +305,12 @@
 //       H를 H_floor로 읽고 K/D/H_marker까지 그대로 쓴다(보정 동작은 중첩과 동일).
 //       설치 메타데이터는 손대지 않고 저장·중계하되, "unit"만 정규화 후 "m"으로 고친다.
 //     - 레거시 {"H":[[...]x3]}만 온 경우도 허용 (왜곡/시차 보정 없이 동작)
-//   POS      payload: {"corners":[[u,v]x4]}  로봇 마커 4점 = "원본 CCTV 픽셀" 좌표
+//   POS      payload: {"ch":2, "corners":[[u,v]x4]}  로봇 마커 4점 = "원본 CCTV 픽셀"
 //     순서 = [전좌, 전우, 후우, 후좌]
+//     - ch(2026-08-03 추가, 선택 - 생략하면 1): 이 마커를 본 채널. 서버는 이
+//       채널의 캘리브레이션(K/D/H_marker)으로 좌표를 변환한다.
+//       ⚠️ 틀린 채널을 실으면 좌표가 통째로 어긋난다 - 에러 없이 그럴듯한 값이
+//       나오므로 특히 주의. 활성 채널과 다른 ch가 오면 그 POS는 무시된다.
 //     - CCTV는 절대 좌표 변환하지 말 것 (undistort도 하지 말 것).
 //       서버가 undistort(P=K 동등) -> H_marker -> pose 계산까지 담당.
 //     - 테스트용으로 {"x","y","theta_deg"}(바닥 미터 좌표)도 허용
