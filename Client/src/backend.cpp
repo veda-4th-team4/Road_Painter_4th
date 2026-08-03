@@ -25,6 +25,14 @@
 
 namespace {
 constexpr qint64 kRobotOnlineMs = 3000;
+// 작업 시작 후 이 시간까지 POSE 가 한 번도 없으면 한 번만 경고를 남긴다.
+constexpr qint64 kPoseWaitWarnMs = 5000;
+// ArUco 마커(ID 49) 중심 ↔ 노즐(펜) 거리. 로봇팀 제원 2026-07-30.
+// **바닥 평면에서의 수평거리**다 — POSE 가 이미 바닥 투영 좌표이므로 같은 평면에서 뺀다.
+// (마커는 로봇 높이 140mm 위에 있지만, 그 시차 보정은 **서버**가 하고 QT 로는 이미
+//  바닥에 투영된 값이 온다. 여기서 높이를 다시 계산하면 이중 보정이 된다.)
+// ⚠️ **표시 전용이다.** 전송 좌표에는 절대 반영하지 않는다 — 오프셋 보정은 로봇 RPi 몫.
+constexpr double kPenOffsetM = 0.155;
 // 테스트 시뮬레이션 틱. 40ms = 25fps — 4cm 후진처럼 짧은 동작도 여러 프레임에 걸친다.
 constexpr int kSimTickMs = 40;
 
@@ -208,14 +216,24 @@ Backend::Backend(QObject *parent)
         if (!msg.isEmpty()) appendLog(QStringLiteral("ACK %1").arg(msg));
     });
     connect(m_client, &ServerClient::peersReceived, this, [this](bool robot, bool cctv) {
+        // STATUS 와 같은 이유로 **바뀔 때만** 남긴다 (로그 도배 방지).
+        const bool changed = (robot != m_peerRobot) || (cctv != m_peerCctv);
+        m_peerRobot = robot;
+        m_peerCctv = cctv;
+        // PEERS 는 서버가 **직접 세는 접속 수**다 — 로봇 접속 여부의 최종 근거.
+        // robot=0 이면 타임아웃을 기다리지 말고 그 자리에서 오프라인으로 내린다.
         if (robot) {
             m_hasRobotBeat = true;
             m_lastRobotBeat.restart();
+        } else {
+            m_hasRobotBeat = false;
+            m_lastRobotBeat.invalidate();
         }
         if (cctv)
             m_cctvOnline = true;
         refreshLinkStatus();
-        appendLog(QString("PEERS robot=%1 cctv=%2").arg(robot).arg(cctv));
+        if (changed)
+            appendLog(QString("PEERS robot=%1 cctv=%2").arg(robot).arg(cctv));
     });
 
     m_linkTimer = new QTimer(this);
@@ -236,12 +254,7 @@ Backend::Backend(QObject *parent)
         }
         m_sim.step(kSimTickMs / 1000.0 * m_simSpeedFactor);
 
-        const QPointF c = m_sim.center();
-        const QPointF pen = m_sim.pen();
-        if (m_topView) {
-            m_topView->setRobotPose(c.x(), c.y(), m_sim.headingDeg(), true);
-            m_topView->setPenMarker(pen.x(), pen.y(), m_sim.nozzleDown(), true);
-        }
+        pushSimPoseToView(m_sim.center(), m_sim.headingDeg(), m_sim.nozzleDown());
         setJobProgress(m_sim.progress01());
 
         const QString phase = m_sim.phaseText();
@@ -502,6 +515,12 @@ void Backend::logout()
     m_robotOnline = false;
     m_poseValid = false;
     m_hasRobotBeat = false;
+    m_lastRobotBeat.invalidate();
+    m_hasPoseBeat = false;
+    m_lastPoseBeat.invalidate();
+    m_poseEverSeen = false;
+    m_poseWaitWarned = false;
+    m_peerRobot = m_peerCctv = -1;
     emit sessionChanged();
     emit linkStatusChanged();
     emit poseChanged();
@@ -646,12 +665,24 @@ void Backend::configureView(VideoView *v, bool topView)
     v->setStrokeWidthMm(m_strokeWidthMm);
     v->setArucoVisible(m_arucoOverlay);
     if (topView) {
+        v->setRobotVisible(m_robotVisible);   // 뷰가 새로 생겨도 토글 상태가 따라간다
         v->setTopView(true);
         v->setInteractive(true);
         if (m_testMode) {
             v->configureTopViewTest();
         } else if (!m_calib.isEmpty()) {
-            v->configureTopViewCalib(m_calib);
+            // 🔴 지연 적용 경로. LOGIN_OK 이 화면보다 먼저 오면 applyCalibObject 가
+            //    "보관됨 — 화면 준비 후 적용"만 남기고 실제 적용은 여기서 일어난다.
+            //    예전에는 여기가 **아무 로그도 남기지 않아서**, 로그만 보면 캘리브가
+            //    적용됐는지 · 단위를 뭐로 판정했는지 알 수 없었다.
+            const bool ok = v->configureTopViewCalib(m_calib);
+            m_calibMissing = false;
+            refreshCalibStatus();
+            appendLog(ok ? QStringLiteral("캘리브 적용(지연, %1): ").arg(m_calibSource)
+                               + m_calibStatus
+                         : QStringLiteral("캘리브 실패(지연, %1) — 테스트 보정으로 폴백")
+                               .arg(m_calibSource));
+            logCalibUnit(v);
         } else {
             v->configureTopViewTest();
         }
@@ -847,7 +878,7 @@ void Backend::commitDrawing()
     // ⚠️ 펜 오프셋은 넘기지 않는다. program 은 **도면 그대로**의 논리 동작이고,
     //    꼭짓점 보정은 로봇이 자기 하드웨어 상수로 알아서 한다 (프로토콜 2026-07-28).
     const QList<motionprogram::Op> program =
-        motionprogram::build(blueprint, route.paint, m_speeds, m_arcEnabled);
+        motionprogram::build(blueprint, route.paint, m_speeds);
 
     if (m_testMode) {
         appendLog(QString("[테스트] BLUEPRINT 전송 생략 (%1점 / 동작 %2개) — 서버 저장 시뮬레이션")
@@ -887,7 +918,6 @@ void Backend::commitDrawing()
     m_topView->clearPath();
     if (m_originalView) m_originalView->setOverlayPaths({}, {});
     m_drawing = false; emit drawingChanged();
-    emit drawingCommitted();
     emit jobChanged();
     updatePhase();
 }
@@ -1042,6 +1072,7 @@ void Backend::beginPainting()
     m_waypointIndex = 0;
     m_jobElapsed.restart();
     m_jobElapsedValid = true;
+    m_poseWaitWarned = false;   // 작업마다 한 번씩은 경고할 기회를 준다
     emit jobChanged();
     appendLog("작업 시작 — 접근 후 도색까지 자동 진행 (완료 시 DRAW_DONE)");
     updatePhase();
@@ -1072,11 +1103,11 @@ QList<motionprogram::Op> Backend::currentProgram() const
 {
     if (!m_program.isEmpty()) return m_program;
     if (m_routePts.size() >= 2)
-        return motionprogram::build(m_routePts, m_routePaint, m_speeds, m_arcEnabled);
+        return motionprogram::build(m_routePts, m_routePaint, m_speeds);
     if (!m_topView) return {};
     QList<bool> closed;
     const routeplan::Route r = buildRoute(m_topView->pathsToMeters(&closed), closed);
-    return motionprogram::build(r.pts, r.paint, m_speeds, m_arcEnabled);
+    return motionprogram::build(r.pts, r.paint, m_speeds);
 }
 
 QVariantList Backend::motionPlan() const
@@ -1305,6 +1336,20 @@ void Backend::deleteJob(const QString &id)
     }
 }
 
+// H 가 mm 를 내는지 m 를 내는지 판정한 결과를 로그에 남긴다.
+// 번들의 `unit` 은 믿을 수 없다(서버가 ÷1000 후 갱신하거나 안 하거나) — 그래서 QT 가
+// canvas_mm·image_size 로 검산한다. **어느 쪽으로 판정했는지가 로그에 없으면
+// 좌표가 1000배 어긋났을 때 원인을 찾을 수가 없다.**
+void Backend::logCalibUnit(VideoView *v)
+{
+    if (!v) return;
+    const QString note = v->calibUnitNote();
+    if (note.isEmpty()) return;
+    appendLog(note.startsWith(QChar(0x26A0))     // ⚠️ 로 시작하면 불일치 경고다
+                  ? note
+                  : QStringLiteral("H 단위 검산 — ") + note);
+}
+
 // TopView 보정 요약 + 축척(1px = ? mm)을 UI로 밀어준다.
 void Backend::refreshCalibStatus()
 {
@@ -1375,7 +1420,7 @@ void Backend::pushMissionToView()
         m_topView->setMissionPathsMeters(m_missionPaths, m_missionClosed);
         m_topView->setMissionProgress(m_jobProgress);
         if (m_poseValid)
-            m_topView->setRobotPose(m_poseX, m_poseY, m_poseTheta, true);
+            pushPoseToView(true);
     }
     if (m_originalView && m_topView) {
         QList<QList<QPointF>> cctvPaths;
@@ -1447,16 +1492,78 @@ double Backend::progressAlongPath(const QPointF &pose) const
     return qBound(0.0, distanceAlongPolyline(travel, false, pose) / L, 1.0);
 }
 
+// 서버가 주는 POSE(x, y)는 **ArUco 마커(ID 49)의 중심**이다. 로봇팀 제원(2026-07-30):
+//
+//      ArUco 마커 중심  ──── 155mm ────  노즐(= 펜 = 페인트가 나오는 곳)
+//
+// 즉 **마커 = 로봇 기준점**이고, 펜은 거기서 155mm 떨어져 있다. 화면은 이렇게 나눈다:
+//   · setRobotPose  ← POSE 그대로            = 마커 = 로봇 기준점 (섀시를 여기 그린다)
+//   · setPenMarker  ← POSE − 155mm·heading   = 노즐 (실제로 칠하는 점)
+//
+// 방향이 **뒤**인 근거: 로봇은 "1m 직진"을 받으면 오프셋만큼 **더 가서** 1m 를 긋는다
+// (사용자 확인). 펜이 뒤에 달려 있어야 그 보정이 성립한다 — 중심이 d 만큼 더 나아가야
+// 뒤따라오는 펜이 시작점에 닿는다. 앞에 달렸다면 반대로 덜 가야 한다.
+// 방향이 틀린 것으로 밝혀지면 아래 부호 하나만 뒤집으면 된다.
+//
+// ⚠️ 진행률·시작점 도착 판정은 **보정 안 한 POSE(마커)** 를 그대로 쓴다. 서버가 이탈
+//    감시를 하는 기준도 같은 POSE 라, 여기서만 다른 점을 쓰면 두 판정이 어긋난다.
+// ⚠️ 155mm 를 반영해서 로봇에 보내지 않는다. QT 는 도면 그대로만 낸다. 오프셋 보정은
+//    로봇 RPi 전담이다(`pen_offset_m` 은 2026-07-28 프로토콜에서 폐지).
+void Backend::pushPoseToView(bool valid)
+{
+    if (!m_topView) return;
+    const double th = m_poseTheta * 0.017453292519943295;   // deg → rad
+    m_topView->setRobotPose(m_poseX, m_poseY, m_poseTheta, valid);
+    m_topView->setPenMarker(m_poseX - kPenOffsetM * std::cos(th),
+                            m_poseY - kPenOffsetM * std::sin(th),
+                            m_painting, valid);
+}
+
+// 테스트 재생 화면 표시 — 위와 **정확히 거울 관계**다.
+//
+// 실주행: 마커(POSE)를 받아서   → 노즐 = 마커 − 155mm
+// 재생  : 노즐(도면 위 점)에서 → 마커 = 노즐 + 155mm
+//
+// 재생기는 시퀀스를 그대로 굴리므로 그 좌표가 곧 노즐이다(motionsim.h 참고).
+// 🔴 예전에는 재생기 좌표를 setRobotPose 에도 그대로 넣어서, **미리보기에서는
+//    섀시가 도면 선 위에** 있고 실주행에서는 155mm 옆에 있었다. 같은 도면인데
+//    미리보기와 실주행의 로봇 자세가 달라 보이면 미리보기를 믿을 수 없게 된다.
+void Backend::pushSimPoseToView(const QPointF &nozzleM, double headingDeg, bool down)
+{
+    if (!m_topView) return;
+    const double th = headingDeg * 0.017453292519943295;    // deg → rad
+    m_topView->setRobotPose(nozzleM.x() + kPenOffsetM * std::cos(th),
+                            nozzleM.y() + kPenOffsetM * std::sin(th),
+                            headingDeg, true);
+    m_topView->setPenMarker(nozzleM.x(), nozzleM.y(), down, true);
+}
+
 void Backend::onPose(double x, double y, double thetaDeg)
 {
     m_poseX = x; m_poseY = y; m_poseTheta = thetaDeg;
     m_poseValid = true;
-    m_hasRobotBeat = true;
-    m_lastRobotBeat.restart();
+
+    // 🔴 POSE 를 로봇 접속 신호로 쓰면 **안 된다.**
+    //    POSE 는 서버가 *CCTV 가 본 마커*를 변환해 만드는 값이다. 로봇이 서버에
+    //    접속돼 있든 아니든, 마커 49 가 화면에 보이기만 하면 계속 발행된다.
+    //    예전에는 여기서 m_lastRobotBeat 를 리셋해서, 전원만 켜 둔(=접속 안 된)
+    //    로봇도 "연결됨" 으로 떴고, **마커를 손으로 치우면 오프라인**이 됐다.
+    //    로그에는 `PEERS robot=0` 이 찍혀 있는데 화면은 연결됨 — 정면으로 모순.
+    //    접속 여부는 PEERS(서버가 직접 세는 접속 수)와 STATUS(로봇이 직접 보냄)만
+    //    판단한다. 여기서는 **위치 수신 시각**만 기록한다.
+    m_hasPoseBeat = true;
+    m_lastPoseBeat.restart();
+
+    // 첫 수신만 남긴다. POSE 는 초당 15~30개라 매번 찍으면 로그가 통째로 덮인다.
+    // "한 번도 안 옴" 과 "오다가 끊김" 을 화면에서 구분하려면 이 한 줄이 있어야 한다.
+    if (!m_poseEverSeen) {
+        m_poseEverSeen = true;
+        appendLog(QStringLiteral("로봇 위치 수신 시작 — POSE (%1, %2) m, %3°")
+                      .arg(x, 0, 'f', 3).arg(y, 0, 'f', 3).arg(thetaDeg, 0, 'f', 1));
+    }
     emit poseChanged();
 
-    if (m_topView)
-        m_topView->setRobotPose(x, y, thetaDeg, true);
+    pushPoseToView(true);
 
     // 진행률은 "실제로 칠하기 시작한 뒤"부터만 의미가 있다.
     // START_DRAW 직후에는 로봇이 시작점으로 접근하는 중이라, 그때 경로상 위치를
@@ -1470,6 +1577,11 @@ void Backend::onPose(double x, double y, double thetaDeg)
 
 void Backend::onStatus(const QString &state, bool painting)
 {
+    // STATUS 는 로봇이 초당 여러 번 보낸다 — 값이 그대로면 로그에 남기지 않는다.
+    // 예전에는 무조건 찍어서 `STATUS IDLE painting=false` 가 로그를 통째로 덮었고,
+    // 정작 봐야 할 줄이 스크롤 밖으로 밀려났다. 상태 자체는 상단 표시로 항상 보인다.
+    const bool changed = (state != m_robotState) || (painting != m_painting);
+
     m_robotState = state;
     m_painting = painting;
     // 접근이 끝나고 도색으로 넘어가는 순간은 통지되지 않는다 → painting 으로 유추
@@ -1498,7 +1610,8 @@ void Backend::onStatus(const QString &state, bool painting)
     }
 
     emit robotStatusChanged();
-    appendLog(QString("STATUS %1 painting=%2").arg(state, painting ? "true" : "false"));
+    if (changed)
+        appendLog(QString("STATUS %1 painting=%2").arg(state, painting ? "true" : "false"));
 
     // ⚠️ 여기서 완료 판정을 하지 말 것. 접근 도중에도 IDLE 이 잠깐씩 뜨기 때문에
     //    (READY 정렬 대기 등) 오판으로 작업이 끝나버린다. 끝은 DRAW_DONE 뿐이다.
@@ -1518,10 +1631,44 @@ void Backend::refreshLinkStatus()
     else if (m_serverLabel != "재연결…")
         m_serverLabel = m_userId.isEmpty() ? "대기" : "끊김";
 
-    if (wasOnline != m_robotOnline)
-        emit linkStatusChanged();
-    else
-        emit linkStatusChanged(); // keep UI timers fresh for labels
+    // POSE 가 끊기면 로봇 표시도 내린다.
+    // 🔴 서버는 POSE 를 주기적으로 만들지 않는다(SRV-REP-QT-001 §2): CCTV 가 마커를
+    //    놓친 프레임은 POSE 가 **아예 발행되지 않는다**. 예전에는 m_poseValid 를 로그아웃
+    //    때만 껐기 때문에, 마커를 놓치면 로봇이 마지막 위치에 계속 붙어 있어서
+    //    "그 자리에 멈춴 것"과 "위치를 못 받는 것"이 화면에서 구분되지 않았다.
+    //
+    // ⚠️ 판정 근거는 **m_robotOnline 이 아니라 POSE 자체의 수신 시각**이다.
+    //    둘은 다른 사실이다 — 로봇이 접속 안 돼 있어도 마커만 보이면 POSE 는 오고,
+    //    그때 위치 표시는 유효하다(로봇을 손으로 밀어도 화면에서 따라간다).
+    //    예전처럼 m_robotOnline 에 물려두면 접속이 끊긴 순간 멀쩡히 들어오는 위치까지
+    //    같이 지워버린다.
+    const bool poseFresh = m_hasPoseBeat && m_lastPoseBeat.isValid()
+                           && m_lastPoseBeat.elapsed() < kRobotOnlineMs;
+    if (!poseFresh && m_poseValid && !m_testMode) {
+        m_poseValid = false;
+        pushPoseToView(false);   // 섀시·노즐 표시를 함께 내린다
+        emit poseChanged();
+        updatePhase();
+        appendLog(QStringLiteral("로봇 위치 수신 끊김 (%1초) — 마커 검출 실패")
+                      .arg(kRobotOnlineMs / 1000));
+    }
+
+    // 작업을 시작했는데 POSE 가 **한 번도** 안 오는 경우. 화면에는 "위치 수신 대기" 만
+    // 뜨고 왜 안 오는지는 안 나와서, 로봇 아이콘이 안 보인다는 신고로만 들어온다.
+    // 흔한 오해를 여기서 끊는다: CCTV 패널의 ArUco 표시는 **QT 로컬 검출**이라,
+    // 거기 ID 49 가 보인다고 POSE 가 오는 게 아니다. POSE 는 다른 경로다.
+    if (m_jobActive && !m_testMode && !m_poseEverSeen && !m_poseWaitWarned
+        && m_jobElapsedValid && m_jobElapsed.elapsed() > kPoseWaitWarnMs) {
+        m_poseWaitWarned = true;
+        appendLog(QStringLiteral("⚠️ POSE 미수신 %1초 — 서버가 로봇 위치를 못 만들고 있습니다. "
+                                 "경로: CCTV 마커 검출 → 서버 변환 → QT. "
+                                 "왼쪽 영상의 ArUco 표시는 QT 자체 검출이라 이 경로와 무관합니다.")
+                      .arg(kPoseWaitWarnMs / 1000));
+    }
+
+    // 라벨의 경과시간 표시가 계속 갱신돼야 해서 상태 변화가 없어도 매번 알린다.
+    Q_UNUSED(wasOnline);
+    emit linkStatusChanged();
 }
 
 void Backend::updatePhase()
@@ -1589,21 +1736,15 @@ void Backend::startTestProgressSim()
         appendLog("[테스트] 재생할 동작 시퀀스가 없습니다.");
         return;
     }
-    // 시퀀스가 **도면 그대로**(펜 기준)라 재생기도 펜을 그대로 따라가게 한다.
-    // 펜 오프셋은 로봇이 자기 안에서 흡수하므로 여기서 d 를 먹이면 미리보기만
-    // 실제보다 d 만큼 뒤처져 보인다 → 0 을 넣는다.
+    // 시퀀스가 **도면 그대로**(펜 기준)라 재생기도 노즐을 그대로 따라간다.
+    // 오프셋은 로봇이 자기 안에서 흡수하므로 재생기는 관여하지 않는다.
     m_sim.load(prog, motionprogram::approachCenter(pts),
-               motionprogram::approachHeadingDeg(pts), 0.0);
+               motionprogram::approachHeadingDeg(pts));
     m_simPhase = m_sim.phaseText();
     m_simRunning = true;
     emit simChanged();
 
-    const QPointF c = m_sim.center();
-    const QPointF pen = m_sim.pen();
-    if (m_topView) {
-        m_topView->setRobotPose(c.x(), c.y(), m_sim.headingDeg(), true);
-        m_topView->setPenMarker(pen.x(), pen.y(), false, true);
-    }
+    pushSimPoseToView(m_sim.center(), m_sim.headingDeg(), false);
     appendLog(QString("[테스트] 동작 %1개 재생 — 예상 %2초 (%3배속)")
                   .arg(prog.size())
                   .arg(m_sim.remainingSec(), 0, 'f', 0)
@@ -1935,28 +2076,21 @@ QString Backend::applyCalibObject(const QJsonObject &raw, const QString &source)
     pushOverlayToOriginal();   // 좌표 변환이 바뀌었으니 원본 뷰 오버레이도 다시 만든다
     appendLog(ok ? QStringLiteral("캘리브 적용(%1): ").arg(source) + m_calibStatus
                  : QStringLiteral("캘리브 실패(%1) — 테스트 보정으로 폴백").arg(source));
+    logCalibUnit(m_topView);
     return ok ? (QStringLiteral("적용됨 · ") + m_calibStatus)
               : QStringLiteral("적용 실패 (테스트 보정 사용)");
 }
 
 // 곡선을 ARC op 으로 보낼지.
-//
-// 🔴 기본값은 OFF 다. 서버(router.cpp)는 ARC 를 받아주지만, 로봇
-//    PathFollower.cpp 의 세그먼트 실행부가 이렇게 생겼다:
-//        if (op == "MOVE") { ... } else if (op == "TURN") { ... }
-//    else 가 없어서 ARC 를 만나면 속도 0 으로 그 자리에 **영구 정지**한다.
-//    (NetworkManager.cpp 도 radius_m / direction 을 읽지 않는다)
-//    로봇이 ARC 를 구현하면 켜면 된다 — 그 전까지는 폴리라인으로 나간다.
-void Backend::setArcEnabled(bool on)
-{
-    if (m_arcEnabled == on) return;
-    m_arcEnabled = on;
-    appendLog(on ? QStringLiteral("곡선 ARC 전송 ON — 로봇이 ARC op 을 구현했는지 확인하세요")
-                 : QStringLiteral("곡선 ARC 전송 OFF — 곡선도 MOVE/TURN 으로 내보냅니다"));
-    emit arcChanged();
-    emit jobChanged();      // 미리보기 시퀀스 갱신
-    saveSettings();
-}
+// ⚠️ 여기 있던 setArcEnabled / m_arcEnabled 는 지웠다.
+//    곡선은 **항상 ARC op** 으로 보낸다 — 켜고 끌 대상이 아니다.
+//      · 동작 수가 4~10배 줄어든다 (O: 49 → 4, STOP: 157 → 25).
+//      · 로봇에 원호 주행 코드가 **이미 있고 실측 검증됐다** (arc_test.cpp):
+//          R_robot = √(R_paint² + 0.155²)                  ← 노즐 오프셋 보정
+//          r_left/right = R_robot ∓ 0.364/2                ← 트랙 폭
+//          목표 스텝 = |r_wheel · θ| · 15433.09 pulses/m
+//          바퀴 속도 = 771.65 · (r_wheel / R_robot)         ← 동시 도착
+//    남은 작업은 로봇 main.cpp 의 op 분기에 이 로직을 연결하는 것뿐이다.
 
 // TopView 배경에 렌즈 보정을 적용할지 토글한다.
 // 끄면 예전 동작(호모그래피만)이라, 같은 화면에서 켜고 끄며 어느 쪽이 잘 펴지는지
@@ -1972,6 +2106,20 @@ void Backend::setLensCorrection(bool on)
         appendLog(on ? QStringLiteral("렌즈 보정 ON — TopView 배경을 remap 으로 펍니다")
                      : QStringLiteral("렌즈 보정 OFF — 호모그래피만 사용 (예전 동작)"));
     emit lensChanged();
+    saveSettings();
+}
+
+// 로봇 아이콘을 켜고 끈다. 265mm 기체를 실축으로 그리면 900×600 도면의 1/4 을 덮어서,
+// 로봇이 도면 한가운데 서 있으면 그리던 선이 통째로 가려진다.
+// ⚠️ 표시만 끈다 — POSE 수신·진행률·시작점 판정은 그대로 돈다.
+void Backend::setRobotVisible(bool on)
+{
+    if (m_robotVisible == on) return;
+    m_robotVisible = on;
+    if (m_topView) m_topView->setRobotVisible(on);
+    appendLog(on ? QStringLiteral("[표시] 로봇 아이콘 ON")
+                 : QStringLiteral("[표시] 로봇 아이콘 OFF — 위치 수신은 계속됩니다"));
+    emit robotVisibleChanged();
     saveSettings();
 }
 
@@ -2042,11 +2190,6 @@ void Backend::addTextWorldMm(const QString &text, double heightMm, bool outline)
     updatePhase();
 }
 
-int Backend::pathShapeCount() const
-{
-    return m_topView ? m_topView->shapeCount() : 0;
-}
-
 // 거의 일직선인 점 제거 → 로봇이 "직진 + 회전"만 하게
 void Backend::simplifyPaths(double toleranceMm)
 {
@@ -2098,7 +2241,7 @@ void Backend::loadSettings()
     m_speeds.turnDps   = qBound(1.0,  s.value("robot/turnDps",   30.0).toDouble(), 360.0);
     m_simSpeedFactor   = qBound(0.5,  s.value("ui/simSpeed",      4.0).toDouble(), 20.0);
     m_lensOn = s.value("camera/lensCorrection", false).toBool();
-    m_arcEnabled = s.value("robot/arcEnabled", false).toBool();
+    m_robotVisible = s.value("ui/robotVisible", true).toBool();
 
     // 마지막으로 실제로 붙었던 카메라 주소. 이게 없으면 앱이 매번 하드코딩 기본값으로
     // 되돌아가는데, 그 IP 에 카메라가 없으면 "왜 영상이 안 나오지" 로만 보인다.
@@ -2117,7 +2260,7 @@ void Backend::saveSettings() const
     s.setValue("robot/turnDps", m_speeds.turnDps);
     s.setValue("ui/simSpeed", m_simSpeedFactor);
     s.setValue("camera/lensCorrection", m_lensOn);
-    s.setValue("robot/arcEnabled", m_arcEnabled);
+    s.setValue("ui/robotVisible", m_robotVisible);
     s.setValue("camera/rtspUrl", m_rtspUrl);
     s.setValue("camera/ip", m_camIp);
 }

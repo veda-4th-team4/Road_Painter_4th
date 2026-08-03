@@ -530,8 +530,8 @@ void VideoView::paint(QPainter *p)
         }
     }
 
-    // 3) 로봇 마커
-    if (m_isTopView)
+    // 3) 로봇 마커 — 끄면 그리는 것만 멈춘다(위치 수신·진행률 계산은 그대로).
+    if (m_isTopView && m_robotVisible)
         paintRobot(p, sx, sy, ox, oy);
 
     // 4) 원점 힌트 — 좌하단 (0,0)
@@ -545,11 +545,12 @@ void VideoView::paint(QPainter *p)
         p->drawText(QPointF(w.x() + 6, w.y() - 6), QStringLiteral("0,0"));
     }
 
-    // 5) CCTV: 서버가 중계한 로봇 마커(원본 픽셀)
-    if (!m_isTopView)
-        paintMarker(p, sx, sy, ox, oy);
+    // ⚠️ 여기 있던 paintMarker(서버가 중계한 로봇 마커 원본 픽셀) 호출은 지웠다.
+    //    POS 가 2026-07-27 부터 QT 로 오지 않아 setMarkerCorners 를 부르는 곳이
+    //    사라졌고, m_markerPx 는 영원히 비어서 매 프레임 즉시 return 만 했다.
+    //    로봇 마커 표시는 로컬 ArUco 검출(paintAruco)이 담당한다.
 
-    // 6) ArUco 마커 ID 오버레이 (양쪽 뷰)
+    // ArUco 마커 ID 오버레이 (양쪽 뷰)
     paintAruco(p, sx, sy, ox, oy);
 
     p->restore();
@@ -718,29 +719,6 @@ void VideoView::paintGrid(QPainter *p, double sx, double sy, double ox, double o
     p->restore();
 }
 
-void VideoView::setMarkerCorners(const QVariantList &cornersPx)
-{
-    m_markerPx.clear();
-    for (const QVariant &v : cornersPx) m_markerPx.append(v.toPointF());
-    update();
-}
-
-void VideoView::paintMarker(QPainter *p, double sx, double sy, double ox, double oy)
-{
-    if (m_markerPx.size() < 3) return;
-    auto toW = [&](const QPointF &ip) {
-        return QPointF(ip.x() * sx + ox, ip.y() * sy + oy);
-    };
-    QPolygonF poly;
-    for (const QPointF &q : std::as_const(m_markerPx)) poly << toW(q);
-    p->setBrush(QColor(0, 200, 255, 40));
-    p->setPen(QPen(QColor(0, 200, 255, 220), 2));
-    p->drawPolygon(poly);
-    p->setBrush(QColor(0, 200, 255));
-    p->setPen(Qt::NoPen);
-    p->drawEllipse(toW(m_markerPx.first()), 3.5, 3.5);
-}
-
 // ArUco 오버레이 — CCTV: 노란 외곽선 + ID 칩 / TopView: 변환한 위치에 ID 칩
 void VideoView::paintAruco(QPainter *p, double sx, double sy, double ox, double oy)
 {
@@ -807,6 +785,13 @@ void VideoView::setArucoVisible(bool on)
 {
     if (m_arucoVisible == on) return;
     m_arucoVisible = on;
+    update();
+}
+
+void VideoView::setRobotVisible(bool on)
+{
+    if (m_robotVisible == on) return;
+    m_robotVisible = on;
     update();
 }
 
@@ -922,66 +907,193 @@ void VideoView::paintEdgeLengths(QPainter *p, const QVector<QPointF> &pts, bool 
     }
 }
 
-// 탑뷰 로봇 아이콘 — 실제 기체(메카넘 4륜, 상판 마커, 전방 노즐) 형상
+// 탑뷰 로봇 표시 — **노면표시 중장비**의 위에서 본 모습.
+//
+// 디자인 기준(실제 도로장비 도장 관습):
+//   · 면취(chamfer)한 강판 섀시 — 둥근 모서리보다 '기계'로 읽힌다
+//   · 세로 프레임 레일 2줄 — 구조물이 있다는 신호
+//   · 데크 위 도료 드럼 + 컨트롤 박스 — 이 기계가 무슨 일을 하는지
+//   · 전면 범퍼 **위험 사선**(호박/검정) — 중장비의 시각적 서명
+//   · 후방 회전 경고등 — 강조색은 여기와 범퍼뿐
+//
+// ⚠️ 크기는 줄이지 않는다. 265mm 기체는 900×600 도면에서 실제로 1/4 을 차지하고,
+//    그게 배치 판단의 근거다. 도면을 가리는 게 문제면 **로봇표시 토글로 끈다**
+//    (Backend::setRobotVisible). 축척을 속이는 쪽으로 풀지 말 것.
+// ⚠️ 화살표를 따로 그리지 않는다 — 면취한 앞코와 범퍼가 곧 진행 방향이다.
+//
+// 디테일은 화면상 크기(L)로 단계를 둔다. 작을 때 다 그리면 뭉개져서 노이즈만 된다.
 void VideoView::paintRobot(QPainter *p, double sx, double sy, double ox, double oy)
 {
     if (!m_robotValid) { paintPenMarker(p, sx, sy, ox, oy); return; }
-    Q_UNUSED(sy);
     const QPointF w(m_robotPx.x() * sx + ox, m_robotPx.y() * sy + oy);
 
-    double L = 0.25 * m_tvPxPerM * sx;
-    L = qBound(26.0, L, 90.0);
-    const double W = L * 0.80;
+    // 기체 실측(2026-07-30 로봇팀 제원):
+    //   전장 265mm · 휠베이스 166mm · 바퀴 지름 66mm · 높이 140mm
+    //   바퀴 6개 = 가운데 고무 구동륜 2개(2륜 차동구동) + 옴니휠 4개
+    // ⚠️ **폭은 제원에 없다.** 아래 kBodyWidM 은 전장 대비 비율 추정치다.
+    //    실측이 나오면 이 상수만 바꾸면 된다.
+    constexpr double kBodyLenM  = 0.265;   // 전장
+    constexpr double kBodyWidM  = 0.212;   // ← 미실측(추정)
+    constexpr double kWheelBase = 0.166;   // 앞뒤 옴니휠 축간
+    constexpr double kWheelDia  = 0.066;   // 바퀴 지름
+
+    // 실제 축척으로 그린다 — 900×600 도면에서 로봇이 얼마나 큰지가 그대로 보여야
+    // 배치 판단이 된다.
+    //
+    // ⚠️ 상한을 140px 로 두고 있었는데, 그러면 **기본 배율에서 이미 잘린다**
+    //    (900mm 도면이 620px 이면 265mm 기체 = 182px). 축척이 정확하다고 주석에
+    //    써 놓고 실제로는 23% 작게 그리고 있었다. 게다가 노즐 점은 월드 좌표라
+    //    배율대로 멀어지는데 몸통만 고정되니, 확대할수록 **노즐이 몸통에서 떨어져
+    //    날아갔다**. 상한은 극단적 확대만 막는 값으로 올린다.
+    const double L = qBound(16.0, kBodyLenM * m_tvPxPerM * sx, 420.0);
+    const double W = L * (kBodyWidM / kBodyLenM);
+    const double pxPerM = L / kBodyLenM;   // 아이콘 안에서 쓰는 축척
+
+    // 색: 강판 회색 계열 + 호박색 강조 두 곳(범퍼·경고등)만. 몸통을 밝게 칠하면
+    // 도면보다 로봇이 먼저 보인다 — 중장비는 원래 어둡고 경고색만 튄다.
+    const QColor cBody(52, 57, 64);       // 섀시 강판
+    const QColor cDeck(72, 79, 88);       // 데크 (한 톤 밝게 → 저상형 입체감)
+    const QColor cRail(31, 34, 39);       // 프레임 레일
+    const QColor cEdge(122, 131, 142);    // 판금 엣지 하이라이트
+    const QColor cHazard(240, 176, 44);   // 위험 사선 · 경고등
+    const QColor cWheel(20, 22, 26);      // 고무 구동륜 (2륜 차동구동)
+    const QColor cOmni(78, 85, 95);       // 옴니휠 — 종동륜이라 한 톤 흐리게
 
     p->save();
     p->translate(w);
+    p->setRenderHint(QPainter::Antialiasing, true);
+
     p->rotate(-m_robotThetaDeg);
 
-    p->setPen(QPen(kProgress, std::max(2.0, L * 0.09), Qt::SolidLine, Qt::RoundCap));
-    p->drawLine(QPointF(L * 0.62, 0), QPointF(L * 1.10, 0));
-    {
-        QPolygonF head;
-        head << QPointF(L * 1.32, 0) << QPointF(L * 1.02, -L * 0.17)
-             << QPointF(L * 1.02, L * 0.17);
-        p->setBrush(kProgress);
+    // 접지 그림자 — 도면 위에 떠 있는 물체로 읽히게 (평면 아이콘의 관습).
+    // ⚠️ 반드시 rotate **뒤에** 그린다. 앞에서 그리면 로봇이 45° 로 섰을 때
+    //    그림자만 축에 붙어 있어서 몸통 밖으로 삐져나온다.
+    p->setPen(Qt::NoPen);
+    p->setBrush(QColor(0, 0, 0, 52));
+    p->drawRoundedRect(QRectF(-L / 2 + L * 0.02, -W / 2 + L * 0.03, L, W),
+                       L * 0.06, L * 0.06);
+
+    // ① 바퀴 6개 — 섀시 밖으로 살짝 나오게. 이게 있어야 '차량'으로 읽힌다.
+    //    구동륜(가운데 고무 2개)만 진하게, 옴니휠 4개는 한 톤 흐리게 → 어느 쪽이
+    //    움직임을 만드는지가 아이콘만 봐도 읽힌다.
+    if (L >= 30.0) {
+        const double wl = kWheelDia * pxPerM;          // 옆에서 본 바퀴 길이 = 지름
+        const double wt = W * 0.15;                    // 두께(림 폭은 미실측)
+        const double ax = (kWheelBase * 0.5) * pxPerM; // 앞뒤 옴니휠 축 위치
         p->setPen(Qt::NoPen);
-        p->drawPolygon(head);
+        auto wheelAt = [&](double x, double y, const QColor &c) {
+            p->setBrush(c);
+            p->drawRoundedRect(QRectF(x - wl / 2, y - wt / 2, wl, wt),
+                               wt * 0.45, wt * 0.45);
+        };
+        for (int j = -1; j <= 1; j += 2) {
+            wheelAt(-ax, j * (W * 0.46), cOmni);        // 뒤 옴니휠
+            wheelAt(+ax, j * (W * 0.46), cOmni);        // 앞 옴니휠
+            wheelAt(0.0, j * (W * 0.50), cWheel);       // 가운데 고무 구동륜
+        }
     }
 
-    p->setBrush(QColor(30, 33, 38));
-    p->setPen(QPen(QColor(90, 96, 104), 1));
-    const double ww = L * 0.34, wh = W * 0.20;
-    for (int i = -1; i <= 1; i += 2)
+    // ② 섀시 — 앞모서리를 크게, 뒷모서리를 작게 깎은 팔각 강판.
+    //    둥근 사각형은 가전제품처럼 보인다. 면취한 직선 실루엣이 '기계'로 읽히고,
+    //    앞뒤 깎임이 달라서 **방향 표시 없이도 어디가 앞인지** 알 수 있다.
+    const double hw = W * 0.42;            // 섀시 반폭
+    const double cf = L * 0.15;            // 앞 면취
+    const double cr = L * 0.07;            // 뒤 면취
+    QPainterPath body;
+    body.moveTo(-L / 2 + cr, -hw);
+    body.lineTo(L / 2 - cf, -hw);
+    body.lineTo(L / 2,      -hw + cf);
+    body.lineTo(L / 2,       hw - cf);
+    body.lineTo(L / 2 - cf,  hw);
+    body.lineTo(-L / 2 + cr, hw);
+    body.lineTo(-L / 2,      hw - cr);
+    body.lineTo(-L / 2,     -hw + cr);
+    body.closeSubpath();
+    p->setBrush(cBody);
+    p->setPen(QPen(cEdge, std::max(1.0, L * 0.016)));
+    p->drawPath(body);
+
+    // ③ 세로 프레임 레일 2줄 — 강판 아래 구조물. 이것만으로 두께감이 생긴다.
+    if (L >= 34.0) {
+        p->setPen(Qt::NoPen);
+        p->setBrush(cRail);
         for (int j = -1; j <= 1; j += 2)
-            p->drawRoundedRect(QRectF(i * L * 0.28 - ww / 2, j * W * 0.50 - wh / 2, ww, wh), 2, 2);
+            p->drawRect(QRectF(-L * 0.44, j * (hw * 0.62) - hw * 0.09,
+                               L * 0.80, hw * 0.18));
+    }
 
-    p->setBrush(kProgress);
-    p->setPen(QPen(QColor(170, 76, 18), 1.2));
-    p->drawRoundedRect(QRectF(-L / 2, -W * 0.40, L, W * 0.80), L * 0.10, L * 0.10);
+    // ④ 데크 플레이트 — 안쪽으로 물린 밝은 면. 저상형 기체의 평평한 윗면.
+    if (L >= 26.0) {
+        p->setBrush(cDeck);
+        p->setPen(Qt::NoPen);
+        p->drawRoundedRect(QRectF(-L * 0.38, -hw * 0.70, L * 0.70, hw * 1.40),
+                           L * 0.03, L * 0.03);
+    }
 
-    p->setBrush(QColor(205, 210, 218));
-    p->setPen(QPen(QColor(120, 126, 134), 1));
-    p->drawRoundedRect(QRectF(L * 0.44, -W * 0.24, L * 0.14, W * 0.48), 2, 2);
+    // ⑤ 데크 적재물 — 도료 드럼(뒤) + 컨트롤 박스(앞).
+    //    "이 기계가 무슨 일을 하는가" 를 말하는 유일한 부분이다.
+    if (L >= 46.0) {
+        const double dr = hw * 0.52;                       // 도료 드럼 반지름
+        p->setBrush(QColor(38, 42, 48));
+        p->setPen(QPen(cEdge, std::max(0.8, L * 0.010)));
+        p->drawEllipse(QPointF(-L * 0.16, 0.0), dr, dr);   // 드럼 외곽
+        p->setPen(Qt::NoPen);
+        p->setBrush(QColor(96, 105, 116));
+        p->drawEllipse(QPointF(-L * 0.16, 0.0), dr * 0.34, dr * 0.34);  // 주입구
+
+        p->setBrush(QColor(40, 44, 50));                   // 컨트롤 박스
+        p->setPen(QPen(cEdge, std::max(0.8, L * 0.010)));
+        p->drawRoundedRect(QRectF(L * 0.06, -hw * 0.42, L * 0.20, hw * 0.84),
+                           L * 0.02, L * 0.02);
+    }
+
+    // ⑥ 전면 범퍼 — **위험 사선**(호박/검정). 중장비의 시각적 서명이자,
+    //    화면에서 앞쪽을 단번에 찍어주는 표식. 강조색은 여기와 경고등뿐이다.
+    const QRectF bump(L * 0.30, -hw * 0.96, L * 0.16, hw * 1.92);
+    p->save();
+    QPainterPath bumpPath;
+    bumpPath.addRoundedRect(bump, L * 0.025, L * 0.025);
+    p->setClipPath(bumpPath);
+    p->fillRect(bump, QColor(26, 28, 32));
+    if (L >= 32.0) {
+        p->setPen(QPen(cHazard, std::max(1.6, L * 0.052)));
+        for (double t = -hw * 2.2; t < hw * 2.2; t += std::max(4.0, L * 0.115))
+            p->drawLine(QPointF(bump.left() - 2.0, t),
+                        QPointF(bump.right() + 2.0, t - bump.width() * 2.0));
+    } else {
+        p->fillRect(bump, cHazard);        // 작을 때는 사선 대신 통칠
+    }
+    p->restore();
     p->setBrush(Qt::NoBrush);
-    p->drawEllipse(QPointF(L * 0.58, -W * 0.13), L * 0.07, L * 0.07);
-    p->drawEllipse(QPointF(L * 0.58,  W * 0.13), L * 0.07, L * 0.07);
+    p->setPen(QPen(cEdge, std::max(0.8, L * 0.012)));
+    p->drawPath(bumpPath);
 
-    const double mk = std::min(L, W) * 0.46;
-    p->setBrush(Qt::white);
-    p->setPen(QPen(QColor(26, 29, 33), 1));
-    p->drawRect(QRectF(-mk / 2, -mk / 2, mk, mk));
-    p->setBrush(QColor(26, 29, 33));
+    // ⚠️ 여기 있던 후방 회전 경고등(호박색 점)은 지웠다. 노즐 연결선이 붙는 자리와
+    //    정확히 겹쳐서, 호박색 점이 **노즐로 오독**됐다. 실제 노즐은 흰 원이고 훨씬
+    //    뒤에 있다. 강조색은 전면 범퍼 하나로 충분하다.
+
+    // ⑧ 기준점 십자 = **ArUco 마커(ID 49) 중심** = 서버가 준 POSE(x, y) 그 자체.
+    //    노즐은 여기가 아니라 155mm 뒤다 (Backend::pushPoseToView 참고).
+    //    점 하나보다 십자가 낫다: 도료 드럼 위에서도 축이 어디인지 정확히 짚힌다.
+    if (L >= 30.0) {
+        const double ct = std::max(2.6, L * 0.075);
+        p->setBrush(Qt::NoBrush);
+        p->setPen(QPen(QColor(236, 242, 248, 200), std::max(1.0, L * 0.014)));
+        p->drawLine(QPointF(-ct, 0), QPointF(ct, 0));
+        p->drawLine(QPointF(0, -ct), QPointF(0, ct));
+    }
     p->setPen(Qt::NoPen);
-    p->drawRect(QRectF(-mk * 0.30, -mk * 0.30, mk * 0.24, mk * 0.24));
-    p->drawRect(QRectF(mk * 0.06, -mk * 0.30, mk * 0.22, mk * 0.22));
-    p->drawRect(QRectF(-mk * 0.30, mk * 0.08, mk * 0.22, mk * 0.22));
+    p->setBrush(QColor(236, 242, 248, 235));
+    p->drawEllipse(QPointF(0, 0), std::max(1.6, L * 0.030), std::max(1.6, L * 0.030));
+
     p->restore();
 
     paintPenMarker(p, sx, sy, ox, oy);
 }
 
-// 펜(노즐) 끝. 회전중심 뒤 d 에 있어서 로봇 몸통에 가려진다 → **아이콘 위에** 찍는다.
-// 꼭짓점에서 후진·제자리회전할 때 실제로 어디를 칠하는지 이것만 보면 된다.
+// 노즐(펜) 끝 — 페인트가 실제로 나오는 점. 기준점(ArUco 마커) 뒤 155mm 라 로봇 몸통에
+// 가려진다 → **아이콘 위에** 찍는다. 전장 265mm 의 절반(132mm)보다 멀어서 섀시 밖으로
+// 조금 나온다. 꼭짓점에서 후진·제자리회전할 때 어디를 칠하는지 이것만 보면 된다.
 // 내려간 상태 = 채운 점(칠하는 중), 올라간 상태 = 빈 원(이동/회전).
 void VideoView::paintPenMarker(QPainter *p, double sx, double sy, double ox, double oy)
 {
@@ -989,7 +1101,7 @@ void VideoView::paintPenMarker(QPainter *p, double sx, double sy, double ox, dou
     const QPointF pw(m_penPx.x() * sx + ox, m_penPx.y() * sy + oy);
     const double r = qBound(5.0, 0.025 * m_tvPxPerM * sx, 11.0);
 
-    // 회전중심 → 펜 연결선. 오프셋이 4cm 뿐이라 화면에서는 몇 픽셀밖에 안 된다.
+    // 기준점 → 노즐 연결선. 실측 오프셋 155mm (ArUco 마커 중심 ↔ 노즐).
     // 선이 없으면 꼭짓점에서 뒤로 물러났다 돌아오는 게 눈에 안 들어온다.
     if (m_robotValid) {
         const QPointF cw(m_robotPx.x() * sx + ox, m_robotPx.y() * sy + oy);
@@ -1153,13 +1265,6 @@ int VideoView::selectedPointCount() const
     return n;
 }
 
-bool VideoView::hasMultiShapeSelection() const
-{
-    for (const QSet<int> &s : m_doneSel)
-        if (!s.isEmpty()) return true;
-    return false;
-}
-
 void VideoView::clearDoneSelection()
 {
     for (QSet<int> &s : m_doneSel) s.clear();
@@ -1278,15 +1383,6 @@ QList<int> VideoView::transformTargets() const
         for (int i = 0; i < m_points.size(); ++i) t << i;
     }
     return t;
-}
-
-QPointF VideoView::transformPivot() const
-{
-    const QList<int> t = transformTargets();
-    if (t.isEmpty()) return QPointF();
-    double cx = 0, cy = 0;
-    for (int i : t) { cx += m_points[i].x(); cy += m_points[i].y(); }
-    return QPointF(cx / t.size(), cy / t.size());
 }
 
 // ── 선택 박스 + 크기조절/회전 핸들 ───────────────────────────────────
@@ -1500,15 +1596,6 @@ void VideoView::selectAllActive()
         m_doneSel[s].clear();
         for (int i = 0; i < m_done[s].pts.size(); ++i) m_doneSel[s].insert(i);
     }
-    emit selectionChanged();
-    update();
-}
-
-void VideoView::clearSelection()
-{
-    if (selectedPointCount() == 0) return;
-    m_selection.clear();
-    clearDoneSelection();
     emit selectionChanged();
     update();
 }
@@ -1992,6 +2079,12 @@ void VideoView::mouseReleaseEvent(QMouseEvent *e)
             for (int s = 0; s < m_done.size(); ++s)
                 for (int i = 0; i < m_done[s].pts.size(); ++i)
                     if (inRect(m_done[s].pts[i])) m_doneSel[s].insert(i);
+            // 🔴 올가미로 뭔가 잡았으면 편집 표시를 **반드시 다시 켠다**.
+            //    올가미는 빈 곳에서 시작하므로 mousePressEvent 6번 분기가 방금
+            //    m_focused=false 로 껐다. 여기서 안 켜면 선택은 됐는데 박스도
+            //    핸들도 안 그려지고, "박스 안쪽 드래그로 이동"이 박스가 빈 것으로
+            //    판정돼 통째로 죽는다.
+            if (selectedPointCount() > 0) m_focused = true;
             emit selectionChanged();
         }
         update();
@@ -2007,6 +2100,7 @@ void VideoView::mouseReleaseEvent(QMouseEvent *e)
     // (선택된 점을 직접 집은 경우는 해제하지 않는다 — 잡았다 놨을 뿐이다)
     if (m_movingSel && !m_selMoveDragged && !m_selMoveOnVertex) {
         resetSelection();
+        m_focused = false;         // 빈 곳 클릭과 결과가 같아야 한다 (박스도 같이 꺼짐)
         update();
     }
 
@@ -2558,16 +2652,119 @@ void VideoView::configureTopViewTest()
     emit scaleChanged();
 }
 
+// ── H 의 출력 단위 검산 ───────────────────────────────────────────────
+//
+// 왜 필요한가: 번들의 `unit` 필드를 믿을 수 없다. 서버(router.cpp:419)는
+// 수신 즉시 H_floor/H_marker 를 ÷1000 해서 **미터로 바꿔** 저장·중계하는데
+// `unit` 은 "mm" 그대로 남긴다. 그 말을 믿으면 좌표가 통째로 1000 배 어긋난다.
+//
+// 어떻게: 번들에 `canvas_mm` 과 `image_size` 가 이미 있다. 캔버스가 화면을
+// 대충 채운다고 보면 "월드단위/픽셀" 배율의 기대값을 알 수 있고, 실측 배율이
+// 기대값의 1 배면 mm, 1/1000 배면 m 이다. 두 후보가 **3 decade** 떨어져 있어서
+// "대충 채운다"는 가정이 30 배 틀려도 판정이 뒤집히지 않는다.
+//
+// (실측: 현장 번들 2026-07-29-1411 은 r=3.04 → mm. 같은 H 를 ÷1000 하면
+//  r=0.0030 → m. 판정 경계는 r=0.032 이라 양쪽 다 10 배 여유가 있다)
+enum class HUnit { Unknown, Mm, M };
+
+static HUnit verifyHUnit(const cv::Mat &Hraw, const QJsonObject &calib, double *ratioOut)
+{
+    if (Hraw.empty() || Hraw.type() != CV_64F) return HUnit::Unknown;
+    const QJsonArray canvas = calib.value(QStringLiteral("canvas_mm")).toArray();
+    const QJsonArray isz    = calib.value(QStringLiteral("image_size")).toArray();
+    if (canvas.size() < 2 || isz.size() < 2) return HUnit::Unknown;
+    const double cw = canvas.at(0).toDouble(), chh = canvas.at(1).toDouble();
+    const double iw = isz.at(0).toDouble(),    ih  = isz.at(1).toDouble();
+    if (cw < 10.0 || chh < 10.0 || iw < 16.0 || ih < 16.0) return HUnit::Unknown;
+
+    const double *h = Hraw.ptr<double>();
+    auto mapPt = [&](double x, double y, QPointF *out) {
+        const double w = h[6] * x + h[7] * y + h[8];
+        if (std::abs(w) < 1e-12) return false;
+        *out = QPointF((h[0] * x + h[1] * y + h[2]) / w,
+                       (h[3] * x + h[4] * y + h[5]) / w);
+        return true;
+    };
+
+    // 영상 중심 부근의 국소 배율. 화면 끝은 원근 때문에 발산할 수 있어 쓰지 않는다.
+    const double cx = iw * 0.5, cy = ih * 0.5;
+    const double d = std::max(8.0, iw * 0.05);
+    QPointF p0, pdx, pdy;
+    if (!mapPt(cx, cy, &p0) || !mapPt(cx + d, cy, &pdx) || !mapPt(cx, cy + d, &pdy))
+        return HUnit::Unknown;
+    const double sX = QLineF(p0, pdx).length() / d;
+    const double sY = QLineF(p0, pdy).length() / d;
+    const double s = std::sqrt(std::max(1e-30, sX * sY));   // 기하평균
+    const double expect = std::hypot(cw, chh) / std::hypot(iw, ih);   // mm/px 기대값
+    if (s < 1e-12 || expect < 1e-9) return HUnit::Unknown;
+
+    const double r = s / expect;      // 1 근처 = mm, 0.001 근처 = m
+    if (ratioOut) *ratioOut = r;
+    const double lg = std::log10(r);
+    const double dMm = std::abs(lg);
+    const double dM  = std::abs(lg + 3.0);
+    if (std::min(dMm, dM) > 1.5) return HUnit::Unknown;   // 어느 쪽도 아니다 → 판정 보류
+    return (dMm <= dM) ? HUnit::Mm : HUnit::M;
+}
+
 bool VideoView::configureTopViewCalib(const QJsonObject &calib)
 {
     // H 가 어느 픽셀 공간을 받는지 기억해 둔다 — 원본 뷰로 되돌릴 때 왜곡을
     // 한 번 더 태울지가 여기서 갈린다.
     m_hCoordUndistort = (calib.value(QStringLiteral("coord_mode")).toString().toLower()
                          == QLatin1String("undistort"));
+    // ── 단위 결정 ────────────────────────────────────────────────────
+    // 선언값(`unit`)을 먼저 읽고, H 로 검산해서 어긋나면 **검산을 따른다**.
+    // 선언을 그대로 믿던 예전 코드는 서버 경유 번들(H는 미터·unit은 "mm")에서
+    // 좌표를 1000 배 축소시켰다.
     const QString unit = calib.value(QStringLiteral("unit")).toString(QStringLiteral("mm")).toLower();
-    const bool unitIsMm = (unit != QStringLiteral("m") && unit != QStringLiteral("meter")
-                           && unit != QStringLiteral("meters"));
-    const double toMm = unitIsMm ? 1.0 : 1000.0;
+    const bool declaredMm = (unit != QStringLiteral("m") && unit != QStringLiteral("meter")
+                             && unit != QStringLiteral("meters"));
+
+    // H 를 스케일 적용 **전에** 먼저 뜬다 (검산 대상이 원본 H 라야 한다).
+    cv::Mat Hraw;
+    bool haveH = false;
+    if (parseHomography3x3(calib.value(QStringLiteral("H")).toArray(), Hraw))
+        haveH = true;
+    else if (parseHomography3x3(calib.value(QStringLiteral("H_floor")).toArray(), Hraw))
+        haveH = true;
+
+    bool unitIsMm = declaredMm;
+    m_calibUnitNote.clear();
+    if (haveH) {
+        double ratio = 0.0;
+        const HUnit v = verifyHUnit(Hraw, calib, &ratio);
+        if (v == HUnit::Unknown) {
+            m_calibUnitNote = QStringLiteral("단위 %1 (선언값 · 검산 불가)")
+                                  .arg(declaredMm ? QStringLiteral("mm") : QStringLiteral("m"));
+        } else {
+            const bool verified = (v == HUnit::Mm);
+            if (verified == declaredMm) {
+                m_calibUnitNote = QStringLiteral("단위 %1 (검산 일치, r=%2)")
+                                      .arg(verified ? QStringLiteral("mm") : QStringLiteral("m"))
+                                      .arg(ratio, 0, 'g', 3);
+            } else {
+                // 🔴 선언과 실제가 다르다 — 조용히 넘기면 1000 배 사고다.
+                unitIsMm = verified;
+                m_calibUnitNote = QStringLiteral("⚠️ 단위 불일치: 선언 %1 / 실제 %2 "
+                                                 "— 실제값 채택 (r=%3)")
+                                      .arg(declaredMm ? QStringLiteral("mm") : QStringLiteral("m"))
+                                      .arg(verified ? QStringLiteral("mm") : QStringLiteral("m"))
+                                      .arg(ratio, 0, 'g', 3);
+                qWarning().noquote() << "[VideoView]" << m_calibUnitNote;
+            }
+        }
+    }
+    cv::Mat Himg2mm;
+    if (haveH) {
+        Himg2mm = Hraw;
+        if (!unitIsMm) {
+            cv::Mat Sm = cv::Mat::eye(3, 3, CV_64F);
+            Sm.at<double>(0, 0) = 1000.0;
+            Sm.at<double>(1, 1) = 1000.0;
+            Himg2mm = Sm * Himg2mm;
+        }
+    }
 
     QJsonArray corners = calib.value(QStringLiteral("corners")).toArray();
     if (corners.isEmpty() && calib.contains(QStringLiteral("corner")))
@@ -2590,31 +2787,10 @@ bool VideoView::configureTopViewCalib(const QJsonObject &calib)
             mm = QJsonArray{ o.value(QStringLiteral("mm_x")), o.value(QStringLiteral("mm_y")) };
         if (px.size() < 2 || mm.size() < 2) continue;
         srcPx.emplace_back(float(px.at(0).toDouble()), float(px.at(1).toDouble()));
-        dstMm.emplace_back(float(mm.at(0).toDouble() * toMm), float(mm.at(1).toDouble() * toMm));
-    }
-
-    cv::Mat Himg2mm;
-    bool haveH = false;
-    if (calib.contains(QStringLiteral("H"))
-        && parseHomography3x3(calib.value(QStringLiteral("H")).toArray(), Himg2mm)) {
-        if (!unitIsMm) {
-            cv::Mat Sm = cv::Mat::eye(3, 3, CV_64F);
-            Sm.at<double>(0, 0) = 1000.0;
-            Sm.at<double>(1, 1) = 1000.0;
-            Himg2mm = Sm * Himg2mm;
-        }
-        haveH = true;
-    } else if (calib.contains(QStringLiteral("H_floor"))
-               && parseHomography3x3(calib.value(QStringLiteral("H_floor")).toArray(), Himg2mm)) {
-        // ⚠️ 예전에는 H_floor 를 무조건 m 단위로 보고 ×1000 했다. 번들이 mm 로 주면
-        //    1000 배 어긋난다. "H" 가지와 똑같이 unit 을 따른다.
-        if (!unitIsMm) {
-            cv::Mat Sm = cv::Mat::eye(3, 3, CV_64F);
-            Sm.at<double>(0, 0) = 1000.0;
-            Sm.at<double>(1, 1) = 1000.0;
-            Himg2mm = Sm * Himg2mm;
-        }
-        haveH = true;
+        // ⚠️ 앵커 좌표는 **항상 mm** 다 (키 이름이 곧 단위 — `mm`/`mm_x`). unit 은 H 의
+        //    출력 단위일 뿐이라 여기에 곱하면 안 된다. 서버가 unit:"m" 로 내려주기
+        //    시작한 뒤(2026-07-30) 앵커까지 ×1000 되던 잠재 버그를 막는다.
+        dstMm.emplace_back(float(mm.at(0).toDouble()), float(mm.at(1).toDouble()));
     }
 
     auto buildMmToTv = [](double originX, double originY, double maxY, double pxPerMm) {
@@ -2726,6 +2902,8 @@ bool VideoView::configureTopViewCalib(const QJsonObject &calib)
     m_tvMapDirty = true;   // H 가 바뀌면 remap 대응표도 다시 만들어야 한다
         m_tvUseFrac = false;
         m_tvBuilt = true;
+        if (!m_calibUnitNote.isEmpty())
+            note += QStringLiteral(" · ") + m_calibUnitNote;
         m_calibSummary = QStringLiteral("앵커%1 · 좌하(0,0) · %2×%3 mm · %4×%5px · 1px=%6mm%7")
                              .arg(int(srcPx.size()))
                              .arg(worldWmm, 0, 'f', 0)
@@ -2765,10 +2943,13 @@ bool VideoView::configureTopViewCalib(const QJsonObject &calib)
     m_tvMapDirty = true;   // H 가 바뀌면 remap 대응표도 다시 만들어야 한다
         m_tvUseFrac = false;
         m_tvBuilt = true;
-        m_calibSummary = QStringLiteral("H만 · 좌하(0,0) · %1×%2 mm · %3×%4px · 1px=%5mm")
+        m_calibSummary = QStringLiteral("H만 · 좌하(0,0) · %1×%2 mm · %3×%4px · 1px=%5mm%6")
                              .arg(canvasW, 0, 'f', 0).arg(canvasH, 0, 'f', 0)
                              .arg(m_tvOutW).arg(m_tvOutH)
-                             .arg(mmPerPx(), 0, 'f', 3);
+                             .arg(mmPerPx(), 0, 'f', 3)
+                             .arg(m_calibUnitNote.isEmpty()
+                                      ? QString()
+                                      : QStringLiteral(" · ") + m_calibUnitNote);
         emit scaleChanged();
         return true;
     }

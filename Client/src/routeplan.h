@@ -96,16 +96,8 @@ inline QList<QPointF> simplify(const QList<QPointF> &in, double tolM)
     return out;
 }
 
-inline double ringLength(const QList<QPointF> &pts, bool closed)
-{
-    if (pts.size() < 2) return 0.0;
-    double L = 0.0;
-    for (int i = 1; i < pts.size(); ++i)
-        L += QLineF(pts[i - 1], pts[i]).length();
-    if (closed && pts.size() > 2)
-        L += QLineF(pts.last(), pts.first()).length();
-    return L;
-}
+// ⚠️ 여기 있던 ringLength(폴리라인 둘레) 는 지웠다 — 호출부 0.
+//    경로 길이가 필요한 곳은 backend.cpp 의 polylineLength() 를 쓴다.
 
 namespace detail {
 

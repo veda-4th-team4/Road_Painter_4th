@@ -1,0 +1,21 @@
+# Line endings: LF everywhere, in the repo AND in the working copy.
+#
+# This project is edited on Windows, but everything that consumes the files is
+# Linux: `make` runs in a container that mounts this folder at
+# /mnt/cctv_app, and rpi/*.py is scp'd to the Pi. Windows git defaults
+# to core.autocrlf=true, which would hand those consumers a CRLF working copy
+# and break the shebangs ("bad interpreter: No such file or directory") in
+# opencv_cross/build_opencv.sh and the Pi scripts. Pinning eol=lf here overrides
+# each developer's autocrlf setting, so the rule travels with the repo.
+* text=auto eol=lf
+
+# Binary assets — never convert, never diff as text.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.ttf  binary
+*.cap  binary
+*.crt  binary
+*.key  binary

@@ -19,19 +19,23 @@ namespace motionprogram {
 class Player {
 public:
     // ops        : 실행할 시퀀스
-    // startCenter: 로봇 **중심**의 시작 위치 = approachCenter(pts)
-    // startHead  : 시작 방위(deg)          = approachHeadingDeg(pts)
-    // penOffM    : 펜이 회전중심 뒤로 떨어진 거리 d (m).
-    //   ⚠️ 시퀀스가 **도면 그대로**(펜 기준)로 바뀐 뒤로는 0 을 넣는 게 맞다.
-    //   로봇이 오프셋을 스스로 흡수하므로 펜은 도면 위를 정확히 따라간다.
-    //   0 이 아니면 미리보기 펜이 실제보다 d 만큼 뒤처져 보인다.
-    void load(const QList<Op> &ops, const QPointF &startCenter, double startHeadDeg,
-              double penOffM, double nozzleSec = 0.5)
+    // startStart : 시작 위치 = approachCenter(pts)
+    // startHead  : 시작 방위(deg) = approachHeadingDeg(pts)
+    //
+    // ⚠️ 이 재생기가 다루는 점은 **노즐(펜)** 이다. 시퀀스가 도면 그대로(펜 기준)라
+    //    노즐이 도면 위를 정확히 따라가고, 로봇은 155mm 오프셋을 자기 안에서 흡수한다.
+    //    화면의 섀시(= ArUco 마커 기준점)는 여기서 155mm **앞**이며, 그 보정은
+    //    Backend::pushSimPoseToView() 가 한다 — 재생기는 관여하지 않는다.
+    //
+    // ⚠️ 예전에는 penOffM 인자로 오프셋을 받았는데, 시퀀스가 펜 기준으로 바뀐 뒤로는
+    //    호출부가 항상 0.0 만 넘겼다(넣으면 미리보기 펜이 d 만큼 뒤처져 보였다).
+    //    영원히 0 인 인자라 지웠다.
+    void load(const QList<Op> &ops, const QPointF &startPos, double startHeadDeg,
+              double nozzleSec = 0.5)
     {
         m_ops = ops;
-        m_start = startCenter;
+        m_start = startPos;
         m_startHead = startHeadDeg;
-        m_d = (penOffM > 1e-4) ? penOffM : 0.0;
         m_nozzleSec = qMax(0.0, nozzleSec);
         m_i = 0;
         m_t = 0.0;
@@ -45,8 +49,8 @@ public:
 
     bool empty() const { return m_ops.isEmpty(); }
     bool finished() const { return m_i >= m_ops.size(); }
-    int opIndex() const { return m_i; }
-    int opCount() const { return m_ops.size(); }
+    // ⚠️ opIndex()/opCount() 는 지웠다 — 호출부 0. 재생 상태는 phaseText() 와
+    //    progress01() 로만 화면에 나간다.
 
     // dtSec 만큼 시간을 흘린다. op 경계를 넘어가면 남은 시간을 다음 op 로 이어 준다
     // (한 프레임 안에서 노즐 op 여러 개를 지나가는 경우가 흔하다).
@@ -71,15 +75,12 @@ public:
     QPointF center() const { return state().center; }
     double headingDeg() const { return state().head; }
     bool nozzleDown() const { return state().down; }
-    double paintedM() const { return state().painted; }
-    double paintTotalM() const { return m_paintTotal; }
+    // ⚠️ paintedM()/paintTotalM() 도 지웠다 — 호출부 0. 두 값의 비(比)인
+    //    progress01() 만 쓰인다. m_paintTotal 자체는 거기서 분모로 살아 있다.
 
-    QPointF pen() const
-    {
-        const St s = state();
-        const double r = s.head * kPi / 180.0;
-        return s.center - QPointF(std::cos(r), std::sin(r)) * m_d;
-    }
+    // ⚠️ 여기 있던 pen() 은 지웠다. m_d 가 항상 0 이라 center() 와 완전히 같은 값을
+    //    돌려줬다 — 두 이름이 다른 점인 것처럼 보여서 오히려 헷갈렸다.
+    //    center() 가 곧 노즐 위치다(위 load() 주석 참고).
 
     // 도색 진행률 — 빈 이동·회전은 진행률을 올리지 않는다. 화면의 미션 오버레이가
     // "칠해진 길이"를 그대로 채우므로 두 값이 어긋나지 않는다.
@@ -190,7 +191,6 @@ private:
     QList<Op> m_ops;
     QPointF m_start;
     double m_startHead = 0.0;
-    double m_d = 0.0;
     double m_nozzleSec = 0.5;
     int m_i = 0;        // 실행 중인 op
     double m_t = 0.0;   // 그 op 안에서 흐른 시간(초)

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# TEMPLATE for the gitignored config.sh.
+#
+#   cp config.sh.example config.sh
+#   # then edit in your real host / account / ports
+#   source config.sh
+#
+# Real values never enter git (config.sh is gitignored). Auth to the Pi is
+# SSH key-based; do NOT put passwords here.
+# ---------------------------------------------------------------------------
+
+# RPi vision server
+export PI_USER="<ssh-user>"                  # <-- SSH account
+export PI_HOST="<rpi-ip>"                     # <-- RPi IP (Wi-Fi, may change)
+export PI_APP_DIR="~/cctv_calibration_manager"
+
+# Ports (must match app_config_local.h and the web_gui.py launch args)
+export POSE_PORT=7000
+export GUI_PORT=8082
+export SNAPSHOT_PORT=7001
+
+# Camera (web UI upload target)
+export CAM_HOST="<camera-ip>"                 # <-- camera IP
