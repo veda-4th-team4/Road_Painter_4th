@@ -1,4 +1,5 @@
 #include "PathFollower.h"
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 
