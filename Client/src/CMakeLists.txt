@@ -20,6 +20,10 @@ qt_add_executable(RoadPainterQml
     backend.h backend.cpp
     videoview.h videoview.cpp
     video_worker.h video_worker.cpp
+    # 4채널 미리보기 (PNM). 경량 캡처 + 타일 — video_worker/VideoView 와 별개다
+    # (미리보기에 ArUco 검출과 3000줄짜리 작도 뷰를 재사용하면 CPU 가 녹는다)
+    preview_worker.h preview_worker.cpp
+    channel_tile.h channel_tile.cpp
     serverclient.h serverclient.cpp
     routeplan.h
     motionprogram.h
@@ -43,6 +47,7 @@ qt_add_qml_module(RoadPainterQml
         LoginPage.qml
         SignupDialog.qml
         MainPage.qml
+        ChannelGrid.qml
         PresetTile.qml
         PresetPanel.qml
         UndoButton.qml

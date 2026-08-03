@@ -16,6 +16,13 @@ Item {
         || cctvPanel.floating || topPanel.floating || logPanel.floating
         || dashPanel.floating || manualPanel.floating
 
+    // 4채널 미리보기 화면인가. 중계 주소가 없으면(단일 채널) 언제나 false 라
+    // 예전 화면만 뜬다 — PNM 을 안 쓰는 현장은 아무것도 달라지지 않는다.
+    // (테스트 모드는 중계가 없으므로 4채널 화면을 띄우지 않는다 — Backend 쪽에서도
+    //  enterInitialView() 가 같은 판단을 한다)
+    readonly property bool channelGridMode:
+        Backend.channelMode && !Backend.testMode && Backend.workingChannel === 0
+
     function captureLayout() {
         defaultLayout = {
             outer:  outerSplit.saveState(),
@@ -222,6 +229,40 @@ Item {
                     font.family: Theme.fontFamily
                 }
             }
+            // 4채널 모드에서 지금 어느 채널로 작업 중인지 + 목록으로 돌아가기.
+            // 단일 채널(중계 주소 없음)에서는 통째로 사라진다.
+            Row {
+                visible: Backend.channelMode && Backend.workingChannel > 0
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 6
+                AppButton {
+                    text: "◀ 채널 목록"
+                    enabled: !Backend.jobActive
+                    ToolTip.visible: hovered && Backend.jobActive
+                    // 작업 중 채널을 바꾸면 지금 로봇을 보고 있는 카메라가 바뀌어
+                    // pose 공급이 끊긴다. 서버는 안 막으므로 여기서 막는다.
+                    ToolTip.text: "작업 중에는 채널을 바꿀 수 없습니다 — 먼저 작업을 취소하세요"
+                    onClicked: Backend.showChannelGrid()
+                }
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    radius: 4
+                    color: Theme.accentSoft
+                    border.color: Theme.accent
+                    border.width: 1
+                    width: chLabel.implicitWidth + 16
+                    height: 24
+                    Text {
+                        id: chLabel
+                        anchors.centerIn: parent
+                        text: "CH" + Backend.workingChannel
+                        color: Theme.accentDim
+                        font.pixelSize: 11
+                        font.bold: true
+                        font.family: Theme.fontFamily
+                    }
+                }
+            }
         }
 
         Row {
@@ -369,6 +410,20 @@ Item {
         TextEdit { id: adminUrlHolder; visible: false; width: 1; height: 1 }
     }
 
+    // ── 4채널 미리보기 (PNM) ─────────────────────────────────────────
+    // 중계 주소가 설정돼 있고 아직 채널을 안 골랐으면 이 화면부터 시작한다.
+    // 🔴 아래 작업 화면(outerSplit)을 갈아엎지 않고 **덮기만** 한다 — 중계 주소를
+    //    비우면 channelMode 가 꺼지면서 예전 화면이 그대로 돌아온다.
+    ChannelGrid {
+        id: channelGridView
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: banner.bottom
+        anchors.bottom: parent.bottom
+        z: 2
+        visible: page.channelGridMode
+    }
+
     // ── 본문: 전부 드래그로 크기 조절 가능 ───────────────────────────
     SplitView {
         id: outerSplit
@@ -377,6 +432,9 @@ Item {
         anchors.top: banner.bottom
         anchors.bottom: parent.bottom
         orientation: Qt.Horizontal
+        // 그리드가 떠 있는 동안은 숨긴다. visible=false 면 입력도 안 받으므로
+        // 뒤에서 실수로 작도가 되는 일이 없다. SplitView 의 분할 상태는 유지된다.
+        visible: !page.channelGridMode
 
         handle: Rectangle {
             implicitWidth: 6
@@ -2529,6 +2587,77 @@ Item {
                 AppButton {
                     text: "RTSP 적용"
                     onClicked: if (rtspField.text.length) Backend.setRtsp(rtspField.text)
+                }
+
+                Rectangle { width: parent.width; height: 1; color: Theme.stroke }
+
+                // ── 4채널 중계 (PNM-C16083RVQ) ──────────────────────────
+                Text {
+                    text: "4채널 중계 주소"
+                    color: Theme.sub
+                    font.pixelSize: 12
+                    font.bold: true
+                    font.family: Theme.fontFamily
+                }
+                Text {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    // 이 칸이 곧 되돌리기 스위치라는 것을 여기 적어둔다. 현장에서
+                    // PNM 이 말썽이면 재빌드 없이 이 한 칸을 비우면 끝이다.
+                    text: "서버의 RTSP 중계 주소를 넣으면 4채널 화면으로 동작합니다. "
+                        + "비우면 위의 단일 카메라 직결 동작으로 즉시 되돌아갑니다 (재시작 불필요)."
+                    color: Theme.muted
+                    font.pixelSize: 11
+                    font.family: Theme.fontFamily
+                }
+                Row {
+                    width: parent.width
+                    spacing: 8
+                    TextField {
+                        id: relayField
+                        width: parent.width - 200
+                        height: 30
+                        color: Theme.text
+                        leftPadding: 8
+                        selectByMouse: true
+                        placeholderText: "rtsp://192.168.0.2:8554   (비우면 단일 채널)"
+                        placeholderTextColor: Theme.muted
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 12
+                        Component.onCompleted: text = Backend.relayBase
+                        onAccepted: Backend.setRelayBase(text)
+                        background: Rectangle {
+                            radius: 4; color: Theme.panel
+                            border.width: 1
+                            border.color: relayField.activeFocus ? Theme.accent : Theme.stroke
+                        }
+                    }
+                    AppButton {
+                        height: 30
+                        text: "적용"
+                        ToolTip.visible: hovered
+                        ToolTip.text: "채널 URL 은 규칙으로 조립합니다:\n"
+                                    + "  메인 <주소>/ch1 … /ch4   (작업 화면)\n"
+                                    + "  서브 <주소>/ch1s … /ch4s (2x2 미리보기)\n"
+                                    + "Server/relay/README.md 의 경로와 같아야 합니다."
+                        onClicked: Backend.setRelayBase(relayField.text)
+                    }
+                    AppButton {
+                        height: 30
+                        text: "비우기"
+                        visible: Backend.channelMode
+                        onClicked: { relayField.text = ""; Backend.setRelayBase("") }
+                    }
+                }
+                Text {
+                    visible: Backend.channelMode
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: "현재 4채널 모드 · 채널 " + Backend.channelCount + "개 · "
+                        + "메인 " + Backend.relayBase + "/ch1 … 서브 " + Backend.relayBase + "/ch1s"
+                    color: Theme.accentDim
+                    font.pixelSize: 11
+                    font.family: Theme.fontFamily
                 }
             }
 

@@ -65,6 +65,10 @@ public:
     // 작업 완전 중지 (프로토콜 v0.4). ESTOP 과 달리 서버·로봇이 받아둔 경로를
     // 버리므로, RESUME 해도 도색이 재개되지 않는다. 도면은 서버에 남는다.
     void sendAbortDraw();
+    // 작업 채널 전환 (프로토콜 v0.4, 다채널 카메라). 서버가 활성 채널을 바꾸고
+    // CCTV 에 중계해 그 채널의 마커를 잡게 한다 → 응답 CHANNEL_OK{ch,calib}.
+    // ⚠️ 영상만 바꾸고 이걸 안 보내면 로봇 위치가 옛 채널 기준이라 조용히 어긋난다.
+    void sendSelectChannel(int ch);
     // ⚠️ sendSpeeds 는 없앴다 — 프로토콜에 속도 CMD 가 없고(2026-07-28 확정),
     //    로봇에도 SET_SPEED 분기가 없어 보내봐야 버려진다.
     // 로그인 후 카메라 IP 변경 (빈 문자열이면 등록 해제)
@@ -85,7 +89,17 @@ signals:
     void poseReceived(double x, double y, double thetaDeg);
     void statusReceived(const QString &state, bool painting);
     void peersReceived(bool robot, bool cctv);
-    void hMatrixReceived(const QJsonObject &calib); // 캘리브레이션 갱신 → top-view 재생성
+    // 캘리브레이션 갱신 → top-view 재생성. ch 는 이 번들이 어느 채널의 것인지
+    // (단일 채널 카메라·v0.3 서버는 ch 를 안 실으므로 1로 온다).
+    void hMatrixReceived(int ch, const QJsonObject &calib);
+    // LOGIN_OK 의 채널별 번들 맵 + 서버가 기억하는 활성 채널 (프로토콜 v0.4).
+    // loginResult 와 따로 두는 이유: 단일 채널 경로는 calib 하나만 보면 되고,
+    // 그 시그니처를 건드리면 4채널과 무관한 코드까지 다 바뀐다.
+    void calibChannelsReceived(const QJsonObject &calibs, int activeCh);
+    // 채널 전환 결과. ok=false 면 서버가 거절한 것(범위 밖 채널 등).
+    // hasCalib=false 면 그 채널은 아직 캘리브레이션이 없다.
+    void channelResult(bool ok, int ch, const QJsonObject &calib, bool hasCalib,
+                       const QString &reason);
     // 도면 접수 확인 — 보낸 것과 서버가 받은 것을 그 자리에서 대조한다.
     // paint/program 이 형식 오류로 무시됐으면 false / 0 으로 온다.
     void blueprintAck(int points, bool paint, int program);

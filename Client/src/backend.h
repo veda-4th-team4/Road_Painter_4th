@@ -11,6 +11,7 @@
 #include <QElapsedTimer>
 #include <QVariantList>
 #include <QPolygonF>
+#include <QHash>
 
 #include "routeplan.h"
 #include "motionprogram.h"
@@ -18,6 +19,8 @@
 #include "camcalib.h"
 
 class video_worker;
+class preview_worker;
+class ChannelTile;
 class ServerClient;
 class VideoView;
 class QTimer;
@@ -81,6 +84,22 @@ class Backend : public QObject
     Q_PROPERTY(double pxPerMm READ pxPerMm NOTIFY calibChanged)
     Q_PROPERTY(QString scaleText READ scaleText NOTIFY calibChanged)
     Q_PROPERTY(QString rtspUrl READ rtspUrl NOTIFY rtspChanged)
+
+    // ── 다채널 카메라 (PNM-C16083RVQ, 프로토콜 v0.4) ──────────────────────
+    // 🔴 relayBase 가 비어 있으면 channelMode 가 false 고, 아래 것들은 전부
+    //    쓰이지 않는다 — 기존 PNO 단일 채널 직결 동작 그대로다. PNM 은 아직
+    //    시도 단계라 언제든 되돌아갈 수 있어야 한다.
+    Q_PROPERTY(bool channelMode READ channelMode NOTIFY channelChanged)
+    Q_PROPERTY(QString relayBase READ relayBase NOTIFY channelChanged)
+    Q_PROPERTY(int channelCount READ channelCount NOTIFY channelChanged)
+    // 클릭해서 테두리가 켜진 채널 (0 = 아무것도 안 고름). 아직 작업 시작 전이다.
+    Q_PROPERTY(int highlightedChannel READ highlightedChannel NOTIFY channelChanged)
+    // [작업하기]로 들어간 채널 (0 = 4채널 그리드 화면). 이 값이 화면을 가른다.
+    Q_PROPERTY(int workingChannel READ workingChannel NOTIFY channelChanged)
+    Q_PROPERTY(bool canStartChannelWork READ canStartChannelWork NOTIFY channelChanged)
+    // 캘리브레이션이 끝난 채널 번호 목록. QML 바인딩용이다 — channelCalibrated() 는
+    // Q_INVOKABLE 이라 캘리가 새로 들어와도 바인딩이 다시 계산되지 않는다.
+    Q_PROPERTY(QVariantList calibratedChannels READ calibratedChannels NOTIFY channelChanged)
 
     // 서버 통지(DRAW_FAIL 등) 배너
     Q_PROPERTY(QString notice READ notice NOTIFY noticeChanged)
@@ -186,6 +205,37 @@ public:
     double pxPerMm() const { return (m_mmPerPx > 1e-9) ? 1.0 / m_mmPerPx : 0.0; }
     QString scaleText() const;
     QString rtspUrl() const { return m_rtspUrl; }
+
+    // ── 다채널 ────────────────────────────────────────────────────────────
+    // 중계 주소가 설정돼 있을 때만 4채널 기능이 켜진다. 비면 전부 예전 동작.
+    bool channelMode() const { return !m_relayBase.isEmpty(); }
+    QString relayBase() const { return m_relayBase; }
+    int channelCount() const { return m_channelCount; }
+    int highlightedChannel() const { return m_highlightedCh; }
+    int workingChannel() const { return m_workingCh; }
+    // 채널을 고르기만 하면 들어갈 수 있다.
+    // ⚠️ "캘리브레이션이 없으면 막는다"로 만들었다가 되돌렸다. 그러면 서버가 아직
+    //    v0.4가 아니거나(=calibs 를 안 보냄) 현장이 캘리 전이면 **어느 채널도 못
+    //    열어 그리드에 갇힌다.** 영상 확인과 수동 조작은 캘리 없이도 필요하고,
+    //    단일 채널 경로도 캘리가 없을 때 막지 않고 경고만 띄운다 — 여기만 더
+    //    엄격하면 일관성도 깨진다. 대신 들어갈 때 경고를 확실히 남긴다.
+    bool canStartChannelWork() const {
+        return channelMode() && m_highlightedCh > 0;
+    }
+    // 그 채널에 캘리브레이션 번들이 있는가 (LOGIN_OK.calibs / CHANNEL_OK 기준)
+    Q_INVOKABLE bool channelCalibrated(int ch) const;
+    QVariantList calibratedChannels() const;
+    // 중계 주소 변경 (설정창). 빈 문자열이면 4채널 기능을 끄고 예전 동작으로.
+    Q_INVOKABLE void setRelayBase(const QString &base);
+    // 타일 클릭 — 하이라이트만 바뀐다 (스트림은 이미 4개 다 흐르는 중)
+    Q_INVOKABLE void highlightChannel(int ch);
+    // [작업하기] — 미리보기를 끄고 그 채널 메인스트림 1개 + 마커검출로 전환
+    Q_INVOKABLE void startChannelWork();
+    // [◀ 채널 목록] — 작업 화면에서 4채널 그리드로 복귀
+    Q_INVOKABLE void showChannelGrid();
+    // ChannelGrid.qml 의 타일을 Backend 에 등록한다 (프레임을 밀어 넣기 위해)
+    Q_INVOKABLE void registerTile(ChannelTile *tile, int ch);
+
     QString notice() const { return m_notice; }
     QString noticeLevel() const { return m_noticeLevel; }
     QString arucoSummary() const { return m_arucoSummary; }
@@ -301,11 +351,22 @@ signals:
     void simChanged();
     void lensChanged();
     void robotVisibleChanged();
+    void channelChanged();
     void historyChanged();
 
 private:
     void startWorker();
     void wireWorker(video_worker *w);
+    // 채널 n 의 중계 URL. 메인 = 작업용(2592x1520 30fps), 서브 = 미리보기용(640x480 10fps).
+    // 서버 relay/README.md 의 경로 규약(/chN, /chNs)과 짝이다.
+    QString mainUrl(int ch) const;
+    QString subUrl(int ch) const;
+    void startPreviews();   // 서브스트림 4개 기동 (그리드 화면 진입)
+    void stopPreviews();    // 미리보기 전부 정지 (작업 화면 진입 · 로그아웃)
+    // 로그인 직후 어디로 갈지 — 4채널이면 그리드, 아니면 예전처럼 바로 작업 화면
+    void enterInitialView();
+    // 채널별 캘리브레이션 맵(LOGIN_OK.calibs)에서 한 채널 번들을 꺼낸다
+    QJsonObject calibOfChannel(int ch) const;
     // 카메라가 없어도 작도는 가능해야 한다 — 빈 바닥 프레임을 대신 밀어준다
     void pushPlaceholderFrame();
     void appendLog(const QString &line);
@@ -403,7 +464,26 @@ private:
     // /profileN/ 은 다른 스트림을 가리키게 되고 이름은 따라온다.
     // QSettings 의 camera/rtspUrl 이 있으면 그게 우선.
     QString m_rtspUrl = "rtsp://admin:5hanwha!@192.168.0.12:554/FullHD/media.smp";
+    // 단일 채널(직결) 주소만 따로 기억한다. 4채널 모드에서는 m_rtspUrl 이
+    // "…:8554/ch2" 같은 중계 주소로 바뀌는데, 그걸 QSettings 에 저장해버리면
+    // 나중에 중계 주소를 비워 PNO 로 되돌아갈 때 돌아갈 곳이 없어진다
+    // (중계를 안 띄운 상태에서 /ch2 를 열려다 실패하고 오프라인 캔버스로 떨어진다).
+    QString m_directRtspUrl = m_rtspUrl;
     int m_brightness = 0, m_contrast = 0, m_sharpen = 0, m_saturation = 0;
+
+    // ── 다채널 (PNM-C16083RVQ) ────────────────────────────────────────────
+    // 🔴 비어 있으면 4채널 기능 전체가 꺼지고 위 m_rtspUrl 직결 경로만 돈다.
+    //    앱 안에서 급히 되돌릴 때는 설정에서 이 칸을 비우면 된다 (재빌드 불필요).
+    //    QSettings: camera/relayBase, camera/channelCount
+    QString m_relayBase;
+    int m_channelCount = 4;
+    int m_highlightedCh = 0;   // 클릭한 채널 (0 = 없음)
+    int m_workingCh = 0;       // 작업 중인 채널 (0 = 그리드 화면)
+    // LOGIN_OK.calibs / CHANNEL_OK 로 받은 채널별 번들. 키는 채널 번호 문자열.
+    // "어느 채널이 캘리 됐는지"를 그리드에 표시하고, 채널 전환 시 그 번들을 적용한다.
+    QJsonObject m_calibs;
+    QList<preview_worker *> m_previews;
+    QHash<int, ChannelTile *> m_tiles;
 
     bool m_serverConnected = false;
     QString m_serverLabel = "대기";
