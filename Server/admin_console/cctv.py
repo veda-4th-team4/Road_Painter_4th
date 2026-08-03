@@ -24,6 +24,7 @@ from collections import deque
 from rp_core import (
     broadcast,
     server_send,
+    CAM_CHANNELS,
     TCP_PORT,
     SNAPSHOT_PORT,
     SERVER_HOST,
@@ -337,7 +338,11 @@ def cctv_link_loop():
 # H exists, send the combined {K,D,H_floor} bundle so the server persists it
 # (user_store) and relays it to Qt. See ../src/calib.hpp for the bundle format.
 # ---------------------------------------------------------------------------
-_calib_cache = {"K": None, "dist": None, "H": None}
+# 🔴 캐시는 **채널별**이다 (프로토콜 v0.4). 채널마다 렌즈 방향이 달라 K/D/H 가
+#    전부 다르므로, 캐시를 하나만 두면 CH2 를 캘리하는 순간 CH1 의 K 가 CH2 의 H 와
+#    섞인 번들이 만들어진다 — 에러 없이 그럴듯한 값이 나오고 좌표만 틀린다.
+_calib_caches = {}          # {ch: {"K":…, "dist":…, "H":…}}
+_calib_channel = 1          # 지금 캘리브레이션 중인 채널
 _calib_lock = threading.Lock()
 
 
@@ -346,29 +351,77 @@ def _reshape3x3(flat):
     return [f[0:3], f[3:6], f[6:9]]
 
 
+def _cache_for(ch):
+    """채널별 캐시 슬롯 (없으면 만든다). _calib_lock 을 잡은 상태에서 호출할 것."""
+    return _calib_caches.setdefault(ch, {"K": None, "dist": None, "H": None})
+
+
+def calib_channel():
+    with _calib_lock:
+        return _calib_channel
+
+
+def set_calib_channel(ch):
+    """캘리브레이션 대상 채널을 바꾸고 카메라에도 알린다.
+
+    서버가 CMD SELECT_CHANNEL 을 CCTV 로 중계하므로, 카메라 앱이 그 채널 영상으로
+    검출 대상을 바꾼다. 이걸 안 보내면 화면상 채널만 바뀌고 실제로는 계속 같은
+    채널을 캘리하게 된다 — 결과가 엉뚱한 슬롯에 저장된다.
+    """
+    global _calib_channel
+    try:
+        ch = int(ch)
+    except (TypeError, ValueError):
+        return False, "채널 번호가 잘못되었습니다."
+    if not 1 <= ch <= CAM_CHANNELS:
+        return False, f"채널은 1~{CAM_CHANNELS} 범위여야 합니다."
+    with _calib_lock:
+        _calib_channel = ch
+    server_send("CMD", {"cmd": "SELECT_CHANNEL", "ch": ch})
+    broadcast(f"[calib] 캘리브레이션 대상 채널 CH{ch} (SELECT_CHANNEL 전송)")
+    return True, None
+
+
+def calib_channel_status():
+    """UI 용 요약 — 채널별로 K/H 가 캐시돼 있는지."""
+    with _calib_lock:
+        cur = _calib_channel
+        chans = [{"ch": ch,
+                  "has_k": _calib_caches.get(ch, {}).get("K") is not None,
+                  "has_h": _calib_caches.get(ch, {}).get("H") is not None}
+                 for ch in range(1, CAM_CHANNELS + 1)]
+    return {"channel": cur, "count": CAM_CHANNELS, "channels": chans}
+
+
 def calib_cache_k(fx, fy, cx, cy, dist):
     if fx is None or fy is None:
         return
     with _calib_lock:
-        _calib_cache["K"] = [[float(fx), 0.0, float(cx or 0)],
-                             [0.0, float(fy), float(cy or 0)],
-                             [0.0, 0.0, 1.0]]
-        _calib_cache["dist"] = [float(x) for x in (dist or [])]
-    push_calib_to_server()
+        ch = _calib_channel
+        c = _cache_for(ch)
+        c["K"] = [[float(fx), 0.0, float(cx or 0)],
+                  [0.0, float(fy), float(cy or 0)],
+                  [0.0, 0.0, 1.0]]
+        c["dist"] = [float(x) for x in (dist or [])]
+    push_calib_to_server(ch)
 
 
 def calib_cache_h(h):
     if not isinstance(h, list) or len(h) != 9:
         return
     with _calib_lock:
-        _calib_cache["H"] = _reshape3x3(h)
-    push_calib_to_server()
+        ch = _calib_channel
+        _cache_for(ch)["H"] = _reshape3x3(h)
+    push_calib_to_server(ch)
 
 
-def push_calib_to_server():
-    """Send the cached calibration to the server (needs at least H_floor)."""
+def push_calib_to_server(ch=None):
+    """Send the cached calibration for one channel (needs at least H_floor)."""
     with _calib_lock:
-        H, K, dist = _calib_cache["H"], _calib_cache["K"], _calib_cache["dist"]
+        if ch is None:
+            ch = _calib_channel
+        c = _calib_caches.get(ch, {})
+        H, K, dist = c.get("H"), c.get("K"), c.get("dist")
     if H is None:
         return  # 서버는 최소 H_floor가 있어야 유효 (calib.hpp)
     bundle = {"version": 1, "H_floor": H}
@@ -381,8 +434,12 @@ def push_calib_to_server():
     # 카메라 직결 시 꺼지는(CCTV_BRIDGE_ENABLED) 대상이라, 그 연결에 캘리 결과를
     # 얹으면 브리지를 끄는 순간 이 관리자 창의 캘리 도구도 같이 죽는다 - ADMIN
     # 연결은 브리지와 무관하게 항상 떠 있으므로 여기 실어야 안전하다.
-    if server_send("H_MATRIX", {"calib": bundle}):
-        broadcast("[bridge] 캘리 결과를 서버로 전송(H_MATRIX, role=ADMIN) — 저장+Qt 중계됨")
+    #
+    # ch 는 payload 최상위에 붙는다 (calib "안"이 아니다 — server_PROTOCOL.md).
+    # 안 실으면 서버가 전부 채널 1로 보고, 4채널을 캘리해도 마지막 하나만 남는다.
+    if server_send("H_MATRIX", {"ch": ch, "calib": bundle}):
+        broadcast(f"[bridge] CH{ch} 캘리 결과를 서버로 전송"
+                  f"(H_MATRIX ch={ch}, role=ADMIN) — 저장+Qt 중계됨")
 
 
 # Above this, "net" is not a delay -- it is the camera and this server
@@ -1449,6 +1506,17 @@ PAGE = """<!doctype html>
     <button type="button" id="tabShell" class="tab" onclick="showTab('shell')">셸</button>
   </div>
   <div id="cmdbox">
+    <!-- 채널 선택 (프로토콜 v0.4). 채널마다 렌즈 방향이 달라 캘리브레이션이
+         완전히 별개다 — 여기서 고른 채널로 결과가 저장된다.
+         1채널 카메라(PNO)면 RP_CAM_CHANNELS=1 로 두어 통째로 숨긴다. -->
+    <span id="chBox" class="helpbtn" style="display:none;padding:0;border:none;background:none">
+      <label style="display:inline-flex;align-items:center;gap:6px">
+        <b>채널</b>
+        <select id="calibCh" onchange="setCalibChannel(this.value)"
+                title="캘리브레이션 결과가 저장될 채널. 바꾸면 카메라에도 SELECT_CHANNEL 을 보냅니다."></select>
+      </label>
+      <span id="chHint" class="brief"></span>
+    </span>
     <button type="button" id="logBtn" class="helpbtn on" onclick="toggleLogPanel()"
             title="오른쪽 로그(터미널) 패널 접기/펴기">터미널</button>
     <button type="button" id="detBtn" class="helpbtn on" onclick="toggleDetect()"
@@ -2643,6 +2711,47 @@ function showTab(name) {
     send('VALIDATION_QUERY');
   }
 }
+
+// ===== 캘리브레이션 대상 채널 (프로토콜 v0.4) =====
+// 채널마다 렌즈 방향이 달라 K/D/H 가 전부 다르다. 여기서 고른 채널로 캘리 결과가
+// 저장되고(H_MATRIX.ch), 카메라에도 SELECT_CHANNEL 이 나가 그 채널을 보게 된다.
+// RP_CAM_CHANNELS=1 (PNO 단일 채널) 이면 선택 UI 자체가 뜨지 않는다.
+function renderCalibChannel(st) {
+  const box = document.getElementById('chBox');
+  if (!st || st.count <= 1) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  const sel = document.getElementById('calibCh');
+  if (sel.options.length !== st.count) {
+    sel.innerHTML = '';
+    for (const c of st.channels) {
+      const o = document.createElement('option');
+      o.value = c.ch;
+      o.textContent = 'CH' + c.ch;
+      sel.appendChild(o);
+    }
+  }
+  sel.value = st.channel;
+  // 어느 채널이 아직 안 끝났는지 한눈에. H 가 없으면 서버로 전송 자체가 안 되므로
+  // (push_calib_to_server) 그 채널은 Qt 에서 여전히 "캘리브레이션 없음"으로 보인다.
+  const left = st.channels.filter(c => !c.has_h).map(c => 'CH' + c.ch);
+  document.getElementById('chHint').textContent =
+    left.length ? ('미완료: ' + left.join(' ')) : '전 채널 완료';
+}
+
+function refreshCalibChannel() {
+  fetch('/calib/channel').then(r => r.json()).then(renderCalibChannel).catch(() => {});
+}
+
+function setCalibChannel(ch) {
+  fetch('/calib/channel', {method: 'POST', body: JSON.stringify({ch: Number(ch)})})
+    .then(r => r.json())
+    .then(res => { if (res.ok) renderCalibChannel(res.status); else alert(res.reason || '채널 변경 실패'); })
+    .catch(() => alert('채널 변경 실패 (서버 응답 없음)'));
+}
+refreshCalibChannel();
+// 캘리가 끝나 캐시가 채워지면 "미완료" 표시가 줄어야 한다. 폴링이 가장 단순하고,
+// 5초면 사람이 다음 채널로 넘어가기 전에 갱신된다.
+setInterval(refreshCalibChannel, 5000);
 
 // ===== Homography workflow sections =====
 function showHgSection(section) {

@@ -115,6 +115,17 @@ def broadcast(line):
 SERVER_HOST = os.environ.get("RP_SERVER_HOST", "127.0.0.1")
 SERVER_PORT = int(os.environ.get("RP_SERVER_PORT", "9000"))
 
+# 카메라 채널 수 (프로토콜 v0.4). PNM-C16083RVQ 는 4채널, PNO-A9081R 은 1채널.
+#
+# 채널마다 렌즈 방향이 달라 캘리브레이션 번들(K/D/H)이 완전히 다르므로, 관리자
+# 창은 "지금 어느 채널을 캘리하는 중인가"를 들고 있어야 한다. 4채널 카메라에서
+# 이걸 안 실어 보내면 네 채널이 전부 서버의 채널 1 슬롯에 덮어써져 **마지막에
+# 캘리한 하나만 남는다.**
+#
+# 1로 두면 채널 선택 UI 가 사라지고 항상 채널 1로 보낸다 = v0.3과 동일 동작.
+# (서버도 ch 가 없거나 1이면 예전 저장 슬롯을 쓴다 — config.sh 로 조정)
+CAM_CHANNELS = max(1, min(8, int(os.environ.get("RP_CAM_CHANNELS", "4"))))
+
 _server_lock = threading.Lock()
 _server_sock = None   # ssl socket while connected, else None
 _server_seq = 0

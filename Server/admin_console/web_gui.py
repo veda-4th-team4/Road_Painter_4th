@@ -639,6 +639,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+        elif path == "/calib/channel":
+            # 현재 캘리 대상 채널 + 채널별 진행 상태 (UI 표시용)
+            self._send_json(cctv.calib_channel_status())
         elif path == "/hg_experiment/export":
             with cctv.hg_experiment_lock:
                 latest = cctv.hg_experiment["last_export"]
@@ -740,6 +743,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (ValueError, json.JSONDecodeError):
                 self.send_response(400)
             self.end_headers()
+        elif self.path == "/calib/channel":
+            # 캘리브레이션 대상 채널 변경 (프로토콜 v0.4). 채널마다 렌즈 방향이
+            # 달라 번들이 완전히 다르므로, 이 값이 틀리면 결과가 엉뚱한 채널 슬롯에
+            # 저장된다 - 그것도 에러 없이 조용히.
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                self._send_json({"ok": False, "reason": "잘못된 요청 형식"}, 400)
+                return
+            ok, reason = cctv.set_calib_channel(data.get("ch"))
+            self._send_json({"ok": ok, "reason": reason,
+                             "status": cctv.calib_channel_status()},
+                            200 if ok else 400)
         elif self.path in ("/hg_experiment/start", "/hg_experiment/stop", "/hg_experiment/result"):
             try:
                 length = int(self.headers.get("Content-Length", 0))
