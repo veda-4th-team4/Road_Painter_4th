@@ -334,3 +334,29 @@ inline json makeMsg(const std::string& type, const json& payload) {
 inline json makePathMsg(const json& segments, const std::string& phase) {
     return makeMsg("PATH", {{"phase", phase}, {"segments", segments}});
 }
+
+// ===== 채널 (v0.4) =====================================================
+// 채널 번호는 1부터 시작한다 (카메라 웹UI의 CH1~CH4와 같은 번호).
+constexpr int kMinChannel = 1;
+// PNM-C16083RVQ는 4채널이지만 상한을 딱 4로 박지 않는다 - 채널이 더 많은 모델로
+// 바꿀 때 서버까지 고쳐야 하기 때문. 이 값은 오타/쓰레기값을 걸러내는 형식 검증용일
+// 뿐이라 넉넉해도 손해가 없다 (없는 채널은 캘리브레이션이 없어 어차피 못 쓴다).
+constexpr int kMaxChannel = 8;
+
+inline bool validChannel(int ch) { return ch >= kMinChannel && ch <= kMaxChannel; }
+
+// payload에서 채널 번호를 읽는다 (POS/H_MATRIX용, 관대한 해석).
+// 🔴 없거나 형식이 어긋나면 1이다 - 단일 채널 카메라(PNO)와 v0.3 클라이언트가
+// ch를 한 번도 안 실어도 그대로 동작해야 한다.
+// ⚠️ SELECT_CHANNEL에는 쓰지 말 것. 거기서는 "잘못된 채널"을 CHANNEL_FAIL로
+//    돌려줘야 하는데, 이 함수는 조용히 1로 바꿔버린다.
+inline int channelOf(const json& payload) {
+    if (!payload.is_object()) return kMinChannel;
+    auto it = payload.find("ch");
+    if (it == payload.end() || !it->is_number_integer()) return kMinChannel;
+    int ch = it->get<int>();
+    return validChannel(ch) ? ch : kMinChannel;
+}
+
+// 채널별 맵의 키. JSON 오브젝트 키는 문자열이어야 하므로 정수를 문자열로 쓴다.
+inline std::string chKey(int ch) { return std::to_string(ch); }

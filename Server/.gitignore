@@ -36,3 +36,6 @@ draw_test
 drive_test
 tap_dump
 cctv_pose
+
+#채널별 캘리브레이션 회귀 테스트 (프로토콜 v0.4)
+calib_channel_test

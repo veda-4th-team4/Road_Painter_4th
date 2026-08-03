@@ -17,6 +17,11 @@
 //               로봇 PATH_DONE(접근) -> 서버가 2단계(도색) PATH 자동 전송 ->
 //               로봇 PATH_DONE(도색) -> QT에 DRAW_DONE 통지.
 //               실패/대기 시 QT에 DRAW_FAIL{stage,reason,msg} 통지
+//   QT    -> CMD ABORT_DRAW -> 경로 실행 상태를 전부 버리고 ROBOT에 중계
+//               (로봇도 받아둔 PATH를 버린다). 도면은 남긴다 - 다시 START_DRAW를
+//               누르면 같은 도면으로 처음부터. -> QT에 DRAW_ABORTED{was_active}
+//   QT    -> CMD SELECT_CHANNEL{ch} -> 활성 채널 전환 + CCTV 중계
+//               -> QT에 CHANNEL_OK{ch,calib} (그 채널의 번들. null이면 미캘리)
 //   ROBOT -> STATUS    -> QT 중계
 //   ROBOT -> READY     -> MOVE 출발 직전 정렬 확인 요청. 서버가 CCTV pose의
 //               실제 각도와 목표 heading을 비교해 ALIGN(미세회전) 또는 GO 응답
@@ -27,8 +32,10 @@
 //               pose 계산 (좌표 변환은 전부 서버 담당) + 계산된 POSE를 QT로 전송
 //               + 이탈 시 재계획. POS 원본은 QT에 중계하지 않는다 (POSE만 사용)
 //               (로봇은 좌표를 받지 않음 - 각도 피드백 ALIGN/DRIFT로만 보정)
+//               payload.ch = 이 마커를 본 채널(없으면 1). 활성 채널이 아니면 무시.
 //   CCTV  -> H_MATRIX  -> 캘리브레이션 번들(K,D,H_floor,H_marker) 수신,
-//               로그인 사용자에 영속 저장 + QT 중계
+//               로그인 사용자에 영속 저장 + QT 중계.
+//               payload.ch = 이 번들의 채널(없으면 1). 채널별로 따로 저장된다.
 //   ROBOT/CCTV 접속·해제 -> QT에 PEERS{"robot":bool,"cctv":bool} 통지
 //               (QT 접속 시에도 현재 스냅샷 1회 전송)
 #include "calib.hpp"
@@ -36,6 +43,7 @@
 #include "protocol.hpp"
 #include "tls_server.hpp"
 #include "user_store.hpp"
+#include <map>
 #include <mutex>
 
 class Router {
@@ -61,6 +69,14 @@ private:
     // Qt의 START_DRAW 수신 시 1단계(시작점 접근) 경로를 로봇에 전송.
     // pose를 아직 모르면 drawRequested_만 세워두고 첫 POS 수신 때 재시도한다.
     void startApproach();
+    // Qt의 ABORT_DRAW 수신 시 경로 실행 상태를 전부 버린다 (도면은 남긴다).
+    // 로봇 중계는 호출부에서 한다 - 이 함수는 서버 상태만 정리한다.
+    // 반환값 = 실제로 진행 중이던 작업을 껐는지 (DRAW_ABORTED.was_active).
+    bool abortDraw();
+    // Qt의 SELECT_CHANNEL 수신 시 활성 채널 전환 + CCTV 중계 + CHANNEL_OK 회신
+    void selectChannel(const json& payload, const json& msg);
+    // 현재 활성 채널의 캘리브레이션 (없으면 valid=false인 빈 Calib)
+    const Calib& activeCalib() const;
     // 로봇의 접근 완료(PATH_DONE) 수신 시 2단계(도색) 경로를 로봇에 전송
     void sendDrawPath();
     // 이탈 복귀 경로. planPts_[k]로 돌아가는 구간만 새로 만들고, Qt program이
@@ -95,7 +111,14 @@ private:
     TlsServer& srv_;
     UserStore users_;          // id/pw/H행렬 영속 저장소
     std::string currentUser_;  // 로그인된 사용자 (단일 사용자 가정)
-    Calib calib_;      // 캘리브레이션 (현재 세션. raw는 calib_.raw)
+    // 채널별 캘리브레이션 (현재 세션. raw는 각 Calib의 .raw).
+    // 채널마다 렌즈 방향이 달라 K/D/H가 전부 다르다 - 하나로 공유하면 채널을
+    // 바꾸는 순간 좌표가 통째로 틀린다. 그것도 에러 없이 조용히.
+    std::map<int, Calib> calibs_;
+    // 지금 로봇을 보고 있는 채널. Qt의 SELECT_CHANNEL로 바뀐다.
+    // 🔴 활성 채널과 다른 ch의 POS는 무시한다 - 다른 채널이 우연히 로봇 마커를
+    //    잡았을 때 pose가 두 채널 사이에서 튀는 것을 막기 위함.
+    int activeChannel_ = kMinChannel;
     json blueprint_;   // Qt가 보낸 도면 원본
     json lastStatus_;  // 로봇 최신 상태
     json lastPos_;     // CCTV 최신 마커 검출 원본 (픽셀)
@@ -126,5 +149,9 @@ private:
                                // 새 BLUEPRINT 수신 시 해제(자동 모드 복귀)
     Pose pose_;                // 로봇 최신 pose (top-view)
     bool poseValid_ = false;
+    // 마지막으로 "활성 채널이 아니라서 버린" POS의 채널 (0 = 없음).
+    // POS는 15~30Hz라 버릴 때마다 로그를 찍으면 뒤덮인다 - 채널이 바뀔 때만
+    // 한 줄 남기려고 들고 있는 값이다.
+    int lastIgnoredPosCh_ = 0;
     long lastPlanMs_ = 0;      // 마지막 PATH 전송 시각 (쿨다운용)
 };

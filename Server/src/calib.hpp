@@ -91,6 +91,43 @@ inline void aliasFloorKey(json& bundle) {
     if (bundle.contains("H") && !bundle.contains("H_floor")) bundle["H_floor"] = bundle["H"];
 }
 
+// ===== 채널별 저장소 (v0.4) =============================================
+// 캘리브레이션은 채널마다 완전히 다르다(렌즈 방향이 다름). 그래서 저장 형식이
+// 번들 하나에서 채널별 맵으로 바뀌었다:  {"1": {…번들…}, "2": {…번들…}}
+//
+// 이미 배포된 파일(users.json / calib_latest.json)에는 예전 형식(번들 하나)이
+// 들어 있으므로, 읽을 때 그것을 "채널 1의 번들"로 승격시켜 준다 - 마이그레이션
+// 스크립트를 돌리지 않아도 기존 현장이 그대로 뜬다.
+
+// 채널별 맵인가? 키가 전부 숫자 문자열이면 맵으로 본다.
+// 번들은 키가 H_floor/K/calib_id... 라서 절대 이 조건에 걸리지 않고, 레거시
+// 번들은 아예 배열이라 걸리지 않는다.
+inline bool isCalibChannelMap(const json& j) {
+    if (!j.is_object() || j.empty()) return false;
+    for (auto it = j.begin(); it != j.end(); ++it) {
+        const std::string& k = it.key();
+        if (k.empty()) return false;
+        for (char c : k)
+            if (c < '0' || c > '9') return false;
+    }
+    return true;
+}
+
+// 저장된 값(맵 | 예전 번들 하나 | null) -> 항상 채널별 맵.
+inline json asCalibChannelMap(const json& stored) {
+    if (stored.is_null()) return json::object();
+    if (isCalibChannelMap(stored)) return stored;
+    // 예전 형식: 번들 하나뿐이었다 -> 채널 1의 것으로 읽는다
+    return json{{chKey(kMinChannel), stored}};
+}
+
+// 채널별 맵에서 한 채널의 번들을 꺼낸다 (없으면 null).
+inline json calibOfChannel(const json& stored, int ch) {
+    const json m = asCalibChannelMap(stored);
+    auto it = m.find(chKey(ch));
+    return (it == m.end()) ? json() : *it;
+}
+
 // H_MATRIX payload의 번들(json) -> Calib. 신규 오브젝트/레거시 3x3 배열 모두 허용.
 inline bool calibFromJson(const json& bundle, Calib& out) {
     out = Calib{};

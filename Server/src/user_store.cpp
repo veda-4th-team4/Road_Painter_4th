@@ -1,4 +1,5 @@
 #include "user_store.hpp"
+#include "calib.hpp"  // asCalibChannelMap / calibOfChannel (채널별 저장 형식)
 #include "log.hpp"
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -86,12 +87,21 @@ bool UserStore::login(const std::string& id, const std::string& pw) {
 }
 
 void UserStore::loadGlobalCalib() {
-    globalCalib_ = nullptr;
+    globalCalib_ = json::object();
     std::ifstream f(calibFile_);
     if (!f) return;  // 아직 캘리를 한 번도 안 올렸으면 파일 없음 - 정상
     json j = json::parse(f, nullptr, false);
-    if (j.is_object() || j.is_array()) globalCalib_ = j;
-    else logf("[WARN] 전역 캘리브레이션 파싱 실패, 무시: %s", calibFile_.c_str());
+    if (!j.is_object() && !j.is_array()) {
+        logf("[WARN] 전역 캘리브레이션 파싱 실패, 무시: %s", calibFile_.c_str());
+        return;
+    }
+    // 파일에는 예전 형식(번들 하나)이 들어 있을 수 있다 - 채널 1의 맵으로 승격.
+    // 여기서 한 번 정규화해두면 이후 코드는 항상 맵만 보면 된다.
+    const bool wasFlat = !isCalibChannelMap(j);
+    globalCalib_ = asCalibChannelMap(j);
+    if (wasFlat)
+        logf("[INFO] 전역 캘리브레이션이 구 형식(번들 하나) - 채널 %d의 번들로 읽음",
+             kMinChannel);
 }
 
 void UserStore::saveGlobalCalib() {
@@ -103,33 +113,60 @@ void UserStore::saveGlobalCalib() {
     f << globalCalib_.dump(2) << "\n";
 }
 
-bool UserStore::setGlobalCalib(const json& calib) {
+bool UserStore::setGlobalCalib(int ch, const json& calib) {
     std::lock_guard<std::mutex> lk(mtx_);
-    globalCalib_ = calib;
+    // 채널 하나만 갈아끼운다. 통째로 대입하면 다른 채널의 번들이 날아가서,
+    // 채널 2를 캘리하는 순간 채널 1이 사라진다.
+    globalCalib_ = asCalibChannelMap(globalCalib_);
+    globalCalib_[chKey(ch)] = calib;
     saveGlobalCalib();
     return true;
 }
 
-json UserStore::getGlobalCalib() {
+json UserStore::getGlobalCalib(int ch) {
     std::lock_guard<std::mutex> lk(mtx_);
-    return globalCalib_;
+    return calibOfChannel(globalCalib_, ch);
 }
 
-json UserStore::getCalib(const std::string& id) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (!users_.contains(id)) return nullptr;
+// 계정에 저장된 캘리브레이션 맵 (구버전 "H" 키 + 번들 하나 형식까지 흡수).
+// mtx_를 잡은 상태에서만 호출할 것.
+json UserStore::accountCalibMap(const std::string& id) {
+    if (!users_.contains(id)) return json::object();
     json c = users_[id].value("calib", json());
     if (c.is_null()) c = users_[id].value("H", json());  // 구버전 파일 호환
-    // 계정에 자기 캘리가 없으면 전역 슬롯으로 대체 (R-1). 계정 값이 있으면 그게
-    // 이긴다 - 사용자가 특정 번들을 자기 계정에 고정해둔 경우를 덮지 않기 위해.
-    if (c.is_null()) c = globalCalib_;
+    return asCalibChannelMap(c);
+}
+
+json UserStore::getCalib(const std::string& id, int ch) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (!users_.contains(id)) return nullptr;
+    json c = calibOfChannel(accountCalibMap(id), ch);
+    // 계정에 그 채널의 캘리가 없으면 전역 슬롯으로 대체 (R-1). 계정 값이 있으면
+    // 그게 이긴다 - 사용자가 특정 번들을 자기 계정에 고정해둔 경우를 덮지 않기 위해.
+    // 🔴 판정은 채널 단위다. 계정에 채널 1만 있으면 채널 2는 전역에서 온다.
+    if (c.is_null()) c = calibOfChannel(globalCalib_, ch);
     return c;
 }
 
-bool UserStore::setCalib(const std::string& id, const json& calib) {
+json UserStore::getCalibs(const std::string& id) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    // 전역을 깔고 계정 값으로 덮는다 - getCalib의 "계정 → 없으면 전역"과 같은
+    // 우선순위를 맵 전체에 한 번에 적용한 것.
+    json out = asCalibChannelMap(globalCalib_);
+    if (users_.contains(id)) {
+        const json acc = accountCalibMap(id);
+        for (auto it = acc.begin(); it != acc.end(); ++it)
+            if (!it->is_null()) out[it.key()] = *it;
+    }
+    return out;
+}
+
+bool UserStore::setCalib(const std::string& id, int ch, const json& calib) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (!users_.contains(id)) return false;
-    users_[id]["calib"] = calib;
+    json m = accountCalibMap(id);   // 구 형식이면 여기서 채널 1의 맵으로 승격된다
+    m[chKey(ch)] = calib;           // 그 채널만 교체 - 나머지 채널은 그대로
+    users_[id]["calib"] = m;
     users_[id].erase("H");  // 구버전 키 정리
     save();
     return true;
