@@ -208,6 +208,9 @@ def ldc_check_log_row(msg, undistorted):
                 f"{u.get('edge_max_px', '')},{u.get('center_max_px', '')}\n")
 
 
+# 카메라가 마지막으로 보고한 동적 ROI 설정. 카메라가 권위이고 여기는 표시용 사본이다.
+dynroi_state = {"enabled": False, "margin": 240, "max_miss": 4, "track_ids": []}
+
 def send_command(cmd):
     with conn_lock:
         conn = current_conn
@@ -658,6 +661,77 @@ def print_msg(msg, last_seq):
                       "(마커 검출 안 됨 — 측정 후 반드시 끌 것)")
         else:
             broadcast("[raw-fps] 측정 모드 OFF — 정상 검출로 복귀")
+        return last_seq
+    if mtype == "DETECT_ENABLE":
+        on = 1 if msg.get("enabled") else 0
+        refused = msg.get("refused") or ""
+        if refused:
+            broadcast(f"[detect] detect_enabled={on} — 끄기 거부됨 ({refused}). "
+                      "수집이 끝난 뒤 다시 시도하세요")
+        elif on:
+            broadcast("[detect] detect_enabled=1 — 마커 검출 ON")
+        else:
+            broadcast("[detect] detect_enabled=0 — 마커 검출 OFF "
+                      "(하트비트만 전송, 카메라 부하 감소). "
+                      "캘리브레이션 전에 반드시 다시 켤 것")
+        return last_seq
+    if mtype == "CENTRAL_STATUS":
+        # Same contract as CALIB_ANCHORS: the camera answers CENTRAL_QUERY and
+        # every CENTRAL_ID / CENTRAL_HMATRIX with its own state, so the tab
+        # never has to trust what it just typed.
+        broadcast("[central] STATUS " + json.dumps({
+            "link": msg.get("link"),
+            "link_on": msg.get("link_on"),
+            "pos_on": msg.get("pos_on"),
+            "marker_id": msg.get("marker_id"),
+            "server": msg.get("server"),
+            "action": msg.get("action"),
+            "detail": msg.get("detail"),
+        }, separators=(",", ":")))
+        return last_seq
+
+    if mtype in ("MARKER_PLANE", "MARKER_PLANE_SAVE"):
+        # Forwarded as JSON rather than a formatted sentence: the browser needs
+        # the individual numbers (camera height, nadir, ratio) to render them,
+        # and re-parsing prose on the client is how those get silently dropped.
+        broadcast("[calib] MARKER_PLANE " + json.dumps(msg, ensure_ascii=False))
+        return last_seq
+    if mtype == "DYNROI":
+        ids = msg.get("track_ids") or []
+        dynroi_state.update({
+            "enabled": bool(msg.get("enabled")),
+            "margin": msg.get("margin", dynroi_state["margin"]),
+            "max_miss": msg.get("max_miss", dynroi_state["max_miss"]),
+            "track_ids": list(ids)})
+        # The id list is broadcast as its own line so the browser can parse it
+        # without picking it out of prose. Empty list = every marker.
+        broadcast("[dynroi] IDS " + json.dumps(list(ids), separators=(",", ":")))
+        scope = f"id {','.join(str(i) for i in ids)}만" if ids else "모든 마커"
+        if msg.get("enabled"):
+            broadcast(f"[dynroi] 동적 ROI ON — 추적 대상 {scope}, "
+                      f"max_margin={msg.get('margin')}px "
+                      f"max_miss={msg.get('max_miss')} "
+                      f"(마커 크기+이동량으로 margin 자동 조절)")
+        else:
+            broadcast("[dynroi] 동적 ROI OFF — 수동 ROI/전체 화면으로 복귀")
+        return last_seq
+    if mtype == "DYNROI_STATE":
+        if msg.get("tracking"):
+            detail = (f" margin={msg.get('margin_used')}px"
+                      f" marker={msg.get('marker_px')}px"
+                      f" move={msg.get('motion_px')}px"
+                      if msg.get("margin_used") is not None else "")
+            broadcast(f"[dynroi] TRACK — 검출 영역 ({msg.get('x')},{msg.get('y')}) "
+                      f"{msg.get('w')}x{msg.get('h')}{detail}")
+        else:
+            broadcast("[dynroi] SEARCH — 마커 놓침, 전체 재탐색 중")
+        return last_seq
+    if mtype == "CPU_STAT":
+        # 카메라가 2초마다 자발적으로 보낸다(요청 없음). -1 은 /proc 을 못 읽은 경우.
+        app = msg.get("app_pct")
+        sys_ = msg.get("sys_pct")
+        cores = msg.get("cores")
+        broadcast(f"[cpu] app={app}% sys={sys_}% cores={cores}")
         return last_seq
     if mtype == "CALIB_K_QUERY":
         if msg.get("available"):
@@ -1113,7 +1187,7 @@ PAGE = """<!doctype html>
      deliberately narrow -- these are short fields and buttons, and every pixel
      spent stretching them is a pixel taken from the log. */
   #content { display:flex; gap:14px; flex:1; min-height:0; }
-  #groups, #homographyPane, #shellPane, #rawPane {
+  #groups, #homographyPane, #shellPane, #rawPane, #centralPane {
             display:flex; flex-flow:row wrap; align-content:flex-start;
             align-items:flex-start; gap:12px; flex:0 1 580px; min-width:0;
             overflow-y:auto; padding-right:4px; margin:0; }
@@ -1126,7 +1200,8 @@ PAGE = """<!doctype html>
   #content.log-collapsed > #groups,
   #content.log-collapsed > #homographyPane,
   #content.log-collapsed > #shellPane,
-  #content.log-collapsed > #rawPane { flex:1 1 auto; }
+  #content.log-collapsed > #rawPane,
+  #content.log-collapsed > #centralPane { flex:1 1 auto; }
 
   /* 앵커·검증점 배치도(그리드): 작업영역 평면 위에 점을 드래그로 배치한다.
      파랑=계산 앵커, 주황=검증 기준점 — 오버레이 범례와 색을 맞춘다.
@@ -1266,7 +1341,7 @@ PAGE = """<!doctype html>
   .qbox { margin-top:8px; }
 
   /* Live per-frame readouts get a FIXED height and scroll inside.
-     handleRaw()/handleHgWorld() rebuild these on every CAM_POSE line -- 4-10x a
+     handleRaw() rebuilds these on every CAM_POSE line -- 4-10x a
      second -- and the row count follows how many markers that frame saw, with a
      MARKER LOST frame emptying them to a single line. Sized to content they
      yo-yo between ~40px and ~400px several times a second and shove everything
@@ -1274,7 +1349,6 @@ PAGE = """<!doctype html>
      scrollbar only appears when several markers are up at once (e.g. the four
      homography anchors). */
   #rawCorners { height:210px; overflow-y:auto; }
-  #hgWorld { height:230px; overflow-y:auto; }
   /* Not per-frame variable -- once frames flow it is always the same two tables
      -- so it only needs its final size reserved while it says "대기 중". */
   #rawLatency { min-height:186px; }
@@ -1306,10 +1380,35 @@ PAGE = """<!doctype html>
   #shellControls { flex-wrap:nowrap; }
   #shellControls #shInput { max-width:none; }
   #shellControls button { min-width:0; padding:10px 11px; white-space:nowrap; }
-  #shOut { background:var(--console); color:var(--console-text); padding:14px; margin:10px 0 0;
+  /* 셸 탭은 진짜 터미널처럼: 출력과 입력줄이 한 상자 안에 붙어 있고, 상자 아무
+     데나 누르면 입력에 포커스가 간다. 콘솔은 두 테마 모두에서 어둡게 유지한다. */
+  .term { background:var(--console); border-radius:14px; margin:10px 0 0;
+          border:1px solid #000; overflow:hidden; display:flex; flex-direction:column; }
+  #shOut { background:none; color:var(--console-text); padding:14px 14px 6px; margin:0;
            min-height:220px; max-height:46vh; overflow:auto; white-space:pre-wrap;
            word-break:break-all; font-family:var(--mono); font-size:12px;
-           line-height:1.6; border-radius:14px; }
+           line-height:1.6; }
+  .term-echo { color:#7dd3fc; }            /* 사용자가 친 명령 */
+  .term-row { display:flex; align-items:center; gap:8px; padding:6px 14px 12px;
+              font-family:var(--mono); font-size:12px; }
+  .term-row .ps1 { color:#4ade80; font-weight:700; user-select:none; }
+  .term-row #shInput { flex:1; min-width:0; background:none; border:none; outline:none;
+                       color:var(--console-text); font-family:var(--mono); font-size:12px;
+                       padding:2px 0; max-width:none; }
+  .term-row #shInput::placeholder { color:#6b7280; }
+
+  /* 빠른 명령: 버튼 더미 대신 "명령 = 설명" 표. 실제로 실행될 문자열을 그대로
+     보여줘야 무엇이 돌아가는지 읽고 판단할 수 있다. */
+  .cmdtable { width:100%; border-collapse:collapse; font-size:12px; margin:4px 0 0; }
+  .cmdtable td { padding:5px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  .cmdtable tr:last-child td { border-bottom:none; }
+  .cmdtable td.c { width:1%; white-space:nowrap; }
+  .cmdtable tr.grp td { border-bottom:none; padding:12px 8px 2px; font-weight:700;
+                        color:var(--muted); font-size:11px; letter-spacing:.03em; }
+  .cmdlink { font-family:var(--mono); font-size:12px; background:var(--field);
+             border:1px solid var(--line); border-radius:7px; padding:3px 8px;
+             cursor:pointer; color:inherit; text-align:left; }
+  .cmdlink:hover { border-color:var(--blue); color:var(--blue); }
 
   /* Below this the side-by-side split stops working: the controls pane and the
      log would each be too narrow to read. Stack them and hand scrolling back to
@@ -1319,7 +1418,7 @@ PAGE = """<!doctype html>
   @media (max-width: 900px) {
     body { height:auto; min-height:100vh; overflow:auto; }
     #content { flex-direction:column; }
-    #groups, #homographyPane, #shellPane, #rawPane {
+    #groups, #homographyPane, #shellPane, #rawPane, #centralPane {
       flex:0 0 auto; overflow-y:visible; padding-right:0; }
     .group.wide, .group.narrow { flex:1 1 100%; max-width:none; }
     #main { flex:0 0 auto; }
@@ -1345,11 +1444,15 @@ PAGE = """<!doctype html>
     <button type="button" id="tabCalib" class="tab active" onclick="showTab('calib')">캘리브레이션</button>
     <button type="button" id="tabHmg" class="tab" onclick="showTab('homography')">호모그래피</button>
     <button type="button" id="tabRaw" class="tab" onclick="showTab('raw')">마커 검출</button>
+    <button type="button" id="tabCentral" class="tab" onclick="showTab('central')"
+            title="카메라가 중앙 서버로 직접 보내는 채널 (이 대시보드의 서버 연결과는 별개)">서버 송신</button>
     <button type="button" id="tabShell" class="tab" onclick="showTab('shell')">셸</button>
   </div>
   <div id="cmdbox">
     <button type="button" id="logBtn" class="helpbtn on" onclick="toggleLogPanel()"
             title="오른쪽 로그(터미널) 패널 접기/펴기">터미널</button>
+    <button type="button" id="detBtn" class="helpbtn on" onclick="toggleDetect()"
+            title="카메라의 마커 검출을 켜고 끕니다">검출</button>
     <button type="button" id="themeBtn" class="helpbtn" onclick="toggleTheme()">테마</button>
     <button type="button" id="helpBtn" class="helpbtn" onclick="toggleHelp()">도움말</button>
     <label class="toggle"><input type="checkbox" id="hideLost"> MARKER LOST 로그 숨기기</label>
@@ -1479,6 +1582,49 @@ PAGE = """<!doctype html>
   </div>
 
   <div class="group wide">
+    <h2>동적 ROI (마커 추적)</h2>
+    <p class="sub">마커를 찾으면 그 주변만 검출해 <code>proc</code>을 줄입니다. 놓치면 넓혔다가 전체 재탐색.</p>
+    <div class="row">
+      <label class="toggle"><input type="checkbox" id="dynRoiChk" onchange="applyDynRoi()">
+        동적 ROI 사용<span class="cmd">DYNROI</span></label>
+      <label>최대 margin(px) <input type="number" id="dynMargin" value="240" min="0" max="960" step="10" style="width:6em" onchange="applyDynRoi()"></label>
+      <label>실패 허용 <input type="number" id="dynMaxMiss" value="4" min="0" max="60" step="1" style="width:5em" onchange="applyDynRoi()"></label>
+      <span id="dynRoiState" class="desc">상태: —</span>
+    </div>
+    <div class="row">
+      <label class="toggle"><input type="radio" name="dynRoiScope" id="dynRoiAll" value="all" checked onchange="applyDynRoiIds()">
+        모든 마커 추적</label>
+      <label class="toggle"><input type="radio" name="dynRoiScope" id="dynRoiPick" value="pick" onchange="applyDynRoiIds()">
+        특정 ID만</label>
+      <input type="text" id="dynRoiIds" placeholder="예: 49  또는  46,49" autocomplete="off"
+             style="max-width:170px" oninput="onDynRoiIdsInput()" onchange="applyDynRoiIds()">
+      <button type="button" onclick="applyDynRoiIds()">적용<span class="cmd">DYNROI_IDS</span></button>
+      <span id="dynRoiIdsState" class="desc">추적 대상: 모든 마커</span>
+    </div>
+    <div class="hint" id="dynRoiIdsWarn" style="margin:2px 0 0">
+      ⚠️ <b>특정 ID만</b>을 켜면 ROI가 그 마커로 좁혀지므로, <b>범위 밖 마커는 아예 검출되지 않습니다</b>
+      — CAM_POSE에서도 사라집니다. 로봇만 빠르게 쫓을 때 쓰고, 바닥 앵커가 보여야 하는 작업
+      (호모그래피 계산·검증) 전에는 <b>모든 마커</b>로 되돌리세요.
+    </div>
+    <details class="fold panel" id="foldDynRoi">
+      <summary>어떻게 동작하고, margin은 어떻게 정하나</summary>
+      <div class="foldbody hint">
+        <b>SEARCH</b>(전체/수동 ROI)에서 마커를 찾으면 <b>TRACK</b>으로 넘어가, 검출된 마커
+        전체를 감싸는 사각형 + margin 만큼만 검출한다. 마커 여러 개면 <b>합집합</b>이라
+        여러 대도 함께 따라간다.<br>
+        놓치면 바로 전체로 안 가고 ROI를 <b>1.5배씩 넓히며</b> 버티다가, <b>실패 허용</b>
+        횟수를 넘으면 SEARCH로 돌아간다. 순간 가림·빠른 이동을 싸게 회복하기 위함.<br>
+        margin은 마커 네 변의 중앙 길이와 같은 id의 프레임 간 중심 이동량으로 자동 계산한다.
+        최초 검출은 마커 한 변의 2배, 추적 중에는 <code>마커크기 + 1.5×이동량 + 10px</code>이며
+        입력값은 그 자동 margin의 상한이다. 로그의 <code>margin/marker/move</code>와
+        <code>det</code>을 보며 최대값을 조정할 것.<br>
+        <b>호모그래피 계산(CALIB_START) 중에는 자동으로 비활성</b>된다 — 등록된 앵커가
+        <b>하나도 빠짐없이</b> 화면에 보여야 하기 때문.
+      </div>
+    </details>
+  </div>
+
+  <div class="group wide">
     <div class="row"><button id="rawBtn" onclick="toggleRaw()">좌표 보기 시작</button>
       <span class="desc">인식된 마커의 네 꼭짓점 raw 픽셀 좌표를 실시간 표시. 검출/좌표전송엔 영향 없음(표시만).</span></div>
     <div class="row"><label class="toggle"><input type="checkbox" id="undistChk" checked onchange="toggleUndist()">
@@ -1499,20 +1645,22 @@ PAGE = """<!doctype html>
     <div id="rawCorners" class="rawbox">대기 중…</div>
 
     <h2 style="margin-top:18px">이미지 위 오버레이 (raw / 보정 코너)</h2>
-    <p class="sub">기준영상 1장을 배경으로 깔고 raw 코너(주황)와 보정 코너(청록)를 겹쳐 그립니다. 왜곡 보정이 코너를 어디로 얼마나 미는지 눈으로 확인.</p>
-    <div class="row go"><button onclick="rawSnapshot()">기준영상 스냅샷<span class="cmd">HG_SNAPSHOT</span></button>
-      <button id="rawOverlayBtn" type="button" onclick="toggleRawOverlay()">오버레이 보기 시작</button>
-      <span class="desc">스냅샷은 호모그래피 탭과 같은 기준영상을 공유합니다. 배경이 없어도 좌표는 그려집니다.</span></div>
+    <p class="sub">raw 코너(주황)와 보정 코너(청록)를 프레임 좌표계에 겹쳐 그립니다. 왜곡 보정이 코너를 어디로 얼마나 미는지 눈으로 확인.</p>
+    <div class="row go"><button id="rawOverlayBtn" type="button" onclick="toggleRawOverlay()">오버레이 보기 시작</button>
+      <span class="desc">배경 없이 좌표만 그립니다. 캔버스 크기는 K의 (cx×2, cy×2), K가 없으면 1920×1080으로 잡습니다.</span></div>
     <details class="fold panel">
-      <summary>주황 = raw(왜곡 전) · 청록 = 보정(undistort) · 점선 = 코너 이동량</summary>
+      <summary>주황 = raw(왜곡 전) · 청록 = 보정(undistort) · 점선 = 코너 이동량 · 보라 점선 = 동적 ROI</summary>
       <div class="foldbody hint">
         raw 코너는 카메라가 실제 전송하는 왜곡 픽셀이고, 보정 코너는 위 "보정 좌표 함께 표시"와
         같은 K/dist로 브라우저가 <code>undistortPoints</code> 반복해로 계산한 값이다. 두 점을 잇는
         점선이 왜곡 보정에 따른 코너 이동 방향·크기(px, id 라벨에 Δ로 표기)다. K가 없으면 raw만 그린다.
-        표시 전용 — 카메라에 별도 명령을 보내지 않는다(스냅샷 제외).
+        <b>보라 점선</b>은 동적 ROI가 켜져 있을 때 <b>카메라가 다음 프레임에 실제로 훑는 범위</b>다
+        — 이 사각형 밖의 마커는 아예 검출되지 않는다. 카메라는 전이 때만 상태를 보내므로
+        마지막으로 보고된 margin으로 <b>근사</b>해 그린다(실제 검출 ROI와 몇 px 다를 수 있다).
+        TRACK 대상이 없으면 대신 <span style="color:#dc3545">SEARCH</span>로 표시된다.<br>
+        표시 전용 — 카메라에 아무 명령도 보내지 않는다.
       </div>
     </details>
-    <div id="rawCanvasNote" class="hint" style="margin:6px 0"><span class="none">기준영상 없음 — 스냅샷을 받으면 배경이 깔립니다 (없어도 좌표는 표시)</span></div>
     <canvas id="rawCanvas" width="640" height="480" style="max-width:100%;height:auto;display:block;border:1px solid #444;background:#111;border-radius:8px;margin-top:4px"></canvas>
 
     <h2 style="margin-top:18px">지연 — proc (카메라 내부 처리)</h2>
@@ -1529,12 +1677,30 @@ PAGE = """<!doctype html>
       </div>
     </details>
     <div id="rawLatency" class="qbox"><span class="none">CAM_POSE 수신 대기 중…</span></div>
+    <details class="fold panel">
+      <summary>처리량 네 값을 어떻게 읽나</summary>
+      <div class="foldbody hint">
+        <b>수신 fps</b>는 카메라가 보고하는 값이 아니라 <b>브라우저에 줄이 도착한 간격</b>으로
+        잰 값이다. 카메라 송신 주기에 네트워크 지터가 얹혀 있고, 창(최근 120줄) 전체의
+        경과시간으로 나눈다 — 간격의 평균을 쓰면 한 번의 긴 정지가 값을 통째로 끌어내린다.<br>
+        <b>det</b>은 <code>detectMarkers</code>만의 비용이다. <code>proc</code>의 거의 전부가
+        여기라면 병목은 검출이고, ROI를 좁히거나 스캔 횟수를 줄이는 것이 유일한 수단이다.<br>
+        <b>검출률</b>은 마커를 본 프레임의 비율이다. 같은 프레임에 마커가 여러 개면 줄도 여러 개
+        오므로 <code>seq</code> 단위로 한 번만 센다.<br>
+        <b>카메라 CPU</b>는 카메라가 2초마다 스스로 보내는 값이다(<code>/proc</code> 읽기, 요청 없음).
+        <b>앱</b>은 이 <code>.cap</code> 프로세스만, <b>전체</b>는 인코더·SDK 파이프라인까지 포함한
+        카메라 전부다. 둘 중 하나만으로는 "우리가 코어를 먹고 있다"와 "카메라가 원래 바쁘다"가
+        구별되지 않는다. 멀티코어에서는 <b>앱이 100%를 넘을 수 있다</b>(200% = 두 코어 포화) —
+        그래서 코어 수로 나누지 않고 함께 표시한다. 나누면 한 코어가 포화된 상황이 가려진다.<br>
+        <b>seq 누락</b>은 번호가 건너뛴 개수다. 0이 아니면 줄이 유실됐다는 뜻이고,
+        검출이 느린 것과는 다른 문제다(카메라는 프레임을 셌지만 전송이 밀린 경우).
+      </div>
+    </details>
   </div>
 </div>
 <div id="homographyPane" style="display:none">
   <div class="hg-subtabs" role="tablist" aria-label="호모그래피 작업">
     <button type="button" class="hg-subtab active" id="hgSubCompute" onclick="showHgSection('compute')">계산</button>
-    <button type="button" class="hg-subtab" id="hgSubValidate" onclick="showHgSection('validate')">검증</button>
     <button type="button" class="hg-subtab" id="hgSubAdvanced" onclick="showHgSection('advanced')">고급</button>
   </div>
 
@@ -1543,9 +1709,9 @@ PAGE = """<!doctype html>
     <div class="foldbody">
       <p class="sub">H를 계산한 뒤 현장 검증을 하고, 사용할 값만 저장하세요.</p>
       <div id="hgHealth" class="qbox"><span class="none">H 상태를 확인하는 중…</span></div>
-      <div class="row"><label class="kparam">H 입력 좌표계<select id="hgCoordMode"><option value="raw">raw 픽셀</option><option value="undistort">K/dist 보정 픽셀</option></select></label>
+      <div class="row"><label class="kparam">H 입력 좌표계<select id="hgCoordMode"><option value="raw">raw 픽셀</option><option value="undistort" selected>K/dist 보정 픽셀</option></select></label>
         <button type="button" onclick="applyHgCoordMode()">좌표계 적용<span class="cmd">HG_COORD_MODE</span></button></div>
-      <div id="hgCoordStatus" class="hint">모드를 바꾸면 기존 H는 다른 좌표계의 값이므로 H를 다시 계산하세요.</div>
+      <div id="hgCoordStatus" class="hint">기본값은 <b>K/dist 보정 픽셀</b>이며, 호모그래피 탭을 처음 열 때 한 번 자동 적용됩니다. 모드를 바꾸면 기존 H는 다른 좌표계의 값이므로 H를 다시 계산하세요.</div>
     </div>
   </details>
 
@@ -1566,7 +1732,7 @@ PAGE = """<!doctype html>
           <label class="kparam" style="width:auto">배치
             <select id="hgPreset" style="min-width:230px">
               <option value="">— 직접 입력 —</option>
-              <option value="1x1">폼보드 1장 (900×600) — 앵커 4</option>
+              <option value="1x1" selected>폼보드 1장 (900×600) — 앵커 4</option>
               <option value="2x2">폼보드 2×2 (1800×1200) — 앵커 16</option>
             </select></label>
           <button type="button" onclick="applyHgPreset()">표에 채우기</button>
@@ -1602,6 +1768,14 @@ PAGE = """<!doctype html>
         <div class="hint">카메라에 즉시 적용됩니다. 캘리브레이션 중에는 수정할 수 없으며, ID/X/Y 자체는 카메라 재시작 뒤 기본값으로 돌아갑니다. H 계산 결과는 별도의 <b>현재 H 저장</b>으로 보존하세요.</div>
         <div id="hgAnchorEditStatus" class="hint"></div>
       </div>
+      <div class="qbox"><div class="qtitle" style="color:#f59e0b">● 검증 기준점 편집 (계산에 넣지 않음, ID·X·Y mm)</div>
+        <div id="hgValidationRows"></div>
+        <div class="row"><button type="button" onclick="addHgValidationRow()">기준점 추가</button>
+          <button type="button" onclick="queryHgValidation()">현재 값 조회<span class="cmd">VALIDATION_QUERY</span></button>
+          <button type="button" onclick="applyHgValidation()">검증점 적용<span class="cmd">VALIDATION_SET</span></button></div>
+        <div class="hint">0~16개. ID는 서로 다르고 <b>계산 앵커 ID와 겹칠 수 없습니다</b>. 배치도에서 주황 점을 끌거나 표에 직접 입력하세요. 카메라 재시작 뒤 기본값으로 돌아갑니다.</div>
+        <div id="hgValidationEditStatus" class="hint"></div>
+      </div>
       <div class="cmdflow">
         <div class="row go"><button id="hgCalibStartBtn" onclick="send('CALIB_START')">앵커로 H 계산<span class="cmd">CALIB_START</span></button></div>
       </div>
@@ -1609,57 +1783,46 @@ PAGE = """<!doctype html>
     </div>
   </details>
 
-  <div class="group wide" data-hg-section="validate">
-    <h2>현장 검증 — 두 마커 거리</h2>
-    <div>
-      <p class="sub">자 양 끝의 두 마커로 계산거리와 실제길이를 비교합니다.</p>
-      <div class="cmdflow">
-        <div class="row"><button id="hgWorldBtn" onclick="toggleHgWorld()">월드 좌표 보기 시작</button></div>
+<details class="group wide fold panel" id="foldHgMarkerPlane" data-hg-section="compute">
+    <summary>로봇 마커 평면 (시차 보정)</summary>
+    <div class="foldbody">
+      <p class="sub">호모그래피는 <b>평면 하나</b>만 다룹니다. 바닥 앵커로 구한 H에 차체 위쪽 마커를
+        투영하면, 카메라 바로 아래 지점(나디르)에서 <b>멀어지는 방향으로 밀린</b> 위치가 나옵니다.
+        이 오차는 <b>계통 오차</b>라 평균을 내도 사라지지 않습니다.</p>
+      <div class="hint">
+        밀리는 양은 대략 <code>마커높이 ÷ 카메라높이</code> 비율입니다 — 카메라 1.5&nbsp;m,
+        마커 250&nbsp;mm면 나디르까지 거리의 1/6입니다.<br>
+        ⚠️ <b>undistort 모드에서만 계산됩니다.</b> raw 픽셀로 피팅한 H를 분해하면 렌즈 왜곡이
+        회전·평행이동에 흡수돼, 보정에 쓰는 평면 법선 자체가 틀어집니다. 틀린 값이 그럴듯하게
+        나오므로 카메라가 아예 거부합니다.
       </div>
       <div class="row">
-        <label class="kparam">마커 A id<input id="hgIdA" type="number" min="0" style="width:56px"></label>
-        <label class="kparam">마커 B id<input id="hgIdB" type="number" min="0" style="width:56px"></label>
-        <label class="kparam">자 실제 길이(mm)<input id="hgRuler" type="number" step="1" style="width:84px"></label>
+        <label class="kparam">마커 높이(mm)<input id="mpHeight" type="number" min="0" step="1" value="0" style="width:90px"></label>
+        <button type="button" onclick="applyMarkerHeight()">적용<span class="cmd">MARKER_HEIGHT</span></button>
       </div>
-      <div class="hint">자 양 끝에 마커 A·B를 붙이고 <b>두 마커 중심 간 실제 거리(mm)</b>를 입력하세요. 바닥에서 옮겨가며 <b>계산거리 vs 실제길이</b> 오차를 실시간 확인합니다. (두 마커는 바닥에 밀착, anchor 사각형 안에서, 캘리브 완료 후 world값 스트리밍)</div>
-      <div id="hgWorld" class="qbox"><span class="none">월드 좌표 보기를 시작하고 마커를 비추세요</span></div>
-    </div>
-  </div>
-
-  <div class="group wide" data-hg-section="validate">
-    <h2>등록 기준점 검증</h2>
-    <div>
-      <p class="sub">이 목록의 마커는 H 계산에 넣지 않고, 실측 등록 좌표와 결과를 비교합니다.</p>
-      <div class="qbox"><div class="qtitle">검증 기준점 편집 (ID / X, Y mm)</div>
-        <div id="hgValidationRows"></div>
-        <div class="row"><button type="button" onclick="addHgValidationRow()">기준점 추가</button>
-          <button type="button" onclick="queryHgValidation()">현재 값 조회<span class="cmd">VALIDATION_QUERY</span></button>
-          <button type="button" onclick="applyHgValidation()">입력값 모두 적용<span class="cmd">VALIDATION_SET</span></button></div>
-        <div class="hint">0~16개를 설정할 수 있습니다. ID는 서로 달라야 하며 계산 앵커 ID와 겹칠 수 없습니다. 이 목록은 카메라 재시작 뒤 기본값으로 돌아갑니다.</div>
-        <div id="hgValidationEditStatus" class="hint"></div>
+      <div class="row">
+        <label class="kparam">카메라 높이 실측(mm)<input id="mpCamHeight" type="number" min="0" step="1" value="0" style="width:100px"></label>
+        <button type="button" onclick="applyCameraHeight()">적용<span class="cmd">CAMERA_HEIGHT</span></button>
+        <span class="desc"><b>0 = 미측정</b> (H 분해 역산값 사용). 줄자로 쟀으면 넣으세요.</span>
       </div>
-      <div class="hint">기준영상 스냅샷을 한 번 받은 뒤 검증 마커를 비추세요. 표에는 X/Y 오차와 위치 오차, 하단에는 RMSE와 최대 오차가 표시됩니다.</div>
-      <div id="hgValidation" class="qbox"><span class="none">기준영상 스냅샷 및 H 캘리브레이션 후 검증 마커를 비추세요</span></div>
+      <div class="hint">
+        보정량은 <code>마커높이 ÷ 카메라높이</code> 비율입니다. 마커 높이는 실측해서 넣지만
+        카메라 높이는 <b>H를 분해해 역산</b>하는데, 이 분해가 핀홀을 가정하므로 남은 왜곡이
+        스케일을 편향시킵니다. <b>Cz가 틀리면 보정량이 그 비율만큼 통째로 틀립니다</b> —
+        예: 역산이 20% 크면 보정이 17% 부족해집니다. 실측값을 넣으면 이 항이 사라집니다.
+      </div>
+      <div class="row">
+        <button type="button" onclick="send('MARKER_PLANE_QUERY')">조회<span class="cmd">MARKER_PLANE_QUERY</span></button>
+        <button type="button" onclick="send('MARKER_PLANE_SAVE')">저장<span class="cmd">MARKER_PLANE_SAVE</span></button>
+      </div>
+      <div class="hint">적용은 RAM에만 반영됩니다 — 재부팅 뒤에도 유지하려면 <b>저장</b>을 누르세요 (두 높이 모두 함께 저장).</div>
+      <div id="mpStatus" class="qbox"><span class="none">마커 높이를 입력하고 적용하세요 (H 계산 완료 후)</span></div>
+      <div class="hint"><b>카메라 높이는 줄자로 검산하세요.</b> 1.5&nbsp;m에 달아둔 카메라가 4&nbsp;m로
+        역산되면 K나 H가 틀린 것이고, 시차 보정값도 같이 틀립니다.</div>
     </div>
-  </div>
+  </details>
 
-  <div class="group wide" data-hg-section="validate">
-    <h2>검증 보조 — 바닥 기준영상 오버레이</h2>
-    <div>
-    <p class="sub">기준영상 1장 위에 anchor 작업영역과 실시간 마커를 겹쳐 그립니다.</p>
-    <div class="cmdflow">
-      <div class="row go"><button onclick="hgSnapshot()">기준영상 스냅샷<span class="cmd">HG_SNAPSHOT</span></button>
-        <span class="desc">카메라가 현재 프레임 1장을 JPEG로 보내 배경으로 깝니다. 등록된 계산 anchor가 다 보일 때 누르세요.</span></div>
-      <div class="row"><button id="hgOverlayBtn" onclick="toggleHgOverlay()">오버레이 보기 시작</button>
-        <span class="desc">실시간 마커 사각형·중심·id·월드좌표와 anchor 작업영역(내부 초록/외부 빨강)을 배경 위에 그립니다.</span></div>
-    </div>
-    <div class="hint">배경은 정지 스냅샷(바닥은 안 움직임), 그 위 마커만 <code>CAM_POSE</code>로 실시간 갱신됩니다. H가 있으면 마커 중심의 월드 mm도 라벨로 표시. 색: 작업영역 안=초록, 밖=빨강.</div>
-    <canvas id="hgCanvas" width="640" height="480" style="max-width:100%;height:auto;display:block;border:1px solid #444;background:#111;border-radius:8px;margin-top:8px"></canvas>
-    <div id="hgCanvasNote" class="qbox"><span class="none">기준영상 스냅샷을 눌러 배경을 받아오세요</span></div>
-    </div>
-  </div>
-
-  <details class="group wide fold panel" id="foldHgSave" data-hg-section="compute">
+    <details class="group wide fold panel" id="foldHgSave" data-hg-section="compute">
     <summary>3. 확정 및 저장</summary>
     <div class="foldbody">
       <p class="sub">검증 결과가 만족스러울 때만 현재 적용 H를 저장하세요. 저장 전에도 H는 즉시 좌표 변환에 사용됩니다.</p>
@@ -1693,6 +1856,126 @@ PAGE = """<!doctype html>
     </div>
   </div>
 </div>
+<div id="centralPane" style="display:none">
+  <div class="group wide">
+    <h2>카메라 → 중앙 서버 (TLS 9000, role=CCTV)</h2>
+    <p class="sub">
+      카메라가 중앙 서버에 직접 붙어 보내는 채널입니다. 이 대시보드(7000)와는 별개이며,
+      서버 <code>PROTOCOL.md</code>의 <code>POS</code>/<code>H_MATRIX</code> 규격을 씁니다.
+    </p>
+    <div id="centralStatus" class="qbox"><span class="none">상태를 조회하면 여기에 표시됩니다</span></div>
+    <div class="row">
+      <button onclick="send('CENTRAL_QUERY')">상태 조회<span class="cmd">CENTRAL_QUERY</span></button>
+      <button id="ctLinkBtn" onclick="toggleCentralLink()">연결 —<span class="cmd">CENTRAL_LINK</span></button>
+      <button id="ctPosBtn" onclick="toggleCentralPos()">POS 전송 —<span class="cmd">CENTRAL_POS</span></button>
+    </div>
+    <p class="sub">
+      <b>연결</b>을 끄면 TLS 세션이 끊겨 서버의 CCTV 접속 목록에서 사라집니다(재접속 시험용).
+      <b>POS 전송</b>만 끄면 접속은 유지한 채 좌표만 멈춥니다 — 서버 입장에선
+      "카메라는 붙어 있는데 로봇이 안 보이는" 상태가 됩니다.
+    </p>
+
+    <h2 style="margin-top:22px">POS 대상 마커</h2>
+    <p class="sub">
+      서버의 <code>POS</code> 스키마에는 마커 id 필드가 없어서, 보내는 좌표가 곧 로봇으로
+      취급됩니다. 앵커·검증 마커가 섞이지 않도록 카메라가 <b>여기서 지정한 id 하나만</b>
+      9000으로 보냅니다.
+    </p>
+    <div class="row">
+      <input id="ctId" type="number" style="max-width:120px" placeholder="예: 15" autocomplete="off">
+      <button onclick="sendCentralId()">적용<span class="cmd">CENTRAL_ID</span></button>
+    </div>
+
+    <h2 style="margin-top:22px">H_MATRIX 전송</h2>
+    <p class="sub">
+      서버는 <code>calib</code> 번들이 있어야 POS 픽셀을 미터로 바꿉니다. 아래 payload가
+      그대로 <code>{"type":"H_MATRIX","seq":n,"payload":…}</code>에 실려 나갑니다.
+      <b>H는 mm 기준</b>(pixel→world mm)으로 보내면 서버가 ÷1000로 미터 정규화합니다.
+    </p>
+    <details class="fold warn">
+      <summary><b>⚠ 값 검증 없이 그대로 전송됩니다</b></summary>
+      <div class="foldbody">
+        카메라는 JSON 객체인지만 확인하고 내용은 손대지 않습니다. 서버는 이 번들을
+        로그인 사용자에 <b>영속 저장</b>하고 QT에 중계하므로, 시험값을 보내면 그 값이
+        저장된 캘리브레이션이 됩니다.
+      </div>
+    </details>
+    <div class="row">
+      <textarea id="ctHm" spellcheck="false"
+                style="width:100%;min-height:190px;font-family:monospace;font-size:12px"></textarea>
+    </div>
+    <div class="row">
+      <label class="kparam" style="width:auto">calib_id
+        <input id="ctCalibId" type="text" spellcheck="false" autocomplete="off" style="width:150px"></label>
+      <label class="kparam" style="width:auto">canvas_mm (W×H)
+        <input id="ctCanvasW" type="number" min="1" step="10" style="width:78px">
+        <input id="ctCanvasH" type="number" min="1" step="10" style="width:78px"></label>
+    </div>
+    <div class="row">
+      <button onclick="sendCentralHmatrix()">전송<span class="cmd">CENTRAL_HMATRIX</span></button>
+      <button onclick="fillCentralHmatrixTemplate()">QT-REQ-CCTV-001 형식으로 채우기</button>
+      <button onclick="fillCentralHmatrixLegacy()">구 형식(H_floor/H_marker)</button>
+    </div>
+    <div id="ctHmNote" class="hint">
+      카메라가 이번 세션에 보고한 K·dist·H·coord_mode를 그대로 채웁니다.
+      빠진 항목이 있으면 자리표시자가 들어가므로 <b>여기 경고가 뜨면 전송하지 마세요</b>.
+    </div>
+    <details class="fold panel">
+      <summary>두 형식의 차이 — 무엇을 언제 쓰나</summary>
+      <div class="foldbody hint">
+        <b>QT-REQ-CCTV-001 형식</b>(요청서 rev.2)은 최상위 평면 스키마다. 요청서 본문에는
+        <code>H</code> 하나뿐이지만, 여기서는 <b><code>H_marker</code>를 함께 싣는다</b> —
+        요청서가 필수 필드를 정할 뿐 추가 필드를 금지하지는 않고, 서버의 로봇 제어 경로는
+        시차 보정에 그 값이 필요하기 때문이다. QT는 <code>H</code>만 읽으면 되고
+        <code>H_marker</code>는 무시하면 된다.<br>
+        <b>구 형식</b>은 <code>{"calib":{…}}</code> <b>중첩</b>에 <code>H_floor</code>·
+        <code>H_marker</code>·<code>marker_height_m</code>을 싣는다. 담기는 행렬은 사실상 같고
+        <b>차이는 키 이름과 중첩 구조뿐</b>이다. <b>서버는 2026-07-30부터 두 형식을 동등하게
+        읽는다</b> — 평면 형식의 <code>H</code>를 <code>H_floor</code>로 받고 <code>K</code>·
+        <code>D</code>·<code>H_marker</code>까지 그대로 쓰므로 왜곡·시차 보정 결과가 같다.
+        어느 쪽을 보내도 되고, 설치 메타데이터(<code>calib_id</code>·<code>canvas_mm</code> 등)가
+        같이 저장·중계되는 쪽은 평면 형식이다.<br>
+        (그 전에는 평면 형식을 보내면 서버가 레거시로 오인해 <code>H</code>만 남기고
+        <code>K</code>·<code>D</code>·<code>H_marker</code>를 버렸다 — 에러 없이 보정만 꺼졌다.
+        서버 로그의 <code>캘리브레이션 수신 (평면 번들 …)</code> 표기로 확인할 수 있다.)<br>
+        두 형식 모두 <code>H</code>/<code>H_marker</code>는 <b>같은 픽셀 공간</b>(<code>coord_mode</code>)을
+        입력으로 받는다. 짝이 안 맞는 픽셀을 넣으면 에러 없이 조용히 틀린 좌표가 나온다.
+      </div>
+    </details>
+  </div>
+
+  <div class="group wide">
+    <h2>POS 전송 규격 — 카메라가 실제로 내보내는 줄</h2>
+    <p class="sub">
+      POS는 H_MATRIX처럼 사람이 편집해 보내는 값이 아니라, <b>검출될 때마다 카메라가 자동으로</b>
+      보내는 스트림입니다. 여기서는 그 형식을 확인하고 현재 프레임 값으로 채워볼 수만 있습니다.
+    </p>
+    <div class="row">
+      <textarea id="ctPos" spellcheck="false" readonly
+                style="width:100%;min-height:110px;font-family:monospace;font-size:12px"></textarea>
+    </div>
+    <div class="row">
+      <button onclick="fillCentralPosSample()">현재 프레임으로 채우기</button>
+      <button onclick="copyCentralPos()">복사</button>
+      <span id="ctPosNote" class="desc"></span>
+    </div>
+    <details class="fold panel">
+      <summary>이 좌표가 서버에서 무엇이 되나 — 왜 여기엔 캘리브레이션이 없나</summary>
+      <div class="foldbody hint">
+        <code>corners</code>는 <b>보정 전 raw 픽셀</b>이고 순서는 카메라가 검출한 그대로다.
+        마커 <b>하나</b>(중앙 대상 id)만 실리며, 놓친 프레임(하트비트)은 <b>보내지 않는다</b>.<br>
+        서버는 이 픽셀을 받아 <code>undistort → H_marker</code>로 바닥 미터 좌표를 만들고,
+        QT에는 <code>POSE</code>(x, y, theta_deg)로 바꿔 중계한다. 원본 픽셀은 QT로 가지 않는다 —
+        캘리브레이션을 가진 쪽이 서버뿐이라 QT는 해석할 방법이 없기 때문이다.<br>
+        그래서 <b>POS에는 K/H가 실리지 않는다</b>. 그 값들은 H_MATRIX로 <b>따로 한 번</b> 올려두고,
+        서버가 저장해 두었다가 매 POS에 적용한다. H_MATRIX를 안 보냈거나 옛 값이면
+        POS는 정상인데 위치만 조용히 틀린다 — 서버 로그의
+        <code>캘리브레이션 없음 - pose 계산 불가</code>가 그 신호다.<br>
+        <code>seq</code>는 카메라가 POS마다 1씩 올리는 값이며 CAM_POSE의 seq와는 별개다.
+      </div>
+    </details>
+  </div>
+</div>
 <div id="shellPane" style="display:none">
   <div class="group wide">
     <h2>카메라 셸 — 빠른 진단</h2>
@@ -1707,28 +1990,30 @@ PAGE = """<!doctype html>
         <code>stderr</code>도 함께 옵니다.
       </div>
     </details>
-    <div class="row" id="shellControls">
-      <input id="shInput" type="text"
-             placeholder="예: ls -lah /mnt   (Enter 실행 · ↑/↓ 이전 명령)" autocomplete="off">
+    <table class="cmdtable">
+      <tr class="grp"><td colspan="2">기본 상태</td></tr>
+      <tr><td class="c"><button class="cmdlink" onclick="runShell('date; uptime; id')">date; uptime; id</button></td><td>시간 · 업타임 · 실행 권한</td></tr>
+      <tr><td class="c"><button class="cmdlink" onclick="runShell('ps | head -n 20')">ps | head -n 20</button></td><td>프로세스 목록 (상위 20)</td></tr>
+      <tr class="grp"><td colspan="2">/mnt 저장소</td></tr>
+      <tr><td class="c"><button class="cmdlink" onclick="runShell('ls -lah /mnt/opensdk/storage/')">ls -lah /mnt/opensdk/storage/</button></td><td>앱 저장소 목록 — H·K/dist 저장 파일이 있는 곳</td></tr>
+      <tr><td class="c"><button class="cmdlink" onclick="runShell('df -h /mnt')">df -h /mnt</button></td><td>/mnt 남은 용량</td></tr>
+      <tr><td class="c"><button class="cmdlink" onclick="runShell('mount | grep mnt')">mount | grep mnt</button></td><td>/mnt 마운트 옵션 (ro 로 잡혀 있으면 저장이 실패한다)</td></tr>
+      <tr><td class="c"><button class="cmdlink" onclick="runShell('ls -ld /mnt /mnt/opensdk /mnt/opensdk/storage')">ls -ld /mnt /mnt/opensdk /mnt/opensdk/storage</button></td><td>상위 폴더 권한</td></tr>
+      <tr><td class="c"><button class="cmdlink" onclick="runShell('touch /mnt/__wtest &amp;&amp; echo WRITABLE &amp;&amp; rm -f /mnt/__wtest')">touch /mnt/__wtest &amp;&amp; echo WRITABLE &amp;&amp; rm -f /mnt/__wtest</button></td><td>/mnt 쓰기 가능 여부 확인</td></tr>
+    </table>
+    <div class="hint" style="margin:8px 0 2px">호모그래피·K/dist 저장 파일은 <code>/mnt/opensdk/storage/&lt;appName&gt;/</code> 아래에 있습니다.</div>
+    <div class="term" onclick="focusShellInput(event)">
+      <pre id="shOut"></pre>
+      <div class="term-row"><span class="ps1">$</span>
+        <input id="shInput" type="text"
+               placeholder="ls -lah /mnt   (Enter 실행 · ↑/↓ 이전 명령 · Esc 지우기)" autocomplete="off"
+               spellcheck="false"></div>
+    </div>
+    <div class="row" style="margin-top:8px">
       <button onclick="sendShell()">실행</button>
-      <button onclick="document.getElementById('shOut').textContent=''">지우기</button>
+      <button onclick="clearShellOutput()">지우기</button>
       <button onclick="copyShellOutput()">출력 복사</button>
     </div>
-    <h3 style="margin:16px 0 4px;font-size:13px">기본 상태</h3>
-    <div class="cmdflow">
-      <div class="row"><button onclick="runShell('date; uptime; id')">시간 · 업타임 · 권한</button></div>
-      <div class="row"><button onclick="runShell('ps | head -n 20')">프로세스 목록</button></div>
-    </div>
-    <h3 style="margin:14px 0 4px;font-size:13px">/mnt 저장소</h3>
-    <div class="cmdflow">
-      <div class="row"><button onclick="runShell('ls -lah /mnt/opensdk/storage/')">앱 저장소 목록</button></div>
-      <div class="row"><button onclick="runShell('df -h /mnt')">/mnt 용량</button></div>
-      <div class="row"><button onclick="runShell('mount | grep mnt')">/mnt 마운트 옵션</button></div>
-      <div class="row"><button onclick="runShell('ls -ld /mnt /mnt/opensdk /mnt/opensdk/storage')">폴더 권한</button></div>
-      <div class="row"><button onclick="runShell('touch /mnt/__wtest && echo WRITABLE && rm -f /mnt/__wtest')">/mnt 쓰기 테스트</button></div>
-    </div>
-    <div class="hint" style="margin:10px 0 2px">호모그래피·K/dist 저장 파일은 앱의 <code>/mnt/opensdk/storage/&lt;appName&gt;/</code> 아래에 있을 수 있습니다.</div>
-    <pre id="shOut"></pre>
   </div>
 
   <div class="group wide">
@@ -2109,6 +2394,13 @@ function markerSidePx(c) {
 }
 function renderRaw() {
   const ids = Object.keys(rawFrame);
+  // 검출이 꺼져 있으면 '마커 없음'이 아니라 꺼졌다고 말한다. 둘 다 빈 화면이라
+  // 구분이 안 되면 기능이 고장난 것처럼 보인다.
+  if (!detectOn) {
+    rawBox.innerHTML = '<span class="none">마커 검출이 꺼져 있습니다 — ' +
+      '상단 [검출 OFF] 버튼을 눌러 켜세요 (카메라가 하트비트만 보내는 중)</span>';
+    return;
+  }
   if (!ids.length) { rawBox.innerHTML = '<span class="none">이 프레임에 인식된 마커 없음</span>'; return; }
   const cmp = showUndist && kCalib;   // 보정 열을 함께 그릴지
   let html = '';
@@ -2141,17 +2433,91 @@ function renderRaw() {
 // per line and the numbers are only trustworthy while frames actually flow.
 const PROC_WINDOW = 120;
 let procs = [], lastNet = null;
+// fps 는 카메라가 알려주지 않는다 -- 브라우저에 줄이 도착한 간격으로 잰다.
+// 그래서 정확히는 "수신 fps"이고, 카메라 송신 주기에 네트워크 지터가 얹힌 값이다.
+let arrivals = [], dets = [], hits = [], lastSeqSeen = null, seqGaps = 0;
+// 카메라 CPU. CAM_POSE 와 별개로 2초마다 오므로 마지막 값을 들고 있다가 지연 표가
+// 다시 그려질 때 같이 렌더한다 -- 값이 없다고 표에서 줄이 사라지면 더 헷갈린다.
+let cpuApp = null, cpuSys = null, cpuCores = null, cpuAt = 0;
+function handleCpu(line) {
+  const m = line.match(/\\[cpu\\] app=(-?[\\d.]+)% sys=(-?[\\d.]+)% cores=(\\d+)/);
+  if (!m) return;
+  const a = Number(m[1]), b = Number(m[2]);
+  cpuApp = a >= 0 ? a : null;      // 카메라가 -1 로 "못 읽음"을 알린다
+  cpuSys = b >= 0 ? b : null;
+  cpuCores = Number(m[3]);
+  cpuAt = Date.now();
+  renderRawLatency();
+}
+function cpuText() {
+  if (cpuApp === null && cpuSys === null)
+    return '<span class="none">보고 없음 (카메라 재빌드 필요)</span>';
+  const stale = (Date.now() - cpuAt) > 8000 ? ' <span class="none">(오래됨)</span>' : '';
+  const app = cpuApp === null ? '—' : cpuApp.toFixed(1) + '%';
+  const sys = cpuSys === null ? '—' : cpuSys.toFixed(1) + '%';
+  return '앱 ' + app + ' · 전체 ' + sys + ' · ' + (cpuCores || 1) + '코어' + stale;
+}
 const rawLatency = document.getElementById('rawLatency');
 
 function handleLatency(line) {
   const pm = line.match(/proc=(-?\\d+)ms/);
   if (!pm) return;
-  procs.push(Number(pm[1]));
+  // 렌더는 scheduleRawRender() 의 rAF 에서 한 번만 한다 -- 줄마다 표를 다시 만들면
+  // 마커 개수만큼 innerHTML 이 교체되어 표가 깜빡인다.
+  handleLatencyCollect(line, Number(pm[1]));
+  scheduleRawRender();
+}
+function handleLatencyCollect(line, procMs) {
+  procs.push(procMs);
   if (procs.length > PROC_WINDOW) procs.shift();
 
   const nm = line.match(/net=(-?\\d+)ms/);
   lastNet = nm ? Number(nm[1]) : null;      // absent/?clock -> unknown
 
+  arrivals.push(Date.now());
+  if (arrivals.length > PROC_WINDOW) arrivals.shift();
+
+  const dm = line.match(/det=(-?\\d+)ms/);
+  dets.push(dm ? Number(dm[1]) : null);
+  if (dets.length > PROC_WINDOW) dets.shift();
+
+  // 같은 프레임에 마커가 여러 개면 seq 가 같은 줄이 여러 번 온다. 검출률은
+  // "마커를 본 프레임 비율"이어야 하므로 seq 단위로 한 번만 센다.
+  const sm = line.match(/seq=(\\d+)/);
+  const seq = sm ? Number(sm[1]) : null;
+  const fresh = (seq === null || seq !== lastSeqSeen);
+  if (fresh) {
+    if (seq !== null && lastSeqSeen !== null && seq > lastSeqSeen + 1)
+      seqGaps += seq - lastSeqSeen - 1;
+    hits.push(line.includes('MARKER LOST') ? 0 : 1);
+    if (hits.length > PROC_WINDOW) hits.shift();
+  }
+  if (seq !== null) lastSeqSeen = seq;
+}
+
+// 지연 표와 캔버스 HUD 가 함께 쓰는 계산. null = 아직 값이 없음.
+//
+// fps 는 창 전체의 경과시간으로 나눈다. 프레임별 간격의 평균을 쓰면 한 번의 긴
+// 정지가 평균을 통째로 끌어내려 실제 처리량보다 낮게 보인다.
+function metricFps() {
+  if (arrivals.length < 2) return null;
+  const span = (arrivals[arrivals.length - 1] - arrivals[0]) / 1000;
+  return span > 0 ? (arrivals.length - 1) / span : null;
+}
+function metricDetCur() {
+  const dv = dets.filter(v => v !== null);
+  return dv.length ? dv[dv.length - 1] : null;
+}
+function metricDetAvg() {
+  const dv = dets.filter(v => v !== null);
+  return dv.length ? dv.reduce((a, b) => a + b, 0) / dv.length : null;
+}
+function metricHitPct() {
+  return hits.length ? hits.reduce((a, b) => a + b, 0) / hits.length * 100 : null;
+}
+
+function renderRawLatency() {
+  if (!procs.length) return;
   const n = procs.length;
   const cur = procs[n - 1];
   const avg = procs.reduce((a, b) => a + b, 0) / n;
@@ -2163,6 +2529,15 @@ function handleLatency(line) {
   const totTxt = lastNet === null
     ? '<span class="none">—</span>'
     : (cur + lastNet) + ' ms';
+
+  const fpsTxt = metricFps() === null
+    ? '<span class="none">측정 중…</span>' : metricFps().toFixed(1) + ' fps';
+  const detTxt = metricDetCur() === null
+    ? '<span class="none">—</span>'
+    : metricDetCur() + ' ms (평균 ' + metricDetAvg().toFixed(1) + ')';
+  const hitTxt = hits.length
+    ? Math.round(metricHitPct()) + '% (' + hits.reduce((a, b) => a + b, 0) + '/' + hits.length + ' 프레임)'
+    : '<span class="none">—</span>';
   rawLatency.innerHTML =
     '<div class="qtitle">proc — 카메라 내부 처리 (최근 ' + n + '프레임)</div>' +
     '<table>' +
@@ -2174,7 +2549,36 @@ function handleLatency(line) {
     '<table>' +
     '<tr><td>net</td><td>' + netTxt + '</td></tr>' +
     '<tr><td>total</td><td>' + totTxt + '</td></tr>' +
+    '</table>' +
+    '<div class="qtitle" style="margin-top:8px">처리량</div>' +
+    '<table>' +
+    '<tr><td>수신 fps</td><td>' + fpsTxt + '</td></tr>' +
+    '<tr><td>det (검출만)</td><td>' + detTxt + '</td></tr>' +
+    '<tr><td>검출률</td><td>' + hitTxt + '</td></tr>' +
+    '<tr><td>seq 누락</td><td>' + seqGaps + ' 프레임</td></tr>' +
+    '<tr><td>카메라 CPU</td><td>' + cpuText() + '</td></tr>' +
     '</table>';
+}
+
+// 한 프레임에 마커가 여러 개면 CAM_POSE 줄도 여러 개 온다. 줄마다 그리면 한 번의
+// 시각적 갱신을 위해 DOM/캔버스를 N번 다시 만들게 되고, 화면이 깜빡인다.
+//
+// 두 가지로 막는다.
+//  (1) 이중 버퍼 -- 수집은 rawBuilding 에 하고 프레임이 끝날 때 한 번에 교체한다.
+//      예전처럼 프레임 시작에서 rawFrame 을 비우면 "마커 0개 -> 1개 -> 2개" 중간
+//      상태가 그대로 그려져 깜빡임의 주된 원인이 된다.
+//  (2) rAF 가드 -- 브라우저가 그릴 수 있는 속도보다 프레임이 빨리 와도 여러 프레임을
+//      한 번의 페인트로 합친다. 데이터는 잃지 않는다(수집은 매 줄 동기적으로 계속됨).
+let rawBuilding = {}, rawRenderScheduled = false;
+function scheduleRawRender() {
+  if (rawRenderScheduled) return;
+  rawRenderScheduled = true;
+  requestAnimationFrame(() => {
+    rawRenderScheduled = false;
+    if (rawOn) renderRaw();
+    if (rawOverlayOn) redrawRawCanvas();
+    renderRawLatency();
+  });
 }
 
 function handleRaw(line) {
@@ -2185,12 +2589,14 @@ function handleRaw(line) {
   const lost = line.includes('MARKER LOST');
   const cm = line.match(/id=(\\d+)\\s+c0=\\(([\\d.]+),([\\d.]+)\\)\\s+c1=\\(([\\d.]+),([\\d.]+)\\)\\s+c2=\\(([\\d.]+),([\\d.]+)\\)\\s+c3=\\(([\\d.]+),([\\d.]+)\\)/);
   if (!cm && !lost) return;            // not a per-frame pose line
-  if (sm[1] !== rawSeq) { rawSeq = sm[1]; rawFrame = {}; }   // new frame -> reset
-  if (cm) rawFrame[cm[1]] = [[cm[2], cm[3]], [cm[4], cm[5]], [cm[6], cm[7]], [cm[8], cm[9]]];
-  if (rawOn) renderRaw();
-  renderHgValidation();
-  if (hgOverlayOn) redrawHg();
-  if (rawOverlayOn) redrawRawCanvas();
+  // seq 가 바뀌면 "이전" 프레임이 완성된 것이다: 그것을 게시하고 새 수집을 시작한다.
+  if (sm[1] !== rawSeq) {
+    rawSeq = sm[1];
+    rawFrame = rawBuilding;
+    rawBuilding = {};
+    scheduleRawRender();
+  }
+  if (cm) rawBuilding[cm[1]] = [[cm[2], cm[3]], [cm[4], cm[5]], [cm[6], cm[7]], [cm[8], cm[9]]];
 }
 
 // CALIB_K_QUERY 결과를 표로 렌더 (fx/fy/cx/cy + 왜곡계수 k1,k2,p1,p2,k3)
@@ -2219,6 +2625,7 @@ const TABS = {
   homography: {pane: 'homographyPane', tab: 'tabHmg'},
   raw:        {pane: 'rawPane',        tab: 'tabRaw'},
   shell:      {pane: 'shellPane',      tab: 'tabShell'},
+  central:    {pane: 'centralPane',    tab: 'tabCentral'},
 };
 function showTab(name) {
   for (const k in TABS) {
@@ -2226,8 +2633,12 @@ function showTab(name) {
     document.getElementById(TABS[k].tab).classList.toggle('active', k === name);
   }
   if (name === 'shell') document.getElementById('shInput').focus();
+  if (name === 'central') { send('CENTRAL_QUERY'); fillCentralPosSample(); }
+  if (name === 'raw') send('DYNROI');
   if (name === 'homography') {
+    applyHgCoordDefault();
     send('HG_QUERY');
+    send('MARKER_PLANE_QUERY');
     send('ANCHOR_QUERY');
     send('VALIDATION_QUERY');
   }
@@ -2238,7 +2649,7 @@ function showHgSection(section) {
   document.querySelectorAll('[data-hg-section]').forEach(panel => {
     panel.style.display = panel.dataset.hgSection === section ? 'block' : 'none';
   });
-  const map = {compute: 'hgSubCompute', validate: 'hgSubValidate', advanced: 'hgSubAdvanced'};
+  const map = {compute: 'hgSubCompute', advanced: 'hgSubAdvanced'};
   for (const name in map)
     document.getElementById(map[name]).classList.toggle('active', name === section);
 }
@@ -2251,11 +2662,13 @@ let shHistory = [], shPos = -1;
 
 function runShell(c) {
   showTab('shell');
+  shellAppend('$ ' + c + "\\n", 'term-echo');
   send('SHELL ' + c);
 }
 function sendShell() {
   const c = shInput.value.trim();
   if (!c) return;
+  shellAppend('$ ' + c + "\\n", 'term-echo');
   send('SHELL ' + c);
   shHistory.push(c);
   shPos = shHistory.length;
@@ -2281,19 +2694,42 @@ shInput.addEventListener('keydown', (e) => {
 // Route [shell] lines into the terminal pane. They also stay in the main log --
 // the pane is a filtered view, not a redirect, so nothing is hidden from the
 // transcript.
+function shellAtBottom() {
+  return shOut.scrollHeight - shOut.scrollTop - shOut.clientHeight < 40;
+}
+function shellAppend(text, cls) {
+  const stick = shellAtBottom();
+  if (cls) {
+    const el = document.createElement('span');
+    el.className = cls;
+    el.textContent = text;
+    shOut.appendChild(el);
+  } else {
+    // 카메라 출력은 임의 문자열이다 -- 텍스트 노드로만 붙여 마크업으로 해석될
+    // 여지를 없앤다.
+    shOut.appendChild(document.createTextNode(text));
+  }
+  if (stick) shOut.scrollTop = shOut.scrollHeight;
+}
+function clearShellOutput() { shOut.textContent = ''; }
+function focusShellInput(e) {
+  // 드래그로 출력을 선택하는 중이면 가로채지 않는다.
+  if (window.getSelection && String(window.getSelection()).length) return;
+  const el = document.getElementById('shInput');
+  if (el) el.focus();
+}
 function handleShell(line) {
   if (!line.startsWith('[shell]')) return;
-  const stick = shOut.scrollHeight - shOut.scrollTop - shOut.clientHeight < 40;
-  shOut.textContent += line.slice(8) + "\\n";
-  if (stick) shOut.scrollTop = shOut.scrollHeight;
+  shellAppend(line.slice(8) + "\\n");
 }
 
 // ===== Homography Test 탭 =====
+// 기본 배치 = 폼보드 1장(900×600), 마커 중심은 보드 모서리에서 60mm 안쪽.
+// HG_PRESETS['1x1'] 과 같은 값이어야 한다 — 한쪽만 고치면 첫 화면과 프리셋이
+// 어긋나 어느 쪽이 실제 배치인지 알 수 없게 된다.
 const defaultHgAnchors = [
-  {id: 10, wx: 0, wy: 0}, {id: 11, wx: 1000, wy: 0},
-  {id: 12, wx: 2000, wy: 0}, {id: 13, wx: 2000, wy: 750},
-  {id: 14, wx: 2000, wy: 1500}, {id: 15, wx: 1000, wy: 1500},
-  {id: 16, wx: 0, wy: 1500}, {id: 17, wx: 0, wy: 750},
+  {id: 0, wx: 60, wy: 60}, {id: 1, wx: 840, wy: 60},
+  {id: 2, wx: 60, wy: 540}, {id: 3, wx: 840, wy: 540},
 ];
 let hgAnchorEntries = defaultHgAnchors.map(a => ({...a}));
 const hgAnchorRows = document.getElementById('hgAnchorRows');
@@ -2422,12 +2858,17 @@ function applyHgAnchors() {
   // 카메라는 이 명령 하나에 대해 완성된 앵커 표를 되돌려준다.
   send('ANCHOR_SET_ALL ' + values.map(a => `${a.id} ${a.wx} ${a.wy}`).join(' '));
 }
+// 카메라가 마지막으로 보고한 앵커. 중앙서버 번들의 canvas_mm 추정이 이 값을 쓴다
+// (표의 입력값이 아니라 카메라가 실제로 들고 있는 값이어야 한다).
+let hgCameraAnchors = null;
+
 function handleHgAnchors(line) {
   const m = line.match(/^\\[calib\\] ANCHORS (\\[.*\\])$/);
   if (!m) return;
   try {
     const anchors = JSON.parse(m[1]);
     if (Array.isArray(anchors) && anchors.length) {
+      hgCameraAnchors = anchors.map(a => ({id:Number(a.id), wx:Number(a.wx), wy:Number(a.wy)}));
       renderHgAnchorRows(anchors);
       hgAnchorEditStatus.textContent = '카메라의 현재 앵커 좌표를 표시했습니다.';
     }
@@ -2435,10 +2876,8 @@ function handleHgAnchors(line) {
 }
 renderHgAnchorRows(defaultHgAnchors);
 
-const defaultHgValidation = [
-  {id: 20, wx: 500, wy: 500}, {id: 21, wx: 1500, wy: 500},
-  {id: 22, wx: 1500, wy: 1000}, {id: 23, wx: 500, wy: 1000},
-];
+// 1x1 프리셋과 동일하게 비워 둔다. 검증점을 쓰려면 표에서 직접 추가한다.
+const defaultHgValidation = [];
 let hgValidationEntries = defaultHgValidation.map(a => ({...a}));
 const hgValidationRows = document.getElementById('hgValidationRows');
 const hgValidationEditStatus = document.getElementById('hgValidationEditStatus');
@@ -2684,64 +3123,6 @@ async function hgExperimentApply() {
 }
 setInterval(hgExperimentRefresh, 1000);
 
-let hgWorldOn = false, hgSeq = null, hgFrame = {};
-function toggleHgWorld() {
-  hgWorldOn = !hgWorldOn;
-  const b = document.getElementById('hgWorldBtn');
-  b.textContent = hgWorldOn ? '월드 좌표 보기 정지' : '월드 좌표 보기 시작';
-  b.classList.toggle('on', hgWorldOn);
-  if (!hgWorldOn) {
-    document.getElementById('hgWorld').innerHTML = '<span class="none">정지됨</span>';
-    hgFrame = {}; hgSeq = null;
-  }
-}
-function renderHgWorld() {
-  const box = document.getElementById('hgWorld');
-  const ids = Object.keys(hgFrame);
-  if (!ids.length) {
-    box.innerHTML = '<span class="none">이 프레임에 world 좌표를 가진 마커 없음 — 호모그래피 캘리브 완료 여부 확인</span>';
-    return;
-  }
-  // 1) 검출된 마커별 world 좌표
-  let html = '<div class="qtitle">마커 월드 좌표 (mm, deg)</div><table>';
-  html += '<tr><td>id</td><td>X(mm)</td><td>Y(mm)</td><td>θ(deg)</td></tr>';
-  for (const id of ids) {
-    const w = hgFrame[id];
-    html += `<tr><td>${id}</td><td>${w[0]}</td><td>${w[1]}</td><td>${w[2]}</td></tr>`;
-  }
-  html += '</table>';
-  // 2) 두 마커 거리 검증 (A↔B world 거리 vs 자 실제 길이)
-  const idA = document.getElementById('hgIdA').value;
-  const idB = document.getElementById('hgIdB').value;
-  const ruler = parseFloat(document.getElementById('hgRuler').value);
-  html += '<div class="qtitle" style="margin-top:8px">거리 검증 (A↔B)</div>';
-  if (idA && idB && hgFrame[idA] && hgFrame[idB]) {
-    const a = hgFrame[idA], b = hgFrame[idB];
-    const dist = Math.hypot(Number(a[0]) - Number(b[0]), Number(a[1]) - Number(b[1]));
-    let extra = '';
-    if (!isNaN(ruler) && ruler > 0) {
-      const err = dist - ruler, pct = err / ruler * 100;
-      const sg = v => (v >= 0 ? '+' : '');
-      extra = `<tr><td>실제 길이</td><td>${ruler.toFixed(1)} mm</td></tr>` +
-              `<tr><td>오차</td><td>${sg(err)}${err.toFixed(1)} mm (${sg(pct)}${pct.toFixed(2)}%)</td></tr>`;
-    }
-    html += `<table><tr><td>계산 거리 (id ${idA}↔${idB})</td><td>${dist.toFixed(1)} mm</td></tr>${extra}</table>`;
-  } else {
-    html += `<span class="none">마커 A(${idA || '?'})·B(${idB || '?'}) 둘 다 이 프레임에 보여야 거리 계산</span>`;
-  }
-  box.innerHTML = html;
-}
-function handleHgWorld(line) {
-  if (!hgWorldOn) return;
-  const sm = line.match(/seq=(\\d+)/);
-  if (!sm) return;
-  const wm = line.match(/id=(\\d+).*world=\\(([-\\d.]+),([-\\d.]+)mm,([-\\d.]+)deg\\)/);
-  const lost = line.includes('MARKER LOST');
-  if (!wm && !lost) return;
-  if (sm[1] !== hgSeq) { hgSeq = sm[1]; hgFrame = {}; }
-  if (wm) hgFrame[wm[1]] = [wm[2], wm[3], wm[4]];
-  renderHgWorld();
-}
 // 호모그래피 3x3 H 행렬을 표로 렌더 (CALIB_START 완료 / HG_QUERY 응답)
 function setHgHealth(title, detail, tone) {
   const box = document.getElementById('hgHealth');
@@ -2765,17 +3146,22 @@ function renderHgMatrix(available, arr) {
   }
   box.innerHTML = `<div class="qtitle">호모그래피 H (3×3, 픽셀 → mm)</div><table>${rows}</table>`;
 }
+// 중앙서버 번들이 싣는 H. 카메라가 보고한 값만 담는다.
+let hgHfloor = null;
 function handleHgMatrix(line) {
   const hm = line.match(/H=\\[([^\\]]*)\\]/);
   if (hm) {
     const arr = hm[1].split(',').map(s => s.trim()).filter(s => s.length);
     if (arr.length >= 9) {
       renderHgMatrix(true, arr);
+      hgHfloor = arr.slice(0, 9).map(Number);
+      if (hgHfloor.some(v => !Number.isFinite(v))) hgHfloor = null;
       if (line.includes('HOMOGRAPHY'))
         setHgHealth('H 사용 가능', '카메라에 적용된 H가 있습니다. 저장 여부는 마지막 저장 동작으로 확인하세요.', 'ok');
     }
   } else if (line.includes('호모그래피 아직 계산 안 됨')) {
     renderHgMatrix(false);
+    hgHfloor = null;
     setHgHealth('H 없음', '1단계에서 H를 계산하거나 고급 분석 결과를 적용하세요.', 'warn');
   }
 }
@@ -2800,193 +3186,542 @@ function handleHgPersistence(line) {
   else if (line.includes('PC 분석 H 적용 완료'))
     setHgHealth('PC 분석 H 적용됨 · 미저장', '검증 후 3단계에서 저장하세요.', 'ok');
 }
-function applyHgCoordMode() { send('HG_COORD_MODE ' + document.getElementById('hgCoordMode').value); }
+function applyHgCoordMode() {
+  hgCoordDefaultApplied = true;   // 수동 조작 뒤에는 기본값을 다시 밀어넣지 않는다
+  send('HG_COORD_MODE ' + document.getElementById('hgCoordMode').value);
+}
+// QT 파이프라인이 undistortPoints -> H 순서라, raw 로 피팅한 H 는 조용히 왜곡만큼
+// 틀린 좌표를 만든다. 그래서 보정 픽셀을 기본으로 두고 탭 진입 시 한 번 맞춘다.
+let hgCoordDefaultApplied = false;
+function applyHgCoordDefault() {
+  if (hgCoordDefaultApplied) return;
+  hgCoordDefaultApplied = true;
+  send('HG_COORD_MODE undistort');
+}
+// 카메라가 마지막으로 확인해 준 좌표계. 번들의 coord_mode 는 여기서만 온다.
+let hgCoordModeActive = null;
 function handleHgCoordMode(line) {
   if (!line.includes('[hg-coord]')) return;
   const box = document.getElementById('hgCoordStatus');
   if (line.includes('SUCCESS')) {
     const undist = line.includes('undistort');
-    document.getElementById('hgCoordMode').value = undist ? 'undistort' : 'raw';
+    hgCoordModeActive = undist ? 'undistort' : 'raw';
+    document.getElementById('hgCoordMode').value = hgCoordModeActive;
     box.textContent = undist ? 'K/dist 보정 좌표계 적용됨 — H를 다시 계산하세요.' : 'raw 픽셀 좌표계 적용됨 — H를 다시 계산하세요.';
   } else box.textContent = line;
 }
 
-// ===== 호모그래피 캔버스 오버레이 (기준영상 + 실시간 마커) =====
-// 카메라 HG_SNAPSHOT이 보낸 정지 기준영상(/hg_reference.jpg)을 배경으로 깔고,
-// 그 위에 anchor 작업영역과 CAM_POSE로 흐르는 실시간 마커를 겹쳐 그린다.
-let hgOverlayOn = false, hgMeta = null, hgImgLoaded = false;
-const hgImg = new Image();
-const hgCanvas = document.getElementById('hgCanvas');
-const hgCtx = hgCanvas ? hgCanvas.getContext('2d') : null;
-const hgCanvasNote = document.getElementById('hgCanvasNote');
+// H를 h8=1 로 정규화. 카메라가 주는 H는 정규화돼 있지 않을 수 있고, 서버·QT는
+// h8=1 을 전제하므로 내보내기 직전에만 맞춘다(내부 좌표 변환은 원본을 쓴다).
+function normH(flat) {
+  if (!Array.isArray(flat) || flat.length < 9) return null;
+  const s = Number(flat[8]);
+  if (!Number.isFinite(s) || Math.abs(s) < 1e-18) return flat.slice(0, 9);
+  return flat.slice(0, 9).map(v => v / s);
+}
 
-function hgSnapshot() {
-  send('HG_SNAPSHOT');   // 카메라가 기준영상 1장을 스냅샷 채널로 전송 → 파이 저장
-  hgCanvasNote.innerHTML = '<span class="qtitle">기준영상 요청 중…</span> 잠시 후 배경이 갱신됩니다';
-  setTimeout(loadHgReference, 900);   // 파이가 저장할 시간을 준 뒤 로드
-}
-function loadHgReference() {
-  fetch('/hg_meta?_=' + Date.now())
-    .then(r => r.json())
-    .then(m => { hgMeta = (m && m.w) ? m : null; })
-    .catch(() => { hgMeta = null; })
-    .finally(() => {
-      hgImg.onload = () => {
-        hgImgLoaded = true;
-        hgCanvas.width = hgImg.naturalWidth;
-        hgCanvas.height = hgImg.naturalHeight;
-        const at = hgMeta ? new Date((hgMeta.ts || '').replace(/(\\d{8})_(\\d{6})/, '$1 $2')) : null;
-        hgCanvasNote.innerHTML = '<span class="qtitle" style="color:var(--green)">기준영상 로드됨</span> ' +
-          hgImg.naturalWidth + '×' + hgImg.naturalHeight +
-          (hgMeta && hgMeta.H ? ' · H 있음(월드 라벨 표시)' : ' · H 없음(캘리브 전)');
-        if (rawCanvasNote) rawCanvasNote.innerHTML =
-          '<span class="qtitle" style="color:var(--green)">기준영상 로드됨</span> ' +
-          hgImg.naturalWidth + '×' + hgImg.naturalHeight + ' · raw/보정 코너 오버레이';
-        redrawHg();
-        renderHgValidation();
-        redrawRawCanvas();
-      };
-      hgImg.onerror = () => {
-        hgCanvasNote.innerHTML = '<span class="none">기준영상 없음 — 스냅샷을 먼저 받으세요</span>';
-        if (rawCanvasNote) rawCanvasNote.innerHTML = '<span class="none">기준영상 없음 — 스냅샷을 받으면 배경이 깔립니다 (없어도 좌표는 표시)</span>';
-      };
-      hgImg.src = '/hg_reference.jpg?_=' + Date.now();
-    });
-}
-function toggleHgOverlay() {
-  hgOverlayOn = !hgOverlayOn;
-  const b = document.getElementById('hgOverlayBtn');
-  b.textContent = hgOverlayOn ? '오버레이 정지' : '오버레이 보기 시작';
-  b.classList.toggle('on', hgOverlayOn);
-  if (hgOverlayOn && !hgImgLoaded) loadHgReference();
-  redrawHg();
-}
-// H(3×3, 픽셀→mm) 적용
-function applyH(H, x, y) {
-  const d = H[6] * x + H[7] * y + H[8];
-  return [(H[0] * x + H[1] * y + H[2]) / d, (H[3] * x + H[4] * y + H[5]) / d];
-}
-// Independent validation: these known markers are deliberately excluded from
-// H estimation. Compare only their live pixel centers transformed by H with
-// their surveyed world coordinates supplied in the snapshot metadata.
-function renderHgValidation() {
-  const box = document.getElementById('hgValidation');
+// 마커 검출 탭의 바닥 투영 오버레이가 쓰는 값. 카메라가 분해해 준 H_marker를
+// 그대로 쓴다 — 부호 처리와 퇴화 판정이 이미 거기서 끝나 있다.
+let mpPlane = null;   // {H_marker:[9], height_mm, ratio, ...}
+
+function handleMarkerPlane(line) {
+  const m = line.match(/^\\[calib\\] MARKER_PLANE (\\{.*\\})$/);
+  if (!m) return;
+  let d;
+  try { d = JSON.parse(m[1]); } catch (_) { return; }
+
+  if (d.type === 'MARKER_PLANE') {
+    mpPlane = (d.ready && Array.isArray(d.H_marker) && d.H_marker.length >= 9)
+            ? {H: d.H_marker.map(Number), height_mm: Number(d.height_mm),
+               ratio: Number(d.ratio)}
+            : null;
+    redrawRawCanvas();
+  }
+
+  const box = document.getElementById('mpStatus');
   if (!box) return;
-  if (!hgMeta || !hgMeta.H || !hgMeta.validation || !hgMeta.validation.length) {
-    box.innerHTML = '<span class="none">기준영상 스냅샷 및 H 캘리브레이션 후 검증 마커를 비추세요</span>';
+
+  if (d.type === 'MARKER_PLANE_SAVE') {
+    box.innerHTML = d.ok
+      ? `<span class="qtitle" style="color:var(--green)">저장됨</span> 마커 높이 ${d.height_mm} mm — 재부팅 후에도 유지됩니다`
+      : '<span class="qtitle" style="color:var(--red)">저장 실패</span> 카메라 /mnt 쓰기 오류';
     return;
   }
-  let rows = '', sumSq = 0, maxErr = 0, visible = 0;
-  for (const v of hgMeta.validation) {
-    const c = rawFrame[String(v.id)];
-    if (!c) continue;
-    const p = markerCenter(c);
-    const w = applyH(hgMeta.H, p[0], p[1]);
-    const dx = w[0] - Number(v.wx), dy = w[1] - Number(v.wy);
-    const err = Math.hypot(dx, dy);
-    sumSq += err * err; maxErr = Math.max(maxErr, err); ++visible;
-    const signed = n => (n >= 0 ? '+' : '') + n.toFixed(1);
-    rows += `<tr><td>${v.id}</td><td>${w[0].toFixed(1)}, ${w[1].toFixed(1)}</td>` +
-            `<td>${Number(v.wx).toFixed(1)}, ${Number(v.wy).toFixed(1)}</td>` +
-            `<td>${signed(dx)}, ${signed(dy)}</td><td>${err.toFixed(1)}</td></tr>`;
-  }
-  if (!visible) {
-    box.innerHTML = '<span class="none">등록된 검증 마커가 현재 프레임에 없습니다</span>';
+
+  const inp = document.getElementById('mpHeight');
+  if (inp && d.height_mm !== undefined && document.activeElement !== inp)
+    inp.value = d.height_mm;
+
+  if (!d.ready) {
+    box.innerHTML = '<span class="qtitle" style="color:var(--red)">시차 보정 불가</span> ' +
+                    (d.reason || '알 수 없는 원인');
     return;
   }
-  const rmse = Math.sqrt(sumSq / visible);
-  box.innerHTML = '<div class="qtitle">독립 검증 결과 (mm)</div><table>' +
-    '<tr><td>id</td><td>계산 X, Y</td><td>실측 X, Y</td><td>ΔX, ΔY</td><td>위치 오차</td></tr>' +
-    rows + '</table><div class="qtitle" style="margin-top:8px">' +
-    `보이는 마커 ${visible}/${hgMeta.validation.length} · RMSE ${rmse.toFixed(1)} mm · 최대 오차 ${maxErr.toFixed(1)} mm</div>`;
-}
-// 점이 anchor 폴리곤 내부인지 (ray casting)
-function pointInPoly(px, py, poly) {
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
-    if (((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) inside = !inside;
+  const camInp = document.getElementById('mpCamHeight');
+  if (camInp && d.camera_z_measured_mm !== undefined && document.activeElement !== camInp)
+    camInp.value = d.camera_z_measured_mm;
+
+  const derived  = Number(d.camera_z_mm);
+  const measured = Number(d.camera_z_measured_mm || 0);
+  const used     = Number(d.camera_z_used_mm !== undefined ? d.camera_z_used_mm : derived);
+
+  // 역산 대 실측의 괴리가 K/H 품질을 판정하는 가장 유용한 한 숫자다.
+  let camRow;
+  if (measured > 0) {
+    const gap = derived - measured;
+    const pct = measured !== 0 ? (100 * gap / measured) : 0;
+    const tone = Math.abs(pct) > 15 ? 'var(--red)' : Math.abs(pct) > 5 ? '#f59e0b' : 'var(--green)';
+    camRow =
+      `<tr><td>카메라 높이 (실측)</td><td><b>${measured.toFixed(1)} mm</b> — 보정에 사용됨</td></tr>` +
+      `<tr><td>카메라 높이 (역산)</td><td>${derived.toFixed(1)} mm ` +
+      `<b style="color:${tone}">(${gap >= 0 ? '+' : ''}${gap.toFixed(0)} mm, ${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%)</b></td></tr>` +
+      `<tr><td></td><td class="hint">괴리가 클수록 K 또는 H가 부정확하다는 뜻입니다. ` +
+      `실측값을 쓰므로 시차 보정 자체는 이 오차의 영향을 받지 않습니다.</td></tr>`;
+  } else {
+    camRow =
+      `<tr><td>카메라 높이 (역산)</td><td><b>${derived.toFixed(1)} mm</b> — 보정에 사용됨</td></tr>` +
+      `<tr><td></td><td class="hint">⚠️ 실측값 미입력. <b>줄자로 재서 위에 넣으세요</b> — ` +
+      `역산값이 틀리면 보정량이 같은 비율로 틀립니다.</td></tr>`;
   }
-  return inside;
+
+  box.innerHTML =
+    `<span class="qtitle" style="color:var(--green)">H_marker 도출됨</span>` +
+    `<table>` +
+    `<tr><td>마커 높이</td><td><b>${Number(d.height_mm).toFixed(1)} mm</b> (입력값)</td></tr>` +
+    camRow +
+    `<tr><td>나디르</td><td>(${Number(d.nadir_x_mm).toFixed(1)}, ${Number(d.nadir_y_mm).toFixed(1)}) mm</td></tr>` +
+    `<tr><td>보정 비율 h/Cz</td><td>${Number(d.ratio).toFixed(4)} (Cz=${used.toFixed(0)} mm)</td></tr>` +
+    `</table>` +
+    `<div class="hint">나디르에서 1000 mm 떨어진 지점의 마커는 약 ` +
+    `<b>${(Number(d.ratio) * 1000).toFixed(0)} mm</b> 밀려 보입니다.</div>`;
 }
+
+// 로봇 마커 평면(시차 보정). 카메라가 H를 분해해 낸 값을 그대로 보여준다 —
+// 브라우저는 계산하지 않는다.
+function applyMarkerHeight() {
+  const v = parseFloat(document.getElementById('mpHeight').value);
+  if (!(v >= 0)) { alert('높이는 0 이상의 mm 값이어야 합니다'); return; }
+  send('MARKER_HEIGHT ' + v);
+}
+function applyCameraHeight() {
+  const v = parseFloat(document.getElementById('mpCamHeight').value);
+  if (!(v >= 0)) { alert('카메라 높이는 0 이상의 mm 값이어야 합니다 (0 = 미측정)'); return; }
+  send('CAMERA_HEIGHT ' + v);
+}
+// POS 미리보기. 카메라가 [central_tls_sender.cpp] 에서 만드는 줄과 같은 모양을
+// 그대로 쓴다 -- 여기서 새로 규격을 정하지 않는다. 값은 지금 흐르는 CAM_POSE 의
+// raw 코너를 그대로 넣는다(같은 픽셀이 실제로 POS 로도 나간다).
+function fillCentralPosSample() {
+  const note = document.getElementById('ctPosNote');
+  const box = document.getElementById('ctPos');
+  const idBox = document.getElementById('ctId');
+  const want = idBox ? String(Number(idBox.value)) : '';
+  const c = (want && rawFrame[want]) ? rawFrame[want] : null;
+  const q = c ? c.map(pt => [Number(Number(pt[0]).toFixed(2)), Number(Number(pt[1]).toFixed(2))])
+              : [[0, 0], [0, 0], [0, 0], [0, 0]];
+  box.value = JSON.stringify({type: 'POS', seq: 0, payload: {corners: q}});
+  if (!idBox || !want) note.textContent = '대상 id를 알 수 없습니다.';
+  else if (c) note.textContent = `id ${want} 의 현재 프레임 코너를 넣었습니다.`;
+  else note.textContent = `id ${want} 가 지금 화면에 없습니다 — 코너는 0 자리표시자입니다.`;
+}
+function copyCentralPos() {
+  const box = document.getElementById('ctPos');
+  if (!box.value) fillCentralPosSample();
+  navigator.clipboard.writeText(box.value).then(
+    () => { document.getElementById('ctPosNote').textContent = '복사했습니다.'; },
+    () => { document.getElementById('ctPosNote').textContent = '복사 실패 — 직접 선택해 복사하세요.'; });
+}
+
+// 마지막으로 자동 생성한 calib_id. 조작자가 손으로 적은 값과 구별하기 위한 것이다.
+// lastAutoStamp/Seq 는 같은 초에 여러 번 발행할 때 뒤에 붙일 일련번호용이다.
+let lastAutoCalibId = null, lastAutoStamp = null, lastAutoSeq = 0;
+
+// ===== 중앙 서버(9000) 탭 =====
+// The camera is authoritative here too: every CENTRAL_* command is answered
+// with a full CENTRAL_STATUS, so the box below only ever renders what the
+// camera reports back.
+function handleCentralStatus(line) {
+  const m = line.match(/^\\[central\\] STATUS (\\{.*\\})$/);
+  if (!m) return;
+  let s;
+  try { s = JSON.parse(m[1]); } catch (_) { return; }
+  const LINKS = {
+    online:      ['연결됨', '#2e7d32'],
+    connecting:  ['TCP 연결 중…', '#ef6c00'],
+    handshaking: ['TLS 핸드셰이크 중…', '#ef6c00'],
+    offline:     ['끊김 (재시도 중)', '#c62828'],
+    disabled:    ['꺼짐 (수동)', '#6b6b6b'],
+  };
+  const [label, color] = LINKS[s.link] || [s.link || '알 수 없음', '#c62828'];
+  const posLabel = s.pos_on
+      ? `<b style="color:#2e7d32">전송 중</b> — id ${s.marker_id}`
+      : `<b style="color:#6b6b6b">중지됨</b> (대상 id ${s.marker_id})`;
+  const note = s.detail ? ` — ${s.detail}` : '';
+  document.getElementById('centralStatus').innerHTML =
+      `<div>링크: <b style="color:${color}">${label}</b> (${s.server || '-'})</div>` +
+      `<div>POS: ${posLabel}</div>` +
+      (s.action ? `<div class="sub">최근 동작: ${s.action}${note}</div>` : '');
+  centralLinkOn = !!s.link_on;
+  centralPosOn = !!s.pos_on;
+  paintCentralToggle('ctLinkBtn', '연결', centralLinkOn);
+  paintCentralToggle('ctPosBtn', 'POS 전송', centralPosOn);
+  const idBox = document.getElementById('ctId');
+  if (document.activeElement !== idBox) idBox.value = s.marker_id;
+}
+// Toggles mirror the camera's reported state, never a local guess: the button
+// label only changes once CENTRAL_STATUS confirms the switch actually flipped.
+let centralLinkOn = true, centralPosOn = true;
+function paintCentralToggle(id, label, on) {
+  const b = document.getElementById(id);
+  if (!b) return;
+  b.firstChild.nodeValue = `${label} ${on ? 'ON' : 'OFF'}`;
+  b.classList.toggle('on', on);
+}
+function toggleCentralLink() {
+  if (centralLinkOn && !confirm('중앙 서버 연결을 끊을까요? 다시 켤 때까지 POS가 전송되지 않습니다.')) return;
+  send('CENTRAL_LINK ' + (centralLinkOn ? 0 : 1));
+}
+function toggleCentralPos() { send('CENTRAL_POS ' + (centralPosOn ? 0 : 1)); }
+function sendCentralId() {
+  const v = document.getElementById('ctId').value.trim();
+  if (v === '' || !Number.isInteger(Number(v))) { alert('마커 ID를 정수로 입력하세요.'); return; }
+  send('CENTRAL_ID ' + Number(v));
+}
+// 3x3 row-major flat array -> nested rows, the shape the server's calib schema
+// uses. Returns null so callers can fall back to a placeholder.
+function rows3(flat) {
+  if (!Array.isArray(flat) || flat.length < 9) return null;
+  const v = flat.map(Number);
+  if (v.some(x => !Number.isFinite(x))) return null;
+  return [v.slice(0, 3), v.slice(3, 6), v.slice(6, 9)];
+}
+
+// ISO 8601 with the LOCAL utc offset, e.g. 2026-07-29T14:18:03+09:00.
+// toISOString() would give Z, which is valid ISO but loses the site's local
+// time -- and the spec's own example is written with an offset.
+function isoWithOffset(d) {
+  const p = (n, w) => String(Math.abs(n)).padStart(w || 2, '0');
+  const off = -d.getTimezoneOffset();                 // 분, 동쪽이 +
+  const sign = off >= 0 ? '+' : '-';
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}` +
+         `T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}` +
+         `${sign}${p(off / 60 | 0)}:${p(off % 60)}`;
+}
+
+// 앵커 실측 좌표가 도는 범위 + 마커 안쪽 여백 → 판 크기. 앵커는 검정 사각형
+// 중심이고 폼보드 모서리에서 흰색/2 만큼 안쪽에 있으므로, 양쪽으로 그만큼 되돌려야
+// 판 크기가 된다. 기본값 60mm 는 이 프로젝트의 100/120mm 마커 기준이며, 다른
+// 배치면 조작자가 입력칸에서 고치라고 값을 채워만 둔다.
+function guessCanvasMm() {
+  if (!Array.isArray(hgCameraAnchors) || !hgCameraAnchors.length) return null;
+  const xs = hgCameraAnchors.map(a => Number(a.wx));
+  const ys = hgCameraAnchors.map(a => Number(a.wy));
+  const inset = 60;
+  const w = Math.max.apply(null, xs) - Math.min.apply(null, xs) + 2 * inset;
+  const h = Math.max.apply(null, ys) - Math.min.apply(null, ys) + 2 * inset;
+  return (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) ? [w, h] : null;
+}
+
+// QT-REQ-CCTV-001 rev.2 §3. 최상위 평면 스키마이고 H 는 하나뿐이다.
+// 서버는 이 객체를 가공 없이 보관·중계하므로, 여기 담기는 내용이 곧 QT 가 보는
+// 내용이다 -- 자리표시자를 남기면 그게 저장된 캘리브레이션이 된다.
+function fillCentralHmatrixTemplate() {
+  const missing = [], violations = [];
+
+  const idBox = document.getElementById('ctCalibId');
+  // R-8: 재발행마다 달라야 한다. 예전에는 "비어 있을 때만" 채워서, [채우기]를 두 번
+  // 누르면 같은 calib_id 가 그대로 나갔다 -- 서버·QT 는 그 둘을 같은 번들로 본다.
+  //
+  // 그래서 자동 생성값이면 매번 새로 만들고, 조작자가 직접 적은 값은 건드리지 않는다.
+  // 마지막 자동값을 기억해 두고 현재 입력과 비교하는 방식이다(빈 칸도 자동으로 본다).
+  // 초까지 넣는 이유: 분 단위면 같은 분 안의 재발행이 또 충돌한다.
+  if (idBox && (!idBox.value.trim() || idBox.value.trim() === lastAutoCalibId)) {
+    const d = new Date(), p = n => String(n).padStart(2, '0');
+    const stamp =
+      `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-` +
+      `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+    // 같은 초 안에 두 번 누르면 초까지 넣어도 문자열이 같아진다. 그때는 일련번호를
+    // 붙여 반드시 달라지게 한다 -- R-8 은 "재발행마다 변경" 이므로, 시각이 같다는
+    // 이유로 같은 id 가 나가면 서버·QT 는 두 번들을 같은 것으로 본다.
+    // 시각 문자열을 정규식으로 다시 쪼개려 하면 시각 부분과 일련번호를 구분할 수
+    // 없다(둘 다 '-숫자' 꼬리). 그래서 직전 시각과 카운터를 따로 들고 비교한다.
+    if (stamp === lastAutoStamp) {
+      lastAutoCalibId = stamp + '-' + (++lastAutoSeq);
+    } else {
+      lastAutoStamp = stamp;
+      lastAutoSeq = 0;
+      lastAutoCalibId = stamp;
+    }
+    idBox.value = lastAutoCalibId;
+  }
+  const calibId = idBox ? idBox.value.trim() : '';
+  if (!calibId) missing.push('calib_id');
+
+  const wBox = document.getElementById('ctCanvasW');
+  const hBox = document.getElementById('ctCanvasH');
+  if (wBox && hBox && !wBox.value && !hBox.value) {
+    const g = guessCanvasMm();
+    if (g) { wBox.value = g[0]; hBox.value = g[1]; }
+  }
+  const canvas = [Number(wBox && wBox.value), Number(hBox && hBox.value)];
+  if (!(canvas[0] > 0 && canvas[1] > 0)) missing.push('canvas_mm (작업영역 크기)');
+
+  const K = kCalib
+    ? [[kCalib.fx, 0, kCalib.cx], [0, kCalib.fy, kCalib.cy], [0, 0, 1]]
+    : (missing.push('K/dist (마커 검출 탭에서 CALIB_K_QUERY)'),
+       [[1400, 0, 960], [0, 1400, 540], [0, 0, 1]]);
+  const D = kCalib ? kCalib.dist.slice(0, 5) : [0, 0, 0, 0, 0];
+
+  // R-1: H[2][2] = 1 로 정규화해서 보낼 것.
+  const H = rows3(normH(hgHfloor));
+  if (!H) missing.push('H (호모그래피 탭에서 H 계산)');
+
+  // H_marker: 로봇 위에 달린 마커를 넣으면 차체가 실제로 선 바닥점이 나오는 H.
+  // H 와 같은 픽셀 공간(coord_mode)을 입력으로 받고 출력도 같은 월드 mm 다 --
+  // 다른 건 어느 평면을 기준으로 삼았는지뿐이다.
+  //
+  // 카메라가 H 를 분해해 만든 값을 그대로 싣는다(브라우저는 재계산하지 않는다).
+  // undistort 모드에서만 도출되므로, raw 로 찍힌 번들에는 애초에 들어갈 수 없다.
+  const Hm = mpPlane ? rows3(normH(mpPlane.H)) : null;
+  if (!Hm)
+    missing.push('H_marker (로봇 마커 평면 — "로봇 마커 평면" 패널에서 MARKER_HEIGHT 적용 필요)');
+  else if (!(Number(mpPlane.height_mm) > 0))
+    missing.push('marker_height_m (마커 높이가 0 — 시차 보정이 꺼진 것과 같다)');
+
+  // R-2 는 이 요청서의 최우선 항목이다. raw 로 피팅한 H 를 보내면 QT 가 왜곡
+  // 보정을 켜는 순간 좌표가 발산한다 -- 에러가 아니라 그림이 깨져서 나타난다.
+  if (!hgCoordModeActive) missing.push('coord_mode (HG_COORD_MODE 적용 이력 없음)');
+  else if (hgCoordModeActive !== 'undistort')
+    violations.push(`R-2 위반: coord_mode=${hgCoordModeActive} — undistort 로 재피팅이 필요합니다`);
+
+  // R-4: 1920x1080 이어야 한다.
+  // 기준영상 수신 경로가 이 대시보드에는 없다(스냅샷 패널 제거). 카메라 raw 는
+  // 1920×1080 고정이므로 그 값을 싣되, 확인된 값이 아니라는 점을 남긴다.
+  const size = [1920, 1080];
+  missing.push('image_size (기준영상 없음 — 1920×1080 으로 가정)');
+
+  const bundle = {
+    calib_id:   calibId || 'MISSING',
+    created_at: isoWithOffset(new Date()),
+    image_size: size,
+    coord_mode: hgCoordModeActive || 'unknown',
+    unit:       'mm',                       // R-5 고정
+    K: K,
+    D: D,
+    H: H || [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+    // R-0: 옛 서버는 H_floor 만 인식했다(H 단일 키는 파싱 실패로 번들 폐기). 현재 서버는
+    // H_floor 를 먼저 보고 없을 때 H 로 넘어가므로, 같은 값을 두 이름으로 실으면 어느
+    // 버전에서도 읽힌다. 값이 같으니 둘이 어긋날 여지도 없다.
+    H_floor: H || [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+    H_marker: Hm || [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+    // 서버가 시차 보정에 쓰는 값. 카메라가 보고한 mm 를 m 로 바꿔 싣는다 -- 이 필드만
+    // 미터인 것은 서버 스키마가 그렇게 정해져 있기 때문이다(H 계열은 mm, R-5).
+    marker_height_m: mpPlane ? Number(mpPlane.height_mm) / 1000 : 0,
+    origin_mm:  [0, 0],                     // R-6: 월드 원점 = 폼보드 좌하단
+    canvas_mm:  (canvas[0] > 0 && canvas[1] > 0) ? canvas : [0, 0],
+    axis:       'x_right_y_up',             // R-6 고정
+  };
+  document.getElementById('ctHm').value = JSON.stringify(bundle, null, 2);
+
+  const note = document.getElementById('ctHmNote');
+  if (!note) return;
+  const parts = [];
+  if (violations.length)
+    parts.push('<b style="color:var(--red)">' + violations.join('<br>') + '</b>');
+  if (missing.length)
+    parts.push('<b style="color:var(--red)">자리표시자 포함 — 전송 전에 채우세요:</b> ' +
+               missing.join(' · '));
+  if (!violations.length && !missing.length)
+    parts.push('<b style="color:var(--green)">QT-REQ-CCTV-001 rev.2 형식으로 채웠습니다.</b> ' +
+               `coord_mode=${hgCoordModeActive}, canvas ${canvas[0]}×${canvas[1]}mm`);
+  // A-2 는 이 화면이 답할 수 없다. 검증점이 피팅에서 빠져 있어야 하고 그 마커가
+  // 실제로 보여야 나오는 수치인데, 여기서는 어느 쪽도 확인할 방법이 없다.
+  parts.push('※ 수락기준 <b>A-2(검증점 재투영 RMS ≤ 5mm)</b>는 번들에 들어가지 않습니다 — ' +
+             '검증 마커가 보이는 배치에서 따로 측정해 회신하세요.');
+  note.innerHTML = parts.join('<br>');
+}
+
+function fillCentralHmatrixLegacy() {
+  // Built from whatever the camera has actually reported this session, not a
+  // dummy identity. The server PERSISTS this bundle as the user's calibration
+  // and relays it to QT, so shipping placeholder numbers is not a harmless
+  // default -- it silently becomes the calibration everyone downstream trusts.
+  const missing = [];
+
+  const K = kCalib
+    ? [[kCalib.fx, 0, kCalib.cx], [0, kCalib.fy, kCalib.cy], [0, 0, 1]]
+    : (missing.push('K/dist (마커 검출 탭에서 CALIB_K_QUERY)'),
+       [[1400, 0, 960], [0, 1400, 540], [0, 0, 1]]);
+  const D = kCalib ? kCalib.dist.slice(0, 5) : [0, 0, 0, 0, 0];
+
+  const Hf = rows3(hgHfloor);
+  if (!Hf) missing.push('H_floor (호모그래피 탭에서 H 계산)');
+
+  const Hm = mpPlane ? rows3(mpPlane.H) : null;
+  if (!Hm) missing.push('H_marker (로봇 마커 평면 — 높이 적용 필요)');
+
+  if (!hgCoordModeActive) missing.push('coord_mode (HG_COORD_MODE 적용 이력 없음)');
+
+  const bundle = {
+    calib: {
+      version: 1,
+      // QT checks these two before anything else: without them it has to guess
+      // which pixel space H expects and which frame size K belongs to.
+      coord_mode: hgCoordModeActive || 'unknown',
+      image_size: [1920, 1080],
+      K: K,
+      D: D,
+      H_floor:  Hf || [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+      H_marker: Hm || [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+      marker_height_m: mpPlane ? (Number(mpPlane.height_mm) / 1000.0) : 0.0
+    }
+  };
+  document.getElementById('ctHm').value = JSON.stringify(bundle, null, 2);
+
+  const note = document.getElementById('ctHmNote');
+  if (note) {
+    note.innerHTML = missing.length
+      ? '<b style="color:var(--red)">자리표시자 포함 — 전송 전에 채우세요:</b> ' + missing.join(' · ')
+      : '<b style="color:var(--green)">카메라의 현재 값으로 채웠습니다.</b> ' +
+        `coord_mode=${hgCoordModeActive}, 마커 높이 ${mpPlane.height_mm} mm`;
+  }
+}
+function sendCentralHmatrix() {
+  const raw = document.getElementById('ctHm').value.trim();
+  let obj;
+  // Parse before sending: the camera only checks that it starts with '{', and
+  // a malformed bundle would be stored by the server as the user's calibration.
+  try { obj = JSON.parse(raw); } catch (e) { alert('JSON 파싱 실패: ' + e.message); return; }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) { alert('payload는 JSON 객체여야 합니다.'); return; }
+  const compact = JSON.stringify(obj);
+  // Camera-side ceiling is CENTRAL_TLS_MAX_LINE (2048) for the whole line;
+  // leave room for the command word and the envelope it gets wrapped in.
+  if (compact.length > 1700) { alert('payload가 너무 깁니다 (' + compact.length + 'B). 1700B 이하로 줄이세요.'); return; }
+  // coord_mode is the one field whose absence is silently wrong downstream:
+  // QT applies undistortPoints before H, so a bundle whose H was fitted on raw
+  // pixels produces a plausible map that is off by the lens distortion.
+  // Two schemas ship from this box -- the flat QT-REQ-CCTV-001 one and the
+  // legacy {"calib":{...}} -- so look in both places rather than assuming.
+  const mode = obj && (obj.coord_mode || (obj.calib && obj.calib.coord_mode));
+  if (mode !== 'undistort' &&
+      !confirm(`coord_mode 가 "${mode || '없음'}" 입니다.\\n\\n` +
+               'QT는 undistort 파이프라인을 쓰므로 이대로 보내면 ' +
+               '조용히 왜곡만큼 틀린 좌표가 됩니다.\\n그래도 전송할까요?'))
+    return;
+  if (!confirm('이 번들이 서버에 저장되고 QT로 중계됩니다. 전송할까요?')) return;
+  send('CENTRAL_HMATRIX ' + compact);
+}
+
+function applyDynRoi() {
+  const on = document.getElementById('dynRoiChk').checked ? 1 : 0;
+  const m  = document.getElementById('dynMargin').value || 240;
+  const n  = document.getElementById('dynMaxMiss').value || 4;
+  send('DYNROI ' + on + ' ' + m + ' ' + n);
+}
+
+// 추적 대상 id. 빈 목록 = 모든 마커(카메라 기본값)이라, "모든 마커" 라디오는
+// 인자 없는 DYNROI_IDS 를 보낸다. 카메라가 파싱한 결과를 ACK 로 돌려주므로
+// 화면 표시는 여기서 낙관적으로 갱신하지 않고 ACK([dynroi] IDS)에 맡긴다.
+function readDynRoiIds() {
+  const raw = document.getElementById('dynRoiIds').value || '';
+  const seen = {}, out = [];
+  // 쉼표든 공백이든 받는다 — 현장에서 둘 다 자연스럽게 입력된다.
+  for (const tok of raw.split(/[^0-9]+/)) {
+    if (!tok) continue;
+    const v = Number(tok);
+    if (!Number.isInteger(v) || v < 0 || seen[v]) continue;
+    seen[v] = 1;
+    out.push(v);
+    if (out.length >= 16) break;   // 카메라의 DYNROI_MAX_TRACK_IDS 와 같은 상한
+  }
+  return out;
+}
+function onDynRoiIdsInput() {
+  // 숫자를 치기 시작하면 "특정 ID만" 으로 자동 전환 — 입력해놓고 라디오를 안 눌러
+  // 아무 일도 안 일어나는 게 가장 흔한 실수다. 전송은 하지 않는다(포커스 유지).
+  const ids = document.getElementById('dynRoiIds').value.trim();
+  if (ids) document.getElementById('dynRoiPick').checked = true;
+}
+function applyDynRoiIds() {
+  const pick = document.getElementById('dynRoiPick').checked;
+  const ids = pick ? readDynRoiIds() : [];
+  const st = document.getElementById('dynRoiIdsState');
+  if (pick && !ids.length) {
+    // 빈 목록을 그대로 보내면 카메라는 "전체"로 알아듣는다. 조작자 의도와
+    // 반대이므로 보내지 않고 왜 안 보냈는지 알린다.
+    if (st) st.innerHTML = '<b style="color:var(--red)">추적할 ID를 입력하세요</b> — 비어 있으면 전체와 같아집니다';
+    return;
+  }
+  send('DYNROI_IDS' + (ids.length ? ' ' + ids.join(' ') : ''));
+}
+
+// 카메라는 변화만 속도 제한해 보내므로, 마지막으로 보고된 margin으로 박스를
+// 근사 표시한다. 여기 값은 표시용이며 카메라의 실제 검출 ROI에는 영향이 없다.
+let dynRoiOn = false, dynRoiMargin = 240, dynRoiTracking = false;
+
+function handleDynRoi(line) {
+  if (line.indexOf('[dynroi]') < 0) return;
+  if (rawOverlayOn) setTimeout(redrawRawCanvas, 0);
+  const el = document.getElementById('dynRoiState');
+  // 추적 대상 id — 카메라가 실제로 파싱한 결과다. 화면의 라디오/입력칸을 여기에
+  // 맞춰, 조작자가 친 값이 아니라 카메라가 받아들인 값이 보이게 한다.
+  const idm = line.match(/^\\[dynroi\\] IDS (\\[.*\\])$/);
+  if (idm) {
+    let ids;
+    try { ids = JSON.parse(idm[1]); } catch (_) { return; }
+    if (!Array.isArray(ids)) return;
+    const st = document.getElementById('dynRoiIdsState');
+    const pick = document.getElementById('dynRoiPick');
+    const all = document.getElementById('dynRoiAll');
+    const box = document.getElementById('dynRoiIds');
+    if (ids.length) {
+      if (pick) pick.checked = true;
+      // 입력 중인 칸을 덮어쓰지 않는다 — 타이핑 도중 ACK가 오면 커서가 튄다.
+      if (box && document.activeElement !== box) box.value = ids.join(',');
+      if (st) st.innerHTML = `추적 대상: <b>id ${ids.join(',')}</b> — 나머지 마커는 검출되지 않습니다`;
+    } else {
+      if (all) all.checked = true;
+      if (st) st.textContent = '추적 대상: 모든 마커';
+    }
+    return;
+  }
+  if (line.indexOf('TRACK') >= 0) {
+    dynRoiTracking = true;
+    const m = line.match(/\\((\\d+),(\\d+)\\)\\s*(\\d+)x(\\d+)/);
+    const used = line.match(/margin=(\\d+)px/);
+    if (used) dynRoiMargin = Number(used[1]);
+    if (el) { el.textContent = m ? ('상태: TRACK  ' + m[3] + '×' + m[4]) : '상태: TRACK';
+              el.style.color = '#28a745'; }
+  } else if (line.indexOf('SEARCH') >= 0) {
+    dynRoiTracking = false;
+    if (el) { el.textContent = '상태: SEARCH (재탐색)'; el.style.color = '#dc3545'; }
+  } else if (line.indexOf('OFF') >= 0) {
+    dynRoiOn = false; dynRoiTracking = false;
+    if (el) { el.textContent = '상태: —'; el.style.color = ''; }
+  } else if (line.indexOf('ON') >= 0) {
+    dynRoiOn = true; dynRoiTracking = false;
+    const m = line.match(/max_margin=(\\d+)px/);
+    if (m) dynRoiMargin = Number(m[1]);
+    if (el) { el.textContent = '상태: SEARCH (시작)'; el.style.color = ''; }
+  }
+  if (rawOverlayOn) redrawRawCanvas();
+}
+
+// 마커 중심 = 네 코너 평균. raw 오버레이가 중심점·id 라벨을 찍는 데 쓴다.
 function markerCenter(c) {
   let x = 0, y = 0;
   for (let i = 0; i < 4; i++) { x += Number(c[i][0]); y += Number(c[i][1]); }
   return [x / 4, y / 4];
 }
-function redrawHg() {
-  if (!hgCtx) return;
-  hgCtx.clearRect(0, 0, hgCanvas.width, hgCanvas.height);
-  if (hgImgLoaded) hgCtx.drawImage(hgImg, 0, 0);
-  if (!hgOverlayOn) return;
-  const anchorIds = {};
-  let poly = null;
-  // anchor 작업영역 폴리곤 + 라벨
-  if (hgMeta && hgMeta.anchors && hgMeta.anchors.length) {
-    const seen = hgMeta.anchors.filter(a => a.seen);
-    if (seen.length >= 3) {
-      poly = seen.map(a => [a.px, a.py]);
-      hgCtx.beginPath();
-      poly.forEach((p, i) => i ? hgCtx.lineTo(p[0], p[1]) : hgCtx.moveTo(p[0], p[1]));
-      hgCtx.closePath();
-      hgCtx.strokeStyle = '#3b82f6'; hgCtx.lineWidth = 3; hgCtx.stroke();
-      hgCtx.fillStyle = 'rgba(59,130,246,0.12)'; hgCtx.fill();
-    }
-    hgCtx.font = '20px sans-serif';
-    for (const a of hgMeta.anchors) {
-      anchorIds[a.id] = true;
-      if (!a.seen) continue;
-      hgCtx.fillStyle = '#3b82f6';
-      hgCtx.beginPath(); hgCtx.arc(a.px, a.py, 6, 0, 7); hgCtx.fill();
-      hgCtx.fillText('a' + a.id + ' (' + a.wx + ',' + a.wy + ')', a.px + 9, a.py - 9);
-    }
-  }
-  // 실시간 마커 (rawFrame — CAM_POSE로 갱신). anchor id는 위에서 이미 그렸으니 제외.
-  hgCtx.font = '18px sans-serif';
-  for (const id in rawFrame) {
-    if (anchorIds[id]) continue;
-    const c = rawFrame[id];
-    const [cx, cy] = markerCenter(c);
-    const inside = poly ? pointInPoly(cx, cy, poly) : true;
-    const col = inside ? '#22c55e' : '#ef4444';
-    hgCtx.strokeStyle = col; hgCtx.lineWidth = 3;
-    hgCtx.beginPath();
-    for (let i = 0; i < 4; i++) {
-      const p = c[i];
-      i ? hgCtx.lineTo(Number(p[0]), Number(p[1])) : hgCtx.moveTo(Number(p[0]), Number(p[1]));
-    }
-    hgCtx.closePath(); hgCtx.stroke();
-    hgCtx.fillStyle = col;
-    hgCtx.beginPath(); hgCtx.arc(cx, cy, 5, 0, 7); hgCtx.fill();
-    let label = 'id ' + id;
-    if (hgMeta && hgMeta.H) {
-      const w = applyH(hgMeta.H, cx, cy);
-      label += ' (' + w[0].toFixed(0) + ',' + w[1].toFixed(0) + 'mm)';
-    }
-    hgCtx.fillText(label, cx + 9, cy - 9);
-  }
-}
-
-// ===== 마커 검출 탭 캔버스 오버레이 (기준영상 + raw/보정 코너) =====
-// 호모그래피 탭과 같은 기준영상(hgImg)을 공유한다. raw 코너(주황)를 그리고,
-// K가 로드돼 있고 "보정 좌표 함께 표시"가 켜져 있으면 undistort한 보정 코너(청록)와
-// raw→보정 이동 점선을 겹쳐 그려 왜곡 보정량을 시각화한다.
 let rawOverlayOn = false;
 const rawCanvas = document.getElementById('rawCanvas');
 const rawCtx = rawCanvas ? rawCanvas.getContext('2d') : null;
-const rawCanvasNote = document.getElementById('rawCanvasNote');
 
-function rawSnapshot() {
-  send('HG_SNAPSHOT');   // 호모그래피 탭과 동일한 기준영상을 요청(공유)
-  if (rawCanvasNote) rawCanvasNote.innerHTML = '<span class="qtitle">기준영상 요청 중…</span> 잠시 후 배경이 갱신됩니다';
-  setTimeout(loadHgReference, 900);
-}
 function toggleRawOverlay() {
   rawOverlayOn = !rawOverlayOn;
   const b = document.getElementById('rawOverlayBtn');
   b.textContent = rawOverlayOn ? '오버레이 정지' : '오버레이 보기 시작';
   b.classList.toggle('on', rawOverlayOn);
-  if (rawOverlayOn && !hgImgLoaded) loadHgReference();
   if (rawOverlayOn && showUndist && !kCalib) send('CALIB_K_QUERY');
   redrawRawCanvas();
 }
@@ -2999,20 +3734,116 @@ function drawQuad(ctx, c, col, lw) {
   }
   ctx.closePath(); ctx.stroke();
 }
+// 카메라가 다음 프레임에 훑을 범위의 근사. 이번 프레임 코너 전체를 감싸는
+// 사각형 + margin 이며, 카메라의 TRACK 규칙과 같은 모양이다(합집합 + 여유).
+function computeDynRoiBox(W, H) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, n = 0;
+  for (const id in rawFrame) {
+    for (const p of rawFrame[id]) {
+      const px = Number(p[0]), py = Number(p[1]);
+      if (px < x0) x0 = px;  if (py < y0) y0 = py;
+      if (px > x1) x1 = px;  if (py > y1) y1 = py;
+      n++;
+    }
+  }
+  if (!n) return null;
+  let x = x0 - dynRoiMargin, y = y0 - dynRoiMargin;
+  let w = (x1 - x0) + 2 * dynRoiMargin, h = (y1 - y0) + 2 * dynRoiMargin;
+  const kMin = 80;
+  if (w < kMin) { x -= (kMin - w) / 2; w = kMin; }
+  if (h < kMin) { y -= (kMin - h) / 2; h = kMin; }
+  const rx = Math.max(0, x), ry = Math.max(0, y);
+  return {x: rx, y: ry,
+          w: Math.min(W, x + w) - rx, h: Math.min(H, y + h) - ry};
+}
+// 오버레이 화면 안쪽 아래에 얹는 계기판. 표는 옆에 있지만, 영상을 보는 동안
+// 눈을 옮기지 않고 읽으려면 그림 안에 있어야 한다.
+//
+// 글자 크기는 캔버스 픽셀 기준이다 -- 캔버스는 1849×1032 로 잡히고 브라우저가
+// 축소해 보여주므로, CSS 픽셀 기준으로 고르면 실제 화면에서 읽을 수 없게 작아진다.
+function drawRawHud(W, H) {
+  const fps = metricFps(), det = metricDetCur(), hit = metricHitPct();
+  const proc = procs.length ? procs[procs.length - 1] : null;
+
+  // 값이 없어도 칸을 비우지 않는다. 항목이 나타났다 사라지면 옆 항목이 밀려서
+  // 숫자를 읽는 중에 자리가 바뀐다.
+  const cells = [
+    ['fps',  fps  === null ? '—' : fps.toFixed(1)],
+    ['proc', proc === null ? '—' : proc + 'ms'],
+    ['det',  det  === null ? '—' : det + 'ms'],
+    ['검출', hit  === null ? '—' : Math.round(hit) + '%'],
+    ['CPU',  (cpuApp === null ? '—' : Math.round(cpuApp) + '%') + ' / ' +
+             (cpuSys === null ? '—' : Math.round(cpuSys) + '%')]
+  ];
+
+  // 글자·띠 크기는 화면 폭만으로 정한다. 예전처럼 내용 길이에 맞춰 줄이면 값이
+  // 갱신될 때마다 글자 크기와 띠 폭이 같이 흔들려 오히려 읽기 어려웠다.
+  const fs  = Math.max(14, Math.min(34, Math.round(W / 70)));
+  const lfs = Math.max(11, Math.round(fs * 0.7));
+  const pad = Math.round(fs * 0.6);
+  const bh  = fs + pad * 2;
+  const by  = H - bh - pad;
+  const bx  = pad, bw = W - pad * 2;      // 띠는 항상 같은 자리·같은 크기
+
+  rawCtx.fillStyle = 'rgba(0,0,0,0.62)';
+  rawCtx.fillRect(bx, by, bw, bh);
+
+  // 칸 폭이 고정이라 값이 길어져도 그 칸 안에서만 늘어나고 옆 칸을 밀지 않는다.
+  // 하한(14px)이 있어 이론상 아직 넘칠 수 있으니 띠 안으로 클립해 둔다.
+  rawCtx.save();
+  rawCtx.beginPath();
+  rawCtx.rect(bx, by, bw, bh);
+  rawCtx.clip();
+  rawCtx.textBaseline = 'middle';
+  const cy = by + bh / 2;
+  const cellW = (bw - pad * 2) / cells.length;
+  for (let i = 0; i < cells.length; i++) {
+    const x = bx + pad + cellW * i;
+    rawCtx.font = lfs + 'px sans-serif';
+    rawCtx.fillStyle = '#9ca3af';
+    rawCtx.fillText(cells[i][0], x, cy);
+    const lw = rawCtx.measureText(cells[i][0]).width;
+    // 숫자는 등폭 글꼴로. 자리수가 바뀌어도 글자가 좌우로 움직이지 않는다.
+    rawCtx.font = 'bold ' + fs + 'px ui-monospace, Menlo, Consolas, monospace';
+    rawCtx.fillStyle = '#e5e7eb';
+    rawCtx.fillText(cells[i][1], x + lw + Math.round(fs * 0.4), cy);
+  }
+  rawCtx.restore();
+  rawCtx.textBaseline = 'alphabetic';               // 마커 라벨 기준선 복원
+}
+
 function redrawRawCanvas() {
   if (!rawCtx) return;
-  // 캔버스 해상도: 배경이 있으면 그 크기, 없으면 K(cx*2,cy*2), 그것도 없으면 1920×1080.
-  // raw 코너는 풀프레임 픽셀 좌표라 배경 JPEG와 같은 좌표계에서 겹쳐진다.
-  let W, H;
-  if (hgImgLoaded) { W = hgImg.naturalWidth; H = hgImg.naturalHeight; }
-  else if (kCalib) { W = Math.round(kCalib.cx * 2); H = Math.round(kCalib.cy * 2); }
-  else { W = 1920; H = 1080; }
+  // 캔버스 해상도: K가 있으면 (cx*2, cy*2), 없으면 1920×1080. raw 코너는 풀프레임
+  // 픽셀 좌표라 캔버스가 프레임과 같은 크기여야 위치가 맞는다.
+  const W = kCalib ? Math.round(kCalib.cx * 2) : 1920;
+  const H = kCalib ? Math.round(kCalib.cy * 2) : 1080;
   if (rawCanvas.width !== W || rawCanvas.height !== H) { rawCanvas.width = W; rawCanvas.height = H; }
   rawCtx.clearRect(0, 0, W, H);
-  if (hgImgLoaded) rawCtx.drawImage(hgImg, 0, 0, W, H);
   if (!rawOverlayOn) return;
   const cmp = showUndist && kCalib;   // 보정 코너를 함께 그릴지
   rawCtx.font = '18px sans-serif';
+
+  // 동적 ROI 박스 — 마커보다 먼저 그려 코너를 가리지 않게. 이 사각형이
+  // "다음 프레임에 카메라가 실제로 훑는 범위"다 (밖은 아예 검출되지 않는다).
+  if (dynRoiOn) {
+    const box = computeDynRoiBox(W, H);
+    if (box) {
+      rawCtx.strokeStyle = '#a855f7';            // 보라 = 동적 ROI
+      rawCtx.lineWidth = 3;
+      rawCtx.setLineDash([10, 6]);
+      rawCtx.strokeRect(box.x, box.y, box.w, box.h);
+      rawCtx.setLineDash([]);
+      const pct = (box.w * box.h) / (W * H) * 100;
+      rawCtx.fillStyle = '#a855f7';
+      rawCtx.fillText('동적 ROI ' + Math.round(box.w) + '×' + Math.round(box.h) +
+                      ' (' + pct.toFixed(1) + '%)',
+                      box.x + 6, Math.max(20, box.y - 8));
+    } else if (!dynRoiTracking) {
+      rawCtx.fillStyle = '#dc3545';
+      rawCtx.fillText('SEARCH — 전체 화면 재탐색 중', 12, 26);
+    }
+  }
   for (const id in rawFrame) {
     const c = rawFrame[id];
     drawQuad(rawCtx, c, '#f59e0b', 3);              // raw = 주황
@@ -3042,14 +3873,43 @@ function redrawRawCanvas() {
       rawCtx.fillText('id ' + id, rcx + 9, rcy - 9);
     }
   }
+  drawRawHud(W, H);
 }
 
 const es = new EventSource('/events');
-es.onopen = () => { send('CALIB_K_STATUS'); send('CALIB_K_QUERY'); send('CALIB_K_PROFILE_LIST'); };
+es.onopen = () => { send('CALIB_K_STATUS'); send('CALIB_K_QUERY'); send('CALIB_K_PROFILE_LIST'); send('DETECT_ENABLE'); };
+// 마커 검출 on/off. 상태는 절대 낙관적으로 바꾸지 않는다 - 카메라가 DETECT_ENABLE로
+// 확인해 준 값만 반영한다. 카메라가 거부할 수 있고(호모그래피 수집 중), 링크가 끊겨
+// 명령이 버려졌는데 버튼만 바뀌면 실제와 어긋난 상태를 보여주게 된다.
+let detectOn = true;
+function toggleDetect() { send('DETECT_ENABLE ' + (detectOn ? 0 : 1)); }
+function renderDetectBtn() {
+  const b = document.getElementById('detBtn');
+  if (!b) return;
+  b.classList.toggle('on', detectOn);
+  b.textContent = detectOn ? '검출 ON' : '검출 OFF';
+  b.title = detectOn ? '마커 검출 중 - 눌러서 끕니다 (DETECT_ENABLE 0)'
+                     : '검출 꺼짐 - 눌러서 켭니다 (DETECT_ENABLE 1)';
+}
+function handleDetect(line) {
+  const m = line.match(/detect_enabled=([01])/);
+  if (!m) return;
+  const was = detectOn;
+  detectOn = m[1] === '1';
+  renderDetectBtn();
+  if (was && !detectOn) {
+    // 마지막 프레임의 코너를 버린다. 남겨두면 검출이 멈춘 뒤에도 오버레이에
+    // 옛 좌표가 그대로 떠 있어 살아있는 화면처럼 보인다.
+    rawFrame = {}; rawBuilding = {}; rawSeq = null;
+    if (rawOverlayOn) redrawRawCanvas();
+  }
+  if (rawOn) renderRaw();
+}
+renderDetectBtn();
+
 es.onmessage = (e) => {
   handleRaw(e.data);
   handleLatency(e.data);
-  handleHgWorld(e.data);
   handleHgStatus(e.data);
   handleHgAnchors(e.data);
   handleHgValidationConfig(e.data);
@@ -3058,6 +3918,11 @@ es.onmessage = (e) => {
   handleHgCoordMode(e.data);
   handleKProfiles(e.data);
   handleShell(e.data);
+  handleDetect(e.data);
+  handleDynRoi(e.data);
+  handleCpu(e.data);
+  handleCentralStatus(e.data);
+  handleMarkerPlane(e.data);
   // 이 탭 로그는 카메라 위주로 - 로봇/QT 트래픽은 로봇 탭(/robot)이나
   // 로그 모니터(/logs)에서 본다 (내부 상태 파싱은 위에서 이미 끝났으니 표시만 거른다).
   if (logSubject(e.data) === 'robot' || logSubject(e.data) === 'qt') return;

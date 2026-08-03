@@ -87,7 +87,7 @@ Qt 앱이 없어도 **QT 역할 대역**으로 전체 흐름을 검증할 수 �
 
 ```bash
 make qt_sim
-./qt_sim 127.0.0.1 certs/server.crt      # 서버와 같은 기기면 127.0.0.1
+./tools/qt_sim 127.0.0.1 certs/server.crt      # 서버와 같은 기기면 127.0.0.1
 ```
 
 qt_sim 콘솔에서 순서대로:
@@ -149,7 +149,7 @@ approach 단계는 재계획 안 함). **경로생성(각도·거리 계산) 로
 
 ```bash
 make path_test
-./path_test <서버IP> [server.crt경로] [스냅샷.json]
+./tools/path_test <서버IP> [server.crt경로] [스냅샷.json]
 #  기본 crt    = ../certs/server.crt (Server/에서 실행 시 certs/server.crt 지정)
 #  기본 스냅샷 = tools/sample_snapshot.json  (실측은 tools/cctv_snapshot.json)
 ```

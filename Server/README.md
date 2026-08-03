@@ -22,6 +22,7 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 | [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) | 로봇 주행 통합 테스트 계획 (단계 A~D, 합격 기준, 드라이런 결과) |
 | [docs/REFACTOR_SUMMARY.md](docs/REFACTOR_SUMMARY.md) | graceful shutdown 개선 기록 |
 | [admin_console/PLAN.md](admin_console/PLAN.md) | 관리자 창 설계/진행 상황 |
+| [relay/README.md](relay/README.md) | RTSP 4채널 패스스루 중계 (카메라 → 서버 → Qt 영상 경로) |
 
 ## 파일 구성
 
@@ -52,6 +53,13 @@ Server/
 │   ├── path_test.cpp       최초 1회 경로생성 테스트기 (CCTV 스냅샷 주입 → 접근 PATH 검증)
 │   ├── seed_user.py        테스트 계정 생성 (기본 test/1234 + 예시 캘리브레이션)
 │   └── *_snapshot.json     path_test용 CCTV 스냅샷 (호모그래피 + 마커 4코너)
+├── relay/                  RTSP 4채널 패스스루 중계 (카메라 영상 → Qt, 재인코딩 없음)
+│   ├── mediamtx.yml           중계 설정 (카메라 주소·계정 없음 — 커밋 안전)
+│   ├── cameras.env.example    카메라 접속 정보 템플릿 (cameras.env로 복사, git 제외)
+│   ├── probe_onvif.py         ★ ONVIF로 채널별 RTSP 주소 조회 (경로 짐작 금지 — 계정 잠김)
+│   ├── install.sh             MediaMTX 바이너리 설치 (bin/은 git 제외)
+│   ├── start.sh               중계 기동 (-d 로 백그라운드)
+│   └── README.md              구성·문제 해결
 └── admin_console/          관리자 창 (Python 웹 GUI - 카메라 캘리 도구 + 서버 로그/로봇 제어)
     ├── web_gui.py              진입점: HTTP 라우팅 + 로봇 제어( /robot )·로그 모니터( /logs ) + main()
     ├── cctv.py                 ★ CCTV 파트 (카메라 CAM_POSE·캘리브레이션·스냅샷 + 대시보드 UI) — CCTV팀 작업 파일
@@ -142,11 +150,11 @@ make sim
 ```
 
 ```bash
-./robot_sim 127.0.0.1 --port 9100
+./tools/robot_sim 127.0.0.1 --port 9100
 ```
 
 ```bash
-./draw_test 127.0.0.1 --port 9100 --side 1.0
+./tools/draw_test 127.0.0.1 --port 9100 --side 1.0
 ```
 
 `robot_sim`이 끝에 **펜 자취 요약**(획별 시작/끝 좌표와 도색 길이)을 찍습니다. 이 좌표가
@@ -170,13 +178,40 @@ make drive_test
 ```
 
 ```bash
-./drive_test 127.0.0.1 --side 0.3
+./tools/drive_test 127.0.0.1 --side 0.3
 ```
 
 한 변 0.3 m 정사각형을 **변마다 노즐을 내렸다 올리며**(획 4개) 그립니다. 첫 시운전은
 `--no-paint`로 동선만 확인하세요. 방향은 로봇 자기 기준(PATH 수신 시점이 0도)이고,
 CCTV가 없어 서버가 정렬 판정을 못 하므로 각도 정확도는 로봇 IMU에 달려 있습니다.
 옵션·합격 기준은 [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) 단계 A-3.
+
+### 실시간 CCTV 없이 접근 → 도색 돌려보기 (cctv_pose)
+
+실시간 POS가 아직 안 나올 때, **로봇 시작 위치만 한 번** 넣어주면 접근 → 도색 흐름이
+개루프로 끝까지 돕니다. 서버는 pose가 한 번이라도 잡히면 `START_DRAW`를 진행하고,
+그 pose는 만료되지 않습니다(`poseValid_`는 켜지기만 함). `DRIFT`·이탈 재계획은
+`POS` 핸들러 안에만 있어 POS가 더 안 오면 자연히 멈춥니다.
+
+```bash
+make cctv_pose
+```
+
+```bash
+./tools/cctv_pose 127.0.0.1
+```
+
+좌표는 [tools/cctv_pose.json](tools/cctv_pose.json)에서 읽습니다 — 값을 고치고 도구 콘솔에서
+**Enter**를 치면 파일을 다시 읽어 재전송하므로, 재시작 없이 여러 번 시험할 수 있습니다
+(`--repeat <초>`로 자동 반복도 가능). `corners`(CCTV 원본 픽셀 4점) 대신 `x`/`y`/`theta_deg`를
+넣으면 캘리브레이션 없이도 좌표를 직접 지정할 수 있습니다.
+
+⚠️ **Qt 로그인 후에 쏘세요.** 서버는 캘리브레이션을 로그인 시점에 계정에서 불러오므로,
+그 전에 보낸 `POS`는 `pose 계산 불가`로 버려집니다.
+
+🔴 **이 방식은 Qt가 `program`을 실어 보낸다는 전제입니다.** `program`이 없으면 서버가
+도색 경로를 **낡은 출발 위치** 기준으로 만들어(`sendDrawPath` 폴백), 이미 시작점에 가 있는
+로봇과 어긋납니다.
 
 **카메라가 서버(9000)에 role=CCTV로 직접 붙게 되면** ([server_PROTOCOL.md](server_PROTOCOL.md)의 CCTV 연동 규격대로 전환 후),
 web_gui의 CAM_POSE→POS 통역 다리를 꺼야 합니다 (안 끄면 카메라와 이 다리가 같은 role로
@@ -207,7 +242,7 @@ RP_CCTV_BRIDGE=0 python3 web_gui.py   # 또는 admin_console/config.sh에 RP_CCT
 
 ```bash
 make qt_sim
-./qt_sim 127.0.0.1 certs/server.crt   # 같은 기기에서 서버 띄운 경우
+./tools/qt_sim 127.0.0.1 certs/server.crt   # 같은 기기에서 서버 띄운 경우
 ```
 
 접속 후 콘솔 명령: `register <id> <pw>` / `login <id> <pw>` / `cmd estop|resume|calib` / `blueprint`(테스트 도면 전송) / `quit`. 서버가 중계해주는 STATUS/POS/H_MATRIX 등은 자동으로 로그에 찍힙니다.

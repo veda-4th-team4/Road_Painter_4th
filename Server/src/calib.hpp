@@ -13,6 +13,10 @@
 // 번들 포맷 (신규):
 //   {"version":1, "K":[[fx,0,cx],[0,fy,cy],[0,0,1]], "D":[k1,k2,p1,p2,k3],
 //    "H_floor":[[...]x3], "H_marker":[[...]x3], "marker_height_m":0.25}
+// 평면 포맷 (QT-REQ-CCTV-001 rev.2): 같은 내용이되 바닥 H의 이름이 "H"이고,
+//   설치 메타데이터가 같은 레벨에 붙는다 (calib_id/created_at/image_size/
+//   coord_mode/unit/origin_mm/canvas_mm/axis). 서버는 H를 H_floor로 읽고
+//   나머지는 손대지 않은 채 저장·중계한다.
 // 레거시 포맷 (v0.2 이하): [[...]x3] 단일 H -> H_floor=H_marker=H, 왜곡 보정 생략
 #include "protocol.hpp"
 #include <array>
@@ -65,6 +69,26 @@ inline void normalizeBundleMmToM(json& bundle) {
     if (!bundle.is_object()) return;
     if (bundle.contains("H_floor")) scaleMat3Rows01(bundle["H_floor"], s);
     if (bundle.contains("H_marker")) scaleMat3Rows01(bundle["H_marker"], s);
+    // 평면 스키마(QT-REQ-CCTV-001)는 바닥 H를 "H"로 부른다. 같이 스케일하지 않으면
+    // H_marker만 미터가 되어 한 번들 안에서 두 평면의 단위가 어긋난다.
+    if (bundle.contains("H")) scaleMat3Rows01(bundle["H"], s);
+    // 번들이 스스로 단위를 밝히면("unit") 정규화 결과와 맞춰준다. "mm"인 채로
+    // 중계하면 QT가 미터 값을 mm로 읽는다.
+    if (bundle.contains("unit") && bundle["unit"].is_string()) bundle["unit"] = "m";
+}
+
+// 평면 스키마의 바닥 H("H")에 "H_floor" 별칭을 달아준다.
+//
+// 서버는 두 스키마를 동등하게 읽지만(calibFromJson), 저장·중계하는 JSON은 들어온
+// 그대로여서 출력 키 이름이 입력 형식에 따라 달라졌다. QT는 `calib.H_floor`만 보므로
+// (QT-REQ-SRV-001 rev.3 C-1), 평면 번들로 올리면 QT가 좌표계를 못 잡았다 - 에러 없이
+// 조용히. 관리자 창에서 어느 버튼을 눌렀는지가 QT 동작을 갈랐다.
+//
+// 원본 "H"는 지우지 않고 남긴다: QT-REQ-CCTV-001 형식을 그대로 보존해야 번들을
+// 발행한 CCTV 쪽과 대조할 수 있고, 이미 "H"를 읽는 소비자가 있어도 깨지지 않는다.
+inline void aliasFloorKey(json& bundle) {
+    if (!bundle.is_object()) return;  // 레거시 단일 H 배열은 대상 아님
+    if (bundle.contains("H") && !bundle.contains("H_floor")) bundle["H_floor"] = bundle["H"];
 }
 
 // H_MATRIX payload의 번들(json) -> Calib. 신규 오브젝트/레거시 3x3 배열 모두 허용.
@@ -79,6 +103,10 @@ inline bool calibFromJson(const json& bundle, Calib& out) {
     }
     if (!bundle.is_object()) return false;
     out.hasFloor = bundle.contains("H_floor") && parseMat3(bundle["H_floor"], out.Hf);
+    // 평면 스키마는 바닥 H의 이름이 "H"다 (H_floor 없음). H_floor를 먼저 보고,
+    // 없을 때만 H로 넘어간다 - 둘 다 있으면 명시적인 H_floor가 이긴다.
+    if (!out.hasFloor)
+        out.hasFloor = bundle.contains("H") && parseMat3(bundle["H"], out.Hf);
     out.hasMarker = bundle.contains("H_marker") && parseMat3(bundle["H_marker"], out.Hm);
     if (!out.hasFloor && !out.hasMarker) return false;
     if (!out.hasMarker) {  // 마커용 H가 없으면 바닥 H로 대체 (시차 보정 없이 동작)
