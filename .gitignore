@@ -39,7 +39,7 @@ Paint_Robot/STM32/STM32F401RETX_RAM.ld
 # RTSP 중계 (Server/relay) — 바이너리(60MB)와 카메라 계정은 커밋하지 않는다
 Server/relay/bin/
 Server/relay/cameras.env
-Server/relay/relay.log
+Server/relay/relay.log*
 
 # 로컬 명세/PDF (STM32 펌웨어와 무관)
 Road-Painter_기술명세서_SRS_v1.6_최종 (1).md

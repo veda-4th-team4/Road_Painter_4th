@@ -31,6 +31,8 @@ source ./cameras.env
 set +a
 
 # 경로를 안 채운 채로 띄우면 카메라에 엉뚱한 URL 로 계속 두드리게 된다. 미리 막는다.
+# 메인(CH1~4)은 필수, 서브(CH1S~4S)는 있으면 검사만 한다 — 2x2 미리보기를 안 쓸
+# 수도 있으므로 없다고 막지는 않는다.
 for ch in 1 2 3 4; do
     var="MTX_PATHS_CH${ch}_SOURCE"
     val="${!var:-}"
@@ -46,10 +48,27 @@ for ch in 1 2 3 4; do
     esac
 done
 
+subs=0
+for ch in 1 2 3 4; do
+    var="MTX_PATHS_CH${ch}S_SOURCE"
+    val="${!var:-}"
+    [ -z "$val" ] && continue
+    case "$val" in
+        *PUT_CH*_PATH_HERE*)
+            echo "$var 가 아직 템플릿 값입니다. 지우거나 실제 주소로 채우세요." >&2
+            exit 1
+            ;;
+    esac
+    subs=$((subs + 1))
+done
+
 if [ "${1:-}" = "-d" ]; then
     nohup "$BIN" ./mediamtx.yml >> relay.log 2>&1 &
+    ip="$(ip route get 192.168.0.13 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')"
+    [ -z "$ip" ] && ip="$(hostname -I | awk '{print $1}')"
     echo "중계 기동 (pid $!). 로그: $(pwd)/relay.log"
-    echo "  rtsp://$(hostname -I | awk '{print $1}'):8554/ch1 ... /ch4"
+    echo "  메인 : rtsp://$ip:8554/ch1 ... /ch4    (2592x1520 30fps)"
+    [ "$subs" -gt 0 ] && echo "  서브 : rtsp://$ip:8554/ch1s ... /ch4s  (저해상도, 2x2 미리보기용)"
 else
     exec "$BIN" ./mediamtx.yml
 fi
