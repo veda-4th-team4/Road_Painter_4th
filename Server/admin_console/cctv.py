@@ -3763,45 +3763,51 @@ function computeDynRoiBox(W, H) {
 // 축소해 보여주므로, CSS 픽셀 기준으로 고르면 실제 화면에서 읽을 수 없게 작아진다.
 function drawRawHud(W, H) {
   const fps = metricFps(), det = metricDetCur(), hit = metricHitPct();
-  const parts = [];
-  parts.push(fps === null ? 'fps —' : 'fps ' + fps.toFixed(1));
-  if (procs.length) parts.push('proc ' + procs[procs.length - 1] + 'ms');
-  if (det !== null) parts.push('det ' + det + 'ms');
-  parts.push(hit === null ? '검출 —' : '검출 ' + Math.round(hit) + '%');
-  if (cpuApp !== null || cpuSys !== null) {
-    parts.push('CPU ' + (cpuApp === null ? '—' : Math.round(cpuApp) + '%') +
-               ' / ' + (cpuSys === null ? '—' : Math.round(cpuSys) + '%'));
-  }
-  const text = parts.join('   ');
+  const proc = procs.length ? procs[procs.length - 1] : null;
 
-  // 캔버스는 줄바꿈을 하지 않는다 -- 너무 길면 잘리는 게 아니라 오른쪽으로 넘친다.
-  // 그래서 들어갈 때까지 글자를 줄인다. 항목이 늘어도 한 줄이 유지된다.
-  let fs = Math.max(20, Math.round(W / 62));        // 1849px -> 30px
-  let pad = Math.round(fs * 0.6);
-  let tw = 0;
-  for (;;) {
-    rawCtx.font = 'bold ' + fs + 'px sans-serif';
-    tw = rawCtx.measureText(text).width;
-    if (tw + pad * 4 <= W || fs <= 12) break;
-    fs -= 2;
-    pad = Math.round(fs * 0.6);
-  }
-  const bh = fs + pad * 2;
-  const by = H - bh - pad;
+  // 값이 없어도 칸을 비우지 않는다. 항목이 나타났다 사라지면 옆 항목이 밀려서
+  // 숫자를 읽는 중에 자리가 바뀐다.
+  const cells = [
+    ['fps',  fps  === null ? '—' : fps.toFixed(1)],
+    ['proc', proc === null ? '—' : proc + 'ms'],
+    ['det',  det  === null ? '—' : det + 'ms'],
+    ['검출', hit  === null ? '—' : Math.round(hit) + '%'],
+    ['CPU',  (cpuApp === null ? '—' : Math.round(cpuApp) + '%') + ' / ' +
+             (cpuSys === null ? '—' : Math.round(cpuSys) + '%')]
+  ];
 
-  const bw = Math.min(W - pad * 2, tw + pad * 2);
+  // 글자·띠 크기는 화면 폭만으로 정한다. 예전처럼 내용 길이에 맞춰 줄이면 값이
+  // 갱신될 때마다 글자 크기와 띠 폭이 같이 흔들려 오히려 읽기 어려웠다.
+  const fs  = Math.max(14, Math.min(34, Math.round(W / 70)));
+  const lfs = Math.max(11, Math.round(fs * 0.7));
+  const pad = Math.round(fs * 0.6);
+  const bh  = fs + pad * 2;
+  const by  = H - bh - pad;
+  const bx  = pad, bw = W - pad * 2;      // 띠는 항상 같은 자리·같은 크기
+
   rawCtx.fillStyle = 'rgba(0,0,0,0.62)';
-  rawCtx.fillRect(pad, by, bw, bh);
+  rawCtx.fillRect(bx, by, bw, bh);
 
-  // 축소에도 하한(12px)이 있어 이론상 아직 넘칠 수 있다. 띠 안으로 클립해 두면
-  // 그 경우 영상 위로 글자가 삐져나가는 대신 띠 끝에서 잘린다.
+  // 칸 폭이 고정이라 값이 길어져도 그 칸 안에서만 늘어나고 옆 칸을 밀지 않는다.
+  // 하한(14px)이 있어 이론상 아직 넘칠 수 있으니 띠 안으로 클립해 둔다.
   rawCtx.save();
   rawCtx.beginPath();
-  rawCtx.rect(pad, by, bw, bh);
+  rawCtx.rect(bx, by, bw, bh);
   rawCtx.clip();
-  rawCtx.fillStyle = '#e5e7eb';
   rawCtx.textBaseline = 'middle';
-  rawCtx.fillText(text, pad * 2, by + bh / 2);
+  const cy = by + bh / 2;
+  const cellW = (bw - pad * 2) / cells.length;
+  for (let i = 0; i < cells.length; i++) {
+    const x = bx + pad + cellW * i;
+    rawCtx.font = lfs + 'px sans-serif';
+    rawCtx.fillStyle = '#9ca3af';
+    rawCtx.fillText(cells[i][0], x, cy);
+    const lw = rawCtx.measureText(cells[i][0]).width;
+    // 숫자는 등폭 글꼴로. 자리수가 바뀌어도 글자가 좌우로 움직이지 않는다.
+    rawCtx.font = 'bold ' + fs + 'px ui-monospace, Menlo, Consolas, monospace';
+    rawCtx.fillStyle = '#e5e7eb';
+    rawCtx.fillText(cells[i][1], x + lw + Math.round(fs * 0.4), cy);
+  }
   rawCtx.restore();
   rawCtx.textBaseline = 'alphabetic';               // 마커 라벨 기준선 복원
 }
