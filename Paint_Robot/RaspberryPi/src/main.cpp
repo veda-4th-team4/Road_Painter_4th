@@ -192,7 +192,17 @@ int main(int argc, char **argv) {
                           Msg_Status_t status_snap{};
                           if (robot_comm.GetLatestStatus(status_snap)) {
                               if (path_follower.UpdateTurn(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed)) {
-                                  // Micro-turn completed: re-send READY
+                                  // Micro-turn completed: Send stop & wait 500ms for camera settling before re-sending READY
+                                  robot_comm.SendSetSpeed(0, 0);
+                                  std::cout << "[MAIN ALIGN] Micro-turn complete -> Waiting 500ms for camera settling..." << std::endl;
+                                  
+                                  auto start_wait = std::chrono::steady_clock::now();
+                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - start_wait).count() < 500) {
+                                      robot_comm.SendSetSpeed(0, 0);
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                  }
+
                                   net_manager.SendReady(seg_idx);
                               }
                           }
