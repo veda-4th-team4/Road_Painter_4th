@@ -36,6 +36,21 @@ public:
     int channel() const { return m_ch; }
     void stop();
 
+    // 🔴 일시정지 — **세션은 살려두고 프레임만 안 꺼낸다.**
+    //
+    // 왜 stop 이 아니라 pause 인가: RTSP 를 다시 여는 데 1.1초가 걸리고, 게다가
+    // 4채널이 **직렬로** 열려서(OpenCV FFmpeg 백엔드의 전역 잠금) 마지막 타일이
+    // 4.6초 뒤에야 뜬다. 작업 화면에 들어갔다 나올 때마다 그 값을 다시 치르는 것이
+    // "채널 나오면 렉 걸린다"의 정체였다. 세션을 유지하면 복귀 비용이 0 이 된다.
+    //
+    // 대가가 없는지 재봤다(2026-08-04 유선, 8초): 메인 + 미리보기 4 = 5스트림 동시에서
+    // 메인이 15.0fps · 간격 p50 67.0ms 로, 미리보기를 끈 단독(15.0 / 67.1)과 같았다.
+    // 즉 작업 화면 성능을 깎지 않는다.
+    //
+    // 정지 중에는 grab() 만 돌린다 — 패킷을 계속 받아 세션이 안 끊기게 하되,
+    // retrieve(색변환) · QImage 변환 · 시그널은 건너뛴다.
+    void setPaused(bool on) { m_paused.store(on, std::memory_order_relaxed); }
+
     // GUI 가 프레임 하나를 소비했다고 알린다 (Backend 가 연결해 준다).
     void frameConsumed() { m_queued.fetch_sub(1, std::memory_order_relaxed); }
 
@@ -57,6 +72,7 @@ private:
     int m_ch;
     QString m_rtspUrl;
     std::atomic<bool> m_stopRequested{false};
+    std::atomic<bool> m_paused{false};   // 위 setPaused 참고
     std::atomic<int> m_queued{0};   // GUI 이벤트 큐에 떠 있는 프레임 수
 };
 

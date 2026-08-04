@@ -4,18 +4,21 @@
 #include <opencv2/opencv.hpp>
 
 namespace {
-// 미리보기 타일에 떠 있어도 되는 프레임 수. video_worker(3)보다 낮게 잡는다 —
-// 워커가 4개라 같은 값을 주면 큐에 최대 12장이 뜬다. 미리보기는 640x480 이라
-// 한 장이 ~0.9MB 로 작지만, 늦은 프레임은 감시 화면에서 가치가 없으므로 얕게 둔다.
-constexpr int kMaxQueued = 2;
+// 미리보기 타일에 떠 있어도 되는 프레임 수. 워커가 4개라 이 값 x4 가 큐에 뜬다.
+// ⚠️ 저해상도 서브 프로파일이 없어졌다(2026-08-04) — 미리보기도 메인과 같은
+//    1920x1080 을 받는다. 한 장이 ~6.2MB 라 4채널 x 2장이면 50MB 다.
+//    게다가 15fps 라 한 칸이 66.7ms 짜리다. 늦은 프레임은 감시 화면에서 가치가
+//    없으므로 video_worker 와 같이 1 로 줄인다 (= 최신 것만 살린다).
+constexpr int kMaxQueued = 1;
 
+// ⚠️ video_worker::matToQImage 와 **같은 포맷(BGR888)** 이어야 한다. 미리보기 타일과
+//    본 화면이 다른 포맷을 쓰면 한쪽만 빨강↔파랑이 뒤집힌다.
+//    cvtColor 를 안 타므로 워커 4개가 각자 한 번씩 아끼는 셈이다.
 QImage matToQImage(const cv::Mat &mat)
 {
-    if (mat.type() == CV_8UC3) {
-        cv::Mat rgb;
-        cv::cvtColor(mat, rgb, cv::COLOR_BGR2RGB);
-        return QImage(reinterpret_cast<const uchar *>(rgb.data), rgb.cols, rgb.rows,
-                      rgb.step, QImage::Format_RGB888).copy();
+    if (mat.type() == CV_8UC3) {   // BGR — 변환 없이 그대로 감싼다
+        return QImage(reinterpret_cast<const uchar *>(mat.data), mat.cols, mat.rows,
+                      mat.step, QImage::Format_BGR888).copy();
     }
     if (mat.type() == CV_8UC1) {
         return QImage(reinterpret_cast<const uchar *>(mat.data), mat.cols, mat.rows,
@@ -33,7 +36,15 @@ preview_worker::preview_worker(int ch, const QString &rtspUrl, QObject *parent)
 preview_worker::~preview_worker()
 {
     stop();
-    wait(3000);
+    // 🔴 대기 시간은 **RTSP 소켓 타임아웃(stimeout)보다 길어야 한다.**
+    //    캡처 스레드는 cap.grab() 안에서 최대 그만큼 막혀 있을 수 있는데, 그전에
+    //    wait 가 풀리면 QThread 기반 클래스가 **아직 도는 스레드를 파괴**하게 되고
+    //    "QThread: Destroyed while thread is still running" 으로 죽는다.
+    //    예전 값이 3000 이었다 — stimeout 이 5초라 카메라가 죽은 채로 앱을 닫으면
+    //    타임아웃이 나서 그대로 크래시였다.
+    // ⚠️ video_worker.cpp 의 stimeout 값을 바꾸면 여기도 같이 올려야 한다.
+    if (!wait(7000))
+        qWarning() << "[preview] CH" << m_ch << "캡처 스레드가 7초 안에 안 끝났습니다";
 }
 
 void preview_worker::stop()
@@ -55,13 +66,14 @@ void preview_worker::run()
 {
     const std::string url = m_rtspUrl.toStdString();
 
-    // ⚠️ qputenv 는 프로세스 전역이고 OpenCV 는 VideoCapture 를 **열 때** 읽는다.
-    //    미리보기 워커가 4개 + 메인 워커까지 동시에 이 값을 쓰는데, 값은 전부
-    //    같으므로(둘 다 tcp + stimeout 5초) 서로 덮어써도 결과가 달라지지 않는다.
-    //    옵션 이름은 반드시 `stimeout` 이다 — FFmpeg RTSP 디먹서에서 `timeout` 은
-    //    "들어오는 연결을 기다리는 시간"이라 주는 순간 클라이언트가 아니라 서버로
-    //    동작하려 들고 접속조차 못 한다 (video_worker.cpp 의 같은 주석 참고).
-    qputenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000");
+    // 🔴 여기서 qputenv 를 **하지 않는다.** 예전에는 했는데, 그건 버그였다.
+    //    qputenv 는 프로세스 전역이고 OpenCV 는 VideoCapture 를 **열 때** 읽는다.
+    //    여기서 덮어쓰면 메인 워커가 열릴 때 이 값을 집어간다 — 예전엔 두 값이
+    //    같아서 티가 안 났지만, 메인 쪽에 flags;low_delay 와 짧은 탐색(analyzeduration/
+    //    probesize)이 붙으면서 **값이 달라졌다.** 그때부터는 "누가 마지막에 열었나"에
+    //    따라 옵션이 달라지는 경합이 된다.
+    //    옵션은 main() 에서 video_worker::applyFfmpegCaptureOptions() 로 딱 한 번
+    //    설정한다 — 미리보기도 그 값을 그대로 쓰는 것이 맞다.
 
     cv::VideoCapture cap;
     cv::Mat frame;
@@ -106,6 +118,15 @@ void preview_worker::run()
             ++retry;
             continue;
         }
+        // 일시정지 중에는 여기서 끝낸다 — grab() 으로 패킷은 계속 받아 세션을 살려두되
+        // 색변환·QImage·시그널은 건너뛴다. 그래야 그리드로 복귀할 때 다시 열지 않는다
+        // (다시 열면 1.1초 + 4채널 직렬화로 4.6초가 든다. preview_worker.h 참고).
+        if (m_paused.load(std::memory_order_relaxed)) {
+            everGotFrame = true;
+            retry = 0;
+            continue;
+        }
+
         if (!cap.retrieve(frame) || frame.empty())
             continue;
 

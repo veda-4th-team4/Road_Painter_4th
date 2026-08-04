@@ -51,13 +51,37 @@ Item {
         Qt.callLater(captureLayout)
     }
 
+    // 🔴 4채널에서는 [작업하기] **버튼**을 눌러 작업 화면으로 들어온다. Button 은
+    //    클릭하면 포커스를 가져가므로, 그대로 두면 방향키가 여기 Keys 핸들러까지
+    //    오지 않아 로봇 수동 조작이 먹지 않는다. 1채널 때는 로그인 직후 곧바로
+    //    작업 화면이라(Component.onCompleted 의 forceActiveFocus) 안 드러났던 문제다.
+    //    빈 곳을 클릭하면 아래 MouseArea 가 살려주긴 하지만, 그건 조작자가 원인을
+    //    알아야 가능한 복구다 — 채널에 들어올 때마다 여기서 되돌린다.
+    Connections {
+        target: Backend
+        function onChannelChanged() {
+            if (Backend.workingChannel > 0) page.forceActiveFocus()
+        }
+    }
+
     Keys.onPressed: function(event) {
         if (event.isAutoRepeat) { event.accepted = true; return }
+        // ⚠️ 그리드 화면에서는 **이동 명령을 보내지 않는다.** 아직 채널을 안 고른
+        //    상태라 조작자가 로봇을 화면으로 보고 있지 않다. 안 보고 움직이는 건
+        //    위험하다. (ESTOP 은 아래에서 화면과 무관하게 항상 받는다)
+        if (page.channelGridMode) {
+            switch (event.key) {
+            case Qt.Key_Up: case Qt.Key_Down: case Qt.Key_Left: case Qt.Key_Right:
+            case Qt.Key_PageUp: case Qt.Key_PageDown:
+                event.accepted = true; return
+            }
+        }
         switch (event.key) {
         case Qt.Key_Up:    Backend.sendRobotCmd("FORWARD", "전진"); event.accepted = true; break
         case Qt.Key_Down:  Backend.sendRobotCmd("BACKWARD", "후진"); event.accepted = true; break
         case Qt.Key_Left:  Backend.sendRobotCmd("TURN_LEFT", "좌회전"); event.accepted = true; break
         case Qt.Key_Right: Backend.sendRobotCmd("TURN_RIGHT", "우회전"); event.accepted = true; break
+        // 비상정지는 어느 화면에서든 받는다 — 막을 이유가 없다
         case Qt.Key_Space: Backend.toggleEstop(); event.accepted = true; break
         // 노즐은 누르고 있는 동작이 아니라 상태 전환이라 눌렀을 때 한 번만
         case Qt.Key_PageUp:   Backend.setNozzle(false); event.accepted = true; break
@@ -2653,8 +2677,10 @@ Item {
                     visible: Backend.channelMode
                     width: parent.width
                     wrapMode: Text.WordWrap
+                    // 중계일 수도 카메라 직결일 수도 있어서 백엔드가 문장을 만들어 준다
+                    // (relayBase 만 찍으면 직결일 때 빈칸이라 설정 누락처럼 보인다).
                     text: "현재 4채널 모드 · 채널 " + Backend.channelCount + "개 · "
-                        + "메인 " + Backend.relayBase + "/ch1 … 서브 " + Backend.relayBase + "/ch1s"
+                        + Backend.streamSourceText
                     color: Theme.accentDim
                     font.pixelSize: 11
                     font.family: Theme.fontFamily

@@ -9,12 +9,17 @@ set(CMAKE_AUTORCC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2 Network Gui)
 
-# MinGW용 OpenCV. 원래 C:/opencv/mingw(OpenCV 4.12, 팀 공유 빌드)를 썼는데 이 머신엔
-# 없어서, MSYS2 mingw64 패키지(OpenCV 4.13.0, pacman -S mingw-w64-x86_64-opencv)로
-# 대체했다. Qt의 MinGW 13.1.0과 MSYS2의 mingw64 GCC는 별개 배포판이라 ABI가 완전히
-# 같다는 보장은 없지만, 실측(이 CMakeLists로 직접 빌드+링크)까지 통과했다.
-# 팀 공유 빌드(4.12)가 있는 머신에서는 이 줄을 원래 경로로 되돌릴 것.
-set(OpenCV_DIR "C:/msys64/mingw64/lib/cmake/opencv4")
+# MinGW용 OpenCV 4.12 (팀 공유 빌드).
+#
+# ⚠️ 머신마다 다르다. MSYS2 로 대체한 머신에서는 아래 줄로 바꿔 쓴다:
+#       set(OpenCV_DIR "C:/msys64/mingw64/lib/cmake/opencv4")   # OpenCV 4.13.0
+#    Qt 의 MinGW 13.1.0 과 MSYS2 mingw64 GCC 는 별개 배포판이라 ABI 가 완전히 같다는
+#    보장은 없지만, 양쪽 다 빌드+링크까지 통과한 것이 확인돼 있다.
+#
+# ⚠️ 이 경로를 바꾸면 번들 FFmpeg 버전도 같이 바뀐다. video_worker 의 RTSP 타임아웃
+#    옵션 이름이 FFmpeg 5.0 을 기점으로 stimeout → timeout 으로 달라지므로,
+#    코드가 실행 시점에 avformat 버전을 보고 고르게 돼 있다 (video_worker.cpp 참고).
+set(OpenCV_DIR "C:/opencv/mingw")
 find_package(OpenCV REQUIRED)
 
 qt_standard_project_setup(REQUIRES 6.5)

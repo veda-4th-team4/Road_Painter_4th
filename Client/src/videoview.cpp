@@ -305,15 +305,14 @@ void VideoView::onFrame(const QImage &original)
 {
     const QSize before = m_frame.size();
     if (m_isTopView) {
-        // ⚠️ warpToTopView 는 1920x1080 을 통째로 warpPerspective 하는데, 이 함수는
-        //    **GUI 스레드**에서 불린다 (frameReceived → onFrame). 30fps 로 매 프레임
-        //    펴면 GUI 스레드를 15~20ms 씩 붙잡아, 마우스로 작도하는 것까지 끊긴다.
-        //    TopView 는 작도용 배경이라 12fps 면 충분하다 — 로봇/경로 오버레이는
-        //    자기가 바뀔 때 따로 update() 를 부르므로 반응성에 영향이 없다.
-        constexpr int kTopViewMinIntervalMs = 80;      // ≈ 12fps
-        if (m_tvThrottle.isValid() && m_tvThrottle.elapsed() < kTopViewMinIntervalMs)
-            return;
-        m_tvThrottle.restart();
+        // 🔴 여기 있던 80ms(≈12fps) 스로틀은 지웠다. 근거로 적혀 있던
+        //    "1920x1080 을 통째로 펴서 GUI 스레드를 15~20ms 붙잡는다" 가 **사실이 아니다.**
+        //    warpToTopView 의 출력은 TopView 캔버스 크기(840x560)라 입력 해상도와
+        //    무관하다. 실측(2026-07-31, 1920x1080 입력):
+        //        remap 0.86ms + QImage copy 0.38ms = 프레임당 1.23ms
+        //    30fps 여도 GUI 스레드 부담은 초당 37ms(3.7%)뿐이다.
+        //    반대로 스로틀 때문에 들어온 프레임을 버려서 TopView 만 끊겨 보였다.
+        //    ⚠️ 다시 넣고 싶어지면 먼저 재라. 추정으로 넣은 값이 이 사달을 냈다.
         QImage w = warpToTopView(original);
         m_frame = w.isNull() ? original : w;
     } else {
@@ -3094,9 +3093,13 @@ QImage VideoView::warpToTopView(const QImage &src)
     if (src.isNull()) return QImage();
     buildTopViewIfNeeded(src.width(), src.height());
     if (!m_tvBuilt || m_tvH.empty()) return QImage();
-    QImage rgb = src.convertToFormat(QImage::Format_RGB888);
-    cv::Mat m(rgb.height(), rgb.width(), CV_8UC3,
-              const_cast<uchar *>(rgb.bits()), size_t(rgb.bytesPerLine()));
+    // ⚠️ 들어오는 프레임은 **BGR888** 이다 (video_worker::matToQImage 주석 참고).
+    //    여기서 RGB888 로 바꾸면 워커에서 없앤 변환이 GUI 스레드로 옮겨올 뿐이다.
+    //    remap 은 채널 순서를 신경쓰지 않으므로 BGR 그대로 펴서 BGR 로 내보낸다.
+    QImage bgr = src.format() == QImage::Format_BGR888
+                     ? src : src.convertToFormat(QImage::Format_BGR888);
+    cv::Mat m(bgr.height(), bgr.width(), CV_8UC3,
+              const_cast<uchar *>(bgr.bits()), size_t(bgr.bytesPerLine()));
     cv::Mat warped;
 
     // 렌즈 보정을 켜면 warpPerspective 대신 remap 을 쓴다.
@@ -3115,7 +3118,7 @@ QImage VideoView::warpToTopView(const QImage &src)
     if (warped.empty())
         cv::warpPerspective(m, warped, m_tvH, cv::Size(m_tvOutW, m_tvOutH));
 
-    QImage out(warped.data, warped.cols, warped.rows, int(warped.step), QImage::Format_RGB888);
+    QImage out(warped.data, warped.cols, warped.rows, int(warped.step), QImage::Format_BGR888);
     return out.copy();
 }
 

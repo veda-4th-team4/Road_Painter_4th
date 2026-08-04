@@ -186,6 +186,28 @@ Backend::Backend(QObject *parent)
                       .arg(activeCh));
         emit channelChanged();
     });
+    // LOGIN_OK 의 중계 스트림 주소 (선택 필드). 있으면 QSettings 값을 덮는다.
+    //
+    // 카메라가 4채널로 바뀌면서 RTSP 를 카메라에서 직접이 아니라 **중계 서버를 거쳐**
+    // 받는다. 그 주소를 사람이 설정에 손으로 넣는 대신 서버가 로그인 때 알려주는 것이
+    // 운영상 맞다 — 중계 주소가 바뀌어도 클라이언트를 안 건드린다.
+    //
+    // ⚠️ 서버가 안 보내면 **아무것도 하지 않는다.** 지금 서버(v0.3)는 이 필드가 없으므로
+    //    빈 문자열이 오고, 그러면 QSettings 의 relayBase 가 그대로 쓰인다. 중계 주소를
+    //    비워두면 PNO 단일 채널 직결로 돌아가는 것도 그대로다.
+    // ⚠️ cam_ip 의 의미는 건드리지 않는다. 그걸 바꾸면 PNO 경로가 깨진다.
+    connect(m_client, &ServerClient::streamInfoReceived, this,
+            [this](const QString &base, int channels) {
+        if (base.trimmed().isEmpty()) return;          // 서버가 안 준다 → 설정값 유지
+        if (channels > 0 && channels != m_channelCount) {
+            m_channelCount = channels;
+            saveSettings();
+        }
+        if (base.trimmed() == m_relayBase) return;     // 같은 값이면 조용히 넘어간다
+        setRelayBase(base);
+        appendLog(QStringLiteral("LOGIN_OK stream — 중계 주소를 서버 값으로 설정: %1 (%2채널)")
+                      .arg(m_relayBase).arg(m_channelCount));
+    });
     // 채널 전환 결과. startChannelWork() 가 이미 갖고 있던 번들로 화면을 만들었으므로
     // 보통은 확인용이지만, 서버에만 있는 최신 번들이 여기서 오는 경우가 있다.
     connect(m_client, &ServerClient::channelResult, this,
@@ -356,23 +378,28 @@ Backend::~Backend()
     // 종료할 때는 실제로 기다린다. 여기서 안 기다리면 QThread 가 살아 있는 채로
     // 파괴돼 "QThread: Destroyed while thread is still running" 으로 죽는다.
     // (stopPreviews() 는 UI 응답성 때문에 기다리지 않으므로 여기서 별도로 처리)
+    //
+    // ⚠️ **먼저 전부 stop 을 걸고, 그다음에 기다린다.** 하나씩 stop→wait 을 반복하면
+    //    워커가 4개라 최악의 경우 대기가 4배로 직렬화된다(스트림이 죽어 있으면
+    //    각각 소켓 타임아웃까지 간다). 다 같이 멈추게 해두면 한 번의 대기로 끝난다.
+    for (preview_worker *w : std::as_const(m_previews))
+        if (w) { w->disconnect(); w->stop(); }
     for (preview_worker *w : std::as_const(m_previews)) {
         if (!w) continue;
-        w->disconnect();
-        w->stop();
-        w->wait(3000);
+        // 소멸자(~preview_worker)도 같은 이유로 기다린다 — 여기 값은 그것과 맞춘다.
+        if (!w->wait(7000))
+            qWarning() << "[shutdown] CH" << w->channel() << "미리보기 스레드가 안 끝났습니다";
     }
     qDeleteAll(m_previews);
     m_previews.clear();
 }
 
-void Backend::setKeyboardControl(bool v)
-{
-    if (m_keyboardControl == v) return;
-    m_keyboardControl = v;
-    emit keyboardControlChanged();
-    if (v) appendLog("키보드 로봇 제어 ON");
-}
+// ⚠️ 여기 있던 setKeyboardControl / keyboardControl / m_keyboardControl 은 지웠다.
+//    **아무 데서도 안 쓰였다** — QML 이 이 프로퍼티를 읽지도 쓰지도 않았고, C++ 에서
+//    setter 를 부르는 곳도 없었다. 즉 m_keyboardControl 은 항상 false 였고, 그 값을
+//    조건으로 쓰는 코드도 없어서 켜져도 아무 일이 안 일어났다(로그 한 줄 빼고).
+//    키보드 로봇 제어를 실제로 붙일 때는 "값을 읽어 동작을 가르는 곳"부터 만들 것 —
+//    프로퍼티만 되살리면 똑같이 죽은 코드가 된다.
 
 void Backend::login(const QString &id, const QString &pw)
 {
@@ -540,8 +567,12 @@ void Backend::setArucoOverlay(bool on)
     m_arucoOverlay = on;
     if (m_originalView) m_originalView->setArucoVisible(on);
     if (m_topView) m_topView->setArucoVisible(on);
+    // 🔴 워커에도 알린다 — 예전에는 뷰의 표시 플래그만 껐고 **검출은 계속 돌았다.**
+    //    끄나 켜나 CPU 를 똑같이 태웠다는 뜻이다. 이제 끄면 검출 자체를 안 한다.
+    if (m_worker) m_worker->setArucoEnabled(on);
     emit arucoChanged();
-    appendLog(on ? "ArUco 마커 표시 켬" : "ArUco 마커 표시 끔");
+    appendLog(on ? QStringLiteral("ArUco 검출 켬")
+                 : QStringLiteral("ArUco 검출 끔 — 검출 자체를 멈춥니다 (로봇 위치는 서버 POSE로 계속 수신)"));
 }
 
 void Backend::setNotice(const QString &text, const QString &level, const QString &key)
@@ -588,7 +619,6 @@ void Backend::logout()
     m_originalView = nullptr;
 
     if (m_drawing) { m_drawing = false; emit drawingChanged(); }
-    if (m_keyboardControl) { m_keyboardControl = false; emit keyboardControlChanged(); }
     m_estopActive = false;
 
     if (m_client && m_client->isConnected()) m_client->disconnectFromServer();
@@ -682,6 +712,9 @@ void Backend::wireWorker(video_worker *w)
                                  "(카메라 설정 저장·세션 경합 등으로 스트림이 재시작된 경우)"));
     });
     connect(w, &video_worker::arucoDetected, this, &Backend::onAruco);
+    // 워커가 새로 만들어질 때마다(채널 전환·주소 변경) 현재 토글 상태를 물려준다.
+    // 안 하면 껐던 사람이 채널을 바꾸는 순간 검출이 다시 켜진다.
+    w->setArucoEnabled(m_arucoOverlay);
     if (m_topView)
         connect(w, &video_worker::frameReceived, m_topView, &VideoView::onFrame);
     if (m_originalView)
@@ -1852,16 +1885,50 @@ void Backend::updatePhase()
 // 행위 = setRtsp() 를 새 URL 로 부르는 것 + 그 채널의 캘리브레이션을 적용하는 것.
 // 캘리브레이션·ArUco·작도·도면 변환 코드는 한 줄도 안 건드린다.
 
-// 중계 경로 규약은 Server/relay/README.md 와 짝이다. 여기만 바꾸면 안 되고
-// mediamtx.yml 의 경로 이름도 같이 바꿔야 한다.
-QString Backend::mainUrl(int ch) const
+// 주소는 두 갈래다:
+//   · 중계 있음 → {relayBase}/chN · /chNs   (Server/relay/README.md 와 짝. 여기만
+//                                            바꾸면 안 되고 mediamtx.yml 도 같이)
+//   · 중계 없음 → 카메라 직결 템플릿 ({ch0} 치환, 센서 번호는 0부터)
+// **중계가 있으면 중계가 이긴다.** 서버가 나중에 LOGIN_OK.stream 으로 중계 주소를
+// 주면 직결 템플릿은 저절로 안 쓰이게 된다 — 그때 코드를 고칠 필요가 없다.
+QString Backend::channelUrl(int ch, bool sub) const
 {
-    return QStringLiteral("%1/ch%2").arg(m_relayBase).arg(ch);
+    if (!m_relayBase.isEmpty())
+        return QStringLiteral("%1/ch%2%3").arg(m_relayBase).arg(ch)
+                                          .arg(sub ? QStringLiteral("s") : QString());
+
+    // 직결. ⚠️ 이 카메라에는 저해상도 서브 프로파일이 없어서 sub 여부와 무관하게
+    //    같은 주소가 나간다 (현재 4채널 전부 H.264 1920x1080 15fps 2560kbps GOV 8).
+    //    서브가 생기면 여기서 sub 일 때 다른 템플릿을 쓰도록 갈라주면 된다.
+    QString url = m_channelUrlTemplate;
+    url.replace(QStringLiteral("{ch0}"), QString::number(ch - 1));
+    url.replace(QStringLiteral("{ch}"),  QString::number(ch));
+    return url;
 }
 
-QString Backend::subUrl(int ch) const
+QString Backend::mainUrl(int ch) const { return channelUrl(ch, false); }
+QString Backend::subUrl(int ch)  const { return channelUrl(ch, true);  }
+
+// 지금 영상을 어디서 받는지 한 줄로. ⚠️ 직결 URL 에는 계정이 들어 있으므로
+// 비밀번호를 가린 뒤에 낸다 — 이 문자열은 화면에도 로그에도 나간다.
+static QString maskRtspPassword(const QString &url)
 {
-    return QStringLiteral("%1/ch%2s").arg(m_relayBase).arg(ch);
+    // rtsp://user:pass@host/... 에서 pass 만 ***** 로 바꾼다
+    static const QRegularExpression re(QStringLiteral("^(\\w+://[^:/@]+:)([^@/]*)(@)"));
+    QString out = url;
+    const auto m = re.match(out);
+    if (m.hasMatch())
+        out.replace(m.capturedStart(2), m.capturedLength(2), QStringLiteral("*****"));
+    return out;
+}
+
+QString Backend::streamSourceText() const
+{
+    if (!channelMode()) return QStringLiteral("단일 채널 직결");
+    if (!m_relayBase.isEmpty())
+        return QStringLiteral("중계 %1 · 메인 /ch1 … 서브 /ch1s").arg(m_relayBase);
+    return QStringLiteral("카메라 직결 · %1 (서브 없음 — 미리보기도 풀해상도)")
+               .arg(maskRtspPassword(channelUrl(1, false)));
 }
 
 QJsonObject Backend::calibOfChannel(int ch) const
@@ -1894,8 +1961,9 @@ void Backend::setRelayBase(const QString &base)
     saveSettings();
 
     if (!channelMode()) {
-        // 4채널 기능 끄기 = 예전 단일 채널 동작으로 즉시 복귀. 재빌드가 필요 없는
-        // 되돌리기 수단이라 여기서 확실히 정리해야 한다.
+        // 중계도 직결 템플릿도 둘 다 비었다 = 4채널 기능 끄기.
+        // 예전 단일 채널 동작으로 즉시 복귀한다. 재빌드가 필요 없는 되돌리기
+        // 수단이라 여기서 확실히 정리해야 한다.
         stopPreviews();
         m_highlightedCh = 0;
         m_workingCh = 0;
@@ -1909,9 +1977,25 @@ void Backend::setRelayBase(const QString &base)
         return;
     }
 
+    if (m_relayBase.isEmpty()) {
+        // 중계만 해제됐고 직결 템플릿은 남아 있다 → 4채널을 **카메라 직결**로 계속한다.
+        // 화면에 떠 있는 스트림이 중계 URL 이면 그대로 두면 안 되므로 다시 잡는다.
+        appendLog(QStringLiteral("중계 주소 해제 — 카메라 직결로 4채널을 계속합니다: %1")
+                      .arg(channelUrl(1, false)));
+        emit channelChanged();
+        // ⚠️ 주소가 바뀌었으므로 미리보기를 **완전히 끊고** 새 주소로 다시 연다.
+        //    startPreviews() 는 이미 워커가 있으면 재개만 하므로, 여기서 안 끊으면
+        //    옛 주소를 계속 보게 된다.
+        stopPreviews();
+        if (m_workingCh > 0) setRtsp(mainUrl(m_workingCh));
+        else                 showChannelGrid();
+        return;
+    }
+
     appendLog(QStringLiteral("중계 주소 설정: %1 (채널 %2개)")
                   .arg(m_relayBase).arg(m_channelCount));
     emit channelChanged();
+    stopPreviews();   // 위와 같은 이유 — 새 주소로 다시 열어야 한다
     showChannelGrid();
 }
 
@@ -1956,9 +2040,12 @@ void Backend::startChannelWork()
     if (!canStartChannelWork()) return;
     const int ch = m_highlightedCh;
 
-    // 미리보기를 먼저 끈다. 4채널 서브(3.1Mbps)를 켜둔 채 메인(2.5Mbps/채널)까지
-    // 열면 대역과 CPU 를 둘 다 이유 없이 쓴다 — 작업 화면에서는 안 보이는 영상이다.
-    stopPreviews();
+    // 미리보기는 **끄지 않고 일시정지**한다. 작업 화면에서 안 보이는 건 맞지만,
+    // 끄면 그리드로 돌아올 때 4채널을 다시 열어야 하고 그게 4.6초다(직렬화 때문).
+    // 일시정지는 grab 만 돌려 세션만 살려두므로 복귀가 즉시다.
+    // 대가가 있는지 실측했다: 메인+미리보기4 동시에도 메인이 15.0fps · p50 67.0ms 로
+    // 단독과 같았다 (2026-08-04 유선). 즉 작업 화면 성능을 깎지 않는다.
+    pausePreviews(true);
     m_workingCh = ch;
 
     // 서버에 "이 채널을 본다"고 알린다. 서버가 CCTV 에 중계해 그 채널의 마커를
@@ -2006,8 +2093,9 @@ void Backend::showChannelGrid()
         return;
     }
     m_workingCh = 0;
-    // 작업용 메인스트림을 끊는다. 안 끊으면 그리드(서브 4개) 위에 2592x1520
-    // 30fps 디코드가 계속 얹혀 돈다.
+    // 작업용 메인스트림을 끊는다. 안 끊으면 그리드(4채널) 위에 메인 디코드가
+    // 계속 얹혀 돈다 — 서브 프로파일이 없어진 뒤로는 그리드 자체가 1080p 4장이라
+    // 이걸 안 끊으면 5장을 동시에 디코딩하게 된다.
     if (m_worker) {
         video_worker *old = m_worker;
         m_worker = nullptr;
@@ -2023,10 +2111,55 @@ void Backend::showChannelGrid()
     updatePhase();
 }
 
+// 수동 새로고침. 자동 재접속이 있는데도 이게 필요한 이유는 backend.h 주석 참고.
+void Backend::refreshStreams()
+{
+    if (m_workingCh > 0) {
+        // 작업 화면 — 메인스트림만 다시 연다. 미리보기는 일시정지 상태 그대로 둔다.
+        appendLog(QStringLiteral("새로고침 — CH%1 메인스트림을 다시 엽니다").arg(m_workingCh));
+        setRtsp(mainUrl(m_workingCh));
+        if (!m_workerStarted) startWorker();
+        return;
+    }
+    if (!channelMode()) {
+        appendLog(QStringLiteral("새로고침 — 스트림을 다시 엽니다"));
+        setRtsp(m_rtspUrl);
+        if (!m_workerStarted) startWorker();
+        return;
+    }
+    // 그리드 — 4채널을 전부 끊고 다시 연다 (약 4.6초)
+    appendLog(QStringLiteral("새로고침 — 미리보기 %1채널을 다시 엽니다 (몇 초 걸립니다)")
+                  .arg(m_channelCount));
+    stopPreviews();
+    startPreviews();
+}
+
+void Backend::pausePreviews(bool on)
+{
+    for (preview_worker *w : std::as_const(m_previews))
+        if (w) w->setPaused(on);
+    if (!m_previews.isEmpty())
+        appendLog(on ? QStringLiteral("미리보기 일시정지 (세션은 유지 — 복귀가 즉시입니다)")
+                     : QStringLiteral("미리보기 재개"));
+}
+
 void Backend::startPreviews()
 {
     if (!channelMode()) return;
-    stopPreviews();
+    // 이미 돌고 있으면 **다시 열지 않는다.** 작업 화면에서 돌아온 경우가 이쪽인데,
+    // 여기서 stop→start 를 하면 채널당 1.1초 x 4채널 직렬 = 4.6초를 그대로 낸다.
+    // ⚠️ 단, 채널 수가 달라졌으면 재개하면 안 된다 — m_channelCount 는 서버의
+    //    LOGIN_OK.stream 으로 **런타임에 바뀔 수 있다**(streamInfoReceived 참고).
+    //    그대로 재개하면 채널이 늘어도 옛 개수만 보이고, 줄면 없는 채널을 계속 문다.
+    if (!m_previews.isEmpty()) {
+        if (m_previews.size() == m_channelCount) {
+            pausePreviews(false);
+            return;
+        }
+        appendLog(QStringLiteral("채널 수가 %1 → %2 로 바뀌어 미리보기를 다시 엽니다")
+                      .arg(m_previews.size()).arg(m_channelCount));
+        stopPreviews();
+    }
     for (int ch = 1; ch <= m_channelCount; ++ch) {
         auto *w = new preview_worker(ch, subUrl(ch), this);
         connect(w, &preview_worker::frameReceived, this,
@@ -2388,9 +2521,14 @@ QString Backend::applyCalibObject(const QJsonObject &raw, const QString &source)
             if (m.imgW > 0 && m_frameW > 0 && (m.imgW != m_frameW || m.imgH != m_frameH)) {
                 appendLog(QStringLiteral("⚠️ 캘리브 해상도 %1×%2 ≠ 영상 %3×%4 — 좌표가 맞지 않습니다")
                               .arg(m.imgW).arg(m.imgH).arg(m_frameW).arg(m_frameH));
-                setNotice(QStringLiteral("캘리브레이션 해상도와 카메라 영상 해상도가 다릅니다. "
-                                         "카메라 프로파일을 %1×%2 로 되돌리세요.")
-                              .arg(m.imgW).arg(m.imgH),
+                // ⚠️ "프로파일을 되돌리세요" 라고만 쓰지 않는다. 해상도를 **일부러**
+                //    바꾸는 경우가 있어서(16:9 모니터에 맞춰 2592x1520 → 1920x1080 으로
+                //    바꾼 2026-08-04 처럼) 그때는 되돌리는 게 아니라 캘리브레이션을
+                //    새 해상도로 다시 잡는 것이 맞다. 둘 다 제시해야 조작자가 고른다.
+                setNotice(QStringLiteral("캘리브레이션은 %1×%2 기준인데 영상은 %3×%4 입니다. "
+                                         "카메라 프로파일을 %1×%2 로 되돌리거나, "
+                                         "캘리브레이션을 %3×%4 로 다시 잡아야 합니다.")
+                              .arg(m.imgW).arg(m.imgH).arg(m_frameW).arg(m_frameH),
                           QStringLiteral("warn"), QStringLiteral("calibsize"));
             } else {
                 clearNotice(QStringLiteral("calibsize"));
@@ -2616,6 +2754,11 @@ void Backend::loadSettings()
     // 돈다 — PNM 은 아직 시도 단계라 언제든 PNO 직결로 되돌아갈 수 있어야 한다.
     m_relayBase = s.value("camera/relayBase").toString().trimmed();
     while (m_relayBase.endsWith('/')) m_relayBase.chop(1);
+    // 중계 없이 카메라에 직결할 때의 채널 URL 템플릿. 기본값은 현장 4채널 카메라다.
+    // ⚠️ 여기를 **비우면** 4채널 기능이 꺼지고 단일 채널 직결로 돌아간다
+    //    (relayBase 도 비어 있을 때). 재빌드 없는 되돌리기 수단이다.
+    if (s.contains("camera/channelUrlTemplate"))
+        m_channelUrlTemplate = s.value("camera/channelUrlTemplate").toString().trimmed();
     m_channelCount = qBound(1, s.value("camera/channelCount", 4).toInt(), 8);
 }
 
@@ -2631,6 +2774,7 @@ void Backend::saveSettings() const
     s.setValue("camera/rtspUrl", m_directRtspUrl);   // 중계 주소가 아니라 직결 주소
     s.setValue("camera/ip", m_camIp);
     s.setValue("camera/relayBase", m_relayBase);
+    s.setValue("camera/channelUrlTemplate", m_channelUrlTemplate);
     s.setValue("camera/channelCount", m_channelCount);
 }
 

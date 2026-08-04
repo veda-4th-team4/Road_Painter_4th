@@ -257,18 +257,37 @@ Q_PROPERTY(int  selectedChannel  READ selectedChannel  NOTIFY channelChanged)  /
 
 - 서브스트림 4개(640x480 10fps)는 소프트웨어로도 여유롭다 → **Phase 3 까지는 그대로 가도 된다.**
 - 메인스트림 1개(2592x1520 30fps) + ArUco 도 아마 버틴다.
-- 문제가 되면 그때 하드웨어 가속을 켠다:
 
-```cpp
-cv::VideoCapture cap;
-cap.open(url, cv::CAP_FFMPEG, {
-    cv::CAP_PROP_HW_ACCELERATION, cv::VIDEO_ACCELERATION_ANY,
-});
-```
+### 🔴 하드웨어 가속 — 실측 결과 **켜면 안 된다** (2026-08-04 추가)
 
-번들된 OpenCV 는 4.12.0 (`Client/libopencv_*4120.dll`) 이라 이 API 를 지원한다.
-켠 뒤에는 **작업관리자에서 GPU "Video Decode" 그래프가 올라가는지** 반드시 확인할 것
-— 조용히 소프트웨어로 폴백되는 경우가 흔하다.
+원래 이 절은 "문제가 되면 하드웨어 가속을 켠다" 로 `CAP_PROP_HW_ACCELERATION` 을
+권하고 있었다. **실측해보니 반대였다.** 같은 스트림(1080p 15fps)에서:
+
+| 설정 | decode 중앙값 | 파이프라인에 고인 프레임 |
+|---|---|---|
+| 소프트웨어 (기본) | **7~9 ms** | 1~7 |
+| `HW=VIDEO_ACCELERATION_ANY` | **24.2 ms** | **38** |
+| `HW=VIDEO_ACCELERATION_D3D11` | **24.3 ms** | **39** |
+
+디코딩이 3배 느려지고 버퍼가 38프레임(15fps 기준 2.5초 분량) 쌓인다.
+
+원인은 **GPU→CPU 되읽기**다. 하드웨어 디코더는 프레임을 GPU 메모리에 만드는데, 이
+앱은 `cv::Mat` 으로 받아 ArUco 검출·TopView 워프·QImage 변환을 전부 CPU 에서 한다.
+매 프레임 GPU 에서 시스템 메모리로 끌어내려야 하고, 그 비용이 디코딩으로 아낀 것보다
+크다. 게다가 그 경로는 `fflags;nobuffer` 를 듣지 않는 것으로 보인다.
+
+하드웨어 디코딩은 **GPU 에서 렌더까지 끝낼 때만** 이득이다. 우리처럼 픽셀을 CPU 로
+가져와야 하는 파이프라인에서는 손해다. 나중에 누가 다시 켜보고 싶어지면 위 표부터 볼 것.
+
+### 디코더 스레드 수 — 건드릴 근거 없음 (2026-08-04)
+
+`CAP_PROP_N_THREADS` 로 제어 가능하지만, 1 / 2 / 기본(8) 을 반복 측정한 결과가
+**서로 겹쳐서** 유의미한 차이가 안 나왔다.
+
+프레임 단위 멀티스레딩이 (스레드수−1) 프레임만큼 출력을 늦춘다는 것은 사실이지만
+(FFmpeg `doc/multithreading.txt`), **`flags;low_delay` 가 그 재정렬 지연을 끄기 때문에**
+이미 해결돼 있다 — 이론상 7프레임(233ms) 지연을 예상했는데 실측은 1~7프레임이었다.
+2592x1520 30fps 에서는 부하가 달라질 수 있으니 그때 다시 잴 것.
 
 ### ⚠️ `stimeout` 문제
 

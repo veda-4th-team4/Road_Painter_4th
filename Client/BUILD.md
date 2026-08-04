@@ -13,9 +13,13 @@
 `Client/` 루트에 이미 빌드된 `RoadPainter.exe` + DLL 전부가 커밋돼 있다.
 **그냥 쓰기만 할 거면 `git pull` 하고 더블클릭하면 끝** — 아무것도 설치할 필요 없다.
 
-코드를 고치고 다시 빌드하려면 얘기가 다르다: 이 브랜치는 원래 팀 공유
-OpenCV 빌드(`C:/opencv/mingw`, 4.12) 대신 **이 PC 로컬에 설치한 MSYS2 OpenCV
-4.13**으로 링크돼 있다. 그대로는 다른 PC에서 빌드가 안 된다 — §2 참고.
+코드를 고치고 다시 빌드하려면 **팀 공유 OpenCV 빌드(`C:/opencv/mingw`, 4.12)** 가
+필요하다 — §2 참고.
+
+> **2026-08-04 변경**: 한때 이 브랜치가 MSYS2 OpenCV **4.13** 으로 링크돼 있었는데,
+> 그 경로(`C:/msys64/...`)는 특정 PC 한 대에만 있어서 다른 PC에서 빌드가 안 됐다.
+> **팀 공유 4.12 로 되돌렸다.** 성능 때문이 아니라 재현성 때문이다 —
+> 실측상 두 버전의 차이는 의미가 없다(아래 §5).
 
 ---
 
@@ -29,54 +33,34 @@ git pull
 
 - Qt·MSYS2·OpenCV 아무것도 설치할 필요 없다. DLL이 전부 `Client/` 루트에
   같이 커밋돼 있어서 폴더 자체로 독립 실행된다.
-- 확인 방법: 이 exe를 **MSYS2가 전혀 없는 PATH 상태**에서 직접 실행해서
-  4초 이상 안 죽고 로그인 화면이 뜨는 것까지 검증했다.
+- 검증 방법(2026-08-04): exe 의 **DLL 임포트 그래프를 끝까지 따라가서**, 모든
+  의존성이 이 폴더 안에 있거나 Windows 기본 DLL 인지 확인했다(23개 바이너리).
+  `api-ms-win-*` 은 실제 파일이 아니라 로더가 해석하는 API 세트라 예외다.
+  소프트웨어 렌더링 폴백(`opengl32sw.dll`, `D3Dcompiler_47.dll`)도 포함돼 있어
+  GPU 드라이버가 약한 PC에서도 뜬다.
 
 ---
 
 ## 2. 코드를 고치고 다시 빌드하려는 사람
 
-### 2-1. 지금 상태 — 왜 그냥 열면 안 되는가
+### 2-1. 필요한 것
 
-`Client/src/CMakeLists.txt`:
-
-```cmake
-set(OpenCV_DIR "C:/msys64/mingw64/lib/cmake/opencv4")
-```
-
-이 경로는 **이 브랜치를 작업한 PC 하나에만** 있다. 팀 공유 OpenCV 빌드가
-있는 PC에서 그대로 열면 `find_package(OpenCV REQUIRED)`가 그 시점에
-`C:/msys64/...`를 찾다가 실패한다. 반대로 아무 OpenCV도 없는 PC에서 열어도
-당연히 실패한다.
-
-### 2-2. 옵션 A — 팀 공유 빌드(OpenCV 4.12)를 쓴다
-
-원래 하던 방식. `C:/opencv/mingw`에 팀 공유 OpenCV 4.12 MinGW 빌드를 받아두고,
-`CMakeLists.txt`를 원래대로 되돌린다:
+`Client/src/CMakeLists.txt` 는 팀 공유 OpenCV 빌드를 가리킨다:
 
 ```cmake
 set(OpenCV_DIR "C:/opencv/mingw")
 ```
 
-### 2-3. 옵션 B — MSYS2로 새로 받는다 (이 브랜치 지금 상태와 동일하게)
+`C:/opencv/mingw` 에 팀 공유 **OpenCV 4.12 MinGW 빌드**를 받아두면 된다.
+이 경로가 없으면 `find_package(OpenCV REQUIRED)` 에서 바로 실패한다.
 
-팀 공유 빌드가 없거나 못 구했을 때. **주의: OpenCV 4.12가 아니라 4.13이 깔린다**
-(팀 공유 빌드와 정확히 같은 버전이 아니다 — 지금까지는 문제없이 링크·실행됐지만
-100% 같은 코드는 아니라는 뜻).
+### 2-2. ⚠️ MSYS2 OpenCV 4.13 으로 바꾸지 말 것 (이유는 §5)
 
-```powershell
-winget install --id MSYS2.MSYS2
-```
+`C:/msys64/mingw64/lib/cmake/opencv4` 로 바꿔도 링크·실행은 된다. 하지만
+**특정 PC 한 대에만 있는 경로**라 다른 팀원이 빌드를 못 하게 된다.
+성능 이득도 실측상 없다 — §5 를 먼저 읽을 것.
 
-설치 후 (MSYS2 터미널에서, 첫 실행은 자기 자신을 업데이트하며 창이 닫힐 수 있음 —
-그러면 다시 열어서 이어서):
-
-```bash
-pacman -Syu
-pacman -S mingw-w64-x86_64-opencv
-```
-
-`CMakeLists.txt`는 지금 상태(`C:/msys64/mingw64/lib/cmake/opencv4`) 그대로 두면 된다.
+굳이 써야 한다면 `CMakeLists.txt` 를 **커밋하지 말고** 로컬에서만 바꿔 쓴다.
 
 ### 2-4. Qt Creator에서 열기
 
@@ -94,18 +78,26 @@ pacman -S mingw-w64-x86_64-opencv
 
 ### 2-5. 빌드 후 배포본 갱신 (실행 파일을 다시 커밋할 때)
 
-CMake 빌드 결과물은 `Client/src/build/<킷>/dist/`에 생긴다 (이 폴더 자체는
-`.gitignore`에 걸려있어 커밋 안 됨). 이걸 실제 배포본으로 반영하려면:
+CMake 빌드 결과물은 `dist/` 에 생긴다. Qt Creator 로 열었으면
+`Client/src/build/<킷>/dist/`, 명령줄로 `Client/build` 에 빌드했으면
+`Client/build/dist/` 다. 두 경로 다 `.gitignore` 에 걸려 있다.
 
 ```powershell
-# Qt 자체 DLL·QML 모듈을 dist/ 안에 채워 넣기 (OpenCV DLL은 이미 dist/에 있음)
-C:\Qt\6.11.0\mingw_64\bin\windeployqt.exe --qmldir Client\src Client\src\build\<킷>\dist\RoadPainter.exe
+# 1) Qt 자체 DLL·QML 모듈·렌더링 폴백을 dist/ 안에 채운다
+#    (OpenCV DLL 은 CMake 가 이미 dist/ 에 넣어둔다)
+C:\Qt\6.11.0\mingw_64\bin\windeployqt.exe --qmldir Client\src Client\build\dist\RoadPainter.exe
 
-# 그 dist/ 내용을 Client/ 루트로 복사 (기존 파일 덮어씀)
+# 2) 루트의 옛 배포본을 지우고 새 것으로 갈아끼운다
+#    ⚠️ 덮어쓰기만 하면 예전에 있던 불필요한 DLL 이 그대로 남는다.
+#       실제로 한때 whisper/GStreamer 등 무관한 DLL 이 쌓여 320MB 였다(현재 169MB).
 ```
 
-그다음 `Client/` 루트에서 `git status`로 바뀐 파일 확인 후 커밋한다.
-(개별 DLL 300개 넘게 나올 수 있다 — `git add Client/`로 한 번에.)
+지운 뒤 `dist/` 내용을 `Client/` 루트로 복사하고, `git status` 로 확인 후 커밋한다.
+(`src`, `build`, `.gitignore`, `BUILD.md`, `PNM_4CH_QT_PLAN.md` 는 지우면 안 된다.)
+
+**배포 전 확인**: exe 의 DLL 임포트를 따라가 모든 의존성이 폴더 안에 있는지 본다.
+빠진 게 있으면 Qt 가 없는 PC 에서 "DLL 을 찾을 수 없습니다" 로 죽는다 — 그런데
+개발 PC 에서는 PATH 에 Qt 가 있어서 **멀쩡히 돌아 보이므로** 놓치기 쉽다.
 
 ---
 
@@ -137,3 +129,30 @@ Qt는 의심 없이 붙는다. 사내망 초기 개발 단계에서는 큰 문�
 권장 방향(코드 주석에도 이미 적혀있음): `server.crt`를 신뢰 CA로 등록하고
 `VerifyNone` → 정식 검증으로 바꾸는 것. 이번 세션에서는 손대지 않았다 — 이
 초안 문서에 남기는 이유가 이거다.
+
+---
+
+## 5. OpenCV 4.12(FFmpeg 4.4) vs 4.13(FFmpeg 7.x) — 왜 4.12 를 쓰나
+
+"더 최신이 더 빠르지 않냐"는 질문이 반복돼서 근거를 남긴다. **성능 차이는 없다.**
+
+측정(2026-08-04, 유선, 카메라 1920x1080/15fps): 어떤 옵션 조합에서도 프레임 간격
+중앙값이 **67.0ms** 로 같았다. 이는 15fps 한 프레임과 정확히 일치한다 —
+즉 **디코더가 아니라 카메라를 기다리고 있다.** 1080p 디코딩은 7~14ms 로
+프레임 예산 66.7ms 대비 5배 여유가 있다. 놀고 있는 디코더를 빠르게 해도 얻을 게 없다.
+(H.264 소프트웨어 디코딩은 10년 넘게 SIMD 최적화가 끝난 영역이라 4.4 → 7.x 에서
+유의미한 디코딩 속도 향상 자체가 없다.)
+
+반면 바꾸면 **잃는 것은 확실하다**:
+
+1. RTSP 타임아웃 옵션 이름이 FFmpeg 5.0 에서 `stimeout` → `timeout` 으로 바뀐다.
+   코드는 실행 시점에 avformat 버전을 읽어 고르게 돼 있고(`video_worker.cpp`),
+   분기 로직은 검증했다(58/59/62/파싱실패 전부 통과). 하지만 **실제 스트림으로는
+   한 번도 안 돌려봤다** — 여기서 어긋나면 타임아웃이 조용히 기본값 30초로 돌아가
+   `stop()` 이 30초씩 안 먹는다.
+2. 채널 전환 튜닝값(`analyzeduration;200000|probesize;200000`)을 포함해 지금 코드에
+   박혀 있는 실측 근거가 전부 4.12/FFmpeg 4.4 기준이다. 바꾸면 다시 재야 한다.
+3. 경로가 특정 PC 한 대에만 있어 팀원 빌드가 깨진다.
+
+**결론: 4.12 유지.** 바꿀 이유가 생기면 위 3번부터 해결하고, 채널 전환 시간과
+프레임 간격을 다시 측정해서 근거를 이 문서에 갱신할 것.

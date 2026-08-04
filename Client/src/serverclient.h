@@ -96,6 +96,12 @@ signals:
     // loginResult 와 따로 두는 이유: 단일 채널 경로는 calib 하나만 보면 되고,
     // 그 시그니처를 건드리면 4채널과 무관한 코드까지 다 바뀐다.
     void calibChannelsReceived(const QJsonObject &calibs, int activeCh);
+    // LOGIN_OK 의 중계 스트림 주소 (**선택 필드**):
+    //   "stream": { "base": "rtsp://192.168.0.2:8554", "channels": 4 }
+    // 위와 같은 이유로 loginResult 시그니처를 안 건드린다.
+    // ⚠️ base 가 비면 아무 일도 안 일어나고 QSettings 값이 그대로 쓰인다.
+    //    서버가 이 필드를 안 보내는 동안에도 기존 동작이 100% 유지되어야 한다.
+    void streamInfoReceived(const QString &base, int channels);
     // 채널 전환 결과. ok=false 면 서버가 거절한 것(범위 밖 채널 등).
     // hasCalib=false 면 그 채널은 아직 캘리브레이션이 없다.
     void channelResult(bool ok, int ch, const QJsonObject &calib, bool hasCalib,

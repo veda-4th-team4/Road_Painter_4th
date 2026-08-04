@@ -49,10 +49,20 @@ Rectangle {
                 spacing: 8
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: Backend.relayBase
+                    // 중계/직결 어느 쪽이든 맞는 문장이 나온다 (Backend 가 만든다)
+                    text: Backend.streamSourceText
                     color: Theme.muted
                     font.pixelSize: 11
                     font.family: Theme.fontFamily
+                }
+                // 한 채널만 까맣거나 안 돌아올 때 쓰는 수동 탈출구.
+                // 평소엔 필요 없다 — 끊기면 워커가 알아서 다시 붙는다.
+                AppButton {
+                    text: "새로고침"
+                    ToolTip.visible: hovered
+                    ToolTip.text: "미리보기 " + Backend.channelCount + "채널을 전부 다시 엽니다.\n"
+                                + "다시 여는 데 몇 초 걸립니다 (채널당 약 1초, 순차)."
+                    onClicked: Backend.refreshStreams()
                 }
                 AppButton {
                     accent: Backend.canStartChannelWork

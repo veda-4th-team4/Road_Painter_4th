@@ -37,7 +37,6 @@ class Backend : public QObject
     Q_PROPERTY(bool painting READ painting NOTIFY robotStatusChanged)
     Q_PROPERTY(bool nozzleDown READ nozzleDown NOTIFY robotStatusChanged)
     Q_PROPERTY(QString robotLog READ robotLog NOTIFY robotLogChanged)
-    Q_PROPERTY(bool keyboardControl READ keyboardControl WRITE setKeyboardControl NOTIFY keyboardControlChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
 
     Q_PROPERTY(bool serverConnected READ serverConnected NOTIFY linkStatusChanged)
@@ -51,12 +50,14 @@ class Backend : public QObject
 
     Q_PROPERTY(double poseX READ poseX NOTIFY poseChanged)
     Q_PROPERTY(double poseY READ poseY NOTIFY poseChanged)
-    Q_PROPERTY(double poseTheta READ poseTheta NOTIFY poseChanged)
     Q_PROPERTY(bool poseValid READ poseValid NOTIFY poseChanged)
+    // ⚠️ poseTheta 프로퍼티는 지웠다 — QML 이 poseX/poseY 만 쓴다. 로봇 방위는
+    //    화면에 숫자로 안 나오고 VideoView 가 setRobotPose 로 받아 직접 그린다.
+    //    (m_poseTheta 자체는 그 경로에서 계속 쓰인다 — 멤버는 남아 있다)
 
     Q_PROPERTY(bool jobActive READ jobActive NOTIFY jobChanged)
-    // 도면이 서버에 올라가 있는가 (BLUEPRINT 전송 완료 = START_DRAW 가능)
-    Q_PROPERTY(bool blueprintSent READ blueprintSent NOTIFY jobChanged)
+    // ⚠️ blueprintSent 프로퍼티도 지웠다 — QML 은 이걸 직접 안 읽고 canStart 를 본다.
+    //    (m_blueprintSent 는 canStart 안에서 계속 쓰인다)
     Q_PROPERTY(bool manualEnabled READ manualEnabled NOTIFY jobChanged)
     Q_PROPERTY(bool canEditMission READ canEditMission NOTIFY jobChanged)
     Q_PROPERTY(double jobProgress READ jobProgress NOTIFY jobChanged)
@@ -77,20 +78,24 @@ class Backend : public QObject
     Q_PROPERTY(QString workName READ workName NOTIFY jobChanged)
     Q_PROPERTY(QString calibStatus READ calibStatus NOTIFY calibChanged)
     Q_PROPERTY(bool calibMissing READ calibMissing NOTIFY calibChanged)
-    Q_PROPERTY(QString calibId READ calibId NOTIFY calibChanged)
-    Q_PROPERTY(QString coordMode READ coordMode NOTIFY calibChanged)
-    Q_PROPERTY(QString calibSource READ calibSource NOTIFY calibChanged)
+    // ⚠️ calibId / coordMode / calibSource 프로퍼티는 지웠다 — 셋 다 QML 이 안 읽는다.
+    //    화면에는 이미 calibStatus 하나로 합쳐서 나가고(backend.cpp 의 calibStatus 조립),
+    //    개별 노출은 중복이었다. 멤버 m_calibId/m_coordMode/m_calibSource 는 그 조립과
+    //    렌즈보정 판정에 계속 쓰이므로 남아 있다.
     Q_PROPERTY(double mmPerPx READ mmPerPx NOTIFY calibChanged)
     Q_PROPERTY(double pxPerMm READ pxPerMm NOTIFY calibChanged)
     Q_PROPERTY(QString scaleText READ scaleText NOTIFY calibChanged)
     Q_PROPERTY(QString rtspUrl READ rtspUrl NOTIFY rtspChanged)
 
     // ── 다채널 카메라 (PNM-C16083RVQ, 프로토콜 v0.4) ──────────────────────
-    // 🔴 relayBase 가 비어 있으면 channelMode 가 false 고, 아래 것들은 전부
-    //    쓰이지 않는다 — 기존 PNO 단일 채널 직결 동작 그대로다. PNM 은 아직
-    //    시도 단계라 언제든 되돌아갈 수 있어야 한다.
+    // 🔴 relayBase **와** channelUrlTemplate 이 둘 다 비어 있으면 channelMode 가
+    //    false 고, 아래 것들은 전부 쓰이지 않는다 — 기존 PNO 단일 채널 직결 동작
+    //    그대로다. 언제든 되돌아갈 수 있어야 한다.
+    //    중계가 없어도 직결 템플릿만 있으면 4채널이 돈다 (2026-08-04).
     Q_PROPERTY(bool channelMode READ channelMode NOTIFY channelChanged)
     Q_PROPERTY(QString relayBase READ relayBase NOTIFY channelChanged)
+    // 화면 표시용 — "중계 …" 또는 "카메라 직결 …". 비밀번호는 가려져 있다.
+    Q_PROPERTY(QString streamSourceText READ streamSourceText NOTIFY channelChanged)
     Q_PROPERTY(int channelCount READ channelCount NOTIFY channelChanged)
     // 클릭해서 테두리가 켜진 채널 (0 = 아무것도 안 고름). 아직 작업 시작 전이다.
     Q_PROPERTY(int highlightedChannel READ highlightedChannel NOTIFY channelChanged)
@@ -152,8 +157,8 @@ public:
     // 로봇이 노즐 상태를 STATUS 로 알려주지 않으므로 마지막으로 보낸 명령을 기억한다
     bool nozzleDown() const { return m_nozzleDown; }
     QString robotLog() const { return m_robotLog; }
-    bool keyboardControl() const { return m_keyboardControl; }
-    void setKeyboardControl(bool v);
+    // ⚠️ keyboardControl 프로퍼티/게터/세터는 지웠다 — 아무도 안 읽고 안 썼다.
+    //    (근거는 backend.cpp 의 같은 자리 주석)
     bool busy() const { return m_busy; }
 
     bool serverConnected() const { return m_serverConnected; }
@@ -167,11 +172,9 @@ public:
 
     double poseX() const { return m_poseX; }
     double poseY() const { return m_poseY; }
-    double poseTheta() const { return m_poseTheta; }
     bool poseValid() const { return m_poseValid; }
 
     bool jobActive() const { return m_jobActive; }
-    bool blueprintSent() const { return m_blueprintSent; }
     // 경로 실행(접근+도색) 중에는 서버가 QT 수동조작을 무시한다 → UI도 잠근다
     bool manualEnabled() const { return !m_jobActive; }
     bool canEditMission() const {
@@ -198,18 +201,22 @@ public:
     QString calibStatus() const { return m_calibStatus; }
     bool calibMissing() const { return m_calibMissing; }
     // 지금 걸려 있는 번들이 어느 것인지 화면에서 바로 보이게 한다.
-    QString calibId() const { return m_calibId; }
-    QString coordMode() const { return m_coordMode; }
-    QString calibSource() const { return m_calibSource; }
     double mmPerPx() const { return m_mmPerPx; }
     double pxPerMm() const { return (m_mmPerPx > 1e-9) ? 1.0 / m_mmPerPx : 0.0; }
     QString scaleText() const;
     QString rtspUrl() const { return m_rtspUrl; }
 
     // ── 다채널 ────────────────────────────────────────────────────────────
-    // 중계 주소가 설정돼 있을 때만 4채널 기능이 켜진다. 비면 전부 예전 동작.
-    bool channelMode() const { return !m_relayBase.isEmpty(); }
+    // 4채널 기능은 **주소를 만들 방법이 있을 때** 켜진다 — 중계 주소든 직결
+    // 템플릿이든 하나만 있으면 된다. 둘 다 비우면 예전 단일 채널 동작으로 돌아간다
+    // (재빌드 없이 되돌리는 탈출구라, 이 조건은 유지해야 한다).
+    bool channelMode() const
+    { return !m_relayBase.isEmpty() || !m_channelUrlTemplate.isEmpty(); }
     QString relayBase() const { return m_relayBase; }
+    // 지금 어디서 영상을 받고 있는지 한 줄로. 중계인지 카메라 직결인지 화면에
+    // 보여주기 위한 것 — relayBase 만 표시하면 직결일 때 빈칸이라 "설정이 안 됐나"
+    // 로 보인다. ⚠️ URL 에 계정이 들어 있으므로 **비밀번호는 가려서** 낸다.
+    QString streamSourceText() const;
     int channelCount() const { return m_channelCount; }
     int highlightedChannel() const { return m_highlightedCh; }
     int workingChannel() const { return m_workingCh; }
@@ -233,6 +240,13 @@ public:
     Q_INVOKABLE void startChannelWork();
     // [◀ 채널 목록] — 작업 화면에서 4채널 그리드로 복귀
     Q_INVOKABLE void showChannelGrid();
+    // [새로고침] — 지금 보고 있는 스트림을 **완전히 끊고 다시 연다.**
+    // 평소에는 필요 없다(끊기면 워커가 알아서 다시 붙는다). 이건 그래도 화면이
+    // 안 돌아올 때 쓰는 수동 탈출구다 — 한 채널만 죽어 있거나, 카메라 설정을
+    // 바꾼 직후처럼 스트림 구성 자체가 달라졌을 때.
+    // ⚠️ 다시 여는 데 채널당 약 1.1초가 들고 4채널은 직렬이라 4.6초쯤 걸린다.
+    //    그래서 화면 전환에는 쓰지 않는다 (그쪽은 일시정지/재개로 처리한다).
+    Q_INVOKABLE void refreshStreams();
     // ChannelGrid.qml 의 타일을 Backend 에 등록한다 (프레임을 밀어 넣기 위해)
     Q_INVOKABLE void registerTile(ChannelTile *tile, int ch);
 
@@ -332,7 +346,6 @@ signals:
     void drawingChanged();
     void robotStatusChanged();
     void robotLogChanged();
-    void keyboardControlChanged();
     void busyChanged();
     void linkStatusChanged();
     void poseChanged();
@@ -357,12 +370,18 @@ signals:
 private:
     void startWorker();
     void wireWorker(video_worker *w);
-    // 채널 n 의 중계 URL. 메인 = 작업용(2592x1520 30fps), 서브 = 미리보기용(640x480 10fps).
-    // 서버 relay/README.md 의 경로 규약(/chN, /chNs)과 짝이다.
+    // 채널 n 의 URL. 메인 = 작업용, 서브 = 2x2 미리보기용.
+    // 중계가 있으면 relay/README.md 의 경로 규약(/chN, /chNs), 없으면 카메라 직결.
+    // ⚠️ 직결일 때는 서브 프로파일이 없어서 서브도 메인과 같은 주소다 (아래 주석 참고).
+    QString channelUrl(int ch, bool sub) const;
     QString mainUrl(int ch) const;
     QString subUrl(int ch) const;
-    void startPreviews();   // 서브스트림 4개 기동 (그리드 화면 진입)
-    void stopPreviews();    // 미리보기 전부 정지 (작업 화면 진입 · 로그아웃)
+    void startPreviews();   // 미리보기 4개 기동 (없을 때만 — 이미 있으면 재개한다)
+    void stopPreviews();    // 미리보기 **완전 종료** (로그아웃 · 주소 변경 · 종료)
+    // 작업 화면을 드나들 때는 stop 이 아니라 이걸 쓴다. 세션을 살려두므로 복귀가
+    // 즉시다 — 다시 열면 채널당 1.1초에 4채널이 직렬화돼 4.6초가 든다.
+    // (근거와 실측은 preview_worker.h 의 setPaused 주석)
+    void pausePreviews(bool on);
     // 로그인 직후 어디로 갈지 — 4채널이면 그리드, 아니면 예전처럼 바로 작업 화면
     void enterInitialView();
     // 채널별 캘리브레이션 맵(LOGIN_OK.calibs)에서 한 채널 번들을 꺼낸다
@@ -442,7 +461,6 @@ private:
     bool m_workerStarted = false;
     bool m_drawing = false;
     bool m_busy = false;
-    bool m_keyboardControl = false;
     bool m_estopActive = false;
     QString m_robotStatus = "대기";
     QString m_robotState = "IDLE";
@@ -476,6 +494,19 @@ private:
     //    앱 안에서 급히 되돌릴 때는 설정에서 이 칸을 비우면 된다 (재빌드 불필요).
     //    QSettings: camera/relayBase, camera/channelCount
     QString m_relayBase;
+    // 🔴 중계 없이 **카메라에 직결**할 때 쓰는 채널 URL 템플릿.
+    //    치환: {ch0} = 0부터 센 채널번호, {ch} = 1부터 센 채널번호.
+    //    한화 멀티센서 경로는 **센서 번호가 0부터**다 — 웹 UI 의 CH1 이 `0` 이다.
+    //    (2026-08-04 원시 DESCRIBE 로 0~3 전부 200 OK 확인)
+    //    중계(m_relayBase)가 설정돼 있으면 **중계가 이긴다**. 즉 나중에 서버가
+    //    LOGIN_OK.stream 으로 중계 주소를 내려주면 이 템플릿은 자동으로 안 쓰인다.
+    // ⚠️ 이 카메라에는 **저해상도 서브 프로파일이 없다.** 그래서 subUrl 은 직결
+    //    모드에서 메인과 같은 주소를 준다 — 미리보기 4장이 전부 같은 해상도를
+    //    디코딩한다. 서브가 생기면 여기만 고치면 된다.
+    //    현재 프로파일(2026-08-04): 4채널 전부 H.264 1920x1080 15fps 2560kbps GOV 8.
+    //    16:9 모니터에 맞춘 값이고, 2592x1520(2026-08-04 이전) 대비 픽셀 47% 감소.
+    QString m_channelUrlTemplate =
+        QStringLiteral("rtsp://admin:5hanwha!@192.168.0.13:554/{ch0}/H.264/media.smp");
     int m_channelCount = 4;
     int m_highlightedCh = 0;   // 클릭한 채널 (0 = 없음)
     int m_workingCh = 0;       // 작업 중인 채널 (0 = 그리드 화면)
