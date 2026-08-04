@@ -224,6 +224,41 @@ int main(int argc, char **argv) {
                         }
                       }
                   }
+              } else if (current_seg.op == "TURN") {
+                  // TURN segment runs pure in-place turn (wheel center is already at vertex)
+                  auto_nozzle = 0; // Force nozzle UP during turning
+                  Msg_Status_t status_snap{};
+                  if (robot_comm.GetLatestStatus(status_snap)) {
+                      int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
+                      int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
+
+                      if (!path_follower.IsTurning()) {
+                          path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
+                      }
+                      
+                      if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
+                          std::cout << "[MAIN TURN] In-place turn (" << current_seg.angle_deg 
+                                    << " deg) complete on vertex." << std::endl;
+                          path_follower.AdvanceSegment();
+                      }
+                  }
+              } else if (current_seg.op == "ARC") {
+                  Msg_Status_t status_snap{};
+                  if (robot_comm.GetLatestStatus(status_snap)) {
+                      int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
+                      int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
+
+                      if (!path_follower.IsMovingStraight()) {
+                          path_follower.StartArc(current_seg.radius_m, current_seg.angle_deg, current_seg.direction, l_steps, r_steps);
+                      }
+                      
+                      if (path_follower.UpdateArc(l_steps, r_steps, target_speed)) {
+                          std::cout << "[MAIN ARC] Arc segment (R=" << current_seg.radius_m 
+                                    << "m, " << current_seg.angle_deg << " deg " << current_seg.direction 
+                                    << ") complete." << std::endl;
+                          path_follower.AdvanceSegment();
+                      }
+                  }
               } else if (current_seg.op == "NOZZLE") {
                   std::string phase = net_manager.GetPathPhase();
                   if (phase == "draw") {
