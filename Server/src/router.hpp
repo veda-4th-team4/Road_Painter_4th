@@ -56,6 +56,13 @@ private:
     // 로그인 처리 (QT/ADMIN 공용): currentUser_ 갱신 + 저장된 캘리 복원 + 결과 회신.
     // replyRole = LOGIN_OK/LOGIN_FAIL을 돌려줄 role ("QT" 또는 "ADMIN").
     void handleLogin(const json& payload, const std::string& replyRole);
+    // READY 정렬 판정 본체(ALIGN 또는 GO 회신). READY 수신 즉시 호출되거나,
+    // ALIGN 반영을 기다리느라 유예됐다면 새 POS가 충분히 쌓인 뒤 호출된다.
+    void judgeReady(int seg);
+    // 유예해 둔 READY가 있으면 조건(새 POS 확보 or 타임아웃)을 확인해 판정한다.
+    void resolvePendingReady();
+    // 유예 상태(대기 중인 seg + 모아둔 theta)를 비운다.
+    void clearPendingReady();
     // 캘리브레이션 번들 수신 처리 (CCTV/ADMIN 공용): 저장 + Qt 중계
     void handleHMatrix(const json& msg);
     // Qt의 START_DRAW 수신 시 1단계(시작점 접근) 경로를 로봇에 전송.
@@ -72,9 +79,49 @@ private:
     // 러프 디폴트 (추후 현장 튜닝)
     static constexpr double kDevThresholdM = 0.3;    // 이탈 판정 거리
     static constexpr long kReplanCooldownMs = 3000;  // 재계획 최소 간격
-    static constexpr double kAlignThresholdDeg = 2.0;  // 출발 전 정렬 허용 오차
+    // 출발 전 정렬 허용 오차.
+    // 🔴 2.0 -> 4.0 (2026-08-03). 정렬 루프의 "1회 오차"가 임계값과 같은 크기라
+    //   수렴할 수 없었다: ① 로봇 메인 루프가 80ms라 회전 중 1틱=1.42°를 눈 감고
+    //   더 돈다(400 SPS / 22.58스텝도) - 오버슛이 항상 목표를 지나치는 한쪽 방향
+    //   계통 편향이다. ② 서버 theta는 마커 코너 픽셀에서 매 프레임 생으로 뽑아
+    //   노이즈가 sigma ~= 코너오차(mm)/마커한변(mm) rad (마커 13cm 기준 1px당 약
+    //   0.7도). 둘이 겹치면 ALIGN 직후 잔차가 2도를 넘는 일이 흔해 kAlignMaxTries를
+    //   태우고 정렬이 안 된 채 GO가 나갔다. 제어 정밀도는 1회 오차의 3배는 잡아야
+    //   한다. 로봇이 감속 접근(또는 예측 정지)을 넣어 오버슛을 줄이면 다시 내릴 것.
+    //   ⚠️ 정지 상태 theta 노이즈 실측 전까지는 러프 디폴트다.
+    static constexpr double kAlignThresholdDeg = 4.0;
     static constexpr int kAlignMaxTries = 4;  // ALIGN 최대 반복 (초과 시 그냥 GO)
     static constexpr long kDriftPeriodMs = 200;  // 주행 중 각도 피드백(DRIFT) 최소 간격
+    // ALIGN 이후 온 READY를 재판정하기 전에 기다릴 "새 POS 프레임" 수.
+    // 기준점은 ALIGN 송신 시각이 아니라 READY 수신 시각이다 - ALIGN을 보낸
+    // 직후부터 세면 로봇이 회전하는 동안 흘러간 프레임까지 포함돼 버려서,
+    // 정작 "회전이 끝난 뒤의 장면"을 한 장도 못 보고 판정하게 된다.
+    // 🔴 왜 필요한가: 로봇은 스텝 카운터가 목표에 닿는 즉시 READY를 다시 보내는데,
+    //   미세회전은 0.1~0.3초짜리라 그 회전이 CCTV -> 서버 pose에 반영되기 전에
+    //   READY가 도착한다 (POS에는 타임스탬프가 없어 서버는 pose가 몇 ms 전
+    //   장면인지 알 수 없다). 그대로 판정하면 "회전 전 각도"로 같은 ALIGN을 또
+    //   계산해 과회전 -> 반대 방향 ALIGN -> 진동이 나고, kAlignMaxTries를 태워
+    //   정렬이 안 된 채 GO가 나간다. 그래서 새 POS가 이만큼 쌓일 때까지 판정을
+    //   미룬다 (로봇은 어차피 정지한 채 응답을 기다리는 중).
+    static constexpr int kAlignFreshFrames = 3;
+    // 그래도 POS가 안 들어오면(마커 소실/CCTV 지연) 있는 pose로 판정해 버린다.
+    // 로봇을 무응답으로 세워두는 것보다 낫다.
+    static constexpr long kAlignWaitMaxMs = 1000;
+
+    // ----- POS 이상치 게이트 (운동학 기반) -----
+    // 로봇이 물리적으로 낼 수 있는 최대 회전속도는 알려져 있다: TURN 400 SPS,
+    // 15433스텝/m, 축간거리 ~0.167m -> 2*(400/15433)/0.167 = 0.31 rad/s = 17.8도/s.
+    // 그보다 훨씬 빠른 각도 변화는 주행이 아니라 검출 오류다 - 코너 순서가 한 칸
+    // 돌아가면 theta가 정확히 90/180도 튀고, 부분 가림·반사로 코너 하나만 어긋나도
+    // 수십 도가 어긋난다. 한 프레임이면 엉뚱한 ALIGN/DRIFT가 나가기 충분한데
+    // 지금까지 아무 검사가 없었다.
+    // 허용치 = 상수항(측정 노이즈 몫) + 속도항(실제 회전 몫). 나눗셈이 없어 프레임
+    // 간격이 0에 가까워도 터지지 않고, 간격이 길면 자연히 헐거워진다.
+    static constexpr double kPoseGateBaseDeg = 3.0;    // 노이즈 몫 (sigma ~0.7도의 4배)
+    static constexpr double kPoseGateRateDps = 40.0;   // 물리 상한 17.8도/s에 2배 여유
+    // 연속 거부 한도. 넘으면 그냥 받아들여 재동기한다 - 로봇을 들어 옮겼거나
+    // 추적을 놓친 뒤 새 위치로 잡힌 경우 영원히 거부만 하면 복구가 안 된다.
+    static constexpr int kPoseRejectMax = 5;
     // 펜(노즐)이 마커 중심 뒤로 떨어진 거리 d. 로봇 실측값 = 155mm
     // (rpi-robot PathFollower.h NOZZLE_OFFSET_M = 0.155f). BLUEPRINT 필드이
     // 아니라 서버 상수 - 펜 보정 자체는 로봇이 스스로 하고, 서버는 이 값을
@@ -121,6 +168,17 @@ private:
     json activeSegs_;          // 마지막으로 로봇에 보낸 segments (READY 정렬 판정용)
     int alignSegIdx_ = -1;     // 현재 정렬 중/실행 중인 세그먼트 index
     int alignTries_ = 0;       // 그 세그먼트에서 ALIGN을 보낸 횟수
+    long posSeq_ = 0;          // POS로 pose가 갱신된 누적 횟수 (신선도 판정용)
+    long lastPoseMs_ = 0;      // 마지막으로 채택된 pose의 시각 (이상치 게이트용)
+    int poseRejects_ = 0;      // 게이트가 연속으로 버린 프레임 수 (kPoseRejectMax)
+    int pendingReadySeg_ = -1;   // ALIGN 반영을 기다리며 유예해 둔 READY의 seg (-1 = 없음)
+    long pendingPosSeq_ = 0;     // 그 READY를 받은 시점의 posSeq_ (여기서부터 새 프레임을 센다)
+    long pendingReadyMs_ = 0;    // 그 READY를 받은 시각 (kAlignWaitMaxMs 타임아웃용)
+    // 유예 중 모은 theta를 원 위에서 평균내기 위한 누적(각도를 그냥 더하면 ±180도
+    // 경계에서 깨진다 - 이 시스템 heading은 바로 그 근처에 산다). 어차피 기다리는
+    // 시간이라 추가 지연 0으로 노이즈가 1/sqrt(N)로 준다.
+    double pendingSin_ = 0, pendingCos_ = 0;
+    int pendingPoseN_ = 0;
     long lastDriftMs_ = 0;     // 마지막 DRIFT 전송 시각 (전송률 제한용)
     bool manualMode_ = false;  // Qt 수동 조작(조이스틱) 중 - 자동 경로추종/재계획 중단.
                                // 새 BLUEPRINT 수신 시 해제(자동 모드 복귀)

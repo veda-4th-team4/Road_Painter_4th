@@ -15,6 +15,9 @@ void Router::onMessage(const std::string& role, const json& msg) {
     else if (role == "ROBOT") fromRobot(msg);
     else if (role == "CCTV") fromCctv(msg);
     else if (role == "ADMIN") fromAdmin(msg);
+    // 이번 메시지로 조건이 충족됐을 수 있으니(POS로 새 pose가 들어왔거나, 그냥
+    // 시간이 지났거나) 유예해 둔 READY를 여기서 한 곳에서 회수한다.
+    resolvePendingReady();
 }
 
 // TlsServer가 세션 등록/정리 시 통지 (재접속 교체는 false 없이 넘어감 - tls_server.cpp 참고)
@@ -228,38 +231,23 @@ void Router::fromRobot(const json& msg) {
              payload.value("painting", false) ? "true" : "false");
     } else if (type == "READY") {
         // 로봇이 TURN을 마치고 다음 동작(직진 or 대기) 직전에 정렬 확인을 요청.
-        // CCTV pose의 실제 각도 vs 해당 세그먼트의 목표 heading 비교:
-        //   오차 > 임계값 -> ALIGN(그만큼 미세 회전 후 다시 READY)
-        //   오차 <= 임계값 or 반복 초과 -> GO(직진 시작 / 접근 마지막 TURN이면 대기)
+        // ALIGN을 보낸 뒤 온 READY(= 미세회전 완료 통지)라면 그 회전이 pose에
+        // 반영될 때까지 판정을 미룬다 (router.hpp kAlignFreshFrames 참고).
         int seg = payload.value("seg", -1);
         if (seg != alignSegIdx_) {  // 새 세그먼트 정렬 시작
             alignSegIdx_ = seg;
             alignTries_ = 0;
         }
-        // heading_deg가 있는 세그먼트(MOVE 전부 + 접근 경로 마지막 TURN)만 판정 가능
-        double target = 1e9;
-        if (planActive_ && !manualMode_ && seg >= 0 &&
-            seg < (int)activeSegs_.size())
-            target = activeSegs_[seg].value("heading_deg", 1e9);
-
-        if (target > 1e8 || !poseValid_) {
-            // 판정 불가(계획 없음/수동모드/seg 이상/pose 없음)면 로봇을 세워두지 않는다
-            srv_.sendTo("ROBOT", makeMsg("GO", json::object()));
-            logf("[WARN] READY(seg=%d) - 정렬 판정 불가, 그냥 GO", seg);
+        if (alignTries_ > 0) {  // 미세회전 완료 통지 - 그 회전이 pose에 실릴 때까지 유예
+            clearPendingReady();  // 이번 유예분만 모으도록 누적을 비우고 시작
+            pendingReadySeg_ = seg;
+            pendingPosSeq_ = posSeq_;
+            pendingReadyMs_ = nowMs();
+            logf("[INFO] READY(seg=%d) - 직전 ALIGN 반영 대기 (새 POS %d장 필요)",
+                 seg, kAlignFreshFrames);
             return;
         }
-        double err = normDeg(target - pose_.theta * 180.0 / M_PI);
-        if (std::fabs(err) > kAlignThresholdDeg && alignTries_ < kAlignMaxTries) {
-            ++alignTries_;
-            srv_.sendTo("ROBOT",
-                        makeMsg("ALIGN", {{"angle_deg", std::round(err * 10) / 10}}));
-            logf("[INFO] READY(seg=%d) 각도오차 %.1f도 - ALIGN 전송 (%d/%d회)",
-                 seg, err, alignTries_, kAlignMaxTries);
-        } else {
-            srv_.sendTo("ROBOT", makeMsg("GO", json::object()));
-            logf("[INFO] READY(seg=%d) 오차 %.1f도 - GO%s", seg, err,
-                 alignTries_ >= kAlignMaxTries ? " (ALIGN 반복 초과)" : "");
-        }
+        judgeReady(seg);
     } else if (type == "PATH_DONE") {
         // 받은 PATH를 끝까지 수행했다는 로봇의 통지. 어느 단계였는지는 서버 상태로
         // 판단하고, payload.phase는 어긋났을 때 경고를 남기는 용도로만 쓴다
@@ -278,7 +266,7 @@ void Router::fromRobot(const json& msg) {
                      phase.c_str());
             planActive_ = false;
             activeSegs_ = json::array();
-            alignSegIdx_ = -1, alignTries_ = 0;
+            alignSegIdx_ = -1, alignTries_ = 0; clearPendingReady();
             planCursor_ = 0;
             srv_.sendTo("QT", makeMsg("DRAW_DONE", json::object()));
             logf("[INFO] 도색 완료 - QT에 DRAW_DONE 통지");
@@ -288,6 +276,76 @@ void Router::fromRobot(const json& msg) {
     } else {
         logf("[WARN] ROBOT으로부터 알 수 없는 type: %s", type.c_str());
     }
+}
+
+void Router::clearPendingReady() {
+    pendingReadySeg_ = -1;
+    pendingSin_ = pendingCos_ = 0;
+    pendingPoseN_ = 0;
+}
+
+// READY 정렬 판정. CCTV pose의 실제 각도 vs 해당 세그먼트의 목표 heading 비교:
+//   오차 > 임계값 -> ALIGN(그만큼 미세 회전 후 로봇이 다시 READY)
+//   오차 <= 임계값 or 반복 초과 -> GO(직진 시작 / 접근 마지막 TURN이면 대기)
+// 여기 들어왔다는 건 "지금 pose로 판정해도 된다"가 이미 정해졌다는 뜻이다
+// (READY 수신 즉시 or 유예 후 새 POS 확보). 어느 경로로 오든 반드시 로봇에
+// 응답을 하나 보낸다 - 응답을 빠뜨리면 로봇이 영원히 정지한 채 대기한다.
+void Router::judgeReady(int seg) {
+    // 유예 중 모아둔 theta가 있으면 그 평균으로 판정한다. 기다리는 동안 공짜로
+    // 쌓인 표본이라 지연 없이 노이즈만 1/sqrt(N)로 준다. 각도 평균은 반드시
+    // 원 위에서(sin/cos) - 도를 그냥 더하면 ±180도 경계에서 깨진다.
+    double thetaDeg = pose_.theta * 180.0 / M_PI;
+    char avgDesc[32];
+    if (pendingPoseN_ > 0) {
+        thetaDeg = std::atan2(pendingSin_, pendingCos_) * 180.0 / M_PI;
+        snprintf(avgDesc, sizeof avgDesc, "POS %d장 평균", pendingPoseN_);
+    } else {
+        snprintf(avgDesc, sizeof avgDesc, "단일 POS");
+    }
+    clearPendingReady();
+    // heading_deg가 있는 세그먼트(MOVE 전부 + 접근 경로 마지막 TURN)만 판정 가능
+    double target = 1e9;
+    if (planActive_ && !manualMode_ && seg >= 0 && seg < (int)activeSegs_.size())
+        target = activeSegs_[seg].value("heading_deg", 1e9);
+
+    if (target > 1e8 || !poseValid_) {
+        // 판정 불가(계획 없음/수동모드/seg 이상/pose 없음)면 로봇을 세워두지 않는다
+        srv_.sendTo("ROBOT", makeMsg("GO", json::object()));
+        logf("[WARN] READY(seg=%d) - 정렬 판정 불가, 그냥 GO", seg);
+        return;
+    }
+    double err = normDeg(target - thetaDeg);
+    if (std::fabs(err) > kAlignThresholdDeg && alignTries_ < kAlignMaxTries) {
+        ++alignTries_;
+        srv_.sendTo("ROBOT",
+                    makeMsg("ALIGN", {{"angle_deg", std::round(err * 10) / 10}}));
+        logf("[INFO] READY(seg=%d) 각도오차 %.1f도 (%s) - ALIGN 전송 (%d/%d회)",
+             seg, err, avgDesc, alignTries_, kAlignMaxTries);
+    } else {
+        srv_.sendTo("ROBOT", makeMsg("GO", json::object()));
+        logf("[INFO] READY(seg=%d) 오차 %.1f도 (%s) - GO%s", seg, err, avgDesc,
+             alignTries_ >= kAlignMaxTries ? " (ALIGN 반복 초과)" : "");
+    }
+}
+
+// 유예해 둔 READY가 있으면 판정 조건을 확인한다. READY 수신 이후 새 POS가
+// kAlignFreshFrames만큼 쌓였거나, 그 전에 kAlignWaitMaxMs가 지나면(POS가 끊긴
+// 상황) 있는 pose로 판정한다.
+// POS 수신 때뿐 아니라 onMessage 진입 때마다 호출한다 - POS가 완전히 끊기면 POS
+// 핸들러는 다시 안 돌아 타임아웃이 영영 안 걸리기 때문. 그 경우 로봇 STATUS가
+// heartbeat가 되어 유예된 READY를 반드시 회수한다. 단 STATUS는 500ms 주기(2Hz,
+// 로봇 main.cpp)라 타임아웃 판정이 최대 그만큼 늦다 - POS가 죽은 상황의 최악
+// 응답 지연은 kAlignWaitMaxMs + 500ms다.
+void Router::resolvePendingReady() {
+    if (pendingReadySeg_ < 0) return;
+    long got = posSeq_ - pendingPosSeq_;
+    bool fresh = got >= kAlignFreshFrames;
+    bool timeout = nowMs() - pendingReadyMs_ > kAlignWaitMaxMs;
+    if (!fresh && !timeout) return;
+    if (!fresh)
+        logf("[WARN] READY(seg=%d) 유예 %ldms 초과 (새 POS %ld/%d장) - 현재 pose로 판정",
+             pendingReadySeg_, nowMs() - pendingReadyMs_, got, kAlignFreshFrames);
+    judgeReady(pendingReadySeg_);
 }
 
 void Router::fromCctv(const json& msg) {
@@ -305,8 +363,32 @@ void Router::fromCctv(const json& msg) {
 
         Pose p;
         if (poseFromPos(payload, calib_, p)) {
+            // ----- 이상치 게이트: 물리적으로 불가능한 각도 변화는 검출 오류다 -----
+            // (router.hpp kPoseGateBaseDeg/kPoseGateRateDps 참고)
+            long dtMs = nowMs() - lastPoseMs_;
+            double dTheta =
+                std::fabs(normDeg((p.theta - pose_.theta) * 180.0 / M_PI));
+            double allowed = kPoseGateBaseDeg + kPoseGateRateDps * (dtMs / 1000.0);
+            if (poseValid_ && dTheta > allowed && poseRejects_ < kPoseRejectMax) {
+                ++poseRejects_;
+                logf("[WARN] POS 이상치 - theta %.1f도 급변 (%ldms 내 허용 %.1f도) "
+                     "폐기 %d/%d", dTheta, dtMs, allowed, poseRejects_, kPoseRejectMax);
+                return;  // pose_ 갱신도, QT 중계도, posSeq_ 증가도 하지 않는다
+            }
+            if (poseRejects_ >= kPoseRejectMax)
+                logf("[WARN] POS 이상치 연속 %d회 - 추적을 놓친 것으로 보고 재동기",
+                     poseRejects_);
+            poseRejects_ = 0;
             pose_ = p;
             poseValid_ = true;
+            lastPoseMs_ = nowMs();
+            ++posSeq_;  // ALIGN 반영 여부 판정용 (router.hpp kAlignFreshFrames)
+            // 유예 중인 READY가 있으면 판정용 theta 표본으로 모아둔다
+            if (pendingReadySeg_ >= 0) {
+                pendingSin_ += std::sin(p.theta);
+                pendingCos_ += std::cos(p.theta);
+                ++pendingPoseN_;
+            }
             // 계산된 pose(바닥 미터 좌표)를 QT에 전송 - top-view 위 로봇 표시용
             srv_.sendTo("QT", makeMsg("POSE",
                 {{"x", std::round(p.x * 1000) / 1000},
@@ -367,7 +449,7 @@ void Router::fromCctv(const json& msg) {
                      dev, planCursor_);
             } else if (srv_.sendTo("ROBOT", makePathMsg(segs, "draw"))) {
                 activeSegs_ = segs;
-                alignSegIdx_ = -1, alignTries_ = 0;  // 새 경로 = 정렬 상태 리셋
+                alignSegIdx_ = -1, alignTries_ = 0; clearPendingReady();  // 새 경로 = 정렬 상태 리셋
                 logf("[WARN] 경로 이탈 %.2fm (구간 %zu) - 복귀 PATH 전송 "
                      "(%zu번 꼭짓점으로, %zu 동작)",
                      dev, planCursor_, k, segs.size());
@@ -518,7 +600,7 @@ void Router::startApproach() {
         awaitingArrival_ = true;
         drawRequested_ = false;
         activeSegs_ = segs;
-        alignSegIdx_ = -1, alignTries_ = 0;  // 새 경로 = 정렬 상태 리셋
+        alignSegIdx_ = -1, alignTries_ = 0; clearPendingReady();  // 새 경로 = 정렬 상태 리셋
         lastPlanMs_ = nowMs();
         logf("[INFO] 1단계 접근 경로 전송 (%zu 세그먼트) - 로봇 도착(PATH_DONE) 대기",
              segs.size());
@@ -581,7 +663,7 @@ void Router::sendDrawPath() {
         awaitingArrival_ = false;
         planActive_ = true;
         activeSegs_ = segs;
-        alignSegIdx_ = -1, alignTries_ = 0;
+        alignSegIdx_ = -1, alignTries_ = 0; clearPendingReady();
         lastPlanMs_ = nowMs();
         logf("[INFO] 2단계 도색 경로 전송 (%zu 세그먼트) - 도색 시작", segs.size());
     } else {
