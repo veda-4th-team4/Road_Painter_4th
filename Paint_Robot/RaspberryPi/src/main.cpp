@@ -128,6 +128,18 @@ int main(int argc, char **argv) {
           // Protocol requirement: Ignore DRIFT feedback while executing TURN segment!
           if (!path_follower.IsTurning()) {
               path_follower.SetDriftOffset(drift_angle);
+              
+              // Hybrid Strategy: During approach phase (unpainted navigation), if DRIFT >= 15 deg,
+              // pause straight move to execute an in-place micro-turn pivot alignment!
+              std::string current_phase = net_manager.GetPathPhase();
+              if (current_phase == "approach" && std::abs(drift_angle) >= 15.0f && path_follower.IsMovingStraight()) {
+                  std::cout << "[MAIN] [APPROACH DRIFT RE-ALIGN] Large drift (" << drift_angle 
+                            << " deg) in approach phase. Executing in-place pivot alignment!" << std::endl;
+                  Msg_Status_t status_snap{};
+                  if (robot_comm.GetLatestStatus(status_snap)) {
+                      path_follower.StartTurn(drift_angle, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
+                  }
+              }
           } else {
               std::cout << "[MAIN] [DRIFT IGNORED] Robot is currently turning." << std::endl;
           }

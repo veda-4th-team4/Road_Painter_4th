@@ -159,14 +159,14 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
   // Straight move in progress with server DRIFT + IMU Yaw fusion correction
   float target_v = 0.05f; // 5 cm/s
   
-  // Clamp server DRIFT offset to safe maximum range [-10.0 deg, +10.0 deg]
-  float clamped_drift_deg = std::clamp(drift_offset_deg, -10.0f, 10.0f);
+  // Clamp server DRIFT offset to safe maximum range [-15.0 deg, +15.0 deg]
+  float clamped_drift_deg = std::clamp(drift_offset_deg, -15.0f, 15.0f);
   
   // Server DRIFT: Positive = facing right -> turn CCW (left) (+w)
   // IMU Yaw: Positive = facing left -> turn CW (right) (-w)
-  float drift_w = clamped_drift_deg * 0.015f;
+  float drift_w = clamped_drift_deg * 0.018f;
   float imu_w = -imu_yaw_deg * 0.02f;
-  float target_w = std::clamp(drift_w + imu_w, -0.08f, 0.08f); // Clamp max angular velocity to prevent wheel reversal
+  float target_w = std::clamp(drift_w + imu_w, -0.18f, 0.18f); // Expanded limit (10.3 deg/s) for rapid draw-phase recovery
 
   out_speed = velocity_to_sps(target_v, target_w);
   out_nozzle_on = current_seg.paint ? 1 : 0;
