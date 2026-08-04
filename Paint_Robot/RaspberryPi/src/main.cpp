@@ -126,22 +126,19 @@ int main(int argc, char **argv) {
       float drift_angle = 0.0f;
       if (net_manager.GetDriftCorrection(drift_angle)) {
           // Protocol requirement: Ignore DRIFT feedback while executing TURN segment!
-          if (!path_follower.IsTurning()) {
-              path_follower.SetDriftOffset(drift_angle);
-              
-              // Hybrid Strategy: During approach phase (unpainted navigation), if DRIFT >= 15 deg,
-              // pause straight move to execute an in-place micro-turn pivot alignment!
-              std::string current_phase = net_manager.GetPathPhase();
-              if (current_phase == "approach" && std::abs(drift_angle) >= 15.0f && path_follower.IsMovingStraight()) {
-                  std::cout << "[MAIN] [APPROACH DRIFT RE-ALIGN] Large drift (" << drift_angle 
-                            << " deg) in approach phase. Executing in-place pivot alignment!" << std::endl;
+          if (!path_follower.IsTurning() && path_follower.IsMovingStraight()) {
+              // Stop-and-pivot alignment strategy: When DRIFT >= 3.0 deg, pause MOVE to execute in-place turn!
+              if (std::abs(drift_angle) >= 3.0f) {
+                  float clamped_drift = std::clamp(drift_angle, -15.0f, 15.0f);
+                  std::cout << "[MAIN] [DRIFT PIVOT ALIGN] DRIFT feedback (" << drift_angle 
+                            << " deg) received. Pausing MOVE for in-place turn: " << clamped_drift << " deg" << std::endl;
                   Msg_Status_t status_snap{};
                   if (robot_comm.GetLatestStatus(status_snap)) {
-                      path_follower.StartTurn(drift_angle, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
+                      path_follower.StartTurn(clamped_drift, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
                   }
               }
-          } else {
-              std::cout << "[MAIN] [DRIFT IGNORED] Robot is currently turning." << std::endl;
+          } else if (path_follower.IsTurning()) {
+              std::cout << "[MAIN] [DRIFT IGNORED] Robot is currently executing a turn." << std::endl;
           }
       }
 
