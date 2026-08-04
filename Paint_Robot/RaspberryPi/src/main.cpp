@@ -175,13 +175,10 @@ int main(int argc, char **argv) {
                       if (net_manager.GetAlignCommand(align_deg)) {
                           // Guard 1: Do NOT interrupt an ongoing turn!
                           if (!path_follower.IsTurning()) {
-                              // Guard 2: Clamp ALIGN angle to safe range [-15.0 deg, +15.0 deg]
-                              float clamped_align = std::clamp(align_deg, -15.0f, 15.0f);
-                              std::cout << "[MAIN] Executing ALIGN micro-turn: " << align_deg 
-                                        << " deg (clamped: " << clamped_align << " deg)" << std::endl;
+                              std::cout << "[MAIN] Executing ALIGN micro-turn: " << align_deg << " deg" << std::endl;
                               Msg_Status_t status_snap{};
                               if (robot_comm.GetLatestStatus(status_snap)) {
-                                  path_follower.StartTurn(clamped_align, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
+                                  path_follower.StartTurn(align_deg, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
                               }
                           } else {
                               std::cout << "[MAIN] [ALIGN IGNORED] Robot is currently executing a turn." << std::endl;
