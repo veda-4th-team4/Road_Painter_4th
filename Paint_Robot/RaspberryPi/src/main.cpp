@@ -55,9 +55,6 @@ int main(int argc, char **argv) {
   enum class NozzleSubSeq { OFFSET_MOVE, WAIT_DELAY };
   NozzleSubSeq nozzle_sub_seq = NozzleSubSeq::OFFSET_MOVE;
 
-  enum class CornerSubSeq { REVERSE_OFFSET, INPLACE_TURN, ADVANCE_OFFSET, LOWER_NOZZLE };
-  CornerSubSeq corner_sub_seq = CornerSubSeq::REVERSE_OFFSET;
-
   bool manual_override = false;
   Msg_SetSpeed_t manual_speed = {0, 0};
   uint8_t manual_nozzle = 0;
@@ -225,78 +222,21 @@ int main(int argc, char **argv) {
                       }
                   }
               } else if (current_seg.op == "TURN") {
-                  std::string phase = net_manager.GetPathPhase();
-                  if (phase == "draw") {
-                      // Rear Nozzle Corner Kinematics: -15.5cm reverse -> TURN -> +15.5cm advance -> lower nozzle
-                      Msg_Status_t status_snap{};
-                      if (robot_comm.GetLatestStatus(status_snap)) {
-                          int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
-                          int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
+                  // TURN segment runs pure in-place turn (wheel center is already at vertex)
+                  auto_nozzle = 0; // Force nozzle UP during turning
+                  Msg_Status_t status_snap{};
+                  if (robot_comm.GetLatestStatus(status_snap)) {
+                      int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
+                      int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
 
-                          if (corner_sub_seq == CornerSubSeq::REVERSE_OFFSET) {
-                              auto_nozzle = 0;
-                              robot_comm.SendControlNozzle(0);
-                              if (!path_follower.IsMovingStraight()) {
-                                  std::cout << "[MAIN CORNER] Step 1: Raising nozzle & reversing -15.5cm to position wheel center over vertex..." << std::endl;
-                                  path_follower.StartOffsetMove(PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
-                              }
-                              uint8_t dummy_nozzle = 0;
-                              if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
-                                  corner_sub_seq = CornerSubSeq::INPLACE_TURN;
-                              }
-                          } else if (corner_sub_seq == CornerSubSeq::INPLACE_TURN) {
-                              auto_nozzle = 0;
-                              if (!path_follower.IsTurning()) {
-                                  std::cout << "[MAIN CORNER] Step 2: Executing in-place turn (" << current_seg.angle_deg << " deg) over vertex..." << std::endl;
-                                  path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
-                              }
-                              if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
-                                  corner_sub_seq = CornerSubSeq::ADVANCE_OFFSET;
-                              }
-                          } else if (corner_sub_seq == CornerSubSeq::ADVANCE_OFFSET) {
-                              auto_nozzle = 0;
-                              if (!path_follower.IsMovingStraight()) {
-                                  std::cout << "[MAIN CORNER] Step 3: Advancing +15.5cm to position rear nozzle over vertex..." << std::endl;
-                                  path_follower.StartOffsetMove(-PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
-                              }
-                              uint8_t dummy_nozzle = 0;
-                              if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
-                                  corner_sub_seq = CornerSubSeq::LOWER_NOZZLE;
-                              }
-                          } else if (corner_sub_seq == CornerSubSeq::LOWER_NOZZLE) {
-                              auto_nozzle = 1;
-                              robot_comm.SendControlNozzle(1);
-                              std::cout << "[MAIN CORNER] Step 4: Lowering nozzle (1.0s delay) -> Corner sequence complete!" << std::endl;
-
-                              auto start_wait = std::chrono::steady_clock::now();
-                              while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - start_wait).count() < 1000) {
-                                  robot_comm.SendSetSpeed(0, 0);
-                                  robot_comm.SendControlNozzle(1);
-                                  std::this_thread::sleep_for(std::chrono::milliseconds(80));
-                              }
-
-                              corner_sub_seq = CornerSubSeq::REVERSE_OFFSET; // Reset for next corner
-                              path_follower.AdvanceSegment();
-                          }
+                      if (!path_follower.IsTurning()) {
+                          path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
                       }
-                  } else {
-                      // Approach phase: Pure in-place turn without nozzle offset
-                      auto_nozzle = 0; // Force nozzle UP during turning
-                      Msg_Status_t status_snap{};
-                      if (robot_comm.GetLatestStatus(status_snap)) {
-                          int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
-                          int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
-
-                          if (!path_follower.IsTurning()) {
-                              path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
-                          }
-                          
-                          if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
-                              std::cout << "[MAIN TURN] In-place turn (" << current_seg.angle_deg 
-                                        << " deg) complete on vertex." << std::endl;
-                              path_follower.AdvanceSegment();
-                          }
+                      
+                      if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
+                          std::cout << "[MAIN TURN] In-place turn (" << current_seg.angle_deg 
+                                    << " deg) complete on vertex." << std::endl;
+                          path_follower.AdvanceSegment();
                       }
                   }
               } else if (current_seg.op == "ARC") {
