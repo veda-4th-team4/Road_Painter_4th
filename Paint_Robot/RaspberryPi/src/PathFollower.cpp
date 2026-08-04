@@ -168,7 +168,7 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
     std::cout << "[PathFollower MOVE] Progress: " << progress_steps << "/"
               << move_target_steps << " steps | IMU Yaw: " << imu_yaw_deg
               << " deg | Server Drift: " << drift_offset_deg
-              << " deg (clamped: " << clamped_drift_deg << ") -> Target SPS (L: " << out_speed.left_sps
+              << " deg -> Target SPS (L: " << out_speed.left_sps
               << ", R: " << out_speed.right_sps << ")" << std::endl;
   }
 
