@@ -222,6 +222,8 @@ int main(int argc, char **argv) {
                                 path_follower.AdvanceSegment();
                             }
                         }
+                      }
+                  }
               } else if (current_seg.op == "NOZZLE") {
                   std::string phase = net_manager.GetPathPhase();
                   if (phase == "draw") {
