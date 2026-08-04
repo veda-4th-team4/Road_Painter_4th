@@ -5,7 +5,8 @@ CXX      ?= g++
 CXXFLAGS += -std=c++17 -O2 -Wall -Iinclude -Isrc -pthread
 LDLIBS   += -lssl -lcrypto -pthread
 
-SRCS = src/main.cpp src/tls_server.cpp src/router.cpp src/user_store.cpp
+SRCS = src/main.cpp src/tls_server.cpp src/router.cpp src/router_align.cpp \
+       src/router_calib.cpp src/router_path.cpp src/user_store.cpp
 
 server: $(SRCS) src/*.hpp
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $@ $(LDLIBS)

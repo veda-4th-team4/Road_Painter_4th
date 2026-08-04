@@ -1,9 +1,20 @@
+// 역할별 메시지 분배 (Router의 진입점). 각 role이 보낸 type을 보고 실제 처리를
+// 담당 파일로 넘긴다 - 여기 남은 것은 "누가 무엇을 보냈나"의 분기와, 그 자리에서
+// 끝나는 단순 중계뿐이다.
+//   router_align.cpp - READY 정렬 판정 (ALIGN/GO)
+//   router_calib.cpp - LOGIN / H_MATRIX / SELECT_CHANNEL
+//   router_path.cpp  - START_DRAW / ABORT_DRAW / 경로 생성·복귀
+// 상태(멤버 변수)는 전부 router.hpp에 있고 네 파일이 공유한다. onMessage의
+// 뮤텍스 하나로 직렬화되므로 어느 파일에서 만지든 락을 더 잡을 필요는 없다.
 #include "router.hpp"
 #include "log.hpp"
+#include <algorithm>  // std::min (이상치 게이트 허용치 상한)
 #include <chrono>
-#include <cstdlib>  // std::atoi (채널별 캘리 맵의 키 파싱)
+#include <cmath>
 
-static long nowMs() {
+// 단조 증가 시각 (쿨다운/타임아웃 계산용). 벽시계가 아니라 steady_clock이라
+// 시스템 시간이 바뀌어도(NTP 보정 등) 간격 계산이 뒤틀리지 않는다.
+long Router::nowMs() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch())
         .count();
@@ -16,6 +27,26 @@ void Router::onMessage(const std::string& role, const json& msg) {
     else if (role == "ROBOT") fromRobot(msg);
     else if (role == "CCTV") fromCctv(msg);
     else if (role == "ADMIN") fromAdmin(msg);
+    // 이번 메시지로 조건이 충족됐을 수 있으니(POS로 새 pose가 들어왔거나, 그냥
+    // 시간이 지났거나) 유예해 둔 READY를 여기서 한 곳에서 회수한다.
+    resolvePendingReady();
+    logPosStats();  // POS가 끊긴 것도 보이도록 POS 핸들러 밖에서 (함수 주석 참고)
+}
+
+// POS 수신/채택/폐기 요약. POS 핸들러가 아니라 onMessage() 말단에서 부르는
+// 이유는 resolvePendingReady와 같다 - POS가 완전히 끊기면 POS 핸들러는 다시 안
+// 도는데, 그 "0장"이야말로 제일 보고 싶은 값이다. 로봇 STATUS(2Hz)가 heartbeat로
+// 이 요약을 밀어준다.
+void Router::logPosStats() {
+    if (posStatMs_ == 0) return;  // POS를 한 번도 못 받았으면 조용히 (CCTV 미접속 등)
+    long dt = nowMs() - posStatMs_;
+    if (dt < kPosStatPeriodMs) return;
+    logf("[INFO] POS %.0f초 요약 - 수신 %d, 채택 %d (%.1fHz), 파싱실패 %d, "
+         "속도게이트 %d, 코너뒤집힘 %d",
+         dt / 1000.0, posRecv_, posAccept_, posAccept_ * 1000.0 / dt,
+         posParseFail_, posGateRate_, posGateFlip_);
+    posRecv_ = posAccept_ = posParseFail_ = posGateRate_ = posGateFlip_ = 0;
+    posStatMs_ = nowMs();
 }
 
 // TlsServer가 세션 등록/정리 시 통지 (재접속 교체는 false 없이 넘어감 - tls_server.cpp 참고)
@@ -168,7 +199,6 @@ void Router::fromQt(const json& msg) {
     } else if (type == "BLUEPRINT") {
         // points = Qt가 top-view 픽셀 -> 바닥 미터 변환을 마친 좌표.
         // (top-view 위에 그린 점은 정의상 바닥 평면 위라 높이 보정 불필요)
-        blueprint_ = payload;
         planPts_.clear();
         planPaint_.clear();
         planProgram_ = json::array();
@@ -256,45 +286,29 @@ void Router::fromRobot(const json& msg) {
     json payload = msg.value("payload", json::object());
 
     if (type == "STATUS") {
-        lastStatus_ = payload;
         srv_.sendTo("QT", msg);  // Qt로 상태 중계 (지속 모니터링)
         logf("[INFO] STATUS: state=%s painting=%s",
              payload.value("state", "?").c_str(),
              payload.value("painting", false) ? "true" : "false");
     } else if (type == "READY") {
         // 로봇이 TURN을 마치고 다음 동작(직진 or 대기) 직전에 정렬 확인을 요청.
-        // CCTV pose의 실제 각도 vs 해당 세그먼트의 목표 heading 비교:
-        //   오차 > 임계값 -> ALIGN(그만큼 미세 회전 후 다시 READY)
-        //   오차 <= 임계값 or 반복 초과 -> GO(직진 시작 / 접근 마지막 TURN이면 대기)
+        // ALIGN을 보낸 뒤 온 READY(= 미세회전 완료 통지)라면 그 회전이 pose에
+        // 반영될 때까지 판정을 미룬다 (router.hpp kAlignFreshFrames 참고).
         int seg = payload.value("seg", -1);
         if (seg != alignSegIdx_) {  // 새 세그먼트 정렬 시작
             alignSegIdx_ = seg;
             alignTries_ = 0;
         }
-        // heading_deg가 있는 세그먼트(MOVE 전부 + 접근 경로 마지막 TURN)만 판정 가능
-        double target = 1e9;
-        if (planActive_ && !manualMode_ && seg >= 0 &&
-            seg < (int)activeSegs_.size())
-            target = activeSegs_[seg].value("heading_deg", 1e9);
-
-        if (target > 1e8 || !poseValid_) {
-            // 판정 불가(계획 없음/수동모드/seg 이상/pose 없음)면 로봇을 세워두지 않는다
-            srv_.sendTo("ROBOT", makeMsg("GO", json::object()));
-            logf("[WARN] READY(seg=%d) - 정렬 판정 불가, 그냥 GO", seg);
+        if (alignTries_ > 0) {  // 미세회전 완료 통지 - 그 회전이 pose에 실릴 때까지 유예
+            clearPendingReady();  // 이번 유예분만 모으도록 누적을 비우고 시작
+            pendingReadySeg_ = seg;
+            pendingPosSeq_ = posSeq_;
+            pendingReadyMs_ = nowMs();
+            logf("[INFO] READY(seg=%d) - 직전 ALIGN 반영 대기 (새 POS %d장 필요)",
+                 seg, kAlignFreshFrames);
             return;
         }
-        double err = normDeg(target - pose_.theta * 180.0 / M_PI);
-        if (std::fabs(err) > kAlignThresholdDeg && alignTries_ < kAlignMaxTries) {
-            ++alignTries_;
-            srv_.sendTo("ROBOT",
-                        makeMsg("ALIGN", {{"angle_deg", std::round(err * 10) / 10}}));
-            logf("[INFO] READY(seg=%d) 각도오차 %.1f도 - ALIGN 전송 (%d/%d회)",
-                 seg, err, alignTries_, kAlignMaxTries);
-        } else {
-            srv_.sendTo("ROBOT", makeMsg("GO", json::object()));
-            logf("[INFO] READY(seg=%d) 오차 %.1f도 - GO%s", seg, err,
-                 alignTries_ >= kAlignMaxTries ? " (ALIGN 반복 초과)" : "");
-        }
+        judgeReady(seg);
     } else if (type == "PATH_DONE") {
         // 받은 PATH를 끝까지 수행했다는 로봇의 통지. 어느 단계였는지는 서버 상태로
         // 판단하고, payload.phase는 어긋났을 때 경고를 남기는 용도로만 쓴다
@@ -313,7 +327,7 @@ void Router::fromRobot(const json& msg) {
                      phase.c_str());
             planActive_ = false;
             activeSegs_ = json::array();
-            alignSegIdx_ = -1, alignTries_ = 0;
+            resetAlign();
             planCursor_ = 0;
             srv_.sendTo("QT", makeMsg("DRAW_DONE", json::object()));
             logf("[INFO] 도색 완료 - QT에 DRAW_DONE 통지");
@@ -324,6 +338,7 @@ void Router::fromRobot(const json& msg) {
         logf("[WARN] ROBOT으로부터 알 수 없는 type: %s", type.c_str());
     }
 }
+
 
 void Router::fromCctv(const json& msg) {
     std::string type = msg.value("type", "");
@@ -351,18 +366,72 @@ void Router::fromCctv(const json& msg) {
             return;
         }
         lastIgnoredPosCh_ = 0;
-        lastPos_ = payload;
+        ++posRecv_;
+        if (posStatMs_ == 0) posStatMs_ = nowMs();  // 첫 POS부터 요약 구간 시작
 
         Pose p;
         if (poseFromPos(payload, activeCalib(), p)) {
+            // ----- 이상치 게이트: 물리적으로 불가능한 pose 변화는 검출 오류다 -----
+            // 두 가지를 본다 (router.hpp의 kPoseGate*/kFlip* 주석 참고):
+            //   속도: 각도 변화가 "노이즈 몫 + 물리 회전 몫"을 넘는가 (상한 있음)
+            //   플립: 각도는 크게 변했는데 중심(코너 평균)은 제자리인가
+            //         = 코너 순서가 한 칸 돌아간 것. 마커가 실제로 돌았다면
+            //           중심도 최소한 흔들리므로 이 조합은 나올 수 없다.
+            long dtMs = nowMs() - lastPoseMs_;
+            double dTheta =
+                std::fabs(normDeg((p.theta - pose_.theta) * 180.0 / M_PI));
+            double dCenter = std::hypot(p.x - pose_.x, p.y - pose_.y);
+            double allowed = std::min(
+                kPoseGateBaseDeg + kPoseGateRateDps * (dtMs / 1000.0),
+                kPoseGateMaxDeg);
+            const char* reject = nullptr;
+            if (poseValid_) {
+                if (dTheta > kFlipMinDeg && dCenter < kFlipStillM) reject = "flip";
+                else if (dTheta > allowed) reject = "rate";
+            }
+            // 플립도 연속 거부 한도를 같이 쓴다 - 사람이 로봇을 제자리에서 돌려
+            // 놓으면 "중심 그대로 + 각도 급변"이 진짜로 성립하므로, 영원히
+            // 거부만 하면 복구가 안 된다.
+            if (reject && poseRejects_ < kPoseRejectMax) {
+                ++poseRejects_;
+                if (reject[0] == 'f') {
+                    ++posGateFlip_;
+                    logf("[WARN] POS 코너 순서 뒤집힘 의심 - theta %.1f도 급변인데 "
+                         "중심은 %.3fm만 이동 (%ldms) 폐기 %d/%d",
+                         dTheta, dCenter, dtMs, poseRejects_, kPoseRejectMax);
+                } else {
+                    ++posGateRate_;
+                    logf("[WARN] POS 이상치 - theta %.1f도 급변 (%ldms 내 허용 %.1f도) "
+                         "폐기 %d/%d", dTheta, dtMs, allowed, poseRejects_,
+                         kPoseRejectMax);
+                }
+                return;  // pose_ 갱신도, QT 중계도, posSeq_ 증가도 하지 않는다
+            }
+            if (poseRejects_ >= kPoseRejectMax)
+                logf("[WARN] POS 이상치 연속 %d회 - 추적을 놓친 것으로 보고 재동기",
+                     poseRejects_);
+            poseRejects_ = 0;
+            ++posAccept_;
             pose_ = p;
             poseValid_ = true;
+            lastPoseMs_ = nowMs();
+            ++posSeq_;  // ALIGN 반영 여부 판정용 (router.hpp kAlignFreshFrames)
+            // 유예 중인 READY가 있으면 판정용 theta 표본으로 모아둔다
+            if (pendingReadySeg_ >= 0) {
+                pendingSin_ += std::sin(p.theta);
+                pendingCos_ += std::cos(p.theta);
+                ++pendingPoseN_;
+            }
             // 계산된 pose(바닥 미터 좌표)를 QT에 전송 - top-view 위 로봇 표시용
             srv_.sendTo("QT", makeMsg("POSE",
                 {{"x", std::round(p.x * 1000) / 1000},
                  {"y", std::round(p.y * 1000) / 1000},
                  {"theta_deg", std::round(p.theta * 180.0 / M_PI * 10) / 10}}));
         } else {
+            // 캘리브레이션이 없는 경우만 여기서 소리를 낸다. corners 형식 오류는
+            // 매 프레임 같은 로그가 쏟아지므로 카운터로만 세고, 주기 요약
+            // (logPosStats)의 "파싱실패" 항목으로 드러낸다.
+            ++posParseFail_;
             if (!activeCalib().valid)
                 logf("[WARN] POS 수신했으나 채널 %d 캘리브레이션 없음 - pose 계산 불가 "
                      "(그 채널을 캘리브레이션할 것)", ch);
@@ -418,7 +487,7 @@ void Router::fromCctv(const json& msg) {
                      dev, planCursor_);
             } else if (srv_.sendTo("ROBOT", makePathMsg(segs, "draw"))) {
                 activeSegs_ = segs;
-                alignSegIdx_ = -1, alignTries_ = 0;  // 새 경로 = 정렬 상태 리셋
+                resetAlign();  // 새 경로 = 정렬 상태 리셋
                 logf("[WARN] 경로 이탈 %.2fm (구간 %zu) - 복귀 PATH 전송 "
                      "(%zu번 꼭짓점으로, %zu 동작)",
                      dev, planCursor_, k, segs.size());
@@ -432,388 +501,4 @@ void Router::fromCctv(const json& msg) {
     } else {
         logf("[WARN] CCTV로부터 알 수 없는 type: %s", type.c_str());
     }
-}
-
-// 로그인 처리 (QT/ADMIN 공용). 성공하면 서버가 기억하는 로그인 사용자(currentUser_)를
-// 갱신하고 그 계정에 저장돼 있던 캘리브레이션을 현재 세션에 복원한다.
-// 캘리브레이션(H_MATRIX)은 "그 시점의 currentUser_"에게 영속 저장되므로, QT가 아직
-// 붙지 않은 설치 현장에서도 관리자 창이 먼저 로그인해두면 캘리 결과가 계정에 남는다.
-void Router::handleLogin(const json& payload, const std::string& replyRole) {
-    std::string id = payload.value("id", "");
-    if (!users_.login(id, payload.value("pw", ""))) {
-        srv_.sendTo(replyRole,
-                    makeMsg("LOGIN_FAIL", {{"reason", "id 또는 비밀번호 불일치"}}));
-        logf("[WARN] LOGIN %s 실패 (%s 요청)", id.c_str(), replyRole.c_str());
-        return;
-    }
-    currentUser_ = id;
-    // 저장된 채널별 번들을 현재 세션에 통째로 복원한다. 예전에는 번들이 하나뿐이라
-    // 한 줄이면 됐지만, 이제 채널마다 따로 들고 있어야 한다.
-    const json storedMap = users_.getCalibs(id);
-    calibs_.clear();
-    for (auto it = storedMap.begin(); it != storedMap.end(); ++it) {
-        if (it->is_null()) continue;
-        const int ch = std::atoi(it.key().c_str());
-        if (!validChannel(ch)) {
-            logf("[WARN] 저장된 캘리브레이션에 이상한 채널 키 '%s' - 무시",
-                 it.key().c_str());
-            continue;
-        }
-        Calib c;
-        if (calibFromJson(*it, c)) calibs_[ch] = c;
-        else logf("[WARN] 채널 %d 캘리브레이션 파싱 실패 - 무시", ch);
-    }
-    const Calib& act = activeCalib();
-    // calib(활성 채널 번들)은 v0.3과 의미가 같아 옛 클라이언트도 그대로 동작한다.
-    // calibs(채널별 맵)는 4채널 UI가 "어느 채널이 준비됐는지" 표시하는 데 쓴다.
-    srv_.sendTo(replyRole, makeMsg("LOGIN_OK",
-        {{"id", id},
-         {"calib", act.valid ? act.raw : json()},
-         {"calibs", storedMap},
-         {"active_ch", activeChannel_},
-         {"cam_ip", users_.getCamIp(id)}}));
-    logf("[INFO] LOGIN %s 성공 (%s 요청, 캘리브레이션 %zu채널 보유, 활성 채널 %d %s)",
-         id.c_str(), replyRole.c_str(), calibs_.size(), activeChannel_,
-         act.valid ? "전달" : "없음 - 캘리브레이션 필요");
-}
-
-// 활성 채널의 캘리브레이션. 그 채널이 아직 캘리브레이션되지 않았으면 valid=false인
-// 빈 값을 돌려준다 - 호출부는 calib.valid만 보면 되고 null 검사를 따로 안 해도 된다.
-const Calib& Router::activeCalib() const {
-    static const Calib kNone;
-    auto it = calibs_.find(activeChannel_);
-    return (it == calibs_.end()) ? kNone : it->second;
-}
-
-// ABORT_DRAW: 진행 중인 작업을 취소한다.
-//
-// 버리는 것은 "경로 실행 상태"뿐이다. 도면(blueprint_/planPts_/planPaint_/
-// planProgram_)은 그대로 남긴다 - 취소한 뒤 다시 START_DRAW를 누르면 같은 도면으로
-// 처음부터 시작할 수 있어야 하기 때문. 도면까지 지우면 조작자가 Qt에서 경로를
-// 다시 전송해야 하는데, 취소는 보통 "출발 방향이 이상하니 다시" 정도의 상황이다.
-bool Router::abortDraw() {
-    const bool wasActive = planActive_ || awaitingArrival_ || drawRequested_;
-    planActive_ = false;
-    awaitingArrival_ = false;
-    drawRequested_ = false;  // pose를 기다리며 미뤄둔 시작 요청도 같이 취소한다
-    activeSegs_ = json::array();
-    planCursor_ = 0;
-    alignSegIdx_ = -1;
-    alignTries_ = 0;
-    // manualMode_는 건드리지 않는다. planActive_가 꺼졌으므로 수동 CMD는 이미
-    // 통과하고, 취소 직후 조이스틱으로 로봇을 빼내는 것이 자연스러운 흐름이다.
-    return wasActive;
-}
-
-// SELECT_CHANNEL: 작업 채널 전환. 로봇과는 무관하므로 CCTV로만 중계한다.
-void Router::selectChannel(const json& payload, const json& msg) {
-    if (!payload.contains("ch") || !payload["ch"].is_number_integer() ||
-        !validChannel(payload["ch"].get<int>())) {
-        srv_.sendTo("QT", makeMsg("CHANNEL_FAIL", {{"reason", "bad_channel"}}));
-        logf("[WARN] SELECT_CHANNEL - ch가 없거나 범위(%d..%d) 밖: %s",
-             kMinChannel, kMaxChannel, payload.dump().c_str());
-        return;
-    }
-    const int ch = payload["ch"].get<int>();
-    activeChannel_ = ch;
-    // 예전 채널 기준으로 잡아둔 pose는 새 채널에서 의미가 없다 (좌표계가 다르다).
-    // 그대로 두면 새 채널의 첫 POS가 오기 전까지 서버가 엉뚱한 위치를 믿는다.
-    poseValid_ = false;
-    lastIgnoredPosCh_ = 0;
-    // 카메라도 그 채널을 봐야 POS가 이 채널 기준으로 온다.
-    srv_.sendTo("CCTV", msg);
-    const Calib& c = activeCalib();
-    srv_.sendTo("QT", makeMsg("CHANNEL_OK",
-        {{"ch", ch}, {"calib", c.valid ? c.raw : json()}}));
-    logf("[INFO] 활성 채널 %d 로 전환 -> CCTV 중계 (캘리브레이션 %s)", ch,
-         c.valid ? "있음" : "없음 - 그 채널을 먼저 캘리브레이션할 것");
-}
-
-// 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용). 세 형태를 받는다:
-//   중첩:   payload.calib = {K, D, H_floor, H_marker, marker_height_m, version}
-//   평면:   payload 자체가 번들 = {calib_id, K, D, H, H_marker, canvas_mm, ...}
-//           (QT-REQ-CCTV-001 rev.2 — 바닥 H를 H_floor가 아니라 H로 부른다)
-//   레거시: payload.H = [[...]x3] 뿐 (왜곡 보정 없이 바닥/마커 공용으로 사용)
-// CCTV는 mm 기준(pixel->world mm) 호모그래피를 보낸다. 서버 입구에서 미터로 정규화한 뒤
-// 저장/중계하므로, 이후 pose/POSE/BLUEPRINT/PATH와 QT top-view는 전부 미터로 통일된다.
-void Router::handleHMatrix(const json& msg) {
-    json payload = msg.value("payload", json::object());
-    // 평면 번들과 레거시는 둘 다 최상위 "H"를 갖는다. 예전엔 "calib이 없고 H가 있으면
-    // 레거시"로 단정해 payload["H"] 행렬 하나만 떼어냈고, 그래서 평면 번들이 오면
-    // K/D/H_marker가 통째로 버려져 왜곡 보정과 시차 보정이 조용히 꺼졌다 - 좌표는
-    // 그럴듯하게 나오고 렌즈 왜곡만큼 틀린다. 캘리 내용 필드가 H와 같이 왔으면
-    // 평면 번들로 본다.
-    const bool nested = payload.contains("calib");
-    const bool legacyH = !nested && payload.contains("H") &&
-                         !payload.contains("K") && !payload.contains("D") &&
-                         !payload.contains("H_floor") && !payload.contains("H_marker");
-    json bundle = nested ? payload["calib"] : (legacyH ? payload["H"] : payload);
-    // 어느 채널의 번들인가. payload 최상위의 "ch"를 본다 (없으면 1 - 단일 채널
-    // 카메라와 v0.3 클라이언트 하위호환). 평면 스키마는 payload 자체가 번들이라
-    // "ch"가 번들 안에 남는데, calib_id처럼 손대지 않는 메타데이터로 보존한다 -
-    // 저장된 번들만 봐도 어느 채널 것인지 알 수 있어 오히려 낫다.
-    const int ch = channelOf(payload);
-    normalizeBundleMmToM(bundle);  // mm -> m (÷1000). 이후 번들은 미터 기준.
-    aliasFloorKey(bundle);  // 평면 스키마의 "H"에 "H_floor" 별칭 (QT는 H_floor만 봄)
-    Calib c;
-    if (!calibFromJson(bundle, c)) {
-        logf("[WARN] H_MATRIX(채널 %d) 파싱 실패 - calib/H 형식 확인 필요: %s",
-             ch, payload.dump().c_str());
-        return;
-    }
-    calibs_[ch] = c;
-    // 정규화된(미터) 번들로 다시 싸서 QT에 중계 + 영속 저장 - QT는 미터 H_floor로 top-view.
-    json outMsg = msg;
-    if (nested) outMsg["payload"]["calib"] = bundle;
-    else if (legacyH) outMsg["payload"]["H"] = bundle;
-    else outMsg["payload"] = bundle;  // 평면 번들은 payload 자체가 번들
-    // 중계본에도 채널을 명시한다. 중첩/레거시 스키마는 ch가 payload 밖이라 원본에
-    // 없으면 사라지는데, Qt는 "지금 보고 있는 채널의 번들인가"를 판단해야 한다 -
-    // 다른 채널 캘리로 top-view를 갈아엎으면 화면과 좌표가 통째로 어긋난다.
-    outMsg["payload"]["ch"] = ch;
-    srv_.sendTo("QT", outMsg);
-    // 어느 스키마로 읽혔는지 남긴다 - 평면 번들을 보냈는데 "레거시"로 찍히면
-    // K/D가 빠졌다는 뜻이라, 로그만 보고 바로 알 수 있어야 한다.
-    const char* schema = nested ? "중첩 calib" : (legacyH ? "레거시 H" : "평면 번들");
-    // 로그인 상태와 무관하게 전역 슬롯에 먼저 남긴다 (QT-REQ-SRV-001 R-1).
-    // 캘리브레이션은 현장 속성이라, 아무도 로그인하지 않은 채 올려도 서버 재시작 후
-    // 살아남아야 한다 - 예전엔 이 경우 메모리에만 남아 그대로 유실됐다.
-    users_.setGlobalCalib(ch, bundle);
-    const char* detail_marker =
-        c.hasMarker ? "H_marker 포함" : "H_marker 없음 - 시차 보정 생략됨";
-    const char* detail_kd = c.hasKD ? ", K/D 포함" : ", K/D 없음 - 왜곡 보정 생략됨";
-    // ch를 안 실어 보내면 전부 채널 1에 덮어써진다 - 4채널을 캘리한 줄 알았는데
-    // 마지막 하나만 남는 상황이라, 어느 채널로 저장됐는지 로그에 반드시 남긴다.
-    if (!currentUser_.empty() && users_.setCalib(currentUser_, ch, bundle))
-        logf("[INFO] 캘리브레이션 수신 [채널 %d] (%s, mm->m 정규화, %s%s) - "
-             "사용자 '%s' + 전역 슬롯에 영속 저장",
-             ch, schema, detail_marker, detail_kd, currentUser_.c_str());
-    else
-        logf("[INFO] 캘리브레이션 수신 [채널 %d] (%s, mm->m 정규화, %s%s) - "
-             "로그인 사용자 없음, 전역 슬롯에 영속 저장 (다음 로그인 때 전달됨)",
-             ch, schema, detail_marker, detail_kd);
-}
-
-// 1단계: Qt "그림그리기 시작" -> 로봇 현재 위치에서 도면 시작점(planPts_[0])까지
-// 접근 경로를 만들어 전송. 시작점 도착 후 첫 도색 방향으로 미리 회전까지 시켜두고,
-// 로봇이 PATH_DONE으로 도착을 알리면 서버가 곧바로 2단계(도색)로 이어간다.
-void Router::startApproach() {
-    if (planPts_.size() < 2) {
-        logf("[WARN] START_DRAW 수신 - 도면 없음 (무시)");
-        sendDrawFail("draw", "no_blueprint", "도면 없음 - 먼저 도면을 전송할 것");
-        drawRequested_ = false;
-        return;
-    }
-    if (planActive_) {  // 이미 접근/도색 진행 중 - 중복 시작 방지
-        logf("[WARN] START_DRAW 수신 - 이미 경로 실행 중 (무시)");
-        sendDrawFail("draw", "busy", "이미 경로 실행 중 - 완료 또는 새 도면 전송 후 시작할 것");
-        return;
-    }
-    if (!poseValid_) {
-        // 실패가 아니라 대기다. CCTV로 pose가 잡히는 순간 POS 핸들러가 재호출한다.
-        drawRequested_ = true;
-        logf("[INFO] START_DRAW 수신 - 로봇 위치 미확인, CCTV POS 수신 후 전송 예정");
-        sendDrawFail("draw", "no_pose", "로봇 위치 미확인 - CCTV POS 수신 후 자동 전송 예정");
-        return;
-    }
-    planCursor_ = 0;
-    // 시작점까지 (paint=false). 접근 목표는 planPts_[0] "그대로"다 - 로봇
-    // 중심을 도면 시작점에 세우기만 하면 되고, 펜 오프셋 보정은 로봇이 스스로
-    // 한다 (서버/Qt 둘 다 관여하지 않음).
-    // 접근 구간에는 NOZZLE을 끼우지 않는다. 전부 paint=false라 withNozzleOps를
-    // 통과시켜도 아무것도 안 붙고(노즐은 올라간 채로 시작·유지), 도색/복귀 경로가
-    // 항상 NOZZLE up으로 끝나므로 여기서 다시 올릴 필요도 없다.
-    json segs = buildSegments(pose_, {planPts_[0]});
-
-    // 도착 직후 방향: 접근 MOVE의 heading, 이동이 없었다면 현재 각도
-    double arrival = pose_.theta * 180.0 / M_PI;
-    for (auto& s : segs)
-        if (s.value("op", "") == "MOVE") arrival = s.value("heading_deg", arrival);
-    // 첫 도색 구간(시작점 -> 두번째 점) 방향으로 미리 회전
-    double first = std::atan2(planPts_[1][1] - planPts_[0][1],
-                              planPts_[1][0] - planPts_[0][0]) * 180.0 / M_PI;
-    double turn = normDeg(first - arrival);
-    if (std::fabs(turn) > 2.0)
-        segs.push_back({{"op", "TURN"},
-                        {"angle_deg", std::round(turn * 10) / 10},
-                        {"heading_deg", std::round(first * 10) / 10}});
-    // (마지막 TURN에도 heading_deg를 실어 로봇이 READY로 정렬 확인 가능)
-
-    if (segs.empty()) {
-        // 로봇이 이미 시작점에 첫 도색 방향으로 서 있는 경계 케이스. 접근할 게
-        // 없으므로 도착 통지를 기다리지 않고 곧바로 2단계로 넘어간다.
-        logf("[INFO] 접근 불필요 (이미 시작점) - 곧바로 도색 경로 전송");
-        drawRequested_ = false;
-        awaitingArrival_ = true;  // sendDrawPath의 단계 가드 통과용
-        sendDrawPath();
-        return;
-    }
-    if (srv_.sendTo("ROBOT", makePathMsg(segs, "approach"))) {
-        planActive_ = true;
-        awaitingArrival_ = true;
-        drawRequested_ = false;
-        activeSegs_ = segs;
-        alignSegIdx_ = -1, alignTries_ = 0;  // 새 경로 = 정렬 상태 리셋
-        lastPlanMs_ = nowMs();
-        logf("[INFO] 1단계 접근 경로 전송 (%zu 세그먼트) - 로봇 도착(PATH_DONE) 대기",
-             segs.size());
-    } else {
-        logf("[WARN] 1단계 접근 경로 전송 실패 - 로봇 미접속");
-        sendDrawFail("draw", "robot_offline", "로봇 미접속 - 경로 전송 실패");
-        drawRequested_ = false;
-    }
-}
-
-// 2단계: 로봇 접근 완료(PATH_DONE) -> 시작점에 서 있는 로봇에게 도색 경로 전송.
-// 로봇은 이 PATH(phase=draw)를 받으면 IMU 현재 방향을 0도로 세팅하고 주행 시작.
-void Router::sendDrawPath() {
-    // 아래 실패 경로들은 전부 "접근은 끝났는데 도색을 못 시작한" 상황이다.
-    // 상태를 접어두지 않으면 planActive_/awaitingArrival_가 켜진 채로 남아
-    // Qt가 START_DRAW로 다시 시도할 수도, 완료 통지를 받을 수도 없게 된다.
-    if (!awaitingArrival_) {  // 내부 오류 (정상 흐름에서는 도달하지 않음)
-        logf("[WARN] 도색 경로 전송 요청 - 접근 완료 대기 상태가 아님 (무시)");
-        sendDrawFail("draw", "not_ready", "로봇이 시작점 접근 완료 대기 상태가 아님");
-        return;
-    }
-    if (!poseValid_ || planPts_.size() < 2) {
-        logf("[WARN] 도색 경로 생성 불가 - pose/도면 없음");
-        sendDrawFail("draw", !poseValid_ ? "no_pose" : "no_blueprint",
-                     !poseValid_ ? "로봇 위치 미확인" : "도면 없음");
-        awaitingArrival_ = false;
-        planActive_ = false;
-        return;
-    }
-    planCursor_ = 0;  // 도색 시작 = 첫 구간부터
-    json segs;
-    if (planProgram_.is_array() && !planProgram_.empty()) {
-        // Qt가 입력한 동작 시퀀스를 손대지 않고 그대로 넘긴다. dist_m/angle_deg는
-        // Qt 값 그대로 - 서버는 재계산하지 않는다. 펜 오프셋 보정은 로봇이
-        // TURN 실행 시 스스로 한다.
-        segs = planProgram_;
-        logf("[INFO] Qt 동작 시퀀스 사용 (%zu 동작)", segs.size());
-    } else {
-        // 하위호환: program이 없으면 종전대로 서버가 도면에서 직접 생성.
-        // 시작점에 서 있으므로 남은 경로 = 두번째 점부터.
-        // withNozzleOps로 감싸는 이유: 노즐 제어의 단일 결정권이 NOZZLE op이라
-        // (path_planner.hpp 참고), MOVE.paint만 실어 보내면 로봇이 노즐을
-        // 영영 안 내린다. buildSegments 결과는 반드시 이걸 통과시킬 것.
-        std::vector<Pt> rest(planPts_.begin() + 1, planPts_.end());
-        std::vector<char> restPaint;
-        if (planPaint_.size() == planPts_.size())
-            restPaint.assign(planPaint_.begin() + 1, planPaint_.end());
-        segs = withNozzleOps(buildSegments(pose_, rest, /*firstPaint=*/true,
-                             restPaint.empty() ? nullptr : &restPaint));
-    }
-    if (segs.empty()) {  // 도색할 구간 없음 (드문 경계 케이스) - 그린 것으로 친다
-        logf("[INFO] 도색할 구간 없음 - 곧바로 완료 처리");
-        awaitingArrival_ = false;
-        planActive_ = false;
-        activeSegs_ = json::array();
-        srv_.sendTo("QT", makeMsg("DRAW_DONE", json::object()));
-        return;
-    }
-    if (srv_.sendTo("ROBOT", makePathMsg(segs, "draw"))) {
-        awaitingArrival_ = false;
-        planActive_ = true;
-        activeSegs_ = segs;
-        alignSegIdx_ = -1, alignTries_ = 0;
-        lastPlanMs_ = nowMs();
-        logf("[INFO] 2단계 도색 경로 전송 (%zu 세그먼트) - 도색 시작", segs.size());
-    } else {
-        logf("[WARN] 2단계 도색 경로 전송 실패 - 로봇 미접속");
-        sendDrawFail("draw", "robot_offline", "로봇 미접속 - 경로 전송 실패");
-        awaitingArrival_ = false;
-        planActive_ = false;
-    }
-}
-
-// 이탈 복귀 경로: 로봇을 planPts_[k]로 되돌린 뒤 원래 하던 일을 이어가게 한다.
-//
-// ⚠️ Qt program이 있으면 절대 다시 만들지 않는다. 재생성하면 Qt 화면의
-// 미리보기와 실제 실행이 달라져 조작자가 동선을 검증할 수 없게 된다.
-// 대신 "복귀 구간만 새로 만들고 원본을 잘라 이어 붙인다". 펜 오프셋 보정은
-// 로봇이 자기 TURN 실행 중에 스스로 하므로(program에는 안 드러남) 여기서는
-// 신경 쓰지 않는다 - k번 꼭짓점 이후를 담당하는 첫 op을 찾아 그 앞에 복귀
-// 주행만 이어붙이면 끝이다.
-//
-//   [NOZZLE 올림]            복귀 주행 중에는 칠하지 않는다
-//   [현재 pose -> planPts_[k]]  로봇 "중심"을 꼭짓점에 (buildSegments)
-//   [TURN -> 재개 방위]
-//   [원본 program의 재개 지점부터 끝까지]
-json Router::buildRecovery(size_t k) {
-    if (planPts_.size() < 2 || k >= planPts_.size()) return json::array();
-
-    // ----- 하위호환: program이 없으면 남은 도면으로 직접 생성 (종전 동작) -----
-    if (!planProgram_.is_array() || planProgram_.empty()) {
-        std::vector<Pt> rest(planPts_.begin() + k, planPts_.end());
-        std::vector<char> restPaint;
-        if (planPaint_.size() == planPts_.size()) {
-            restPaint.assign(planPaint_.begin() + k, planPaint_.end());
-            restPaint[0] = 0;  // 복귀 구간(현재 위치 -> pts[k])은 칠하지 않는다
-        }
-        // 여기도 NOZZLE을 끼워 넣는다 (sendDrawPath 폴백과 같은 이유).
-        return withNozzleOps(buildSegments(pose_, rest, /*firstPaint=*/false,
-                             restPaint.empty() ? nullptr : &restPaint));
-    }
-
-    // ----- 재개 지점 찾기: v >= k인 첫 op -----
-    size_t start = planProgram_.size();
-    for (size_t i = 0; i < planProgram_.size(); ++i) {
-        if (planProgram_[i].value("v", -1) >= (int)k) { start = i; break; }
-    }
-    if (start >= planProgram_.size()) {
-        // k가 program의 모든 op보다 뒤 - 남은 program이 없다는 뜻(주로 마지막
-        // 꼭짓점 부근에서 이탈했을 때). 이어붙일 동작이 없으니 꼭짓점까지만
-        // 데려간다 - 그게 이 복귀에서 할 수 있는 전부다.
-        json segs = json::array();
-        segs.push_back({{"op", "NOZZLE"}, {"down", false}});
-        std::vector<Pt> to{planPts_[k]};
-        std::vector<char> noPaint{0};
-        json back = buildSegments(pose_, to, /*firstPaint=*/false, &noPaint);
-        for (auto& s : back) segs.push_back(s);
-        logf("[INFO] 복귀 경로: %zu번 꼭짓점 이후 남은 program 없음 - "
-             "꼭짓점까지만 이동", k);
-        return segs;
-    }
-
-    // 재개 동작이 바라볼 방위. NOZZLE처럼 방위가 없는 op면 뒤에서 찾는다.
-    double heading = 1e9;
-    for (size_t i = start; i < planProgram_.size() && heading > 1e8; ++i)
-        heading = planProgram_[i].value("heading_deg", 1e9);
-    if (heading > 1e8) heading = pose_.theta * 180.0 / M_PI;
-
-    json segs = json::array();
-    segs.push_back({{"op", "NOZZLE"}, {"down", false}});
-
-    // 로봇 중심을 꼭짓점으로 (펜 오프셋 보정은 로봇이 TURN 실행 시 스스로 함)
-    std::vector<Pt> to{planPts_[k]};
-    std::vector<char> noPaint{0};
-    json back = buildSegments(pose_, to, /*firstPaint=*/false, &noPaint);
-    double arrival = pose_.theta * 180.0 / M_PI;
-    for (auto& s : back) {
-        if (s.value("op", "") == "MOVE") arrival = s.value("heading_deg", arrival);
-        segs.push_back(s);
-    }
-
-    double turn = normDeg(heading - arrival);
-    if (std::fabs(turn) > 2.0)
-        segs.push_back({{"op", "TURN"},
-                        {"angle_deg", std::round(turn * 10) / 10},
-                        {"heading_deg", std::round(heading * 10) / 10}});
-    // 재개 지점이 곧바로 도색 MOVE면 노즐을 내려준다 (위에서 올려놨으므로).
-    // program이 NOZZLE로 시작하는 정상 경우엔 중복되지 않는다.
-    if (planProgram_[start].value("op", "") == "MOVE" &&
-        planProgram_[start].value("paint", false))
-        segs.push_back({{"op", "NOZZLE"}, {"down", true}});
-
-    for (size_t i = start; i < planProgram_.size(); ++i)
-        segs.push_back(planProgram_[i]);
-    return segs;
-}
-
-// 경로 생성/전송 실패(또는 대기) 시 Qt에 통지. reason 코드로 상황 구분.
-void Router::sendDrawFail(const char* stage, const char* reason,
-                          const std::string& msg) {
-    srv_.sendTo("QT", makeMsg("DRAW_FAIL",
-        {{"stage", stage}, {"reason", reason}, {"msg", msg}}));
 }

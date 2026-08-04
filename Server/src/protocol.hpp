@@ -102,9 +102,14 @@
 //     - 출발 전 정렬 확인: TURN을 마치고 MOVE를 시작하기 직전에 정지 상태로 전송.
 //       seg = segments 배열에서 곧 실행할 MOVE의 인덱스 (0부터).
 //     - 서버가 CCTV 마커로 잰 실제 각도와 그 MOVE의 heading_deg를 비교해서
-//       오차 > 2도면 ALIGN{angle_deg}(미세 회전 후 다시 READY),
-//       오차 <= 2도(또는 4회 반복 초과)면 GO{} 응답. GO를 받으면 직진 시작.
+//       오차 > 4도면 ALIGN{angle_deg}(미세 회전 후 다시 READY),
+//       오차 <= 4도(또는 4회 반복 초과)면 GO{} 응답. GO를 받으면 직진 시작.
 //       (임계값/횟수 실제값은 router.hpp의 kAlignThresholdDeg/kAlignMaxTries)
+//     - 🔴 ALIGN 뒤에 온 READY에는 서버가 즉답하지 않는다 (2026-08-03). 그 미세
+//       회전이 CCTV pose에 반영될 때까지 유예했다가 판정한다 - POS 정상 시
+//       100~200ms, POS가 끊기면 최악 1.5초. 로봇은 READY에 자체 타임아웃을 걸어
+//       임의 출발하면 안 된다 (server_PROTOCOL.md "ALIGN 이후 READY는 서버가
+//       늦게 답한다" 참고).
 //   PATH_DONE payload: {"phase":"approach"|"draw"}
 //     - 받은 PATH의 마지막 세그먼트까지 수행을 마쳤을 때 1회 전송 (2026-07-27 추가).
 //       phase는 방금 끝낸 PATH의 phase를 그대로 되돌려준다.
@@ -120,14 +125,22 @@
 //        (cam_ip는 선택 - 카메라 IP. 서버는 검증 없이 저장만 함)
 //   LOGIN    payload: {"id":"user1","pw":"..."}
 //     -> 응답 LOGIN_OK {"id":..., "calib":{...}|null, "calibs":{"1":{...},"2":null},
-//                       "active_ch":1, "cam_ip":"..."|null}
+//                       "active_ch":1, "cam_ip":"..."|null,
+//                       "stream":{"base":"rtsp://...:8554","channels":4}}
 //        | LOGIN_FAIL {"reason":...}
 //        (calib  = 활성 채널의 번들. null이면 그 채널은 캘리브레이션 필요.
 //                  v0.3과 의미가 같아 옛 클라이언트도 그대로 동작한다.
 //         calibs = 채널별 번들 맵 (2026-08-03 신설). 키는 채널 번호 문자열.
 //                  4채널 UI가 "어느 채널이 캘리 됐는지" 표시하는 데 쓴다.
 //         active_ch = 서버가 기억하는 활성 채널 (기본 1)
-//         cam_ip = REGISTER 때 등록한 카메라 IP, 없으면 null)
+//         cam_ip = REGISTER 때 등록한 카메라 IP, 없으면 null
+//         stream = 중계(MediaMTX) RTSP 베이스 주소 (2026-08-04 신설, 선택).
+//                  config/stream.json이 있을 때만 실린다 - 없으면 필드 자체가
+//                  빠지고 QT는 자기 설정값을 쓴다. QT가 {base}/ch1 … /ch4(메인),
+//                  {base}/ch1s … /ch4s(서브)로 조립한다. channels는 0/미지정이면
+//                  생략(QT 기본값 4).
+//                  ⚠️ cam_ip와 별개다 - cam_ip는 카메라 IP(PNO 직결용)라
+//                  의미가 다르고, 합치면 PNO로 되돌아갈 수 없게 된다)
 //   SET_CAM_IP payload: {"cam_ip":"192.168.0.31"}   (2026-07-27 추가)
 //     -> 응답 SET_CAM_IP_OK {"cam_ip":"..."|null} | SET_CAM_IP_FAIL {"reason":...}
 //        (로그인 상태에서만 가능. REGISTER와 마찬가지로 형식 검증 없이 저장만 하고,

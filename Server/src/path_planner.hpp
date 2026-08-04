@@ -22,6 +22,14 @@ inline double normDeg(double a) {
     return a;
 }
 
+// 이보다 작은 회전은 TURN op을 만들지 않는다. 로봇이 제자리 회전 1회에 내는
+// 오차(router.hpp kAlignThresholdDeg 주석의 틱당 1.42도 오버슛)보다 작은 회전은
+// 지시해봐야 오히려 각도를 망치고, 세그먼트만 하나 늘려 READY 왕복을 더 태운다.
+// 🔴 경로를 만드는 쪽(buildSegments)과 뒤에 회전을 덧붙이는 쪽(Router::appendTurnTo)이
+// 반드시 같은 값을 써야 한다 - 한쪽만 다르면 "여기선 생략하기로 한 회전"을
+// 다른 쪽이 붙여 로봇이 헛도는 세그먼트가 생긴다.
+constexpr double kMinTurnDeg = 2.0;
+
 // POS payload -> 바닥 좌표계 pose.
 //   {"corners":[[u,v]x4]}  순서 = [전좌, 전우, 후우, 후좌] (CCTV "원본 픽셀" 좌표)
 //     -> 코너별 undistort -> H_marker -> 미터 좌표 4점 -> 중심/방향 계산.
@@ -78,7 +86,7 @@ inline json buildSegments(const Pose& start, const std::vector<Pt>& pts,
         double desired = std::atan2(dy, dx);
         double headingDeg = std::round(desired * 180.0 / M_PI * 10) / 10;
         double turn = normDeg((desired - th) * 180.0 / M_PI);
-        if (std::fabs(turn) > 2.0)  // 2도 미만 회전은 생략
+        if (std::fabs(turn) > kMinTurnDeg)  // 아주 작은 회전은 생략 (위 상수 참고)
             // TURN에도 heading_deg(회전 후 바라볼 절대 각도)를 실어, 로봇이 회전
             // 직후 READY를 보내도 서버가 정렬 판정을 할 수 있게 한다.
             segs.push_back({{"op", "TURN"},

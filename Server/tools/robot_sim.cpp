@@ -54,6 +54,11 @@ static double optStartX = -0.5, optStartY = -0.5, optStartDeg = 0.0;
 
 // 기본 속도 (op에 speed가 없을 때). 실제 로봇 하드코딩값에 맞춘 러프 값.
 static constexpr double kDefaultMps = 0.15;
+// ⚠️ 45도/s는 실제 로봇의 물리적 상한(17.8도/s - router.hpp kPoseGateRateDps 주석의
+// 계산 참고)보다 빠르다. 그래서 드라이런을 돌리면 TURN 구간마다 서버의 POS 이상치
+// 게이트(허용 3도 + 40도/s)가 걸려 "[WARN] POS 이상치 ... 폐기 n/5"가 줄줄이 찍히고
+// 5프레임마다 재동기된다 - 서버 버그가 아니라 이 상수가 비물리적이라는 뜻이다.
+// 게이트까지 같이 검증하려면 17.8 이하로 내려서 돌릴 것 (그만큼 드라이런이 느려진다).
 static constexpr double kDefaultDps = 45.0;
 static constexpr double kTickS = 0.05;  // 시뮬 한 틱 (20Hz)
 

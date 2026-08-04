@@ -1,10 +1,18 @@
 // Road-Painter 중앙 서버 (서버 RPi에서 실행) - TCP/TLS
 //
 // 파일 구성:
-//   main.cpp       - 시작/조립 + 테스트용 콘솔
-//   tls_server.*   - TLS 네트워크 레이어 (접속, role 등록, 송수신)
-//   router.*       - 메시지 라우팅 로직 (QT/ROBOT/CCTV)
-//   protocol.hpp   - 메시지 생성 헬퍼
+//   main.cpp          - 시작/조립 + 테스트용 콘솔
+//   tls_server.*      - TLS 네트워크 레이어 (접속, role 등록, 송수신)
+//   router.hpp        - 라우터의 상태 전부 + 튜닝 상수 (아래 네 .cpp가 공유)
+//   router.cpp        - 역할별 메시지 분배 (QT/ROBOT/CCTV/ADMIN) + 단순 중계
+//   router_align.cpp  - 출발 전 정렬 판정 (READY -> ALIGN/GO)
+//   router_calib.cpp  - 로그인 / 캘리브레이션 번들 / 채널 전환
+//   router_path.cpp   - 경로 생성·전송·복귀 (접근 -> 도색 2단계)
+//   path_planner.hpp  - pose 추정 + 동작 시퀀스 생성 + 이탈 거리 계산
+//   calib.hpp         - 캘리브레이션 번들 파싱 / 픽셀 -> 미터 변환
+//   user_store.*      - 계정·캘리브레이션 영속 저장 (JSON 파일)
+//   stream_cfg.hpp    - 중계 RTSP 주소 설정 (LOGIN_OK.stream, 선택)
+//   protocol.hpp      - 메시지 규격 문서 + 생성 헬퍼
 //
 // 실행 전: ./gen_cert.sh <서버IP> 로 certs/server.crt, server.key 생성
 // 콘솔 명령: path / estop / resume / calib / who / quit
