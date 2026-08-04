@@ -19,6 +19,14 @@ import time
 from collections import deque
 from logging.handlers import RotatingFileHandler
 
+# 이 코드는 로그 문구에 —/⚠️/🔴 같은 non-ASCII 문자를 흔히 쓴다. 리눅스(Pi)에서는
+# stdout이 기본 UTF-8이라 문제가 없었지만, 한국어 로캘 Windows에서 그대로 돌리면
+# 콘솔 기본 인코딩(cp949)이 그 문자들을 못 써서 broadcast() 가 UnicodeEncodeError로
+# 죽는다(예: cctv_link_loop 스레드가 접속 로그 한 줄 찍다가 죽음). stdout/stderr을
+# 켜자마자 UTF-8로 못박아 로캘에 흔들리지 않게 한다.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 TCP_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 6000
 HTTP_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8081
