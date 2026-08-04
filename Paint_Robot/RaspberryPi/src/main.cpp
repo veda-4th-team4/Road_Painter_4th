@@ -151,9 +151,9 @@ int main(int argc, char **argv) {
       } else if (!path_follower.IsPathFinished()) {
           Segment_t current_seg;
           if (path_follower.GetCurrentSegment(current_seg)) {
-              if (current_seg.op == "MOVE") {
+              if (current_seg.op == "MOVE" || (current_seg.op == "NOZZLE" && current_seg.paint)) {
                   uint32_t seg_idx = static_cast<uint32_t>(path_follower.GetCurrentSegmentIndex());
-                  bool bypass_server_go = false; // Wait for server GO/ALIGN handshake before starting MOVE
+                  bool bypass_server_go = false; // Wait for server GO/ALIGN handshake before starting MOVE / NOZZLE
                   
                   if (ready_seg_sent != seg_idx) {
                       // Send READY to server for logging, then proceed directly if bypass enabled
@@ -162,9 +162,10 @@ int main(int argc, char **argv) {
                       waiting_for_go = !bypass_server_go;
                       if (waiting_for_go) {
                           robot_comm.SendSetSpeed(0, 0);
-                          std::cout << "[MAIN] Sent READY for MOVE segment " << seg_idx << ", waiting for GO/ALIGN..." << std::endl;
+                          std::cout << "[MAIN] Sent READY for segment " << seg_idx << " (" << current_seg.op 
+                                    << "), waiting for GO/ALIGN..." << std::endl;
                       } else {
-                          std::cout << "[MAIN] [BYPASS GO] Starting MOVE segment " << seg_idx << " directly." << std::endl;
+                          std::cout << "[MAIN] [BYPASS GO] Starting segment " << seg_idx << " directly." << std::endl;
                       }
                   }
 
@@ -199,63 +200,28 @@ int main(int argc, char **argv) {
 
                       // Check for GO signal
                       if (net_manager.CheckAndClearGoSignal()) {
-                          std::cout << "[MAIN] GO signal received! Starting MOVE segment " << seg_idx << std::endl;
+                          std::cout << "[MAIN] GO signal received! Starting " << current_seg.op << " segment " << seg_idx << std::endl;
                           waiting_for_go = false;
                       }
                   }
 
                   if (!waiting_for_go) {
-                      Msg_Status_t status_snap{};
-                      if (robot_comm.GetLatestStatus(status_snap)) {
-                          int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
-                          int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
+                      if (current_seg.op == "MOVE") {
+                        Msg_Status_t status_snap{};
+                        if (robot_comm.GetLatestStatus(status_snap)) {
+                            int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
+                            int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
 
-                          if (!path_follower.IsMovingStraight()) {
-                              path_follower.StartMove(current_seg.dist_m, l_steps, r_steps);
-                          }
+                            if (!path_follower.IsMovingStraight()) {
+                                path_follower.StartMove(current_seg.dist_m, l_steps, r_steps);
+                            }
 
-                          float imu_yaw = imu_manager.GetYaw();
-                          if (path_follower.UpdateMove(l_steps, r_steps, target_speed, nozzle_on, imu_yaw)) {
-                              // Pure MOVE segment completed -> advance to next segment
-                              path_follower.AdvanceSegment();
-                          }
-                      }
-                  }
-              } else if (current_seg.op == "TURN") {
-                  // TURN segment runs pure in-place turn (wheel center is already at vertex)
-                  auto_nozzle = 0; // Force nozzle UP during turning
-                  Msg_Status_t status_snap{};
-                  if (robot_comm.GetLatestStatus(status_snap)) {
-                      int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
-                      int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
-
-                      if (!path_follower.IsTurning()) {
-                          path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
-                      }
-                      
-                      if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
-                          std::cout << "[MAIN TURN] In-place turn (" << current_seg.angle_deg 
-                                    << " deg) complete on vertex." << std::endl;
-                          path_follower.AdvanceSegment();
-                      }
-                  }
-              } else if (current_seg.op == "ARC") {
-                  Msg_Status_t status_snap{};
-                  if (robot_comm.GetLatestStatus(status_snap)) {
-                      int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
-                      int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
-
-                      if (!path_follower.IsMovingStraight()) {
-                          path_follower.StartArc(current_seg.radius_m, current_seg.angle_deg, current_seg.direction, l_steps, r_steps);
-                      }
-                      
-                      if (path_follower.UpdateArc(l_steps, r_steps, target_speed)) {
-                          std::cout << "[MAIN ARC] Arc segment (R=" << current_seg.radius_m 
-                                    << "m, " << current_seg.angle_deg << " deg " << current_seg.direction 
-                                    << ") complete." << std::endl;
-                          path_follower.AdvanceSegment();
-                      }
-                  }
+                            float imu_yaw = imu_manager.GetYaw();
+                            if (path_follower.UpdateMove(l_steps, r_steps, target_speed, nozzle_on, imu_yaw)) {
+                                // Pure MOVE segment completed -> advance to next segment
+                                path_follower.AdvanceSegment();
+                            }
+                        }
               } else if (current_seg.op == "NOZZLE") {
                   std::string phase = net_manager.GetPathPhase();
                   if (phase == "draw") {
