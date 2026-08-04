@@ -105,22 +105,36 @@ int main(int argc, char **argv) {
           }
       }
 
-      // 3. Handle incoming PATH (segments sequence)
-      std::vector<Segment_t> path;
-      if (net_manager.GetPath(path)) {
-          path_follower.SetPath(path);
-          waiting_for_go = false;
-          ready_seg_sent = 0xFFFFFFFF;
-          path_done_sent = false;  // Reset PATH_DONE tracker for new path
-          nozzle_sub_seq = NozzleSubSeq::OFFSET_MOVE; // Reset nozzle offset sequence state for rear nozzle
-          manual_override = false; // Reset manual override upon receiving autonomous path
-          manual_nozzle = 0;
-          std::string phase = net_manager.GetPathPhase();
-          std::cout << "[MAIN] New PATH received with phase=" << phase << std::endl;
-          if (phase == "draw") {
-              imu_manager.ResetYaw(0.0f); // Protocol requirement: Reset IMU Yaw to 0 deg when entering draw phase
-          }
-      }
+       // 3. Handle incoming PATH (segments sequence)
+       // Defense logic: Buffer incoming new PATH and defer loading until current active segment/offset movement completes!
+       static std::vector<Segment_t> pending_path;
+       static bool has_pending_path = false;
+
+       std::vector<Segment_t> new_path;
+       if (net_manager.GetPath(new_path)) {
+           pending_path = new_path;
+           has_pending_path = true;
+           std::cout << "[MAIN] New PATH received from server (buffered until current segment completes)" << std::endl;
+       }
+
+       if (has_pending_path) {
+           // Apply new PATH only when robot is at a standstill (not in middle of active straight move or turn)
+           if (path_follower.IsPathFinished() || (!path_follower.IsMovingStraight() && !path_follower.IsTurning())) {
+               path_follower.SetPath(pending_path);
+               waiting_for_go = false;
+               ready_seg_sent = 0xFFFFFFFF;
+               path_done_sent = false;  // Reset PATH_DONE tracker for new path
+               nozzle_sub_seq = NozzleSubSeq::OFFSET_MOVE; // Reset nozzle offset sequence state for rear nozzle
+               manual_override = false; // Reset manual override upon receiving autonomous path
+               manual_nozzle = 0;
+               has_pending_path = false;
+               std::string phase = net_manager.GetPathPhase();
+               std::cout << "[MAIN] Applying new PATH (phase=" << phase << ")" << std::endl;
+               if (phase == "draw") {
+                   imu_manager.ResetYaw(0.0f); // Reset IMU Yaw to 0 deg when entering draw phase from standstill
+               }
+           }
+       }
 
       // 4. Check DRIFT feedback from server (~5Hz)
       float drift_angle = 0.0f;
