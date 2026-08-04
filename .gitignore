@@ -46,3 +46,7 @@ Road-Painter_기술명세서_SRS_v1.6_최종 (1).md
 V-[HW] UART 통신-130726-071752.pdf
 V-Road-Painter 시스템 요구사항 명세서 (SRS)_SEMI_FIN-130726-054542.pdf
 V-\[HW\] UART 통신-130726-071752.pdf
+
+# Scratch / temporary simulation scripts
+scratch/
+**/scratch/

@@ -343,6 +343,8 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
                     segment.op = seg.value("op", "");
                     segment.dist_m = seg.value("dist_m", 0.0f);
                     segment.angle_deg = seg.value("angle_deg", 0.0f);
+                    segment.radius_m = seg.value("radius_m", 0.0f);
+                    segment.direction = seg.value("direction", "left");
                     segment.paint = seg.value("paint", false);
                     if (seg.contains("down")) {
                         segment.paint = seg.value("down", false);
@@ -359,6 +361,8 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
                 std::cout << "  [Seg " << i << "] op=" << s.op 
                           << " | dist_m=" << s.dist_m 
                           << " | angle_deg=" << s.angle_deg 
+                          << " | radius_m=" << s.radius_m
+                          << " | dir=" << s.direction
                           << " | heading_deg=" << s.heading_deg 
                           << " | paint=" << (s.paint ? "true" : "false") << std::endl;
             }

@@ -113,6 +113,17 @@ public:
     bool UpdateOffsetMove(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on);
 
     /**
+     * @brief Starts arc (curved) motion with Pythagorean rear nozzle offset compensation.
+     */
+    void StartArc(float radius_m, float angle_deg, const std::string& direction, int32_t start_l_steps, int32_t start_r_steps);
+
+    /**
+     * @brief Updates arc motion execution.
+     * @return true if target arc distance is reached.
+     */
+    bool UpdateArc(int32_t cur_l_steps, int32_t cur_r_steps, Msg_SetSpeed_t& out_speed);
+
+    /**
      * @brief Checks if a straight move is currently in progress.
      */
     bool IsMovingStraight() const { return is_moving_straight; }
@@ -136,6 +147,15 @@ private:
     uint32_t turn_target_steps;
     int32_t turn_start_left_steps;
     int32_t turn_start_right_steps;
+
+    // Arc tracking state
+    bool is_arc;
+    uint32_t arc_target_l_steps;
+    uint32_t arc_target_r_steps;
+    int32_t arc_start_l_steps;
+    int32_t arc_start_r_steps;
+    int16_t arc_sps_l;
+    int16_t arc_sps_r;
 
     // Straight move tracking state
     bool is_moving_straight;

@@ -1,0 +1,21 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// TEMPLATE for the gitignored app_config_local.h.
+//
+//   cp inc/app_config_local.h.example inc/app_config_local.h
+//   # then edit in your real RPi IP / ports
+//
+// app_config.h includes app_config_local.h automatically when it exists and
+// falls back to placeholders otherwise, so real deployment values never enter
+// git. Ports must match the RPi instance launch args (web_gui.py <pose> <gui>
+// <snapshot>).
+// ---------------------------------------------------------------------------
+
+#define POSE_SERVER_IP       "127.0.0.1"     // <-- RPi vision server IP
+#define POSE_SERVER_PORT     7000            // pose channel  (web_gui.py arg 1)
+#define SNAPSHOT_SERVER_PORT 7001            // snapshot chan (web_gui.py arg 3)
+
+// Optional direct central-server TLS channel. Enable it in app_config.h only
+// after setting the real server address here and packaging server.crt.
+#define CENTRAL_TLS_SERVER_IP   "127.0.0.1"
+#define CENTRAL_TLS_SERVER_PORT 9000
