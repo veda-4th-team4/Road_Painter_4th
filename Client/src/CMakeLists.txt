@@ -9,8 +9,12 @@ set(CMAKE_AUTORCC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2 Network Gui)
 
-# MinGW용 OpenCV 4.12
-set(OpenCV_DIR "C:/opencv/mingw")
+# MinGW용 OpenCV. 원래 C:/opencv/mingw(OpenCV 4.12, 팀 공유 빌드)를 썼는데 이 머신엔
+# 없어서, MSYS2 mingw64 패키지(OpenCV 4.13.0, pacman -S mingw-w64-x86_64-opencv)로
+# 대체했다. Qt의 MinGW 13.1.0과 MSYS2의 mingw64 GCC는 별개 배포판이라 ABI가 완전히
+# 같다는 보장은 없지만, 실측(이 CMakeLists로 직접 빌드+링크)까지 통과했다.
+# 팀 공유 빌드(4.12)가 있는 머신에서는 이 줄을 원래 경로로 되돌릴 것.
+set(OpenCV_DIR "C:/msys64/mingw64/lib/cmake/opencv4")
 find_package(OpenCV REQUIRED)
 
 qt_standard_project_setup(REQUIRES 6.5)

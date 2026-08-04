@@ -1,0 +1,4 @@
+# Qt Creator 로컬 CMake 빌드/캐시 — 배포본은 Client/ 루트에 직접 커밋한다
+# (RoadPainter.exe + DLL들), 이 폴더는 그걸 만들어내는 재생성 가능한 산출물이다.
+src/build/
+src/.qtcreator/
