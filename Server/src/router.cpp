@@ -233,7 +233,7 @@ void Router::fromRobot(const json& msg) {
     } else if (type == "READY") {
         // 로봇이 TURN을 마치고 다음 동작(직진 or 대기) 직전에 정렬 확인을 요청.
         // ALIGN을 보낸 뒤 온 READY(= 미세회전 완료 통지)라면 그 회전이 pose에
-        // 반영될 때까지 판정을 미룬다 (router.hpp kAlignFreshFrames 참고).
+        // 반영될 때까지 판정을 미룬다 (router.hpp kAlignWaitMs 참고).
         int seg = payload.value("seg", -1);
         if (seg != alignSegIdx_) {  // 새 세그먼트 정렬 시작
             alignSegIdx_ = seg;
@@ -244,8 +244,8 @@ void Router::fromRobot(const json& msg) {
             pendingReadySeg_ = seg;
             pendingPosSeq_ = posSeq_;
             pendingReadyMs_ = nowMs();
-            logf("[INFO] READY(seg=%d) - 직전 ALIGN 반영 대기 (새 POS %d장 필요)",
-                 seg, kAlignFreshFrames);
+            logf("[INFO] READY(seg=%d) - 직전 ALIGN 반영 대기 (%ldms 고정)",
+                 seg, kAlignWaitMs);
             return;
         }
         judgeReady(seg);
@@ -304,10 +304,22 @@ void Router::judgeReady(int seg) {
         snprintf(avgDesc, sizeof avgDesc, "단일 POS");
     }
     clearPendingReady();
-    // heading_deg가 있는 세그먼트(MOVE 전부 + 접근 경로 마지막 TURN)만 판정 가능
+    // heading_deg가 있는 세그먼트(MOVE 전부 + 접근 경로 마지막 TURN)만 판정 가능.
+    // seg 자체엔 없어도(NOZZLE 등) 뒤따르는 세그먼트에 있으면 그걸 쓴다
+    // (buildRecovery의 재개 방위 탐색과 동일 패턴).
+    // 🔴 2026-08-04 로봇팀 요청: phase=draw 경로는 항상 NOZZLE(펜 오프셋
+    //   +15.5cm 사전 전진)로 시작하는데, 그 전진의 방향이 첫 도색 MOVE의
+    //   heading과 어긋나 있으면 펜이 도색 시작점 정중앙에 안 떨어진다. 그래서
+    //   로봇이 draw 경로를 받자마자(NOZZLE 오프셋 전에) READY(seg=0)을 먼저
+    //   보내도록 바뀌었다 - seg=0은 NOZZLE이라 heading_deg가 없으므로, 뒤의
+    //   MOVE(seg=1)까지 찾아가서 그 방향으로 미리 정렬해 준다.
     double target = 1e9;
-    if (planActive_ && !manualMode_ && seg >= 0 && seg < (int)activeSegs_.size())
-        target = activeSegs_[seg].value("heading_deg", 1e9);
+    if (planActive_ && !manualMode_ && seg >= 0 && seg < (int)activeSegs_.size()) {
+        for (size_t i = (size_t)seg; i < activeSegs_.size(); ++i) {
+            target = activeSegs_[i].value("heading_deg", 1e9);
+            if (target <= 1e8) break;
+        }
+    }
 
     if (target > 1e8 || !poseValid_) {
         // 판정 불가(계획 없음/수동모드/seg 이상/pose 없음)면 로봇을 세워두지 않는다
@@ -329,41 +341,36 @@ void Router::judgeReady(int seg) {
     }
 }
 
-// 유예해 둔 READY가 있으면 판정 조건을 확인한다. READY 수신 이후 새 POS가
-// kAlignFreshFrames만큼 쌓였거나, 그 전에 kAlignWaitMaxMs가 지나면(POS가 끊긴
-// 상황) 있는 pose로 판정한다.
+// 유예해 둔 READY가 있으면 판정한다. 프레임 카운트가 아니라 kAlignWaitMs
+// 고정 시간만 본다 - 그 사이 들어온 POS는 (POS 핸들러가) sin/cos으로 계속
+// 누적해두므로, 여기 도달했을 때 judgeReady가 쓰는 건 "고정 창 동안 모은
+// 평균 theta"다. 대기 자체를 단축하는 조기 판정은 하지 않는다 (프레임 카운트
+// 기반이었을 때는 실측 POS가 들쭉날쭉해 조기 판정이 오히려 거의 안 일어나고
+// 판정 시점만 불규칙해졌다 - router.hpp kAlignWaitMs 참고).
 // POS 수신 때뿐 아니라 onMessage 진입 때마다 호출한다 - POS가 완전히 끊기면 POS
 // 핸들러는 다시 안 돌아 타임아웃이 영영 안 걸리기 때문. 그 경우 로봇 STATUS가
 // heartbeat가 되어 유예된 READY를 반드시 회수한다. 단 STATUS는 500ms 주기(2Hz,
 // 로봇 main.cpp)라 타임아웃 판정이 최대 그만큼 늦다 - POS가 죽은 상황의 최악
-// 응답 지연은 kAlignWaitMaxMs + 500ms다.
+// 응답 지연은 kAlignWaitMs + 500ms다.
 void Router::resolvePendingReady() {
     if (pendingReadySeg_ < 0) return;
+    if (nowMs() - pendingReadyMs_ < kAlignWaitMs) return;  // 아직 고정 대기 안 끝남
+    // 🔴 그 2초 동안 새 POS가 "한 장도" 없었으면 판정하지 않고 GO를 보낸다
+    // (2026-08-04). 여기서 judgeReady를 부르면 pose_가 직전 ALIGN을 계산할 때와
+    // 글자 그대로 같으므로 err도 같고, 결국 **똑같은 ALIGN이 한 번 더 나가는
+    // 것이 보장**된다 (실제로 -34.6도가 값까지 동일하게 세 번 나가 로봇이 약
+    // 104도를 돈 사례가 있었다). GO를 택한 이유: 남은 각도오차는 주행 중
+    // DRIFT가 이어서 잡아주지만, 중복 ALIGN이 만든 누적 오버슛은 되돌릴 방법이
+    // 없다. alignTries_는 소모하지 않는다 - 실제로 정렬을 시도한 게 아니라서다.
     long got = posSeq_ - pendingPosSeq_;
-    bool fresh = got >= kAlignFreshFrames;
-    bool timeout = nowMs() - pendingReadyMs_ > kAlignWaitMaxMs;
-    if (!fresh && !timeout) return;
-    // 🔴 새 POS가 "한 장도" 없으면 판정하지 않고 GO를 보낸다 (2026-08-04).
-    // 여기서 judgeReady를 부르면 pose_가 직전 ALIGN을 계산할 때와 글자 그대로
-    // 같으므로 err도 같고, 결국 **똑같은 ALIGN이 한 번 더 나가는 것이 보장**된다.
-    // 2026-08-04 로그에서 실제로 -34.6도가 값까지 동일하게 세 번 나갔고, 로봇은
-    // 그만큼 세 번 돌아 약 104도를 회전했다.
-    // GO를 택한 이유: 남은 각도오차는 주행 중 DRIFT가 이어서 잡아주지만, 중복
-    // ALIGN이 만든 누적 오버슛은 되돌릴 방법이 없다. 판정 근거가 없을 때 로봇을
-    // 세워두지 않는다는 기존 원칙(judgeReady의 "판정 불가 -> GO")과도 같다.
-    // alignTries_는 소모하지 않는다 - 실제로 정렬을 시도한 것이 아니기 때문이다.
     if (got == 0) {
         int seg = pendingReadySeg_;
-        long waited = nowMs() - pendingReadyMs_;
         clearPendingReady();
         srv_.sendTo("ROBOT", makeMsg("GO", json::object()));
-        logf("[WARN] READY(seg=%d) 유예 %ldms 동안 새 POS 0장 - 직전과 같은 pose라 "
-             "판정 불가, GO (같은 ALIGN 반복 방지)", seg, waited);
+        logf("[WARN] READY(seg=%d) %ldms 대기했지만 새 POS 0장 - 직전과 같은 pose라 "
+             "판정 불가, GO (같은 ALIGN 반복 방지)", seg, kAlignWaitMs);
         return;
     }
-    if (!fresh)
-        logf("[WARN] READY(seg=%d) 유예 %ldms 초과 (새 POS %ld/%d장) - 현재 pose로 판정",
-             pendingReadySeg_, nowMs() - pendingReadyMs_, got, kAlignFreshFrames);
     judgeReady(pendingReadySeg_);
 }
 
@@ -376,10 +383,10 @@ void Router::logPosStats() {
     long dt = nowMs() - posStatMs_;
     if (dt < kPosStatPeriodMs) return;
     logf("[INFO] POS %.0f초 요약 - 수신 %d, 채택 %d (%.1fHz), 파싱실패 %d, "
-         "속도게이트 %d, 코너뒤집힘 %d",
+         "이상치폐기 %d",
          dt / 1000.0, posRecv_, posAccept_, posAccept_ * 1000.0 / dt,
-         posParseFail_, posGateRate_, posGateFlip_);
-    posRecv_ = posAccept_ = posParseFail_ = posGateRate_ = posGateFlip_ = 0;
+         posParseFail_, posGateRate_);
+    posRecv_ = posAccept_ = posParseFail_ = posGateRate_ = 0;
     posStatMs_ = nowMs();
 }
 
@@ -400,40 +407,17 @@ void Router::fromCctv(const json& msg) {
 
         Pose p;
         if (poseFromPos(payload, calib_, p)) {
-            // ----- 이상치 게이트: 물리적으로 불가능한 pose 변화는 검출 오류다 -----
-            // 두 가지를 본다 (router.hpp의 kPoseGate*/kFlip* 주석 참고):
-            //   속도: 각도 변화가 "노이즈 몫 + 물리 회전 몫"을 넘는가 (상한 있음)
-            //   플립: 각도는 크게 변했는데 중심(코너 평균)은 제자리인가
-            //         = 코너 순서가 한 칸 돌아간 것. 마커가 실제로 돌았다면
-            //           중심도 최소한 흔들리므로 이 조합은 나올 수 없다.
+            // ----- 이상치 게이트: 물리적으로 불가능한 각도 변화는 검출 오류다 -----
+            // (router.hpp kPoseGateBaseDeg/kPoseGateRateDps 참고)
             long dtMs = nowMs() - lastPoseMs_;
             double dTheta =
                 std::fabs(normDeg((p.theta - pose_.theta) * 180.0 / M_PI));
-            double dCenter = std::hypot(p.x - pose_.x, p.y - pose_.y);
-            double allowed = std::min(
-                kPoseGateBaseDeg + kPoseGateRateDps * (dtMs / 1000.0),
-                kPoseGateMaxDeg);
-            const char* reject = nullptr;
-            if (poseValid_) {
-                if (dTheta > kFlipMinDeg && dCenter < kFlipStillM) reject = "flip";
-                else if (dTheta > allowed) reject = "rate";
-            }
-            // 플립도 연속 거부 한도를 같이 쓴다 - 사람이 로봇을 제자리에서 돌려
-            // 놓으면 "중심 그대로 + 각도 급변"이 진짜로 성립하므로, 영원히
-            // 거부만 하면 복구가 안 된다.
-            if (reject && poseRejects_ < kPoseRejectMax) {
+            double allowed = kPoseGateBaseDeg + kPoseGateRateDps * (dtMs / 1000.0);
+            if (poseValid_ && dTheta > allowed && poseRejects_ < kPoseRejectMax) {
                 ++poseRejects_;
-                if (reject[0] == 'f') {
-                    ++posGateFlip_;
-                    logf("[WARN] POS 코너 순서 뒤집힘 의심 - theta %.1f도 급변인데 "
-                         "중심은 %.3fm만 이동 (%ldms) 폐기 %d/%d",
-                         dTheta, dCenter, dtMs, poseRejects_, kPoseRejectMax);
-                } else {
-                    ++posGateRate_;
-                    logf("[WARN] POS 이상치 - theta %.1f도 급변 (%ldms 내 허용 %.1f도) "
-                         "폐기 %d/%d", dTheta, dtMs, allowed, poseRejects_,
-                         kPoseRejectMax);
-                }
+                ++posGateRate_;
+                logf("[WARN] POS 이상치 - theta %.1f도 급변 (%ldms 내 허용 %.1f도) "
+                     "폐기 %d/%d", dTheta, dtMs, allowed, poseRejects_, kPoseRejectMax);
                 return;  // pose_ 갱신도, QT 중계도, posSeq_ 증가도 하지 않는다
             }
             if (poseRejects_ >= kPoseRejectMax)
@@ -444,7 +428,7 @@ void Router::fromCctv(const json& msg) {
             pose_ = p;
             poseValid_ = true;
             lastPoseMs_ = nowMs();
-            ++posSeq_;  // ALIGN 반영 여부 판정용 (router.hpp kAlignFreshFrames)
+            ++posSeq_;  // ALIGN 반영 여부 판정용 (router.hpp kAlignWaitMs 대기 중 POS 0장 감지)
             // 유예 중인 READY가 있으면 판정용 theta 표본으로 모아둔다
             if (pendingReadySeg_ >= 0) {
                 pendingSin_ += std::sin(p.theta);
