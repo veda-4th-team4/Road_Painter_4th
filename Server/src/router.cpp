@@ -18,6 +18,7 @@ void Router::onMessage(const std::string& role, const json& msg) {
     // 이번 메시지로 조건이 충족됐을 수 있으니(POS로 새 pose가 들어왔거나, 그냥
     // 시간이 지났거나) 유예해 둔 READY를 여기서 한 곳에서 회수한다.
     resolvePendingReady();
+    logPosStats();  // POS가 끊긴 것도 보이도록 POS 핸들러 밖에서 (함수 주석 참고)
 }
 
 // TlsServer가 세션 등록/정리 시 통지 (재접속 교체는 false 없이 넘어감 - tls_server.cpp 참고)
@@ -342,10 +343,44 @@ void Router::resolvePendingReady() {
     bool fresh = got >= kAlignFreshFrames;
     bool timeout = nowMs() - pendingReadyMs_ > kAlignWaitMaxMs;
     if (!fresh && !timeout) return;
+    // 🔴 새 POS가 "한 장도" 없으면 판정하지 않고 GO를 보낸다 (2026-08-04).
+    // 여기서 judgeReady를 부르면 pose_가 직전 ALIGN을 계산할 때와 글자 그대로
+    // 같으므로 err도 같고, 결국 **똑같은 ALIGN이 한 번 더 나가는 것이 보장**된다.
+    // 2026-08-04 로그에서 실제로 -34.6도가 값까지 동일하게 세 번 나갔고, 로봇은
+    // 그만큼 세 번 돌아 약 104도를 회전했다.
+    // GO를 택한 이유: 남은 각도오차는 주행 중 DRIFT가 이어서 잡아주지만, 중복
+    // ALIGN이 만든 누적 오버슛은 되돌릴 방법이 없다. 판정 근거가 없을 때 로봇을
+    // 세워두지 않는다는 기존 원칙(judgeReady의 "판정 불가 -> GO")과도 같다.
+    // alignTries_는 소모하지 않는다 - 실제로 정렬을 시도한 것이 아니기 때문이다.
+    if (got == 0) {
+        int seg = pendingReadySeg_;
+        long waited = nowMs() - pendingReadyMs_;
+        clearPendingReady();
+        srv_.sendTo("ROBOT", makeMsg("GO", json::object()));
+        logf("[WARN] READY(seg=%d) 유예 %ldms 동안 새 POS 0장 - 직전과 같은 pose라 "
+             "판정 불가, GO (같은 ALIGN 반복 방지)", seg, waited);
+        return;
+    }
     if (!fresh)
         logf("[WARN] READY(seg=%d) 유예 %ldms 초과 (새 POS %ld/%d장) - 현재 pose로 판정",
              pendingReadySeg_, nowMs() - pendingReadyMs_, got, kAlignFreshFrames);
     judgeReady(pendingReadySeg_);
+}
+
+// POS 수신/채택/폐기 요약. POS 핸들러가 아니라 onMessage() 말단에서 부르는
+// 이유는 resolvePendingReady와 같다 - POS가 완전히 끊기면 POS 핸들러는 다시 안
+// 도는데, 그 "0장"이야말로 제일 보고 싶은 값이다. 로봇 STATUS(2Hz)가 heartbeat로
+// 이 요약을 밀어준다.
+void Router::logPosStats() {
+    if (posStatMs_ == 0) return;  // POS를 한 번도 못 받았으면 조용히 (CCTV 미접속 등)
+    long dt = nowMs() - posStatMs_;
+    if (dt < kPosStatPeriodMs) return;
+    logf("[INFO] POS %.0f초 요약 - 수신 %d, 채택 %d (%.1fHz), 파싱실패 %d, "
+         "속도게이트 %d, 코너뒤집힘 %d",
+         dt / 1000.0, posRecv_, posAccept_, posAccept_ * 1000.0 / dt,
+         posParseFail_, posGateRate_, posGateFlip_);
+    posRecv_ = posAccept_ = posParseFail_ = posGateRate_ = posGateFlip_ = 0;
+    posStatMs_ = nowMs();
 }
 
 void Router::fromCctv(const json& msg) {
@@ -360,25 +395,52 @@ void Router::fromCctv(const json& msg) {
         // 원본 POS는 QT에 중계하지 않는다: Qt가 쓰는 건 아래 POSE(미터 좌표)뿐이고,
         // 원본 픽셀은 Qt에서 해석할 방법이 없다 (캘리브레이션은 서버만 갖고 있음).
         lastPos_ = payload;
+        ++posRecv_;
+        if (posStatMs_ == 0) posStatMs_ = nowMs();  // 첫 POS부터 요약 구간 시작
 
         Pose p;
         if (poseFromPos(payload, calib_, p)) {
-            // ----- 이상치 게이트: 물리적으로 불가능한 각도 변화는 검출 오류다 -----
-            // (router.hpp kPoseGateBaseDeg/kPoseGateRateDps 참고)
+            // ----- 이상치 게이트: 물리적으로 불가능한 pose 변화는 검출 오류다 -----
+            // 두 가지를 본다 (router.hpp의 kPoseGate*/kFlip* 주석 참고):
+            //   속도: 각도 변화가 "노이즈 몫 + 물리 회전 몫"을 넘는가 (상한 있음)
+            //   플립: 각도는 크게 변했는데 중심(코너 평균)은 제자리인가
+            //         = 코너 순서가 한 칸 돌아간 것. 마커가 실제로 돌았다면
+            //           중심도 최소한 흔들리므로 이 조합은 나올 수 없다.
             long dtMs = nowMs() - lastPoseMs_;
             double dTheta =
                 std::fabs(normDeg((p.theta - pose_.theta) * 180.0 / M_PI));
-            double allowed = kPoseGateBaseDeg + kPoseGateRateDps * (dtMs / 1000.0);
-            if (poseValid_ && dTheta > allowed && poseRejects_ < kPoseRejectMax) {
+            double dCenter = std::hypot(p.x - pose_.x, p.y - pose_.y);
+            double allowed = std::min(
+                kPoseGateBaseDeg + kPoseGateRateDps * (dtMs / 1000.0),
+                kPoseGateMaxDeg);
+            const char* reject = nullptr;
+            if (poseValid_) {
+                if (dTheta > kFlipMinDeg && dCenter < kFlipStillM) reject = "flip";
+                else if (dTheta > allowed) reject = "rate";
+            }
+            // 플립도 연속 거부 한도를 같이 쓴다 - 사람이 로봇을 제자리에서 돌려
+            // 놓으면 "중심 그대로 + 각도 급변"이 진짜로 성립하므로, 영원히
+            // 거부만 하면 복구가 안 된다.
+            if (reject && poseRejects_ < kPoseRejectMax) {
                 ++poseRejects_;
-                logf("[WARN] POS 이상치 - theta %.1f도 급변 (%ldms 내 허용 %.1f도) "
-                     "폐기 %d/%d", dTheta, dtMs, allowed, poseRejects_, kPoseRejectMax);
+                if (reject[0] == 'f') {
+                    ++posGateFlip_;
+                    logf("[WARN] POS 코너 순서 뒤집힘 의심 - theta %.1f도 급변인데 "
+                         "중심은 %.3fm만 이동 (%ldms) 폐기 %d/%d",
+                         dTheta, dCenter, dtMs, poseRejects_, kPoseRejectMax);
+                } else {
+                    ++posGateRate_;
+                    logf("[WARN] POS 이상치 - theta %.1f도 급변 (%ldms 내 허용 %.1f도) "
+                         "폐기 %d/%d", dTheta, dtMs, allowed, poseRejects_,
+                         kPoseRejectMax);
+                }
                 return;  // pose_ 갱신도, QT 중계도, posSeq_ 증가도 하지 않는다
             }
             if (poseRejects_ >= kPoseRejectMax)
                 logf("[WARN] POS 이상치 연속 %d회 - 추적을 놓친 것으로 보고 재동기",
                      poseRejects_);
             poseRejects_ = 0;
+            ++posAccept_;
             pose_ = p;
             poseValid_ = true;
             lastPoseMs_ = nowMs();
@@ -395,6 +457,10 @@ void Router::fromCctv(const json& msg) {
                  {"y", std::round(p.y * 1000) / 1000},
                  {"theta_deg", std::round(p.theta * 180.0 / M_PI * 10) / 10}}));
         } else {
+            // 캘리브레이션이 없는 경우만 여기서 소리를 낸다. corners 형식 오류는
+            // 매 프레임 같은 로그가 쏟아지므로 카운터로만 세고, 주기 요약
+            // (logPosStats)의 "파싱실패" 항목으로 드러낸다.
+            ++posParseFail_;
             if (!calib_.valid)
                 logf("[WARN] POS 수신했으나 캘리브레이션 없음 - pose 계산 불가");
             return;  // pose를 못 구하면 여기서 끝 (QT로 나가는 건 POSE뿐)

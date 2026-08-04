@@ -63,6 +63,8 @@ private:
     void resolvePendingReady();
     // 유예 상태(대기 중인 seg + 모아둔 theta)를 비운다.
     void clearPendingReady();
+    // POS 수신/채택/폐기 카운터를 주기적으로 한 줄 요약해 남긴다.
+    void logPosStats();
     // 캘리브레이션 번들 수신 처리 (CCTV/ADMIN 공용): 저장 + Qt 중계
     void handleHMatrix(const json& msg);
     // Qt의 START_DRAW 수신 시 1단계(시작점 접근) 경로를 로봇에 전송.
@@ -91,7 +93,12 @@ private:
     //   ⚠️ 정지 상태 theta 노이즈 실측 전까지는 러프 디폴트다.
     static constexpr double kAlignThresholdDeg = 4.0;
     static constexpr int kAlignMaxTries = 4;  // ALIGN 최대 반복 (초과 시 그냥 GO)
-    static constexpr long kDriftPeriodMs = 200;  // 주행 중 각도 피드백(DRIFT) 최소 간격
+    // 주행 중 각도 피드백(DRIFT) 최소 간격.
+    // 🔴 200 -> 400ms (2026-08-04). 현장 POS 실측이 1~2Hz라(kPosStatPeriodMs 요약
+    //   참고) 200ms(5Hz) 상한은 애초에 병목이 아니었다 - POS가 도착하는 족족
+    //   내보내던 것과 다를 바 없었다. 주기를 늘려도 응답성 손해는 없고, 대신
+    //   로봇 쪽 로그/UART 부담과 DRIFT 스팸을 줄인다.
+    static constexpr long kDriftPeriodMs = 400;
     // ALIGN 이후 온 READY를 재판정하기 전에 기다릴 "새 POS 프레임" 수.
     // 기준점은 ALIGN 송신 시각이 아니라 READY 수신 시각이다 - ALIGN을 보낸
     // 직후부터 세면 로봇이 회전하는 동안 흘러간 프레임까지 포함돼 버려서,
@@ -119,9 +126,30 @@ private:
     // 간격이 0에 가까워도 터지지 않고, 간격이 길면 자연히 헐거워진다.
     static constexpr double kPoseGateBaseDeg = 3.0;    // 노이즈 몫 (sigma ~0.7도의 4배)
     static constexpr double kPoseGateRateDps = 40.0;   // 물리 상한 17.8도/s에 2배 여유
+    // 🔴 허용치 상한 (2026-08-04). 속도항만 두면 프레임 간격이 벌어질수록 게이트가
+    //   무한정 헐거워진다 - 현장 POS가 1~2Hz로 들어온 로그에서 간격 1.8초 =
+    //   허용 75도가 되어 90도 코너 뒤집힘이 통과 직전까지 갔다("78.2도 급변,
+    //   1864ms 내 허용 77.6도"는 0.6도 차이로 걸렸다). 로봇 물리 상한 17.8도/s면
+    //   1.8초에 정당한 회전은 32도가 최대라, 45도를 넘는 변화는 간격이 아무리
+    //   길어도 검출 오류로 본다. 갇힐 걱정은 없다 - kPoseRejectMax가 재동기한다.
+    static constexpr double kPoseGateMaxDeg = 45.0;
     // 연속 거부 한도. 넘으면 그냥 받아들여 재동기한다 - 로봇을 들어 옮겼거나
     // 추적을 놓친 뒤 새 위치로 잡힌 경우 영원히 거부만 하면 복구가 안 된다.
     static constexpr int kPoseRejectMax = 5;
+
+    // ----- 코너 순서 뒤집힘 게이트 (2026-08-04) -----
+    // pose의 중심(x,y)은 코너 4점의 "평균"이라 코너 순서가 한 칸 돌아가도 값이
+    // 변하지 않는다. 반면 theta는 앞변 중점 - 뒷변 중점으로 구해 정확히 90도씩
+    // 튄다. 그래서 "각도는 크게 변했는데 중심은 제자리"는 물리적으로 불가능한
+    // 조합이고(회전하려면 마커 중심도 최소한 흔들린다), 코너 순서 회전의 지문이다.
+    // 속도 게이트와 별개로 두는 이유: 간격이 길어 속도 게이트를 통과해 버리는
+    // 플립을 잡기 위함이고, 로그를 따로 남겨야 "코너 순서냐 오검출이냐"를
+    // CCTV팀에 넘길 근거가 쌓이기 때문이다.
+    static constexpr double kFlipMinDeg = 60.0;    // 이 이상 각도 변화이면서
+    static constexpr double kFlipStillM = 0.03;    // 중심이 이만큼도 안 움직였으면 플립
+    // POS 수신/폐기 요약 로그 주기. POS가 완전히 끊긴 것도 보이도록 POS 핸들러가
+    // 아니라 onMessage() 말단에서 찍는다 (로봇 STATUS가 heartbeat 역할).
+    static constexpr long kPosStatPeriodMs = 10000;
     // 펜(노즐)이 마커 중심 뒤로 떨어진 거리 d. 로봇 실측값 = 155mm
     // (rpi-robot PathFollower.h NOZZLE_OFFSET_M = 0.155f). BLUEPRINT 필드이
     // 아니라 서버 상수 - 펜 보정 자체는 로봇이 스스로 하고, 서버는 이 값을
@@ -171,6 +199,13 @@ private:
     long posSeq_ = 0;          // POS로 pose가 갱신된 누적 횟수 (신선도 판정용)
     long lastPoseMs_ = 0;      // 마지막으로 채택된 pose의 시각 (이상치 게이트용)
     int poseRejects_ = 0;      // 게이트가 연속으로 버린 프레임 수 (kPoseRejectMax)
+    // ----- POS 수신 통계 (kPosStatPeriodMs마다 요약 후 0으로) -----
+    // 예전엔 poseFromPos 실패가 캘리브레이션 없을 때만 로그를 남기고 나머지는
+    // 조용히 return이라, POS가 초당 몇 장 들어오는지 서버 로그로 알 방법이
+    // 아예 없었다 - 실제로 "새 POS 0/3장" 같은 간접 증거로 역추적해야 했다.
+    int posRecv_ = 0, posAccept_ = 0, posParseFail_ = 0;
+    int posGateRate_ = 0, posGateFlip_ = 0;
+    long posStatMs_ = 0;       // 마지막 요약 시각 (0 = 아직 POS를 한 번도 못 받음)
     int pendingReadySeg_ = -1;   // ALIGN 반영을 기다리며 유예해 둔 READY의 seg (-1 = 없음)
     long pendingPosSeq_ = 0;     // 그 READY를 받은 시점의 posSeq_ (여기서부터 새 프레임을 센다)
     long pendingReadyMs_ = 0;    // 그 READY를 받은 시각 (kAlignWaitMaxMs 타임아웃용)
