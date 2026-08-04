@@ -2,6 +2,7 @@
 #include "PathFollower.h"
 #include "SerialManager.h"
 #include "ImuManager.h"
+#include <algorithm>
 #include <iostream>
 #include <string>
 #include <unistd.h>
@@ -162,10 +163,18 @@ int main(int argc, char **argv) {
                       // Check for ALIGN micro-rotation request
                       float align_deg = 0.0f;
                       if (net_manager.GetAlignCommand(align_deg)) {
-                          std::cout << "[MAIN] Executing ALIGN micro-turn: " << align_deg << " deg" << std::endl;
-                          Msg_Status_t status_snap{};
-                          if (robot_comm.GetLatestStatus(status_snap)) {
-                              path_follower.StartTurn(align_deg, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
+                          // Guard 1: Do NOT interrupt an ongoing turn!
+                          if (!path_follower.IsTurning()) {
+                              // Guard 2: Clamp ALIGN angle to safe range [-15.0 deg, +15.0 deg]
+                              float clamped_align = std::clamp(align_deg, -15.0f, 15.0f);
+                              std::cout << "[MAIN] Executing ALIGN micro-turn: " << align_deg 
+                                        << " deg (clamped: " << clamped_align << " deg)" << std::endl;
+                              Msg_Status_t status_snap{};
+                              if (robot_comm.GetLatestStatus(status_snap)) {
+                                  path_follower.StartTurn(clamped_align, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
+                              }
+                          } else {
+                              std::cout << "[MAIN] [ALIGN IGNORED] Robot is currently executing a turn." << std::endl;
                           }
                       }
 
@@ -341,8 +350,8 @@ int main(int argc, char **argv) {
           }
       }
 
-      // Delay loop to maintain ~12Hz execution
-      usleep(80000); // 80ms delay
+      // Delay loop to maintain ~50Hz execution (20ms)
+      usleep(20000); // 20ms delay for high-precision turn stopping
   }
 
   robot_comm.Close();
