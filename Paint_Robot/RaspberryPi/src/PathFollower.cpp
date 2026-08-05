@@ -163,7 +163,7 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
   float target_w = -0.5f * drift_rad; // P-gain 0.5 for smooth steering correction
 
   out_speed = velocity_to_sps(target_v, target_w);
-  out_nozzle_on = current_seg.paint ? 1 : 0;
+  out_nozzle_on = current_seg.down ? 1 : 0;
 
   static int move_log_count = 0;
   if (++move_log_count % 10 == 0) {
@@ -246,17 +246,13 @@ void PathFollower::Update(const Pose_t &current_pose, Msg_SetSpeed_t &out_speed,
   float target_v = 0.0f;
   float target_w = 0.0f;
 
-  if (current_seg.op == "MOVE") {
+  if (current_seg.op == "move") {
     target_v = 0.05f; // 5 cm/s straight speed
-    // Apply DRIFT angle correction: positive angle = clockwise drift -> turn
-    // left
     target_w = -drift_offset_deg * 0.05f;
-    out_nozzle_on = current_seg.paint ? 1 : 0;
-  } else if (current_seg.op == "TURN") {
+    out_nozzle_on = current_seg.down ? 1 : 0;
+  } else if (current_seg.op == "turn") {
     target_v = 0.0f;
-    // Positive angle_deg means left turn (positive angular velocity), negative
-    // is right turn
-    target_w = (current_seg.angle_deg > 0.0f) ? 0.2f : -0.2f;
+    target_w = (current_seg.angle_deg > 0.0f) ? -0.2f : 0.2f; // Protocol v2: positive = CW right
     out_nozzle_on = 0;
   }
 
