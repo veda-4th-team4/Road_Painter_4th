@@ -113,7 +113,7 @@ int main(int argc, char **argv) {
        if (net_manager.GetPath(new_path)) {
            pending_path = new_path;
            has_pending_path = true;
-           std::cout << "[MAIN] New PATH received from server (buffered until current segment completes)" << std::endl;
+           std::cout << GetTimestampStr() << "[MAIN] New PATH received from server (buffered until current segment completes)" << std::endl;
        }
 
         if (has_pending_path) {
@@ -128,7 +128,7 @@ int main(int argc, char **argv) {
                has_pending_path = false;
                net_manager.ClearLatches(); // R-8: Clear any stale command latches from previous path
                std::string phase = net_manager.GetPathPhase();
-               std::cout << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2000ms for camera settling..." << std::endl;
+               std::cout << GetTimestampStr() << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2000ms for camera settling..." << std::endl;
                if (phase == "draw") {
                    imu_manager.ResetYaw(0.0f); // Reset IMU Yaw to 0 deg when entering draw phase from standstill
                }
@@ -148,13 +148,13 @@ int main(int argc, char **argv) {
       if (hold_active) {
           static bool hold_logged = false;
           if (!hold_logged) {
-              std::cout << "[MAIN] HOLD active (pos lost). Pausing robot movement..." << std::endl;
+              std::cout << GetTimestampStr() << "[MAIN] HOLD active (pos lost). Pausing robot movement..." << std::endl;
               hold_logged = true;
           }
       } else {
           static bool hold_logged = false;
           if (hold_logged) {
-              std::cout << "[MAIN] HOLD released. Resuming autonomous path execution." << std::endl;
+              std::cout << GetTimestampStr() << "[MAIN] HOLD released. Resuming autonomous path execution." << std::endl;
               hold_logged = false;
           }
       }
@@ -173,7 +173,7 @@ int main(int argc, char **argv) {
               // Check DRIFT feedback matching active op_index (R-6: Pass to path_follower for continuous steering)
               float drift_angle = 0.0f;
               if (net_manager.GetDriftCorrection(active_op_index, drift_angle)) {
-                  std::cout << "[MAIN] [DRIFT] Server drift correction received for op " 
+                  std::cout << GetTimestampStr() << "[MAIN] [DRIFT] Server drift correction received for op " 
                             << active_op_index << ": " << drift_angle << " deg" << std::endl;
                   path_follower.SetDriftOffset(drift_angle);
               }
@@ -184,7 +184,7 @@ int main(int argc, char **argv) {
                   ready_seg_sent = active_op_index;
                   waiting_for_go = true;
                   robot_comm.SendSetSpeed(0, 0);
-                  std::cout << "[MAIN] Sent READY for op " << active_op_index << " (" << current_seg.op 
+                  std::cout << GetTimestampStr() << "[MAIN] Sent READY for op " << active_op_index << " (" << current_seg.op 
                             << "), waiting for GO/ALIGN/MORE..." << std::endl;
               }
 
@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
                       if (!path_follower.IsTurning()) {
                           // Protocol rule: positive angle = turn right (CW) -> StartTurn(-align_deg)
                           float robot_turn_deg = -align_deg;
-                          std::cout << "[MAIN ALIGN] Executing ALIGN micro-turn for op " << active_op_index
+                          std::cout << GetTimestampStr() << "[MAIN ALIGN] Executing ALIGN micro-turn for op " << active_op_index
                                     << ": server=" << align_deg << " deg -> robot=" << robot_turn_deg << " deg" << std::endl;
                           Msg_Status_t status_snap{};
                           if (robot_comm.GetLatestStatus(status_snap)) {
@@ -208,7 +208,7 @@ int main(int argc, char **argv) {
                   float more_dist = 0.0f;
                   if (net_manager.GetMoreCommand(active_op_index, more_dist)) {
                       if (!path_follower.IsMovingStraight() && !path_follower.IsTurning()) {
-                          std::cout << "[MAIN MORE] Executing MORE micro-move for op " << active_op_index
+                          std::cout << GetTimestampStr() << "[MAIN MORE] Executing MORE micro-move for op " << active_op_index
                                     << ": " << more_dist << " m" << std::endl;
                           Msg_Status_t status_snap{};
                           if (robot_comm.GetLatestStatus(status_snap)) {
@@ -223,7 +223,7 @@ int main(int argc, char **argv) {
                           if (path_follower.UpdateTurn(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed)) {
                               // Micro-turn completed: Send stop & wait 2000ms for camera settling before re-sending READY for same op
                               robot_comm.SendSetSpeed(0, 0);
-                              std::cout << "[MAIN ALIGN] Turn complete -> Waiting 2000ms for camera settling..." << std::endl;
+                              std::cout << GetTimestampStr() << "[MAIN ALIGN] Turn complete -> Waiting 2000ms for camera settling..." << std::endl;
                               
                               auto start_wait = std::chrono::steady_clock::now();
                               while (std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -244,7 +244,7 @@ int main(int argc, char **argv) {
                           if (path_follower.UpdateMove(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed, imu_yaw)) {
                               // Micro-move completed: Send stop & wait 2000ms before re-sending READY for same op
                               robot_comm.SendSetSpeed(0, 0);
-                              std::cout << "[MAIN MORE] Move complete -> Waiting 2000ms for camera settling..." << std::endl;
+                              std::cout << GetTimestampStr() << "[MAIN MORE] Move complete -> Waiting 2000ms for camera settling..." << std::endl;
                               
                               auto start_wait = std::chrono::steady_clock::now();
                               while (std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -260,7 +260,7 @@ int main(int argc, char **argv) {
 
                   // Check for GO signal matching active_op_index
                   if (net_manager.CheckAndClearGoSignal(active_op_index)) {
-                      std::cout << "[MAIN] GO signal received for op " << active_op_index 
+                      std::cout << GetTimestampStr() << "[MAIN] GO signal received for op " << active_op_index 
                                 << " (" << current_seg.op << ")" << std::endl;
                       waiting_for_go = false;
                   }
@@ -275,7 +275,7 @@ int main(int argc, char **argv) {
                       if (current_seg.op == "nozzle") {
                           auto_nozzle = current_seg.down ? 1 : 0;
                           robot_comm.SendControlNozzle(auto_nozzle);
-                          std::cout << "[MAIN NOZZLE] Op " << active_op_index 
+                          std::cout << GetTimestampStr() << "[MAIN NOZZLE] Op " << active_op_index 
                                     << " set (down=" << (current_seg.down ? "true" : "false") 
                                     << ", 1000ms delay)..." << std::endl;
                           std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // R-9: 1000ms actuator delay
@@ -288,7 +288,7 @@ int main(int argc, char **argv) {
 
                           float imu_yaw = imu_manager.GetYaw();
                           if (path_follower.UpdateMove(l_steps, r_steps, target_speed, imu_yaw)) {
-                              std::cout << "[MAIN MOVE] Op " << active_op_index << " complete." << std::endl;
+                              std::cout << GetTimestampStr() << "[MAIN MOVE] Op " << active_op_index << " complete." << std::endl;
                               // R-4: Do NOT send SendReady here! AdvanceSegment() lets next loop iteration send READY(active_op_index + 1)
                               path_follower.AdvanceSegment();
                           }
@@ -300,7 +300,7 @@ int main(int argc, char **argv) {
                           }
 
                           if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
-                              std::cout << "[MAIN TURN] Op " << active_op_index << " in-place turn (" 
+                              std::cout << GetTimestampStr() << "[MAIN TURN] Op " << active_op_index << " in-place turn (" 
                                         << current_seg.angle_deg << " deg) complete." << std::endl;
                               // R-4: Do NOT send SendReady here! AdvanceSegment() lets next loop iteration send READY(active_op_index + 1)
                               path_follower.AdvanceSegment();
@@ -311,7 +311,7 @@ int main(int argc, char **argv) {
                           }
 
                           if (path_follower.UpdateArc(l_steps, r_steps, target_speed)) {
-                              std::cout << "[MAIN ARC] Op " << active_op_index << " arc complete." << std::endl;
+                              std::cout << GetTimestampStr() << "[MAIN ARC] Op " << active_op_index << " arc complete." << std::endl;
                               // R-4: Do NOT send SendReady here! AdvanceSegment() lets next loop iteration send READY(active_op_index + 1)
                               path_follower.AdvanceSegment();
                           }
@@ -323,7 +323,7 @@ int main(int argc, char **argv) {
           std::string phase = net_manager.GetPathPhase();
           net_manager.SendPathDone(phase);
           path_done_sent = true;
-          std::cout << "[MAIN] All path segments completed! Transmitted PATH_DONE (phase=" << phase << ")" << std::endl;
+          std::cout << GetTimestampStr() << "[MAIN] All path segments completed! Transmitted PATH_DONE (phase=" << phase << ")" << std::endl;
       }
 
       // 6. Periodic UART heartbeat: Transmit controls to STM32 (every 80ms loop iteration)
@@ -343,7 +343,7 @@ int main(int argc, char **argv) {
           static auto last_status_log_time = std::chrono::steady_clock::now();
           if (stm32_ready && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_status_log_time).count() >= 5000) {
               last_status_log_time = now;
-              std::cout << "[MAIN] STATUS sent to Server -> L: " << static_cast<int32_t>(status.left_steps) 
+              std::cout << GetTimestampStr() << "[MAIN] STATUS sent to Server -> L: " << static_cast<int32_t>(status.left_steps) 
                         << " | R: " << static_cast<int32_t>(status.right_steps) 
                         << " | Flags: 0x" << std::hex << (int)status.flags << std::dec << std::endl;
           }

@@ -127,7 +127,7 @@ void PathFollower::StartMove(float dist_m, int32_t start_left_steps,
   move_target_steps = CalculateMoveSteps(dist_m);
   move_start_left_steps = start_left_steps;
   move_start_right_steps = start_right_steps;
-  std::cout << "[PathFollower] StartMove: target dist=" << dist_m
+  std::cout << GetTimestampStr() << "[PathFollower] StartMove: target dist=" << dist_m
             << " m | target_steps=" << move_target_steps << std::endl;
 }
 
@@ -148,7 +148,7 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
     out_speed.left_sps = 0;
     out_speed.right_sps = 0;
     is_moving_straight = false;
-    std::cout << "[PathFollower] Move completed! Reached " << progress_steps
+    std::cout << GetTimestampStr() << "[PathFollower] Move completed! Reached " << progress_steps
               << "/" << move_target_steps << " steps." << std::endl;
     return true;
   }
@@ -163,7 +163,7 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
 
   static int move_log_count = 0;
   if (++move_log_count % 10 == 0) {
-    std::cout << "[PathFollower MOVE] Progress: " << progress_steps << "/"
+    std::cout << GetTimestampStr() << "[PathFollower MOVE] Progress: " << progress_steps << "/"
               << move_target_steps << " steps | IMU Yaw: " << imu_yaw_deg
               << " deg | Server Drift: " << drift_offset_deg
               << " deg -> Target SPS (L: " << out_speed.left_sps

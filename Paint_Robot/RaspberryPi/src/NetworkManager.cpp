@@ -383,7 +383,7 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
                 }
             }
             has_new_path = true;
-            std::cout << "[NetworkManager] PATH update (phase=" << current_path_phase 
+            std::cout << GetTimestampStr() << "[NetworkManager] PATH update (phase=" << current_path_phase 
                       << "): " << current_path.size() << " ops received." << std::endl;
             for (size_t i = 0; i < current_path.size(); ++i) {
                 const auto& s = current_path[i];
@@ -399,7 +399,7 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
         } else if (type == "ALIGN") {
             uint32_t idx = payload.value("op_index", 0U);
             float angle = payload.value("angle_deg", 0.0f);
-            std::cout << "[NetworkManager] Received ALIGN (op_index=" << idx << "): " << angle << " deg" << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Received ALIGN (op_index=" << idx << "): " << angle << " deg" << std::endl;
             std::lock_guard<std::mutex> lock(align_mutex);
             latest_align_cmd = {idx, angle};
             has_align_cmd = true;
@@ -407,14 +407,14 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
         } else if (type == "MORE") {
             uint32_t idx = payload.value("op_index", 0U);
             float dist = payload.value("dist_m", 0.0f);
-            std::cout << "[NetworkManager] Received MORE (op_index=" << idx << "): " << dist << " m" << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Received MORE (op_index=" << idx << "): " << dist << " m" << std::endl;
             std::lock_guard<std::mutex> lock(more_mutex);
             latest_more_cmd = {idx, dist};
             has_more_cmd = true;
 
         } else if (type == "GO") {
             uint32_t idx = payload.value("op_index", 0U);
-            std::cout << "[NetworkManager] Received GO (op_index=" << idx << ")" << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Received GO (op_index=" << idx << ")" << std::endl;
             std::lock_guard<std::mutex> lock(go_mutex);
             go_op_index = idx;
             has_go_signal = true;
@@ -422,7 +422,7 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
         } else if (type == "DRIFT") {
             uint32_t idx = payload.value("op_index", 0U);
             float angle = payload.value("angle_deg", 0.0f);
-            std::cout << "[NetworkManager] Received DRIFT (op_index=" << idx << "): " << angle << " deg" << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Received DRIFT (op_index=" << idx << "): " << angle << " deg" << std::endl;
             std::lock_guard<std::mutex> lock(drift_mutex);
             latest_drift_cmd = {idx, angle};
             has_drift_cmd = true;
@@ -430,19 +430,19 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
         } else if (type == "HOLD") {
             bool hold = payload.value("hold", false);
             std::string reason = payload.value("reason", "");
-            std::cout << "[NetworkManager] Received HOLD: " << (hold ? "PAUSE" : "RESUME") << " (reason: " << reason << ")" << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Received HOLD: " << (hold ? "PAUSE" : "RESUME") << " (reason: " << reason << ")" << std::endl;
             is_hold_active.store(hold);
 
         } else if (type == "ACK") {
-            std::cout << "[NetworkManager] Received ACK from server: " << payload.value("msg", "") << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Received ACK from server: " << payload.value("msg", "") << std::endl;
         } else if (type == "CMD") {
             std::string cmd = payload.value("cmd", "");
-            std::cout << "[NetworkManager] Received CMD from server: " << cmd << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Received CMD from server: " << cmd << std::endl;
             std::lock_guard<std::mutex> lock(cmd_mutex);
             latest_cmd = cmd;
             has_new_cmd = true;
         } else {
-            std::cout << "[NetworkManager] Unknown message type: " << type << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Unknown message type: " << type << std::endl;
         }
     } catch (const std::exception& e) {
         std::cerr << "[NetworkManager] Parsing exception: " << e.what() << " on data: " << line << std::endl;

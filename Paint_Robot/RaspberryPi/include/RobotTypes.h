@@ -3,6 +3,25 @@
 
 #include <stdint.h>
 #include <string>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <ctime>
+
+inline std::string GetTimestampStr() {
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    auto timer = std::chrono::system_clock::to_time_t(now);
+    std::tm bt{};
+#if defined(_WIN32)
+    localtime_s(&bt, &timer);
+#else
+    localtime_r(&timer, &bt);
+#endif
+    std::ostringstream oss;
+    oss << "[" << std::put_time(&bt, "%H:%M:%S") << "." << std::setfill('0') << std::setw(3) << ms.count() << "] ";
+    return oss.str();
+}
 
 /**
  * @brief Common state indicators for packet parser state machine.
