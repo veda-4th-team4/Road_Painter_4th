@@ -333,7 +333,7 @@ int main(int argc, char **argv) {
           }
           net_manager.SendStatus(status);
           static auto last_status_log_time = std::chrono::steady_clock::now();
-          if (stm32_ready && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_status_log_time).count() >= 2000) {
+          if (stm32_ready && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_status_log_time).count() >= 5000) {
               last_status_log_time = now;
               std::cout << "[MAIN] STATUS sent to Server -> L: " << static_cast<int32_t>(status.left_steps) 
                         << " | R: " << static_cast<int32_t>(status.right_steps) 
