@@ -80,40 +80,7 @@ public:
     bool UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on, float imu_yaw_deg = 0.0f);
 
     /**
-     * @brief Physical offset distance from robot wheel center to rear spray nozzle (-155mm).
-     */
-    static constexpr float NOZZLE_OFFSET_M = -0.155f;
-
-    /**
-     * @brief Sub-sequence states for nozzle offset compensation.
-     */
-    enum class OffsetSeqState {
-        IDLE,
-        APPROACH_START,   // Position rear nozzle at line start
-        MAIN_DRAW,        // Draw main line segment
-        CORNER_REVERSE,   // Reverse -155mm to bring wheel center to vertex
-        IN_PLACE_TURN,    // In-place turn at vertex
-        CORNER_ADVANCE    // Advance +155mm to bring rear nozzle to next line start
-    };
-
-    /**
-     * @brief Calculates motor steps for the 155mm nozzle offset (2,392 pulses).
-     */
-    uint32_t GetNozzleOffsetSteps() const { return CalculateMoveSteps(std::abs(NOZZLE_OFFSET_M)); }
-
-    /**
-     * @brief Starts an offset distance move (+155mm forward or -155mm backward).
-     */
-    void StartOffsetMove(float dist_m, int32_t start_left_steps, int32_t start_right_steps);
-
-    /**
-     * @brief Updates offset move step execution.
-     * @return true when offset distance is reached.
-     */
-    bool UpdateOffsetMove(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on);
-
-    /**
-     * @brief Starts arc (curved) motion with Pythagorean rear nozzle offset compensation.
+     * @brief Starts arc (curved) motion.
      */
     void StartArc(float radius_m, float angle_deg, const std::string& direction, int32_t start_l_steps, int32_t start_r_steps);
 
@@ -159,7 +126,6 @@ private:
 
     // Straight move tracking state
     bool is_moving_straight;
-    float offset_move_dist;
     uint32_t move_target_steps;
     int32_t move_start_left_steps;
     int32_t move_start_right_steps;

@@ -175,59 +175,13 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
   return false;
 }
 
-void PathFollower::StartOffsetMove(float dist_m, int32_t start_left_steps,
-                                   int32_t start_right_steps) {
-  is_moving_straight = true;
-  offset_move_dist = dist_m;
-  move_target_steps = CalculateMoveSteps(std::abs(dist_m));
-  move_start_left_steps = start_left_steps;
-  move_start_right_steps = start_right_steps;
-  std::cout << "[PathFollower Offset] StartOffsetMove: dist=" << dist_m
-            << " m | target_steps=" << move_target_steps << std::endl;
-}
-
-bool PathFollower::UpdateOffsetMove(int32_t cur_left_steps,
-                                    int32_t cur_right_steps,
-                                    Msg_SetSpeed_t &out_speed,
-                                    uint8_t &out_nozzle_on) {
-  if (!is_moving_straight)
-    return true;
-
-  int32_t diff_left = cur_left_steps - move_start_left_steps;
-  int32_t diff_right = cur_right_steps - move_start_right_steps;
-  uint32_t delta_left = static_cast<uint32_t>(std::abs(diff_left));
-  uint32_t delta_right = static_cast<uint32_t>(std::abs(diff_right));
-  uint32_t progress_steps = (delta_left + delta_right) / 2;
-
-  if (progress_steps >= move_target_steps) {
-    out_speed.left_sps = 0;
-    out_speed.right_sps = 0;
-    out_nozzle_on = 0;
-    is_moving_straight = false;
-    std::cout << "[PathFollower Offset] Offset move completed! Reached "
-              << progress_steps << "/" << move_target_steps << " steps."
-              << std::endl;
-    return true;
-  }
-
-  // Determine direction (+0.05m/s forward or -0.05m/s backward)
-  float target_v = (offset_move_dist >= 0.0f) ? 0.05f : -0.05f;
-  out_speed = velocity_to_sps(target_v, 0.0f);
-  out_nozzle_on = 0; // Spray OFF during offset positioning
-
-  return false;
-}
-
 void PathFollower::StartArc(float radius_m, float angle_deg,
                             const std::string &direction, int32_t start_l_steps,
                             int32_t start_r_steps) {
   is_arc = true;
   bool is_left = (direction == "left");
 
-  // Pythagorean corrected robot wheel center radius: R_robot = sqrt(R_paint^2 +
-  // 0.155^2)
-  float r_robot =
-      std::sqrt(radius_m * radius_m + NOZZLE_OFFSET_M * NOZZLE_OFFSET_M);
+  float r_robot = radius_m;
   float r_left =
       is_left ? (r_robot - wheelbase_m / 2.0f) : (r_robot + wheelbase_m / 2.0f);
   float r_right =

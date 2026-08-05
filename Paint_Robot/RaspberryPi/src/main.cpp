@@ -53,7 +53,6 @@ int main(int argc, char **argv) {
   bool path_done_sent = false;          // Track PATH_DONE transmission per path
 
   enum class NozzleSubSeq { OFFSET_MOVE, WAIT_DELAY };
-  NozzleSubSeq nozzle_sub_seq = NozzleSubSeq::OFFSET_MOVE;
 
   bool manual_override = false;
   Msg_SetSpeed_t manual_speed = {0, 0};
@@ -106,7 +105,7 @@ int main(int argc, char **argv) {
       }
 
        // 3. Handle incoming PATH (segments sequence)
-       // Defense logic: Buffer incoming new PATH and defer loading until current active segment/offset movement completes!
+       // Defense logic: Buffer incoming new PATH and defer loading until current active segment movement completes!
        static std::vector<Segment_t> pending_path;
        static bool has_pending_path = false;
 
@@ -124,7 +123,6 @@ int main(int argc, char **argv) {
                waiting_for_go = false;
                ready_seg_sent = 0xFFFFFFFF;
                path_done_sent = false;  // Reset PATH_DONE tracker for new path
-               nozzle_sub_seq = NozzleSubSeq::OFFSET_MOVE; // Reset nozzle offset sequence state for rear nozzle
                manual_override = false; // Reset manual override upon receiving autonomous path
                manual_nozzle = 0;
                has_pending_path = false;
@@ -139,24 +137,15 @@ int main(int argc, char **argv) {
       // 4. Check DRIFT feedback from server (~5Hz)
       float drift_angle = 0.0f;
       if (net_manager.GetDriftCorrection(drift_angle)) {
-          // Protocol requirement: Ignore DRIFT feedback while executing TURN segment!
-          if (!path_follower.IsTurning() && path_follower.IsMovingStraight()) {
-              // Stop-and-pivot alignment strategy: When DRIFT >= 3.0 deg, pause MOVE to execute in-place turn!
-              if (std::abs(drift_angle) >= 3.0f) {
-                  float clamped_drift = std::clamp(drift_angle, -15.0f, 15.0f);
-                  std::cout << "[MAIN] [DRIFT PIVOT ALIGN] DRIFT feedback (" << drift_angle 
-                            << " deg) received. Pausing MOVE for in-place turn: " << clamped_drift << " deg" << std::endl;
-                  Msg_Status_t status_snap{};
-                  if (robot_comm.GetLatestStatus(status_snap)) {
-                      path_follower.StartTurn(clamped_drift, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
-                  }
-              }
-          } else if (path_follower.IsTurning()) {
+          // Server-driven DRIFT logging
+          if (path_follower.IsTurning()) {
               std::cout << "[MAIN] [DRIFT IGNORED] Robot is currently executing a turn." << std::endl;
+          } else {
+              std::cout << "[MAIN] [DRIFT] Server drift correction received: " << drift_angle << " deg" << std::endl;
           }
       }
 
-      // 5. Segment Execution Handshake State Machine
+      // 5. Server-Master Segment Execution Handshake State Machine
       Msg_SetSpeed_t target_speed = {0, 0};
       uint8_t nozzle_on = manual_override ? manual_nozzle : auto_nozzle;
 
@@ -165,37 +154,50 @@ int main(int argc, char **argv) {
       } else if (!path_follower.IsPathFinished()) {
           Segment_t current_seg;
           if (path_follower.GetCurrentSegment(current_seg)) {
-              if (current_seg.op == "MOVE" || (current_seg.op == "NOZZLE" && current_seg.paint)) {
-                  uint32_t seg_idx = static_cast<uint32_t>(path_follower.GetCurrentSegmentIndex());
-                  bool bypass_server_go = false; // Wait for server GO/ALIGN handshake before starting MOVE / NOZZLE
-                  
+              uint32_t seg_idx = static_cast<uint32_t>(path_follower.GetCurrentSegmentIndex());
+
+              if (current_seg.op == "NOZZLE") {
+                  auto_nozzle = current_seg.paint ? 1 : 0;
+                  robot_comm.SendControlNozzle(auto_nozzle);
+                  std::cout << "[MAIN NOZZLE] NOZZLE set (down=" << (auto_nozzle ? "true" : "false") << ")" << std::endl;
+                  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                  net_manager.SendReady(seg_idx);
+                  path_follower.AdvanceSegment();
+              } else if (current_seg.op == "MOVE" || current_seg.op == "TURN" || current_seg.op == "ARC") {
                   if (ready_seg_sent != seg_idx) {
-                      // Send READY to server for logging, then proceed directly if bypass enabled
                       net_manager.SendReady(seg_idx);
                       ready_seg_sent = seg_idx;
-                      waiting_for_go = !bypass_server_go;
-                      if (waiting_for_go) {
-                          robot_comm.SendSetSpeed(0, 0);
-                          std::cout << "[MAIN] Sent READY for segment " << seg_idx << " (" << current_seg.op 
-                                    << "), waiting for GO/ALIGN..." << std::endl;
-                      } else {
-                          std::cout << "[MAIN] [BYPASS GO] Starting segment " << seg_idx << " directly." << std::endl;
-                      }
+                      waiting_for_go = true;
+                      robot_comm.SendSetSpeed(0, 0);
+                      std::cout << "[MAIN] Sent READY for segment " << seg_idx << " (" << current_seg.op 
+                                << "), waiting for GO/ALIGN/MORE..." << std::endl;
                   }
 
                   if (waiting_for_go) {
                       // Check for ALIGN micro-rotation request
                       float align_deg = 0.0f;
                       if (net_manager.GetAlignCommand(align_deg)) {
-                          // Guard 1: Do NOT interrupt an ongoing turn!
                           if (!path_follower.IsTurning()) {
-                              std::cout << "[MAIN] Executing ALIGN micro-turn: " << align_deg << " deg" << std::endl;
+                              // Protocol rule: positive angle = turn right (CW) -> StartTurn(-align_deg)
+                              float robot_turn_deg = -align_deg;
+                              std::cout << "[MAIN ALIGN] Executing ALIGN micro-turn: server=" << align_deg 
+                                        << " deg -> robot=" << robot_turn_deg << " deg" << std::endl;
                               Msg_Status_t status_snap{};
                               if (robot_comm.GetLatestStatus(status_snap)) {
-                                  path_follower.StartTurn(align_deg, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
+                                  path_follower.StartTurn(robot_turn_deg, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
                               }
-                          } else {
-                              std::cout << "[MAIN] [ALIGN IGNORED] Robot is currently executing a turn." << std::endl;
+                          }
+                      }
+
+                      // Check for MORE micro-distance request
+                      float more_dist = 0.0f;
+                      if (net_manager.GetMoreCommand(more_dist)) {
+                          if (!path_follower.IsMovingStraight() && !path_follower.IsTurning()) {
+                              std::cout << "[MAIN MORE] Executing MORE micro-move: " << more_dist << " m" << std::endl;
+                              Msg_Status_t status_snap{};
+                              if (robot_comm.GetLatestStatus(status_snap)) {
+                                  path_follower.StartMove(more_dist, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
+                              }
                           }
                       }
 
@@ -205,7 +207,29 @@ int main(int argc, char **argv) {
                               if (path_follower.UpdateTurn(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed)) {
                                   // Micro-turn completed: Send stop & wait 500ms for camera settling before re-sending READY
                                   robot_comm.SendSetSpeed(0, 0);
-                                  std::cout << "[MAIN ALIGN] Micro-turn complete -> Waiting 500ms for camera settling..." << std::endl;
+                                  std::cout << "[MAIN ALIGN] Turn complete -> Waiting 500ms for camera settling..." << std::endl;
+                                  
+                                  auto start_wait = std::chrono::steady_clock::now();
+                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - start_wait).count() < 500) {
+                                      robot_comm.SendSetSpeed(0, 0);
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                  }
+
+                                  net_manager.SendReady(seg_idx);
+                              }
+                          }
+                      }
+
+                      if (path_follower.IsMovingStraight()) {
+                          Msg_Status_t status_snap{};
+                          if (robot_comm.GetLatestStatus(status_snap)) {
+                              uint8_t dummy_nozzle = 0;
+                              float imu_yaw = imu_manager.GetYaw();
+                              if (path_follower.UpdateMove(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed, dummy_nozzle, imu_yaw)) {
+                                  // Micro-move completed: Send stop & wait 500ms before re-sending READY
+                                  robot_comm.SendSetSpeed(0, 0);
+                                  std::cout << "[MAIN MORE] Move complete -> Waiting 500ms for camera settling..." << std::endl;
                                   
                                   auto start_wait = std::chrono::steady_clock::now();
                                   while (std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -227,133 +251,46 @@ int main(int argc, char **argv) {
                   }
 
                   if (!waiting_for_go) {
-                      if (current_seg.op == "MOVE") {
-                        Msg_Status_t status_snap{};
-                        if (robot_comm.GetLatestStatus(status_snap)) {
-                            int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
-                            int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
-
-                            if (!path_follower.IsMovingStraight()) {
-                                path_follower.StartMove(current_seg.dist_m, l_steps, r_steps);
-                            }
-
-                            float imu_yaw = imu_manager.GetYaw();
-                            if (path_follower.UpdateMove(l_steps, r_steps, target_speed, nozzle_on, imu_yaw)) {
-                                // Pure MOVE segment completed -> advance to next segment
-                                path_follower.AdvanceSegment();
-                            }
-                        }
-                      }
-                  }
-              } else if (current_seg.op == "TURN") {
-                  // TURN segment runs pure in-place turn (wheel center is already at vertex)
-                  auto_nozzle = 0; // Force nozzle UP during turning
-                  Msg_Status_t status_snap{};
-                  if (robot_comm.GetLatestStatus(status_snap)) {
-                      int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
-                      int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
-
-                      if (!path_follower.IsTurning()) {
-                          path_follower.StartTurn(current_seg.angle_deg, l_steps, r_steps);
-                      }
-                      
-                      if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
-                          std::cout << "[MAIN TURN] In-place turn (" << current_seg.angle_deg 
-                                    << " deg) complete on vertex." << std::endl;
-                          path_follower.AdvanceSegment();
-                      }
-                  }
-              } else if (current_seg.op == "ARC") {
-                  Msg_Status_t status_snap{};
-                  if (robot_comm.GetLatestStatus(status_snap)) {
-                      int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
-                      int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
-
-                      if (!path_follower.IsMovingStraight()) {
-                          path_follower.StartArc(current_seg.radius_m, current_seg.angle_deg, current_seg.direction, l_steps, r_steps);
-                      }
-                      
-                      if (path_follower.UpdateArc(l_steps, r_steps, target_speed)) {
-                          std::cout << "[MAIN ARC] Arc segment (R=" << current_seg.radius_m 
-                                    << "m, " << current_seg.angle_deg << " deg " << current_seg.direction 
-                                    << ") complete." << std::endl;
-                          path_follower.AdvanceSegment();
-                      }
-                  }
-              }
-              
-              if (!waiting_for_go && current_seg.op == "NOZZLE") {
-                  std::string phase = net_manager.GetPathPhase();
-                  if (phase == "draw") {
                       Msg_Status_t status_snap{};
                       if (robot_comm.GetLatestStatus(status_snap)) {
                           int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
                           int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
 
-                          if (current_seg.paint) {
-                              // NOZZLE down=true (Start of paint line): +15.5cm advance -> lower nozzle + 1.0s delay
-                              if (nozzle_sub_seq == NozzleSubSeq::OFFSET_MOVE) {
-                                  auto_nozzle = 0; // Force nozzle UP during offset move
-                                  if (!path_follower.IsMovingStraight()) {
-                                      // Forward +15.5cm (unpainted) so rear nozzle lands on line start
-                                      path_follower.StartOffsetMove(-PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
-                                  }
-                                  uint8_t dummy_nozzle = 0;
-                                  if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
-                                      nozzle_sub_seq = NozzleSubSeq::WAIT_DELAY;
-                                  }
-                              } else if (nozzle_sub_seq == NozzleSubSeq::WAIT_DELAY) {
-                                  auto_nozzle = 1;
-                                  robot_comm.SendControlNozzle(1);
-                                  std::cout << "[MAIN NOZZLE] NOZZLE down=true: +15.5cm advance complete -> Lowering nozzle (1.0s delay)..." << std::endl;
+                          if (current_seg.op == "MOVE") {
+                              if (!path_follower.IsMovingStraight()) {
+                                  path_follower.StartMove(current_seg.dist_m, l_steps, r_steps);
+                              }
 
-                                  auto start_wait = std::chrono::steady_clock::now();
-                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                             std::chrono::steady_clock::now() - start_wait).count() < 1000) {
-                                      robot_comm.SendSetSpeed(0, 0);
-                                      robot_comm.SendControlNozzle(1);
-                                      std::this_thread::sleep_for(std::chrono::milliseconds(80));
-                                  }
-
-                                  nozzle_sub_seq = NozzleSubSeq::OFFSET_MOVE; // Reset for next NOZZLE op
+                              float imu_yaw = imu_manager.GetYaw();
+                              if (path_follower.UpdateMove(l_steps, r_steps, target_speed, nozzle_on, imu_yaw)) {
+                                  std::cout << "[MAIN MOVE] Segment " << seg_idx << " complete." << std::endl;
+                                  net_manager.SendReady(seg_idx);
                                   path_follower.AdvanceSegment();
                               }
-                          } else {
-                              // NOZZLE down=false (End of paint line): raise nozzle + 1.0s delay -> -15.5cm reverse
-                              if (nozzle_sub_seq == NozzleSubSeq::OFFSET_MOVE) {
-                                  auto_nozzle = 0;
-                                  robot_comm.SendControlNozzle(0);
-                                  std::cout << "[MAIN NOZZLE] NOZZLE down=false: Raising nozzle (1.0s delay)..." << std::endl;
+                          } else if (current_seg.op == "TURN") {
+                              if (!path_follower.IsTurning()) {
+                                  // Protocol rule: positive angle = turn right (CW) -> StartTurn(-angle_deg)
+                                  float robot_turn_deg = -current_seg.angle_deg;
+                                  path_follower.StartTurn(robot_turn_deg, l_steps, r_steps);
+                              }
 
-                                  auto start_wait = std::chrono::steady_clock::now();
-                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                             std::chrono::steady_clock::now() - start_wait).count() < 1000) {
-                                      robot_comm.SendSetSpeed(0, 0);
-                                      robot_comm.SendControlNozzle(0);
-                                      std::this_thread::sleep_for(std::chrono::milliseconds(80));
-                                  }
-                                  nozzle_sub_seq = NozzleSubSeq::WAIT_DELAY;
-                              } else if (nozzle_sub_seq == NozzleSubSeq::WAIT_DELAY) {
-                                  auto_nozzle = 0; // Force nozzle UP during offset move
-                                  if (!path_follower.IsMovingStraight()) {
-                                      // Reverse -15.5cm (unpainted) so wheel center lands on corner vertex
-                                      path_follower.StartOffsetMove(PathFollower::NOZZLE_OFFSET_M, l_steps, r_steps);
-                                  }
-                                  uint8_t dummy_nozzle = 0;
-                                  if (path_follower.UpdateOffsetMove(l_steps, r_steps, target_speed, dummy_nozzle)) {
-                                      nozzle_sub_seq = NozzleSubSeq::OFFSET_MOVE; // Reset for next NOZZLE op
-                                      std::cout << "[MAIN NOZZLE] NOZZLE down=false: -15.5cm reverse complete -> Wheel center on vertex." << std::endl;
-                                      path_follower.AdvanceSegment();
-                                  }
+                              if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
+                                  std::cout << "[MAIN TURN] In-place turn (" << current_seg.angle_deg << " deg) complete." << std::endl;
+                                  net_manager.SendReady(seg_idx);
+                                  path_follower.AdvanceSegment();
+                              }
+                          } else if (current_seg.op == "ARC") {
+                              if (!path_follower.IsMovingStraight()) {
+                                  path_follower.StartArc(current_seg.radius_m, current_seg.angle_deg, current_seg.direction, l_steps, r_steps);
+                              }
+
+                              if (path_follower.UpdateArc(l_steps, r_steps, target_speed)) {
+                                  std::cout << "[MAIN ARC] Arc segment complete." << std::endl;
+                                  net_manager.SendReady(seg_idx);
+                                  path_follower.AdvanceSegment();
                               }
                           }
                       }
-                  } else {
-                      // phase == "approach" or default: Direct nozzle state update without offset move
-                      auto_nozzle = current_seg.paint ? 1 : 0;
-                      robot_comm.SendControlNozzle(auto_nozzle);
-                      std::cout << "[MAIN] NOZZLE op set (down=" << (auto_nozzle ? "true" : "false") << ")" << std::endl;
-                      path_follower.AdvanceSegment();
                   }
               }
           }

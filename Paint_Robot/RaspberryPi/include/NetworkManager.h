@@ -66,6 +66,13 @@ public:
     bool GetAlignCommand(float& out_angle_deg);
 
     /**
+     * @brief Thread-safely fetches the latest received MORE distance correction.
+     * @param out_dist_m Output float to store the micro-distance adjustment (m).
+     * @return true if a MORE command is available.
+     */
+    bool GetMoreCommand(float& out_dist_m);
+
+    /**
      * @brief Checks if a GO signal was received and clears it.
      * @return true if GO signal was received.
      */
@@ -139,6 +146,10 @@ private:
     std::mutex align_mutex;
     float align_angle_deg;
     bool has_align_cmd;
+
+    std::mutex more_mutex;
+    float more_dist_m;
+    bool has_more_cmd;
 
     std::atomic<bool> go_signal_received;
 

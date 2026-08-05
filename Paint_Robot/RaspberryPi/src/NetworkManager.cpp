@@ -237,6 +237,14 @@ bool NetworkManager::GetAlignCommand(float& out_angle_deg) {
     return true;
 }
 
+bool NetworkManager::GetMoreCommand(float& out_dist_m) {
+    std::lock_guard<std::mutex> lock(more_mutex);
+    if (!has_more_cmd) return false;
+    out_dist_m = more_dist_m;
+    has_more_cmd = false;
+    return true;
+}
+
 bool NetworkManager::CheckAndClearGoSignal() {
     return go_signal_received.exchange(false);
 }
@@ -373,6 +381,13 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
             std::lock_guard<std::mutex> lock(align_mutex);
             align_angle_deg = angle;
             has_align_cmd = true;
+
+        } else if (type == "MORE") {
+            float dist = payload.value("dist_m", 0.0f);
+            std::cout << "[NetworkManager] Received MORE: " << dist << " m" << std::endl;
+            std::lock_guard<std::mutex> lock(more_mutex);
+            more_dist_m = dist;
+            has_more_cmd = true;
 
         } else if (type == "GO") {
             std::cout << "[NetworkManager] Received GO signal from server." << std::endl;
