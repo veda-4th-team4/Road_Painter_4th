@@ -30,6 +30,7 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 | 문서 | 내용 |
 |---|---|
 | **[docs/PROTOCOL_v2_ROBOT.md](docs/PROTOCOL_v2_ROBOT.md)** | 🔴 **서버↔로봇 v2 규격 (정본)**. 로봇팀이 봐야 할 문서 |
+| **[docs/ROBOT_ACTION_ITEMS_20260805.md](docs/ROBOT_ACTION_ITEMS_20260805.md)** | 🔴 로봇 코드 v2 적용 수정 지시서 (R-1~R-10 + 참조 구현·검증 방법) |
 | **[server_PROTOCOL.md](server_PROTOCOL.md)** | 통신 규격 전체 (Qt/CCTV 팀용). ⚠️ 서버↔로봇 절은 v1 시절 내용이라 위 문서가 우선한다 |
 | [docs/TESTING.md](docs/TESTING.md) | 서버/Qt 테스트 가이드 |
 | [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) | 로봇 주행 통합 테스트 계획 (단계 A~D, 합격 기준, 드라이런 결과) |
