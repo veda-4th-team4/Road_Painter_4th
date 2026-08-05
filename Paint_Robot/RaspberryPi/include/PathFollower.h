@@ -77,7 +77,7 @@ public:
      * @brief Updates straight move execution based on latest step counts and IMU yaw heading.
      * @return true if target distance is reached.
      */
-    bool UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on, float imu_yaw_deg = 0.0f);
+    bool UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed, float imu_yaw_deg = 0.0f);
 
     /**
      * @brief Starts arc (curved) motion.
@@ -94,14 +94,6 @@ public:
      * @brief Checks if a straight move is currently in progress.
      */
     bool IsMovingStraight() const { return is_moving_straight; }
-
-    /**
-     * @brief Computes guidance error calculations and outputs left/right motor target speed (sps).
-     * @param current_pose Current absolute coordinate of the robot.
-     * @param out_speed Output struct to store speed commands.
-     * @param out_nozzle_on Output command indicating if the paint spray nozzle should trigger.
-     */
-    void Update(const Pose_t& current_pose, Msg_SetSpeed_t& out_speed, uint8_t& out_nozzle_on);
 
 private:
     std::vector<Segment_t> path;

@@ -232,9 +232,8 @@ int main(int argc, char **argv) {
                   if (path_follower.IsMovingStraight()) {
                       Msg_Status_t status_snap{};
                       if (robot_comm.GetLatestStatus(status_snap)) {
-                          uint8_t dummy_nozzle = 0;
                           float imu_yaw = imu_manager.GetYaw();
-                          if (path_follower.UpdateMove(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed, dummy_nozzle, imu_yaw)) {
+                          if (path_follower.UpdateMove(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed, imu_yaw)) {
                               // Micro-move completed: Send stop & wait 500ms before re-sending READY for same op
                               robot_comm.SendSetSpeed(0, 0);
                               std::cout << "[MAIN MORE] Move complete -> Waiting 500ms for camera settling..." << std::endl;
@@ -280,7 +279,7 @@ int main(int argc, char **argv) {
                           }
 
                           float imu_yaw = imu_manager.GetYaw();
-                          if (path_follower.UpdateMove(l_steps, r_steps, target_speed, nozzle_on, imu_yaw)) {
+                          if (path_follower.UpdateMove(l_steps, r_steps, target_speed, imu_yaw)) {
                               std::cout << "[MAIN MOVE] Op " << active_op_index << " complete." << std::endl;
                               // R-4: Do NOT send SendReady here! AdvanceSegment() lets next loop iteration send READY(active_op_index + 1)
                               path_follower.AdvanceSegment();

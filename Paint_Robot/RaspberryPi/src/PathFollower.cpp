@@ -131,7 +131,7 @@ void PathFollower::StartMove(float dist_m, int32_t start_left_steps,
 }
 
 bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
-                              Msg_SetSpeed_t &out_speed, uint8_t &out_nozzle_on,
+                              Msg_SetSpeed_t &out_speed,
                               float imu_yaw_deg) {
   if (!is_moving_straight)
     return true;
@@ -142,14 +142,10 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
   uint32_t delta_right = static_cast<uint32_t>(std::abs(diff_right));
   uint32_t progress_steps = (delta_left + delta_right) / 2;
 
-  Segment_t current_seg;
-  GetCurrentSegment(current_seg);
-
   if (progress_steps >= move_target_steps) {
     // Move target reached
     out_speed.left_sps = 0;
     out_speed.right_sps = 0;
-    out_nozzle_on = 0;
     is_moving_straight = false;
     std::cout << "[PathFollower] Move completed! Reached " << progress_steps
               << "/" << move_target_steps << " steps." << std::endl;
@@ -163,7 +159,6 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
   float target_w = -0.5f * drift_rad; // P-gain 0.5 for smooth steering correction
 
   out_speed = velocity_to_sps(target_v, target_w);
-  out_nozzle_on = current_seg.down ? 1 : 0;
 
   static int move_log_count = 0;
   if (++move_log_count % 10 == 0) {
@@ -231,34 +226,7 @@ bool PathFollower::UpdateArc(int32_t cur_l_steps, int32_t cur_r_steps,
   return false;
 }
 
-void PathFollower::Update(const Pose_t &current_pose, Msg_SetSpeed_t &out_speed,
-                          uint8_t &out_nozzle_on) {
-  if (path.empty() || current_waypoint_idx >= path.size()) {
-    // No path active, send stop command
-    out_speed.left_sps = 0;
-    out_speed.right_sps = 0;
-    out_nozzle_on = 0;
-    return;
-  }
 
-  // Process segment-based operations (MOVE and TURN)
-  const auto &current_seg = path[current_waypoint_idx];
-  float target_v = 0.0f;
-  float target_w = 0.0f;
-
-  if (current_seg.op == "move") {
-    target_v = 0.05f; // 5 cm/s straight speed
-    target_w = -drift_offset_deg * 0.05f;
-    out_nozzle_on = current_seg.down ? 1 : 0;
-  } else if (current_seg.op == "turn") {
-    target_v = 0.0f;
-    target_w = (current_seg.angle_deg > 0.0f) ? -0.2f : 0.2f; // Protocol v2: positive = CW right
-    out_nozzle_on = 0;
-  }
-
-  // Kinematic translation to steps-per-second
-  out_speed = velocity_to_sps(target_v, target_w);
-}
 
 Msg_SetSpeed_t PathFollower::velocity_to_sps(float v, float w) {
   Msg_SetSpeed_t speed_cmd;
