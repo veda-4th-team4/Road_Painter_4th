@@ -9,6 +9,7 @@
 #include <opencv2/opencv.hpp>
 #include <QMutex>
 #include <atomic>
+#include <array>
 
 struct StreamStats {
     bool isConnected = false;
@@ -67,6 +68,21 @@ signals:
     // 끊겼다가 스스로 다시 붙었을 때. 조작자가 "왜 잠깐 멈췄지" 를 알 수 있게 한다.
     void streamReconnected();
 
+public:
+    // ArUco 검출 on/off. **끄면 검출을 아예 안 돌린다** (표시만 숨기는 게 아니다).
+    // 이 검출은 화면 표시 전용이다 — 로봇의 실제 위치는 CCTV 앱이 검출해 서버로 보내고
+    // 서버가 POSE 로 내려준다. 즉 같은 일을 중복으로 하는 것이라, 필요 없으면 끄면 된다.
+    // 캡처 스레드가 매 프레임 읽으므로 atomic 이다.
+    void setArucoEnabled(bool on) { m_arucoEnabled.store(on, std::memory_order_relaxed); }
+
+    // RTSP 캡처 옵션을 프로세스 전역으로 한 번 세팅한다.
+    // ⚠️ **main() 에서 VideoCapture 를 만들기 전에 한 번만** 부를 것.
+    //    qputenv 는 프로세스 전역이라 워커마다 부르면 서로 덮어쓴다.
+    //    FFmpeg 버전에 따라 타임아웃 옵션 이름이 다른 것도 여기서 처리한다.
+    // ⚠️ 이 선언을 signals: 블록 안에 두면 moc 가 시그널로 취급해
+    //    "'this' is unavailable for static member functions" 로 깨진다.
+    static void applyFfmpegCaptureOptions();
+
 protected:
     void run() override;
 
@@ -75,9 +91,34 @@ private:
     // 캡처 스레드가 읽고 GUI 스레드가 쓴다. 재연결 백오프 중에도 즉시 보여야 한다.
     std::atomic<bool> m_stopRequested;
     std::atomic<int>  m_queued{0};   // GUI 이벤트 큐에 떠 있는 프레임 수
+    std::atomic<bool> m_arucoEnabled{true};   // 위 setArucoEnabled 참고
 
-    // cv::Mat을 QImage로 변환하는 헬퍼 함수
+    // cv::Mat을 QImage로 변환하는 헬퍼 함수 (무복사 — 아래 프레임 풀과 짝이다)
     QImage matToQImage(const cv::Mat& mat);
+
+    // 🔴 프레임 풀 — 디코더가 쓸 버퍼를 돌려쓴다.
+    //
+    // matToQImage 가 깊은 복사를 안 하려면(무복사) QImage 가 가리키는 버퍼가 화면에
+    // 뿌려지는 동안 살아 있어야 한다. 복사를 없애면 프레임당 3.11ms 와 초당 676MB 의
+    // 메모리 대역을 아낀다 (2026-08-04 실측, 당시 2592x1520 = 한 장 11.3MB).
+    // 현재 프로파일 1920x1080 은 한 장 6.2MB 라 절감폭은 그 절반 남짓이지만,
+    // 구조는 그대로 유효하다.
+    //
+    // ⚠️ **Mat 의 refcount 만 믿으면 안 된다.** cv::Mat::create 는 크기·타입이 같으면
+    //    refcount 를 보지 않고 기존 버퍼를 그대로 쓴다. 즉 다음 retrieve() 가 화면에
+    //    떠 있는 버퍼를 덮어쓴다 — 간헐적 화면 깨짐으로만 보여서 원인 찾기가 지옥이다.
+    //    (1차 시도에서 실제로 이 함정을 밟았고, 테스트로 잡았다.)
+    //    그래서 여기서 **재사용 전에 아직 공유 중인지 직접 확인**하고, 공유 중이면
+    //    그 슬롯만 새로 할당한다.
+    //
+    // 슬롯 수는 "동시에 떠 있을 수 있는 프레임 수 + 여유". 백프레셔가 큐를 2장으로
+    // 묶으므로 4면 충분하다 — 실측에서 40프레임을 돌려도 재할당이 0회였다.
+    cv::Mat &nextFrameBuffer();
+    // ⚠️ std::vector<cv::Mat> m_pool{4} 로 쓰지 말 것 — "원소 4개" 인지 "4 라는 원소
+    //    하나" 인지 브레이스 초기화 규칙에 기대게 된다. std::array 면 그 모호함이 없다.
+    static constexpr int kPoolSize = 4;
+    std::array<cv::Mat, kPoolSize> m_pool;
+    int m_poolIdx = 0;
     // 상시 ArUco 검출 (몇 프레임마다 1회). 사전(dictionary)은 처음 잡힌 것으로 고정.
     void detectArucoAlways(const cv::Mat &bgr);
     // 중단 요청을 100ms 마다 확인하며 잔다. 종료 요청이 들어오면 false 를 돌려준다.
@@ -89,6 +130,11 @@ private:
     int m_searchFail = 0;       // 연속 탐색 실패 횟수 → 탐색 간격을 늘리는 데 쓴다
     int m_searchSkip = 0;
     int m_lastArucoCount = -1;
+    // ArUco ROI 추적 — 직전에 마커를 찾은 영역(**축소본 좌표**). 다음 프레임은 여기만
+    // 본다. 전체의 10% 남짓이라 검출이 27ms → 3.3ms 로 떨어진다 (2592x1520 실측).
+    // 놓치면 valid 를 내리고 다음 프레임에 전체부터 다시 찾는다.
+    cv::Rect m_arucoRoi;
+    bool m_arucoRoiValid = false;
 
     QMutex m_mutex; // #include <QMutex> 필요
     int m_brightness = 0;

@@ -1,0 +1,16 @@
+# 빌드 산출물 — 재생성 가능하므로 커밋하지 않는다.
+#
+# ⚠️ 배포본(RoadPainter.exe + DLL들)은 **Client/ 루트에 커밋한다.** 빌드하지 않는
+#    팀원이 git pull 후 더블클릭만으로 쓸 수 있어야 하기 때문이다 (BUILD.md §1).
+#    그래서 여기서 무시하는 건 "빌드 폴더"뿐이고 루트의 exe/DLL 은 아니다.
+#
+# ⚠️ build/ 를 빠뜨리지 말 것 — 예전에는 src/build/ 만 있었는데, 빌드 디렉터리를
+#    Client/build 로 잡으면 그건 걸리지 않아 130MB 넘는 산출물이 통째로 커밋된다.
+build/
+src/build/
+src/.qtcreator/
+
+# CMake / Qt Creator 로컬 캐시
+CMakeCache.txt
+CMakeFiles/
+*.user

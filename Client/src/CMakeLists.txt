@@ -9,7 +9,16 @@ set(CMAKE_AUTORCC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Quick QuickControls2 Network Gui)
 
-# MinGW용 OpenCV 4.12
+# MinGW용 OpenCV 4.12 (팀 공유 빌드).
+#
+# ⚠️ 머신마다 다르다. MSYS2 로 대체한 머신에서는 아래 줄로 바꿔 쓴다:
+#       set(OpenCV_DIR "C:/msys64/mingw64/lib/cmake/opencv4")   # OpenCV 4.13.0
+#    Qt 의 MinGW 13.1.0 과 MSYS2 mingw64 GCC 는 별개 배포판이라 ABI 가 완전히 같다는
+#    보장은 없지만, 양쪽 다 빌드+링크까지 통과한 것이 확인돼 있다.
+#
+# ⚠️ 이 경로를 바꾸면 번들 FFmpeg 버전도 같이 바뀐다. video_worker 의 RTSP 타임아웃
+#    옵션 이름이 FFmpeg 5.0 을 기점으로 stimeout → timeout 으로 달라지므로,
+#    코드가 실행 시점에 avformat 버전을 보고 고르게 돼 있다 (video_worker.cpp 참고).
 set(OpenCV_DIR "C:/opencv/mingw")
 find_package(OpenCV REQUIRED)
 
@@ -20,6 +29,10 @@ qt_add_executable(RoadPainterQml
     backend.h backend.cpp
     videoview.h videoview.cpp
     video_worker.h video_worker.cpp
+    # 4채널 미리보기 (PNM). 경량 캡처 + 타일 — video_worker/VideoView 와 별개다
+    # (미리보기에 ArUco 검출과 3000줄짜리 작도 뷰를 재사용하면 CPU 가 녹는다)
+    preview_worker.h preview_worker.cpp
+    channel_tile.h channel_tile.cpp
     serverclient.h serverclient.cpp
     routeplan.h
     motionprogram.h
@@ -43,6 +56,7 @@ qt_add_qml_module(RoadPainterQml
         LoginPage.qml
         SignupDialog.qml
         MainPage.qml
+        ChannelGrid.qml
         PresetTile.qml
         PresetPanel.qml
         UndoButton.qml

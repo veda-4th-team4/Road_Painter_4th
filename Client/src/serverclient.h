@@ -62,6 +62,13 @@ public:
                        const QList<bool> &paint = QList<bool>(),
                        const QList<motionprogram::Op> &program = {});
     void sendCmd(const QString &cmd);
+    // 작업 완전 중지 (프로토콜 v0.4). ESTOP 과 달리 서버·로봇이 받아둔 경로를
+    // 버리므로, RESUME 해도 도색이 재개되지 않는다. 도면은 서버에 남는다.
+    void sendAbortDraw();
+    // 작업 채널 전환 (프로토콜 v0.4, 다채널 카메라). 서버가 활성 채널을 바꾸고
+    // CCTV 에 중계해 그 채널의 마커를 잡게 한다 → 응답 CHANNEL_OK{ch,calib}.
+    // ⚠️ 영상만 바꾸고 이걸 안 보내면 로봇 위치가 옛 채널 기준이라 조용히 어긋난다.
+    void sendSelectChannel(int ch);
     // ⚠️ sendSpeeds 는 없앴다 — 프로토콜에 속도 CMD 가 없고(2026-07-28 확정),
     //    로봇에도 SET_SPEED 분기가 없어 보내봐야 버려진다.
     // 로그인 후 카메라 IP 변경 (빈 문자열이면 등록 해제)
@@ -82,14 +89,33 @@ signals:
     void poseReceived(double x, double y, double thetaDeg);
     void statusReceived(const QString &state, bool painting);
     void peersReceived(bool robot, bool cctv);
-    void hMatrixReceived(const QJsonObject &calib); // 캘리브레이션 갱신 → top-view 재생성
+    // 캘리브레이션 갱신 → top-view 재생성. ch 는 이 번들이 어느 채널의 것인지
+    // (단일 채널 카메라·v0.3 서버는 ch 를 안 실으므로 1로 온다).
+    void hMatrixReceived(int ch, const QJsonObject &calib);
+    // LOGIN_OK 의 채널별 번들 맵 + 서버가 기억하는 활성 채널 (프로토콜 v0.4).
+    // loginResult 와 따로 두는 이유: 단일 채널 경로는 calib 하나만 보면 되고,
+    // 그 시그니처를 건드리면 4채널과 무관한 코드까지 다 바뀐다.
+    void calibChannelsReceived(const QJsonObject &calibs, int activeCh);
+    // LOGIN_OK 의 중계 스트림 주소 (**선택 필드**):
+    //   "stream": { "base": "rtsp://192.168.0.2:8554", "channels": 4 }
+    // 위와 같은 이유로 loginResult 시그니처를 안 건드린다.
+    // ⚠️ base 가 비면 아무 일도 안 일어나고 QSettings 값이 그대로 쓰인다.
+    //    서버가 이 필드를 안 보내는 동안에도 기존 동작이 100% 유지되어야 한다.
+    void streamInfoReceived(const QString &base, int channels);
+    // 채널 전환 결과. ok=false 면 서버가 거절한 것(범위 밖 채널 등).
+    // hasCalib=false 면 그 채널은 아직 캘리브레이션이 없다.
+    void channelResult(bool ok, int ch, const QJsonObject &calib, bool hasCalib,
+                       const QString &reason);
     // 도면 접수 확인 — 보낸 것과 서버가 받은 것을 그 자리에서 대조한다.
     // paint/program 이 형식 오류로 무시됐으면 false / 0 으로 온다.
     void blueprintAck(int points, bool paint, int program);
     // 카메라 IP 변경 결과
     void camIpResult(bool ok, const QString &camIp, const QString &reason);
-    // 도색 완료 — START_DRAW 이후 유일한 "끝" 신호
+    // 도색 완료 — START_DRAW 이후 정상적인 "끝" 신호
     void drawDone();
+    // 작업 취소 확인 (ABORT_DRAW 응답). wasActive=false 면 진행 중인 작업이
+    // 없었다는 뜻 — 어느 쪽이든 UI 는 "그리는 중" 표시를 끄면 된다.
+    void drawAborted(bool wasActive);
     // 경로 생성/전송 실패 또는 대기 통지
     void drawFailed(const QString &stage, const QString &reason, const QString &msg);
 

@@ -16,6 +16,13 @@ Item {
         || cctvPanel.floating || topPanel.floating || logPanel.floating
         || dashPanel.floating || manualPanel.floating
 
+    // 4채널 미리보기 화면인가. 중계 주소가 없으면(단일 채널) 언제나 false 라
+    // 예전 화면만 뜬다 — PNM 을 안 쓰는 현장은 아무것도 달라지지 않는다.
+    // (테스트 모드는 중계가 없으므로 4채널 화면을 띄우지 않는다 — Backend 쪽에서도
+    //  enterInitialView() 가 같은 판단을 한다)
+    readonly property bool channelGridMode:
+        Backend.channelMode && !Backend.testMode && Backend.workingChannel === 0
+
     function captureLayout() {
         defaultLayout = {
             outer:  outerSplit.saveState(),
@@ -44,13 +51,37 @@ Item {
         Qt.callLater(captureLayout)
     }
 
+    // 🔴 4채널에서는 [작업하기] **버튼**을 눌러 작업 화면으로 들어온다. Button 은
+    //    클릭하면 포커스를 가져가므로, 그대로 두면 방향키가 여기 Keys 핸들러까지
+    //    오지 않아 로봇 수동 조작이 먹지 않는다. 1채널 때는 로그인 직후 곧바로
+    //    작업 화면이라(Component.onCompleted 의 forceActiveFocus) 안 드러났던 문제다.
+    //    빈 곳을 클릭하면 아래 MouseArea 가 살려주긴 하지만, 그건 조작자가 원인을
+    //    알아야 가능한 복구다 — 채널에 들어올 때마다 여기서 되돌린다.
+    Connections {
+        target: Backend
+        function onChannelChanged() {
+            if (Backend.workingChannel > 0) page.forceActiveFocus()
+        }
+    }
+
     Keys.onPressed: function(event) {
         if (event.isAutoRepeat) { event.accepted = true; return }
+        // ⚠️ 그리드 화면에서는 **이동 명령을 보내지 않는다.** 아직 채널을 안 고른
+        //    상태라 조작자가 로봇을 화면으로 보고 있지 않다. 안 보고 움직이는 건
+        //    위험하다. (ESTOP 은 아래에서 화면과 무관하게 항상 받는다)
+        if (page.channelGridMode) {
+            switch (event.key) {
+            case Qt.Key_Up: case Qt.Key_Down: case Qt.Key_Left: case Qt.Key_Right:
+            case Qt.Key_PageUp: case Qt.Key_PageDown:
+                event.accepted = true; return
+            }
+        }
         switch (event.key) {
         case Qt.Key_Up:    Backend.sendRobotCmd("FORWARD", "전진"); event.accepted = true; break
         case Qt.Key_Down:  Backend.sendRobotCmd("BACKWARD", "후진"); event.accepted = true; break
         case Qt.Key_Left:  Backend.sendRobotCmd("TURN_LEFT", "좌회전"); event.accepted = true; break
         case Qt.Key_Right: Backend.sendRobotCmd("TURN_RIGHT", "우회전"); event.accepted = true; break
+        // 비상정지는 어느 화면에서든 받는다 — 막을 이유가 없다
         case Qt.Key_Space: Backend.toggleEstop(); event.accepted = true; break
         // 노즐은 누르고 있는 동작이 아니라 상태 전환이라 눌렀을 때 한 번만
         case Qt.Key_PageUp:   Backend.setNozzle(false); event.accepted = true; break
@@ -222,6 +253,40 @@ Item {
                     font.family: Theme.fontFamily
                 }
             }
+            // 4채널 모드에서 지금 어느 채널로 작업 중인지 + 목록으로 돌아가기.
+            // 단일 채널(중계 주소 없음)에서는 통째로 사라진다.
+            Row {
+                visible: Backend.channelMode && Backend.workingChannel > 0
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 6
+                AppButton {
+                    text: "◀ 채널 목록"
+                    enabled: !Backend.jobActive
+                    ToolTip.visible: hovered && Backend.jobActive
+                    // 작업 중 채널을 바꾸면 지금 로봇을 보고 있는 카메라가 바뀌어
+                    // pose 공급이 끊긴다. 서버는 안 막으므로 여기서 막는다.
+                    ToolTip.text: "작업 중에는 채널을 바꿀 수 없습니다 — 먼저 작업을 취소하세요"
+                    onClicked: Backend.showChannelGrid()
+                }
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    radius: 4
+                    color: Theme.accentSoft
+                    border.color: Theme.accent
+                    border.width: 1
+                    width: chLabel.implicitWidth + 16
+                    height: 24
+                    Text {
+                        id: chLabel
+                        anchors.centerIn: parent
+                        text: "CH" + Backend.workingChannel
+                        color: Theme.accentDim
+                        font.pixelSize: 11
+                        font.bold: true
+                        font.family: Theme.fontFamily
+                    }
+                }
+            }
         }
 
         Row {
@@ -369,6 +434,20 @@ Item {
         TextEdit { id: adminUrlHolder; visible: false; width: 1; height: 1 }
     }
 
+    // ── 4채널 미리보기 (PNM) ─────────────────────────────────────────
+    // 중계 주소가 설정돼 있고 아직 채널을 안 골랐으면 이 화면부터 시작한다.
+    // 🔴 아래 작업 화면(outerSplit)을 갈아엎지 않고 **덮기만** 한다 — 중계 주소를
+    //    비우면 channelMode 가 꺼지면서 예전 화면이 그대로 돌아온다.
+    ChannelGrid {
+        id: channelGridView
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: banner.bottom
+        anchors.bottom: parent.bottom
+        z: 2
+        visible: page.channelGridMode
+    }
+
     // ── 본문: 전부 드래그로 크기 조절 가능 ───────────────────────────
     SplitView {
         id: outerSplit
@@ -377,6 +456,9 @@ Item {
         anchors.top: banner.bottom
         anchors.bottom: parent.bottom
         orientation: Qt.Horizontal
+        // 그리드가 떠 있는 동안은 숨긴다. visible=false 면 입력도 안 받으므로
+        // 뒤에서 실수로 작도가 되는 일이 없다. SplitView 의 분할 상태는 유지된다.
+        visible: !page.channelGridMode
 
         handle: Rectangle {
             implicitWidth: 6
@@ -738,7 +820,7 @@ Item {
                 ToolTip.text: "TopView 위 로봇 아이콘을 숨깁니다.\n"
                     + "작도할 때 로봇이 도면을 가리면 끄세요.\n"
                     + "표시만 꺼지고 위치 수신·진행률 계산은 그대로 돕니다."
-            },
+            }
             // ⚠️ 여기 있던 `곡선ARC ON/OFF` 칩은 지웠다.
             //    곡선은 **항상 ARC op** 으로 보낸다 (프로토콜 v0.3). 끌 이유가 없다:
             //    동작 수가 4~10배 줄고, 로봇에는 arc_test.cpp 로 검증된 원호 주행
@@ -1899,8 +1981,11 @@ Item {
                         height: 38
                         danger: true
                         outline: true
-                        text: "작업 중단"
+                        text: "작업 취소"
                         visible: Backend.jobActive
+                        ToolTip.visible: hovered
+                        // ESTOP 과 뭐가 다른지가 이 버튼의 존재 이유다 — 툴팁으로 못박는다
+                        ToolTip.text: "경로를 폐기하고 로봇을 세웁니다 (ESTOP 은 일시정지라 해제하면 이어서 그립니다)"
                         onClicked: cancelConfirmPopup.open()
                     }
                     AppButton {
@@ -1912,7 +1997,7 @@ Item {
                         enabled: Backend.canEditMission && !Backend.jobActive
                         ToolTip.visible: hovered
                         ToolTip.text: Backend.jobActive
-                            ? "먼저 작업을 중단하세요"
+                            ? "먼저 작업을 취소하세요"
                             : "보냈던 경로를 다시 불러와 고칩니다"
                         onClicked: Backend.editMission()
                     }
@@ -2037,7 +2122,7 @@ Item {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 text: "누르는 즉시 로봇이 시작점으로 이동하고, 도착하면 이어서 도색까지 "
-                    + "자동으로 진행됩니다. 중간에 멈추려면 [작업 중단] 또는 ESTOP 을 쓰세요."
+                    + "자동으로 진행됩니다. 잠깐 세우려면 ESTOP, 아예 그만두려면 [작업 취소]."
                 color: Theme.sub
                 font.pixelSize: 13
                 font.family: Theme.fontFamily
@@ -2094,14 +2179,25 @@ Item {
         contentItem: Column {
             width: 340
             spacing: 14
-            Text { text: "작업 중단"; color: Theme.text; font.pixelSize: 16; font.bold: true; font.family: Theme.fontFamily }
+            Text { text: "작업 취소"; color: Theme.text; font.pixelSize: 16; font.bold: true; font.family: Theme.fontFamily }
             Text {
                 width: parent.width
                 wrapMode: Text.WordWrap
-                text: "진행 중인 작업을 중단합니다. 경로 실행 중에는 일반 정지가 통하지 않으므로 "
-                    + "비상정지(ESTOP)로 세웁니다. 이후 [ESTOP 해제]를 눌러야 다시 움직입니다."
+                text: "진행 중인 작업을 취소하고 로봇을 세웁니다. 경로가 폐기되므로 "
+                    + "[ESTOP 해제]를 눌러도 이어서 그리지 않습니다."
                 color: Theme.sub
                 font.pixelSize: 13
+                font.family: Theme.fontFamily
+            }
+            Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                // 도면은 서버에 남는다 (프로토콜 v0.4 ABORT_DRAW) — 다시 그릴 때
+                // [경로 전송]부터 할 필요가 없다는 것을 알려준다.
+                text: "도면은 서버에 그대로 남습니다. 다시 그리려면 [ESTOP 해제] 후 "
+                    + "[그림그리기 시작]을 누르면 처음부터 다시 진행됩니다."
+                color: Theme.muted
+                font.pixelSize: 12
                 font.family: Theme.fontFamily
             }
             Row {
@@ -2110,7 +2206,7 @@ Item {
                 AppButton { text: "계속 진행"; onClicked: cancelConfirmPopup.close() }
                 AppButton {
                     danger: true
-                    text: "중단"
+                    text: "작업 취소"
                     onClicked: { cancelConfirmPopup.close(); Backend.cancelJob() }
                 }
             }
@@ -2515,6 +2611,79 @@ Item {
                 AppButton {
                     text: "RTSP 적용"
                     onClicked: if (rtspField.text.length) Backend.setRtsp(rtspField.text)
+                }
+
+                Rectangle { width: parent.width; height: 1; color: Theme.stroke }
+
+                // ── 4채널 중계 (PNM-C16083RVQ) ──────────────────────────
+                Text {
+                    text: "4채널 중계 주소"
+                    color: Theme.sub
+                    font.pixelSize: 12
+                    font.bold: true
+                    font.family: Theme.fontFamily
+                }
+                Text {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    // 이 칸이 곧 되돌리기 스위치라는 것을 여기 적어둔다. 현장에서
+                    // PNM 이 말썽이면 재빌드 없이 이 한 칸을 비우면 끝이다.
+                    text: "서버의 RTSP 중계 주소를 넣으면 4채널 화면으로 동작합니다. "
+                        + "비우면 위의 단일 카메라 직결 동작으로 즉시 되돌아갑니다 (재시작 불필요)."
+                    color: Theme.muted
+                    font.pixelSize: 11
+                    font.family: Theme.fontFamily
+                }
+                Row {
+                    width: parent.width
+                    spacing: 8
+                    TextField {
+                        id: relayField
+                        width: parent.width - 200
+                        height: 30
+                        color: Theme.text
+                        leftPadding: 8
+                        selectByMouse: true
+                        placeholderText: "rtsp://192.168.0.2:8554   (비우면 단일 채널)"
+                        placeholderTextColor: Theme.muted
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 12
+                        Component.onCompleted: text = Backend.relayBase
+                        onAccepted: Backend.setRelayBase(text)
+                        background: Rectangle {
+                            radius: 4; color: Theme.panel
+                            border.width: 1
+                            border.color: relayField.activeFocus ? Theme.accent : Theme.stroke
+                        }
+                    }
+                    AppButton {
+                        height: 30
+                        text: "적용"
+                        ToolTip.visible: hovered
+                        ToolTip.text: "채널 URL 은 규칙으로 조립합니다:\n"
+                                    + "  메인 <주소>/ch1 … /ch4   (작업 화면)\n"
+                                    + "  서브 <주소>/ch1s … /ch4s (2x2 미리보기)\n"
+                                    + "Server/relay/README.md 의 경로와 같아야 합니다."
+                        onClicked: Backend.setRelayBase(relayField.text)
+                    }
+                    AppButton {
+                        height: 30
+                        text: "비우기"
+                        visible: Backend.channelMode
+                        onClicked: { relayField.text = ""; Backend.setRelayBase("") }
+                    }
+                }
+                Text {
+                    visible: Backend.channelMode
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    // 중계일 수도 카메라 직결일 수도 있어서 백엔드가 문장을 만들어 준다
+                    // (relayBase 만 찍으면 직결일 때 빈칸이라 설정 누락처럼 보인다).
+                    text: "현재 4채널 모드 · 채널 " + Backend.channelCount + "개 · "
+                        + Backend.streamSourceText
+                    color: Theme.accentDim
+                    font.pixelSize: 11
+                    font.family: Theme.fontFamily
                 }
             }
 
