@@ -29,6 +29,9 @@ class SampleComponent : public Component, public ISampleComponent {
   // Runs on the scheduler thread, the same one as ProcessRawVideo(), so every
   // value it reads is quiescent and none of it needs a lock.
   std::string BuildStatusJson();
+  // Roll every rate the page shows (app CPU, per-core CPU, per-lens delivered
+  // fps) over one shared window. Measurement, kept out of the JSON builder.
+  void SampleRates(long now_ms, double cpu_s);
 
   // PNM-C16083RVQ is a 4-sensor camera: SPMgrVideoRaw_0 .. _3.
   static const int kMaxChannels = 4;
@@ -63,8 +66,13 @@ class SampleComponent : public Component, public ISampleComponent {
   bool HandleDetect(const char* cmd);
   bool HandleScale(const char* cmd);
   bool HandleDynRoiCh(const char* cmd);
+  // DUTY <pct> — the detection budget, at runtime. Named DUTY and not
+  // DETECT_DUTY because HandleDetect() matches "DETECT" with strstr, so any
+  // name containing it is swallowed there and silently does nothing.
+  bool HandleDuty(const char* cmd);
   void ReportDynRoi() const;
   void ReportDetect() const;
+  void ReportDuty() const;
 
   // Intrinsics (K/dist) calibration. Same command vocabulary the RPi dashboard
   // already speaks (CALIB_K_*), so the page here and the server there drive it
@@ -84,8 +92,13 @@ class SampleComponent : public Component, public ISampleComponent {
   // ANCHOR_QUERY's answer on the pose link. Same argument as
   // ReportHomography(): the page reads /status, the RPi has no /status.
   void ReportAnchors(int ch) const;
+  // MARKER_PLANE_QUERY's answer on the pose link: the derived H_marker plus the
+  // camera pose the floor H implies. The pose is the diagnostic half — an
+  // installer who knows the camera is 1.5 m up can see instantly whether the
+  // decomposition is sane, and a nadir in the wrong place means a bad K.
+  void ReportMarkerPlane(int ch) const;
   // Record an ANCHOR_* outcome into anchor_cmd_ and the log, in one place.
-  void SetAnchorResult(int ch, int n, bool ok, const char* reason);
+  void SetAnchorResult(int ch, bool ok, const char* reason);
   // Appends the calibration block to /status.
   void AppendCalibJson(void* jsonbuf, long now_ms);
 
@@ -188,6 +201,35 @@ class SampleComponent : public Component, public ISampleComponent {
   // channel kept winning the race. Each channel now owns its own share of the
   // budget, so a lens can only slow itself down.
   long          detect_budget_until_ms_[kMaxChannels];
+
+  // The budget itself, as a percentage of wall clock, settable by DUTY <pct>.
+  //
+  // Runtime rather than the compile-time constant it started as, because the
+  // right value depends on what the lenses are looking at that day, and finding
+  // it meant a 6-8 minute rebuild-reinstall per attempt. DETECT_DUTY_PCT is now
+  // the starting value only.
+  //
+  // NOT persisted, deliberately, unlike K/dist and the anchors. Those are
+  // measurements of the world that took a person with a tape measure; this is a
+  // load-tuning knob whose right value follows the load. A saved 95 from an
+  // afternoon of debugging would come back after a reboot as an app that cannot
+  // serve its own page, with nothing on screen to say why. A restart returning
+  // to a known-good default is the more useful behaviour.
+  int           detect_duty_pct_;
+  // Bounds for DUTY, and both of them are about staying reachable.
+  //
+  // The high end matters more than it looks: the wait is
+  // cost * (100*n/DUTY - 1), so at DUTY=100 with one channel active the wait is
+  // exactly zero and the search may run back-to-back forever. That is the state
+  // that took HTTP down and, with it, the ability to undo it. 95 leaves a
+  // sliver that keeps the event queue from growing without bound.
+  //
+  // The low end is not a safety limit but an honesty one: below ~5 a 250 ms
+  // scan waits over 20 s, which is indistinguishable from a broken lens. DETECT
+  // <ch> 0 already says "off" clearly, so there is no need for a duty that says
+  // it obscurely.
+  static const int kDutyMin = 5;
+  static const int kDutyMax = 95;
   // Frames the governor dropped, per channel. Per channel and not one total,
   // because the number is only meaningful next to that channel's `frames`:
   // together they give the lens's real duty (detected vs offered) — one shared
@@ -225,7 +267,18 @@ class SampleComponent : public Component, public ISampleComponent {
   // offset (a frame that waited for nothing), and anything above it is queue
   // time. Slow drift between the two clocks would inflate this over a long
   // run; for a debug figure that is a fair trade for needing no clock sync.
-  long          pts_offset_min_;
+  // Smallest (wall clock - pts) ever seen, PER CHANNEL. The four lenses are not
+  // assumed to share a pipeline delay — see the use site.
+  long          pts_offset_min_[kMaxChannels];
+
+  // Raw frames the SDK has delivered on each lens, counted before this app
+  // decides anything about them. See ProcessRawVideo for why the existing
+  // frames/skipped pair could not answer the question this does.
+  unsigned long delivered_[kMaxChannels];
+  // Previous reading, for differencing into a rate. Same shape as cpu_pct:
+  // cumulative counters only mean something when subtracted. The instant it was
+  // taken is stats_sample_ms_, shared with every other rate on the page.
+  unsigned long delivered_prev_[kMaxChannels];
   long          last_queue_ms_[kMaxChannels];
 
   // NOTE: the eVideoConnect / SensorInfo probe that used to live here is gone
@@ -259,10 +312,62 @@ class SampleComponent : public Component, public ISampleComponent {
   bool          last_dets_approx_[kMaxChannels];
 
   long          start_ms_;            // app start, for uptime
-  // Previous /status sample, so CPU can be reported as a percentage over the
-  // interval between two presses of [Refresh] rather than as a meaningless
-  // average since boot.
-  long          cpu_sample_wall_ms_;
+  // Previous CPU reading, so CPU can be reported as a percentage over a recent
+  // interval rather than as a meaningless average since boot. The instant it
+  // was taken is stats_sample_ms_ below, shared with every other rate.
   double        cpu_sample_cpu_s_;
+
+  // Per-core load of the WHOLE CAMERA, from /proc/stat, differenced between
+  // /status calls the same way cpu_pct is.
+  //
+  // Separate from cpu_pct because the two answer different questions and get
+  // mistaken for each other. cpu_pct is THIS APP against wall clock, so on a
+  // two-core box it can legitimately read 130%. The figures here are each
+  // core's total occupancy including the firmware's own work, so each is capped
+  // at 100. "app 83%" next to "cpu0 61% / cpu1 34%" is the pair that says the
+  // app's one scheduler thread is being moved between both cores rather than
+  // pinned to one, and that neither core is saturated. Neither number says
+  // that on its own.
+  //
+  // /proc/stat counters are cumulative since boot, so one reading is an
+  // uptime-wide average and useless for "is it busy now" — only the difference
+  // between two readings means anything, which is why the previous one is kept.
+  static const int kMaxCores = 8;
+  int                core_n_;                     // 0 = never sampled
+  unsigned long long core_busy_[kMaxCores];
+  unsigned long long core_total_[kMaxCores];
+
+  // ONE sampling window for every rate on the page (cpu_pct, core_pct, in_fps),
+  // rolled at most once a second, with the results cached until it rolls again.
+  //
+  // Each of those numbers is a difference between two readings, so each needs a
+  // baseline and an interval to divide by. Until 2026-08-05 each kept its own
+  // baseline and rolled it ON EVERY RENDER, which made the interval whatever
+  // the gap between two /status requests happened to be. That is not a property
+  // of the camera — it is a property of who else is polling. With the dashboard
+  // open at 2 s and a curl arriving 40 ms behind it, the curl measured over
+  // 40 ms.
+  //
+  // At 5 fps a 0.2 s window can hold either 0 or 1 frames, so the answer
+  // quantises to 0 or 5 with nothing in between. Measured on .13: a healthy
+  // lens reported 0.0 fps, and this app reported 2.5% CPU while it was really
+  // near 60%. Those readings were not noisy, they were unanswerable — the
+  // window was too short to contain the question. Caching means requests
+  // arriving inside a window all receive the same still-valid answer instead of
+  // each destroying the next one's baseline; readers stop interacting at all.
+  //
+  // One shared epoch rather than three also makes the three figures describe
+  // the SAME interval, so "app 60% / cpu0 71% / 4.9 fps" is a single coherent
+  // snapshot and not three measurements of three different moments.
+  //
+  // Kept here and not on the frame path because delivery STOPPING has to show
+  // up too: nothing runs in ProcessRawVideo when no frame arrives, so a rate
+  // maintained there would freeze at its last healthy value forever.
+  static const long kStatsWindowMs = 1000;
+  long          stats_sample_ms_;     // 0 = no baseline yet; rates read -1
+  double        stats_window_s_;      // interval the cached figures cover
+  double        cpu_pct_;             // cached; -1 = not measurable yet
+  double        in_fps_[kMaxChannels];
+  double        core_pct_[kMaxCores];
 #endif
 };

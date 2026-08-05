@@ -35,6 +35,30 @@ const double kMaxRoundTripPx = 0.5;
 // millimetres apart, so there is no legitimate measurement this rejects.
 const double kMinAnchorSeparationMm = 1.0;
 
+// A marker height outside this range is a typo, not a measurement. 100 m of
+// ceiling is not a camera installation, and the !(x >= 0) form rejects NaN as
+// well as negatives — a plain `x < 0` lets NaN through, and NaN would poison
+// every derived matrix without ever failing a comparison.
+const double kMaxHeightMm = 100000.0;
+bool ValidHeightMm(double mm) { return (mm >= 0.0) && mm < kMaxHeightMm; }
+
+// Map one point through a 3x3, in world millimetres. False on the vanishing
+// line, where there is no finite ground point and the division would put the
+// robot kilometres away rather than nowhere.
+//
+// One copy, called by both public mappers and by the residual computation.
+// Three copies is what this file had while the marker plane was being added,
+// and they had already drifted: one spelled the horizon epsilon 1e-9 inline
+// while the others used kMinHomogeneousW, so tuning the named constant would
+// have fixed two of the three paths.
+bool MapThrough(const cv::Mat& H, double u, double v, double* wx, double* wy) {
+  const double w = H.at<double>(2, 0) * u + H.at<double>(2, 1) * v + H.at<double>(2, 2);
+  if (std::fabs(w) < kMinHomogeneousW) return false;
+  *wx = (H.at<double>(0, 0) * u + H.at<double>(0, 1) * v + H.at<double>(0, 2)) / w;
+  *wy = (H.at<double>(1, 0) * u + H.at<double>(1, 1) * v + H.at<double>(1, 2)) / w;
+  return true;
+}
+
 }  // namespace
 
 HomographyMapper::HomographyMapper()
@@ -49,15 +73,27 @@ HomographyMapper::HomographyMapper()
     coord_undistorted_[c] = true;
     camera_z_mm_[c] = 0.0;
     anchor_n_[c] = 0;
+    hm_valid_[c] = false;
+    hm_reason_[c] = "이 렌즈에 H가 없습니다";
+    pose_ok_[c] = false;
+    pose_reason_[c] = "이 렌즈에 H가 없습니다";
+    pose_c_[c] = cv::Vec3d(0.0, 0.0, 0.0);
     memset(&fit_[c], 0, sizeof(fit_[c]));
     memset(&result_[c], 0, sizeof(result_[c]));
   }
+  marker_height_mm_ = 0.0;
 }
 
 void HomographyMapper::Init(const IntrinsicsCalib& calib) {
   calib_ = &calib;
   snprintf(persist_dir_, sizeof(persist_dir_), "%s", calib.PersistDir());
   persist_ok_ = calib.Persistable();
+
+  // Shared marker height first: LoadOne() -> Set() -> RefreshMarkerPlane()
+  // derives H_marker, and deriving it against a height of 0 and then never
+  // revisiting would leave every lens uncorrected until someone re-entered the
+  // number they had already saved.
+  LoadMarkerHeightFile();
 
   for (int c = 0; c < kChannels; ++c) {
     available_[c] = LoadOne(c);
@@ -69,6 +105,8 @@ void HomographyMapper::Init(const IntrinsicsCalib& calib) {
   for (int c = 0; c < kChannels; ++c) printf(" ch%d=%d", c, (int)available_[c]);
   printf("  anchors:");
   for (int c = 0; c < kChannels; ++c) printf(" ch%d=%d", c, anchor_n_[c]);
+  printf("  marker_h=%.1fmm  H_marker:", marker_height_mm_);
+  for (int c = 0; c < kChannels; ++c) printf(" ch%d=%d", c, (int)hm_valid_[c]);
   printf("\n");
   fflush(stdout);
 }
@@ -160,24 +198,31 @@ bool HomographyMapper::PreparePixel(int ch, float px, float py, cv::Point2f* out
   // convergent area from 80% of the frame to 85%, and it saturates there —
   // past 20 nothing more converges, so the rest is genuinely not invertible
   // rather than merely slow.
-  std::vector<cv::Point2f> in(1, cv::Point2f(px, py)), norm;
-  cv::undistortPoints(in, norm, K, D, cv::noArray(), cv::noArray(),
+  // cv::Mat HEADERS over stack points, not std::vector.
+  //
+  // This function became a frame-path function when the pose packet started
+  // carrying world coordinates: two calls per detected marker per frame, on
+  // four lenses. The vector form allocated four times per call and OpenCV
+  // allocated more inside, which is roughly 1500 mallocs a second on the one
+  // thread that also runs detection — against a file whose stated rule is that
+  // the frame path does not allocate. A Mat header over an existing point is
+  // the same call with the same arguments and no heap at all: OutputArray sees
+  // a destination that is already the right size and type, so it writes in
+  // place instead of creating.
+  cv::Point2f in_pt(px, py), norm_pt;
+  const cv::Mat in_m(1, 1, CV_32FC2, &in_pt);
+  cv::Mat norm_m(1, 1, CV_32FC2, &norm_pt);
+  cv::undistortPoints(in_m, norm_m, K, D, cv::noArray(), cv::noArray(),
                       cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS,
                                        20, 1e-8));
-  if (norm.empty()) {
-    if (reason) *reason = "undistortPoints 실패";
-    return false;
-  }
 
   static const cv::Mat kZero3 = cv::Mat::zeros(3, 1, CV_64F);
-  std::vector<cv::Point3f> obj(1, cv::Point3f(norm[0].x, norm[0].y, 1.0f));
-  std::vector<cv::Point2f> back;
-  cv::projectPoints(obj, kZero3, kZero3, K, D, back);
-  if (back.empty()) {
-    if (reason) *reason = "projectPoints 실패";
-    return false;
-  }
-  const double dx = back[0].x - px, dy = back[0].y - py;
+  cv::Point3f obj_pt(norm_pt.x, norm_pt.y, 1.0f);
+  cv::Point2f back_pt;
+  const cv::Mat obj_m(1, 1, CV_32FC3, &obj_pt);
+  cv::Mat back_m(1, 1, CV_32FC2, &back_pt);
+  cv::projectPoints(obj_m, kZero3, kZero3, K, D, back_m);
+  const double dx = back_pt.x - px, dy = back_pt.y - py;
   if (dx * dx + dy * dy > kMaxRoundTripPx * kMaxRoundTripPx) {
     if (reason)
       *reason = "왜곡보정이 수렴하지 않는 영역입니다 (화면 좌우 가장자리) — "
@@ -185,8 +230,8 @@ bool HomographyMapper::PreparePixel(int ch, float px, float py, cv::Point2f* out
     return false;
   }
 
-  out->x = (float)(K.at<double>(0, 0) * norm[0].x + K.at<double>(0, 2));
-  out->y = (float)(K.at<double>(1, 1) * norm[0].y + K.at<double>(1, 2));
+  out->x = (float)(K.at<double>(0, 0) * norm_pt.x + K.at<double>(0, 2));
+  out->y = (float)(K.at<double>(1, 1) * norm_pt.y + K.at<double>(1, 2));
   return true;
 }
 
@@ -200,18 +245,316 @@ bool HomographyMapper::PixelToWorld(int ch, float px, float py, double* wx, doub
   }
   cv::Point2f p;
   if (!PreparePixel(ch, px, py, &p, reason)) return false;
-
-  const cv::Mat& H = H_[ch];
-  const double u = p.x, v = p.y;
-  const double w = H.at<double>(2, 0) * u + H.at<double>(2, 1) * v + H.at<double>(2, 2);
-  if (std::fabs(w) < kMinHomogeneousW) return false;
-  *wx = (H.at<double>(0, 0) * u + H.at<double>(0, 1) * v + H.at<double>(0, 2)) / w;
-  *wy = (H.at<double>(1, 0) * u + H.at<double>(1, 1) * v + H.at<double>(1, 2)) / w;
+  if (!MapThrough(H_[ch], p.x, p.y, wx, wy)) {
+    if (reason) *reason = "지평선 (매핑 불가)";
+    return false;
+  }
   return true;
 }
 
 double HomographyMapper::CameraHeightMm(int ch) const {
   return (ch >= 0 && ch < kChannels) ? camera_z_mm_[ch] : 0.0;
+}
+
+// --- marker plane ------------------------------------------------------------
+
+double HomographyMapper::MarkerHeightMm() const { return marker_height_mm_; }
+
+bool HomographyMapper::SetMarkerHeightMm(double mm) {
+  if (!ValidHeightMm(mm)) {
+    fail_reason_ = "마커 높이가 0..100000 mm 범위를 벗어났습니다";
+    return false;
+  }
+  marker_height_mm_ = mm;
+  // Shared value, so every lens's cached matrix is now stale.
+  for (int c = 0; c < kChannels; ++c) RefreshMarkerPlane(c);
+  fail_reason_ = "";
+  return true;
+}
+
+bool HomographyMapper::SetCameraHeightMm(int ch, double mm) {
+  if (ch < 0 || ch >= kChannels) {
+    fail_reason_ = "채널 번호가 0..3 범위를 벗어났습니다";
+    return false;
+  }
+  if (!ValidHeightMm(mm)) {
+    fail_reason_ = "카메라 높이가 0..100000 mm 범위를 벗어났습니다 (0 = 미측정, 분해값 사용)";
+    return false;
+  }
+  camera_z_mm_[ch] = mm;
+  RefreshMarkerPlane(ch);
+  fail_reason_ = "";
+  return true;
+}
+
+bool HomographyMapper::MarkerPlaneReady(int ch) const {
+  return ch >= 0 && ch < kChannels && hm_valid_[ch];
+}
+
+const char* HomographyMapper::MarkerPlaneReason(int ch) const {
+  if (ch < 0 || ch >= kChannels) return "채널 번호가 0..3 범위를 벗어났습니다";
+  return hm_reason_[ch];
+}
+
+bool HomographyMapper::GetMarkerPlane(int ch, double h[9]) const {
+  if (!MarkerPlaneReady(ch) || h == NULL) return false;
+  for (int i = 0; i < 9; ++i) h[i] = Hm_[ch].at<double>(i / 3, i % 3);
+  return true;
+}
+
+/**
+ * The shared front half of the marker plane and the camera pose.
+ *
+ * Ported from cctv_app's decompose(). The two refusals below are the reason it
+ * is a separate function rather than inline in either caller: both callers must
+ * refuse identically, and a check that exists in one copy and not the other is
+ * how a raw-fitted matrix eventually gets through.
+ */
+bool HomographyMapper::Decompose(int ch, cv::Matx33d* K, cv::Vec3d* r1, cv::Vec3d* r2,
+                                 cv::Vec3d* r3, cv::Vec3d* t, const char** reason) const {
+  if (reason) *reason = "";
+  if (!Available(ch)) {
+    if (reason) *reason = "이 렌즈에 H가 없습니다";
+    return false;
+  }
+  // Distortion would be absorbed into R and t, tilting r3 — and r3 IS the
+  // correction. Refuse rather than emit a plausible-looking wrong answer.
+  if (!fitted_undistorted_[ch]) {
+    if (reason)
+      *reason = "H가 raw 픽셀로 피팅돼 있습니다 — 시차 보정은 undistort 공간에서만 성립합니다 "
+                "(HG_CLEAR 후 HG_COORD_MODE 1 로 다시 계산하세요)";
+    return false;
+  }
+  if (calib_ == NULL || !calib_->Available(ch)) {
+    if (reason) *reason = "이 렌즈에 K/dist가 없습니다";
+    return false;
+  }
+
+  double fx, fy, cx, cy, d[5];
+  if (!calib_->Get(ch, &fx, &fy, &cx, &cy, d)) {
+    if (reason) *reason = "K를 읽지 못했습니다";
+    return false;
+  }
+  *K = cv::Matx33d(fx, 0.0, cx,
+                   0.0, fy, cy,
+                   0.0, 0.0, 1.0);
+
+  const cv::Mat& H = H_[ch];
+  const cv::Matx33d Hp2w(H.at<double>(0, 0), H.at<double>(0, 1), H.at<double>(0, 2),
+                         H.at<double>(1, 0), H.at<double>(1, 1), H.at<double>(1, 2),
+                         H.at<double>(2, 0), H.at<double>(2, 1), H.at<double>(2, 2));
+  if (std::fabs(cv::determinant(Hp2w)) < 1e-18) {
+    if (reason) *reason = "H가 특이(singular)합니다";
+    return false;
+  }
+  const cv::Matx33d Hw2p = Hp2w.inv();       // world mm -> pixel
+  const cv::Matx33d B    = K->inv() * Hw2p;  // == [r1 r2 t] up to scale
+
+  const cv::Vec3d b1(B(0, 0), B(1, 0), B(2, 0));
+  const cv::Vec3d b2(B(0, 1), B(1, 1), B(2, 1));
+  const cv::Vec3d b3(B(0, 2), B(1, 2), B(2, 2));
+
+  const double n1 = cv::norm(b1), n2 = cv::norm(b2);
+  if (n1 < 1e-12 || n2 < 1e-12) {
+    if (reason) *reason = "분해가 퇴화했습니다 (degenerate)";
+    return false;
+  }
+  // Homogeneity loses one scale factor. Averaging the two column norms is
+  // steadier than trusting either alone — neither is exactly unit once fitting
+  // noise is in the matrix.
+  double lambda = 2.0 / (n1 + n2);
+  // The sign is lost too. The camera must be on the +Z side of the floor, so
+  // t_z > 0; otherwise the whole solution is mirrored and the correction would
+  // push the marker the wrong way.
+  if (b3[2] < 0.0) lambda = -lambda;
+
+  *r1 = b1 * lambda;
+  *r2 = b2 * lambda;
+  *t  = b3 * lambda;
+  *r3 = (*r1).cross(*r2);
+
+  const double n3 = cv::norm(*r3);
+  if (n3 < 1e-9) {
+    if (reason) *reason = "회전 열벡터가 평행합니다";
+    return false;
+  }
+  *r3 /= n3;  // re-normalise
+  return true;
+}
+
+/**
+ * Reads the cache. Does NOT decompose.
+ *
+ * /status calls this for all four lenses on every poll, and a poll is once a
+ * second with the dashboard open. Decomposing there meant eight 3x3 inversions
+ * per second re-deriving numbers RefreshMarkerPlane() had already computed —
+ * on the thread the frame path shares. The inputs (H, K, the two heights)
+ * change only on an operator action, which is exactly when the cache is
+ * rebuilt.
+ */
+bool HomographyMapper::CameraPose(int ch, double* height_mm, double* nadir_x_mm,
+                                  double* nadir_y_mm, const char** reason) const {
+  if (reason) *reason = "";
+  if (ch < 0 || ch >= kChannels) {
+    if (reason) *reason = "채널 번호가 0..3 범위를 벗어났습니다";
+    return false;
+  }
+  if (!pose_ok_[ch]) {
+    if (reason) *reason = pose_reason_[ch];
+    return false;
+  }
+  if (height_mm)  *height_mm  = pose_c_[ch][2];
+  if (nadir_x_mm) *nadir_x_mm = pose_c_[ch][0];
+  if (nadir_y_mm) *nadir_y_mm = pose_c_[ch][1];
+  return true;
+}
+
+/**
+ * Rebuild this lens's cached H_marker. Never fails loudly — it records why.
+ *
+ * Called from everything that changes H, the marker height or the camera
+ * height. Recomputing rather than invalidating-and-deriving-on-demand keeps the
+ * frame path free of the 3x3 inverse, and there is no path that reads Hm_
+ * without one of those three having been set first.
+ */
+void HomographyMapper::RefreshMarkerPlane(int ch) {
+  if (ch < 0 || ch >= kChannels) return;
+  hm_valid_[ch] = false;
+  hm_reason_[ch] = "";
+  pose_ok_[ch] = false;
+  pose_reason_[ch] = "";
+  Hm_[ch].release();
+
+  if (!Available(ch)) {
+    hm_reason_[ch] = "이 렌즈에 H가 없습니다";
+    pose_reason_[ch] = hm_reason_[ch];
+    return;
+  }
+
+  // Decompose FIRST, and unconditionally.
+  //
+  // The camera pose is a diagnostic the page shows whether or not a marker
+  // height has been entered — it is how an installer checks that the
+  // decomposition is sane before trusting anything derived from it. Deriving it
+  // only on the marker-height path would leave the pose blank in exactly the
+  // state where somebody is deciding whether to enter a height.
+  cv::Matx33d K;
+  cv::Vec3d r1, r2, r3, t;
+  const char* why = "";
+  const bool decomposed = Decompose(ch, &K, &r1, &r2, &r3, &t, &why);
+  if (decomposed) {
+    // Camera centre in world coordinates: C = -R^T t, with R = [r1 r2 r3].
+    const cv::Matx33d R(r1[0], r2[0], r3[0],
+                        r1[1], r2[1], r3[1],
+                        r1[2], r2[2], r3[2]);
+    pose_c_[ch] = -(R.t() * t);
+    pose_ok_[ch] = true;
+  } else {
+    pose_reason_[ch] = why;
+  }
+
+  // A marker genuinely on the floor needs no correction, and deriving one would
+  // only inject decomposition noise into a matrix that is already right. Note
+  // this runs even when the decomposition failed: a raw-fitted H still maps the
+  // floor correctly, it just cannot be lifted to another plane.
+  if (marker_height_mm_ == 0.0) {
+    Hm_[ch] = H_[ch].clone();
+    hm_valid_[ch] = true;
+    return;
+  }
+  if (!decomposed) {
+    hm_reason_[ch] = why;
+    return;
+  }
+
+  // Apply a tape-measured camera height, if one was supplied.
+  //
+  // The parallax is governed by the RATIO h / Cz, and Cz here is whatever the
+  // decomposition produced — its scale is exactly the part residual distortion
+  // corrupts. The obvious fix, rescaling t so the camera lands at the measured
+  // height, is WRONG: t is what reproduces the fitted floor H, and moving it
+  // makes the derived matrices disagree with H_floor itself.
+  //
+  // Scaling the marker height instead leaves t (and therefore H_floor)
+  // untouched while producing exactly the intended ratio:
+  //
+  //     h_eff / Cz_derived  ==  h_measured / Cz_measured
+  double effective_h = marker_height_mm_;
+  if (camera_z_mm_[ch] > 0.0) {
+    // The same number /status shows as derived_z_mm. Recomputing it here would
+    // let the height the page reports drift from the height the correction is
+    // actually scaled against.
+    const double cz_derived = pose_c_[ch][2];
+    if (std::fabs(cz_derived) < 1e-6) {
+      hm_reason_[ch] = "분해된 카메라 높이가 0에 가까워 보정 배율을 낼 수 없습니다";
+      return;
+    }
+    effective_h = marker_height_mm_ * (cz_derived / camera_z_mm_[ch]);
+  }
+
+  // Same camera, plane shifted along its own normal by the marker height.
+  const cv::Vec3d tm = t + r3 * effective_h;
+  const cv::Matx33d Hm_w2p = K * cv::Matx33d(r1[0], r2[0], tm[0],
+                                             r1[1], r2[1], tm[1],
+                                             r1[2], r2[2], tm[2]);
+  if (std::fabs(cv::determinant(Hm_w2p)) < 1e-18) {
+    hm_reason_[ch] = "유도된 마커 평면 행렬이 특이합니다";
+    return;
+  }
+  const cv::Matx33d Hm = Hm_w2p.inv();  // back to pixel -> world mm
+
+  // Normalise so h22 == 1. The server stores and compares these, and an
+  // arbitrary scale makes two mathematically identical matrices look different
+  // in a log.
+  const double s = (std::fabs(Hm(2, 2)) > 1e-18) ? 1.0 / Hm(2, 2) : 1.0;
+  Hm_[ch] = cv::Mat(3, 3, CV_64F);
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c) Hm_[ch].at<double>(r, c) = Hm(r, c) * s;
+  hm_valid_[ch] = true;
+}
+
+bool HomographyMapper::PixelToWorldMarker(int ch, float px, float py, double* wx,
+                                          double* wy, const char** reason) const {
+  if (reason) *reason = "";
+  if (wx == NULL || wy == NULL) return false;
+  if (!MarkerPlaneReady(ch)) {
+    if (reason) *reason = hm_reason_[ch >= 0 && ch < kChannels ? ch : 0];
+    return false;
+  }
+  cv::Point2f p;
+  if (!PreparePixel(ch, px, py, &p, reason)) return false;
+  if (!MapThrough(Hm_[ch], p.x, p.y, wx, wy)) {
+    if (reason) *reason = "지평선 (매핑 불가)";
+    return false;
+  }
+  return true;
+}
+
+bool HomographyMapper::SaveMarkerPlane(int ch) {
+  if (ch < 0 || ch >= kChannels) {
+    fail_reason_ = "채널 번호가 0..3 범위를 벗어났습니다";
+    return false;
+  }
+  if (!persist_ok_) {
+    fail_reason_ = "저장 위치에 쓸 수 없습니다 (/status 의 calib.persist 확인)";
+    return false;
+  }
+  // Two files on purpose: the marker height is shared by every lens, the camera
+  // height belongs to this one and travels in its homography file. Writing the
+  // shared value into four per-lens files would create four copies that can
+  // disagree, and the one that wins would depend on load order.
+  if (!SaveMarkerHeightFile()) {
+    fail_reason_ = "marker_plane.txt 쓰기 실패";
+    return false;
+  }
+  // Only if there is an H to write it alongside. Cz with no H is not a state
+  // worth a file — the next fit will ask for it again anyway.
+  if (Available(ch) && !SaveOne(ch)) {
+    fail_reason_ = "homography_ch<N>.txt 쓰기 실패 (카메라 높이가 저장되지 않았습니다)";
+    return false;
+  }
+  fail_reason_ = "";
+  return true;
 }
 
 /**
@@ -366,9 +709,7 @@ void HomographyMapper::FeedFrame(int ch, const int* ids, const float* cx, const 
   // built is "which of MY markers showed up", and a frame full of markers from
   // some other part of the site should not be able to affect it.
   double px[kMaxAnchors], py[kMaxAnchors];
-  bool   have[kMaxAnchors];
   for (int a = 0; a < anchor_n_[ch]; ++a) {
-    have[a] = false;
     int hit = -1;
     for (int d = 0; d < n; ++d) {
       if (ids[d] == anchors_[ch][a].id) {
@@ -390,16 +731,17 @@ void HomographyMapper::FeedFrame(int ch, const int* ids, const float* cx, const 
     f.seen_ids[f.seen_n++] = anchors_[ch][a].id;
     px[a] = p.x;
     py[a] = p.y;
-    have[a] = true;
   }
 
   // All or nothing. A frame contributing only the markers it happened to see
   // would weight each point by how often it was visible, which quietly favours
   // the middle of the frame — the opposite of what the placement advice is
   // trying to achieve.
+  // seen_n == anchor_n_ is exactly "every anchor filled px/py above", so no
+  // per-anchor validity flag is needed here — one would be a second
+  // representation of the same fact, free to drift from it.
   if (f.seen_n == anchor_n_[ch]) {
     for (int a = 0; a < anchor_n_[ch]; ++a) {
-      if (!have[a]) continue;  // unreachable given the test above; cheap to keep
       sum_x_[ch][a] += px[a];
       sum_y_[ch][a] += py[a];
     }
@@ -449,18 +791,6 @@ bool HomographyMapper::FitSubset(int ch, int skip, cv::Mat* out) const {
   h.convertTo(*out, CV_64F);
   return true;
 }
-
-namespace {
-// Map one point through a 3x3, in world millimetres. Returns false on the
-// vanishing line, where there is no finite answer.
-bool MapThrough(const cv::Mat& H, double u, double v, double* wx, double* wy) {
-  const double w = H.at<double>(2, 0) * u + H.at<double>(2, 1) * v + H.at<double>(2, 2);
-  if (std::fabs(w) < 1e-9) return false;
-  *wx = (H.at<double>(0, 0) * u + H.at<double>(0, 1) * v + H.at<double>(0, 2)) / w;
-  *wy = (H.at<double>(1, 0) * u + H.at<double>(1, 1) * v + H.at<double>(1, 2)) / w;
-  return true;
-}
-}  // namespace
 
 /**
  * Fit on everything, then measure honestly.
@@ -639,6 +969,7 @@ bool HomographyMapper::Clear(int ch) {
   camera_z_mm_[ch] = 0.0;
   H_[ch].release();
   memset(&result_[ch], 0, sizeof(result_[ch]));  // measured the matrix just dropped
+  RefreshMarkerPlane(ch);                        // derived FROM the matrix just dropped
   // The marker list deliberately survives: it is the tape-measured input, not
   // a product of the matrix, and re-registering 24 points because a bad
   // injection had to be undone would be an unreasonable thing to ask.
@@ -766,6 +1097,44 @@ bool HomographyMapper::LoadAnchorsOne(int ch) {
   return true;
 }
 
+/**
+ * Shared marker height, one file for all four lenses.
+ *
+ *   <version> <marker_height_mm>
+ *
+ * The camera height is NOT here — it is per lens and lives in that lens's
+ * homography file, next to the matrix it rescales.
+ */
+bool HomographyMapper::SaveMarkerHeightFile() {
+  char path[512];
+  PathFor("marker_plane.txt", path, sizeof(path));
+  FILE* f = fopen(path, "w");
+  if (!f) return false;
+  fprintf(f, "%d %.4f\n", kFileVersion, marker_height_mm_);
+  const bool ok = (fflush(f) == 0);
+  fclose(f);
+  return ok;
+}
+
+bool HomographyMapper::LoadMarkerHeightFile() {
+  char path[512];
+  PathFor("marker_plane.txt", path, sizeof(path));
+  FILE* f = fopen(path, "r");
+  if (!f) return false;
+  int version = 0;
+  double mm = 0.0;
+  const int got = fscanf(f, "%d %lf", &version, &mm);
+  fclose(f);
+  if (got != 2 || version != kFileVersion) return false;
+  if (!ValidHeightMm(mm)) {
+    printf("[ArucoPosePNM] marker_plane.txt: 높이 %.1f mm — 무시\n", mm);
+    fflush(stdout);
+    return false;
+  }
+  marker_height_mm_ = mm;
+  return true;
+}
+
 bool HomographyMapper::LoadOne(int ch) {
   char leaf[64], path[512];
   snprintf(leaf, sizeof(leaf), "homography_ch%d.txt", ch);
@@ -803,6 +1172,16 @@ bool HomographyMapper::LoadOne(int ch) {
     fflush(stdout);
     return false;
   }
-  camera_z_mm_[ch] = cz;
+  // Through the setter, exactly as the matrix went through Set() and the marker
+  // list goes through SetAnchors(). Cz was the one input that reached a member
+  // by direct assignment, which meant the range check lived only on the command
+  // path — a hand-edited file could install a negative or NaN height that
+  // CAMERA_HEIGHT would have refused — and the cache refresh was a separate
+  // line someone had to remember. Routing it here leaves one mutation site.
+  if (!SetCameraHeightMm(ch, cz)) {
+    printf("[ArucoPosePNM] %s: 카메라 높이 %.1f 거부 (%s) — 0으로 둡니다\n", path, cz,
+           fail_reason_);
+    fflush(stdout);
+  }
   return true;
 }

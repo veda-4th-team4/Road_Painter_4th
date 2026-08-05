@@ -17,7 +17,24 @@
 set -u
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_NAME="$(basename "$APP_DIR")"
+
+# 앱 이름은 매니페스트에서 읽는다. 폴더 이름이 아니다.
+#
+# 원래는 basename 이었고, 개발 폴더가 ArucoPosePNM 인 동안은 우연히 맞았다. 이 소스를
+# Git 저장소 안의 다른 이름(CCTV_4ch)으로 복사한 순간 어긋났다 — packager 와 카메라는
+# 매니페스트의 AppName(ArucoPosePNM)을 쓰는데 스크립트만 CCTV_4ch.cap 을 찾고
+# `-a CCTV_4ch` 로 설치를 시도한다. 빌드는 성공한 뒤 그 다음 줄에서 "산출물이 없다"로
+# 끝나므로, 원인이 이름이라는 것이 어디에도 안 나온다.
+APP_NAME="$(sed -n 's/.*"AppName"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  "$APP_DIR/config/app_manifest.json" 2>/dev/null | head -1)"
+if [ -z "$APP_NAME" ]; then
+  echo "config/app_manifest.json 에서 AppName 을 못 읽었습니다."
+  echo "폴더 이름으로 넘겨짚지 않고 여기서 멈춥니다 — 잘못된 이름으로 설치하면"
+  echo "카메라에 다른 앱이 하나 더 생기거나 설치가 조용히 실패합니다."
+  exit 1
+fi
+[ "$APP_NAME" = "$(basename "$APP_DIR")" ] || \
+  echo "참고: 폴더는 '$(basename "$APP_DIR")' 인데 앱 이름은 '$APP_NAME' 입니다 (매니페스트 기준으로 진행)"
 SOC="cv5"
 SDK_IMAGE="opensdk:26.05.19_full"
 CHANNEL="1"
@@ -46,7 +63,7 @@ done
 
 cd "$APP_DIR" || exit 1
 
-echo "=== [1/4] 빌드 ($APP_NAME, SOC=$SOC) ==="
+echo "=== [1/5] 빌드 ($APP_NAME, SOC=$SOC) ==="
 rm -rf app/build_stale 2>/dev/null
 mv app/build app/build_stale 2>/dev/null
 mkdir -p app/build
@@ -87,11 +104,26 @@ restore_https() {
 }
 trap restore_https EXIT   # 빌드 이후 무슨 일이 있어도 HTTPS 는 되돌린다
 
-echo "=== [2/4] HTTPS 임시 개방 (opensdk_install 은 HTTP 전용) ==="
+echo "=== [2/5] 캘리브레이션 백업 (설치 전) ==="
+# 덮어쓰기 설치는 storage 를 보존하므로 이 백업이 필요한 경우는 드물다. 그래도
+# 여기서 뜨는 이유는, 캘리브레이션을 잃는 유일한 경로가 앱 삭제인데 그 삭제를
+# 하기로 마음먹는 시점은 대개 설치가 꼬인 다음이기 때문이다. 그때 가장 최근
+# 사본이 "설치 직전"이면 잃는 게 없다.
+#
+# 실패해도 빌드를 막지 않는다. 앱이 꺼져 있거나 카메라가 안 붙는 상태에서
+# 백업이 안 된다고 설치까지 못 하게 하면, 정작 그 상태를 고치러 온 사람을
+# 가로막는 셈이다.
+if [ -x ./tools/calib_backup.sh ]; then
+  ./tools/calib_backup.sh || echo "  (백업 실패 — 설치는 계속합니다)"
+else
+  echo "  (tools/calib_backup.sh 없음 — 건너뜀)"
+fi
+
+echo "=== [3/5] HTTPS 임시 개방 (opensdk_install 은 HTTP 전용) ==="
 "${CURL[@]}" "$API/security.cgi?msubmenu=ssl&action=set&Policy=HTTP" >/dev/null
 sleep 5
 
-echo "=== [3/4] 설치 ==="
+echo "=== [4/5] 설치 ==="
 [ -x ./opensdk_install ] || {
   cid=$(docker create "$SDK_IMAGE")
   docker cp "$cid:/opt/opensdk/common/bin/opensdk_install" ./opensdk_install
@@ -106,5 +138,5 @@ restore_https
 trap - EXIT
 sleep 6
 
-echo "=== [4/4] 확인 (Success 출력이 아니라 이 값을 믿을 것) ==="
+echo "=== [5/5] 확인 (Success 출력이 아니라 이 값을 믿을 것) ==="
 "${CURL[@]}" "$API/opensdk.cgi?msubmenu=apps&action=view" | grep -E "InstalledApps|AppName=$APP_NAME|Status|InstalledDate" | head -8

@@ -37,6 +37,23 @@ int pose_sender_send_control_line(const char* json);
 // connection is bidirectional). Non-blocking: returns 1 and copies the line
 // (without '\n') into out when a complete line is available, 0 otherwise.
 // Call in a loop each frame until it returns 0.
+/**
+ * The longest command or control line this transport carries, including the
+ * caller's terminating NUL.
+ *
+ * Exported because FOUR places have to agree on it and three of them are in
+ * another translation unit: the queue that holds outgoing control lines, the
+ * buffer PollDashboardCommands() reads into, the length POST /cmd refuses
+ * above, and the reply buffers ReportAnchors()/ReportMarkerPlane() format into.
+ * They were literals, and they were raised together once by hand — 1024 is
+ * what a 24-marker ANCHOR_SET_ALL (~620 B) and its ANCHORS reply (~880 B)
+ * need. Getting three of four right next time means either a 413 on a body the
+ * transport would have carried, or a reply the queue silently refuses: the
+ * exact silent-truncation class the count argument on ANCHOR_SET_ALL exists to
+ * rule out.
+ */
+#define POSE_SENDER_MAX_LINE 1024
+
 int pose_sender_poll_command(char* out, int out_len);
 
 // True while the TCP link to the vision server is up. A pending non-blocking

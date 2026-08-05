@@ -76,6 +76,13 @@
     th { color: var(--dim); font-weight: 500; }
     tbody th { width: 160px; }
     .num { font-variant-numeric: tabular-nums; }
+    /* The duty input sits in a table cell, not in a .ctl bar, so it carries its
+       own styling rather than inheriting the one above. */
+    input.num[type=number] {
+      font: inherit; font-size: 12px; width: 64px; padding: 3px 6px;
+      border-radius: 6px; border: 1px solid var(--line);
+      background: var(--bg); color: var(--fg);
+    }
     .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
     button.toggle {
       padding: 2px 12px; font-size: 12px; font-weight: 600;
@@ -400,6 +407,25 @@
     <span class="meta" id="hgFlowHint"></span>
   </div>
 
+  <div class="ctl" style="margin:8px 0">
+    <label class="meta"><input type="checkbox" id="hgUndist" checked> undistort 좌표로 피팅
+      <span class="meta">HG_COORD_MODE</span></label>
+    <span class="meta" id="hgUndistHint"></span>
+  </div>
+
+  <details class="fold" style="margin:8px 0">
+    <summary class="meta">픽셀 하나 찍어보기 — undistort + H 사슬 확인 <span class="meta">HG_MAP</span></summary>
+    <div class="ctl" style="margin-top:6px;align-items:flex-end">
+      <label class="meta">px<input type="number" id="hgMapX" step="1" value="1296"></label>
+      <label class="meta">py<input type="number" id="hgMapY" step="1" value="760"></label>
+      <button type="button" id="hgMapGo">사상</button>
+      <span class="meta" id="hgMapOut"></span>
+    </div>
+    <p class="meta" style="margin:6px 0 0">마커가 없어도 사슬 전체를 확인할 수 있는 유일한 수단입니다.
+      화면 좌우 가장자리를 찍으면 왜곡보정이 수렴하지 않는 영역이 어디까지인지 직접 보입니다.
+      <b>이 값은 바닥 평면(H) 기준</b>입니다 — 마커 평면이 아닙니다.</p>
+  </details>
+
   <h2>LOO 잔차 <span class="meta" style="text-transform:none">— 이 H가 실제로 맞는지</span></h2>
   <div class="meta" id="hgFitSummary"></div>
   <div class="scroll"><table id="hgFit"></table></div>
@@ -466,6 +492,41 @@
         <button type="button" id="hgAnchorSave">/mnt에 저장</button>
         <span class="meta">적용은 RAM에만, 저장해야 재부팅 후에도 남습니다.</span>
       </div>
+    </div>
+  </details>
+
+  <h2>마커 평면 (시차 보정)</h2>
+  <p class="meta">호모그래피는 <b>평면 하나</b>만 다룹니다. 바닥 마커로 구한 H에 차체 위 마커를
+    투영하면 카메라 바로 아래(나디르)에서 <b>멀어지는 방향으로 밀린</b> 위치가 나옵니다.
+    거리가 멀수록 커지고, <b>평균으로는 안 사라지는 계통 오차</b>입니다.
+    보정량은 대략 <code>마커높이 ÷ 카메라높이</code> — 카메라 1.5 m, 마커 250 mm면 나디르까지
+    거리의 1/6 입니다.</p>
+  <div class="ctl" style="margin:8px 0;align-items:flex-end">
+    <label class="meta">마커 높이 (mm) <span class="meta">— 4렌즈 공용</span>
+      <input type="number" id="mpMarkerH" min="0" step="1" value="0"></label>
+    <button type="button" id="mpMarkerApply">적용<span class="meta"> MARKER_HEIGHT</span></button>
+    <span class="grow"></span>
+    <label class="meta">카메라 높이 (mm) <span class="meta">— 이 렌즈, 0 = 미측정</span>
+      <input type="number" id="mpCamH" min="0" step="1" value="0"></label>
+    <button type="button" id="mpCamApply">적용<span class="meta"> CAMERA_HEIGHT</span></button>
+    <button type="button" id="mpSave">/mnt에 저장</button>
+  </div>
+  <div class="meta" id="mpState"></div>
+  <details class="fold" style="margin:8px 0">
+    <summary class="meta">카메라 높이를 왜 따로 재는가 · 왜 raw 피팅 H로는 거부되는가</summary>
+    <div class="meta" style="padding:8px 2px 0">
+      <b>보정량은 비율 <code>h / Cz</code> 로 정해집니다.</b> h(마커 높이)는 줄자로 재지만
+      Cz(카메라 높이)는 H를 분해해서 나온 값이고, 그 분해는 핀홀 카메라를 가정합니다. 왜곡이
+      조금이라도 남아 있으면 t의 스케일이 틀어지고 <b>Cz 하나가 전체 보정을 같은 배율로
+      틀리게</b> 만듭니다. 줄자로 잰 Cz를 넣으면 그 오차항이 사라집니다.<br><br>
+      아래 표의 <b>분해된 높이</b>와 직접 잰 <b>카메라 높이</b>가 얼마나 벌어져 있는지가
+      곧 그 스케일 오차의 크기입니다. <b>나디르</b>가 카메라 바로 아래 어딘가가 아니면 K가
+      잘못됐다는 신호입니다.<br><br>
+      <b>주의:</b> 잰 높이를 넣어도 <b>H_floor는 절대 안 건드립니다.</b> t를 다시 스케일하면
+      유도된 행렬이 H_floor 자신과 어긋나므로, 대신 마커 높이 쪽을 같은 비율로 조정합니다.<br><br>
+      <b>raw 픽셀로 피팅한 H에서는 거부됩니다.</b> 취향 문제가 아닙니다 — <code>K⁻¹H</code>가
+      핀홀을 가정하는데 픽셀에 왜곡이 남아 있으면 그게 R·t에 흡수되고, 복원한 평면 법선이
+      기울어져 <b>보정처럼 생긴 틀린 값</b>이 나옵니다.
     </div>
   </details>
 
@@ -559,6 +620,15 @@
 
     const $ = (id) => document.getElementById(id);
 
+    // 마지막으로 받은 /status. 최상단에 두는 이유: 아래의 여러 헬퍼가 이 값을
+    // 읽고, 그 중 일부는 페이지 로드 시점에 한 번 실행된다(폼 초기 상태를
+    // 잡으려고). `let` 은 TDZ 가 있어서, 선언보다 앞선 실행은 ReferenceError 로
+    // 스크립트 전체를 그 자리에서 중단시킨다 — 이벤트 바인딩도 자동 갱신도 첫
+    // 렌더도 못 하고 빈 페이지가 된다. 실제로 그렇게 한 번 죽었다(2026-08-05,
+    // hgLimits() 가 이 값을 읽기 시작하면서). 선언을 사용처 위로 올려 두면
+    // 다음에 로드 시점 헬퍼가 하나 더 늘어도 같은 일이 생기지 않는다.
+    let lastStatus = null;
+
     // --- tabs --------------------------------------------------------------
     // The tab lives in the URL hash so a reload keeps it. Calibration is worked
     // through over many refreshes, and landing back on 운영 every time would
@@ -603,6 +673,10 @@
       if (b) showTab(b.dataset.tab, true);
     });
     window.addEventListener('hashchange', () => showTab(location.hash.slice(1), false));
+    // Follow the camera unless someone is typing in the field — overwriting a
+    // half-typed value on a 1 s auto-refresh is the fastest way to make a form
+    // unusable. Shared by both render functions that have inputs.
+    const setIf = (id, v) => { if (document.activeElement !== $(id)) $(id).value = v; };
     const esc = (s) => String(s).replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
     const nul = '<span class="null">—</span>';
 
@@ -622,12 +696,14 @@
         : '<b>1코어</b>입니다. 스레드를 늘려도 총 처리량은 그대로고, 아래 CPU% 는 100 이 상한입니다.'],
       cpu_s: ['CPU 누적',
         '앱이 켜진 뒤 <b>합계로</b> 쓴 CPU 시간입니다. 절대량이라 "지금" 상태는 말해주지 않습니다 — 실제로 봐야 할 건 아래 "직전 갱신 이후" 쪽입니다.'],
-      cpu_pct: ['CPU (직전 갱신 이후)',
+      core_pct: ['카메라 CPU (코어별)',
+        '<b>카메라 전체</b>가 각 코어를 얼마나 쓰고 있는지입니다. 이 앱뿐 아니라 펌웨어가 하는 일까지 포함하므로 각 값은 <b>100%가 상한</b>입니다.<br><br>바로 위의 "앱 CPU 합계"와는 다른 값입니다 — 그건 이 앱만을 벽시계 기준으로 잰 것이라 코어가 2개면 100을 넘을 수 있습니다. 둘을 나란히 봐야 의미가 나옵니다: 앱 83%가 <b>한 코어만 꽉 찬</b> 상태면 문제고, <b>두 코어에 나뉘어</b> 있으면 여유가 있는 겁니다.<br><br>iowait 는 바쁨으로 세지 않습니다. 그때 코어는 놀고 있고 기다리는 건 저장장치라, 포함시키면 SD 기록이 연산처럼 보입니다.<br><br>직전 갱신 이후 구간의 값입니다. <code>/proc/stat</code> 은 부팅 이후 누적이라 한 번만 읽으면 켠 뒤 전체 평균이 되어 "지금 바쁜지"를 말해주지 못합니다.'],
+      cpu_pct: ['앱 CPU 합계 (직전 갱신 이후)',
         '이 페이지를 <b>직전에 갱신한 시점부터 지금까지</b>의 평균 점유율입니다. 켜진 뒤 전체 평균이 아니라 방금 구간이라 설정을 바꾸면 바로 반영됩니다.<br><br>실측 기준: 4렌즈 + dynROI 켬 = 약 48%, dynROI 끔 = 약 73%, 전부 끄면 1% 입니다.'],
       duty: ['검출 예산',
-        '켜진 렌즈들이 <b>나눠 쓰는</b> CPU 상한입니다. 한 렌즈가 자기 몫을 넘기면 다음 프레임을 그냥 버리고, 그렇게 남긴 여유로 이 페이지와 파이 서버 통신이 항상 응답합니다.<br><br>이게 없던 시절엔 검출이 스레드를 다 잡아먹어서 페이지가 아예 안 떴습니다(502). 렌즈별로 얼마나 버리는지는 아래 Channels 표의 <b>검출/제공</b> 칸에서 봅니다.'],
+        '켜진 렌즈들이 <b>나눠 쓰는</b> CPU 상한입니다. 한 렌즈가 자기 몫을 넘기면 다음 프레임을 그냥 버리고, 그렇게 남긴 여유로 이 페이지와 파이 서버 통신이 항상 응답합니다.<br><br>이게 없던 시절엔 검출이 스레드를 다 잡아먹어서 페이지가 아예 안 떴습니다(502). 렌즈별로 얼마나 버리는지는 아래 Channels 표의 <b>검출/제공</b> 칸에서 봅니다.<br><br><b>여기서 바로 고칠 수 있습니다</b>(<code>DUTY &lt;%&gt;</code>). 올리면 검출이 빨라지고 이 페이지의 응답 여유가 줄어듭니다. 저장되지 않으므로 <b>재시작하면 기본값으로 돌아갑니다</b> — 튜닝 값이 살아남아 "페이지가 안 뜨는데 이유가 화면에 없는" 상태가 되지 않게 일부러 그렇게 했습니다.<br><br>다만 올리기 전에 <b>dynROI 부터 켜 보세요.</b> 지금 한 번 검출에 250 ms 가 드는 건 마커를 잡고도 매 프레임 화면 전체를 훑기 때문입니다. dynROI 가 걸리면 7 ms 급으로 떨어져서 예산에 아예 안 닿습니다 — 예산을 90 으로 올려도 0.6→1.0 fps 정도지만, dynROI 는 카메라 상한인 5 fps 까지 갑니다.'],
       video: ['영상 입력',
-        '앱이 붙어 있는 raw 영상 그룹과, 카메라가 이 경로로 실제로 주는 프레임 수입니다.<br><br><b>렌즈당 5fps 는 카메라 쪽 상한</b>이라 검출을 아무리 빠르게 만들어도 그 이상은 안 올라갑니다. 해상도를 낮춰도, 프로파일을 바꿔도 안 바뀐다는 걸 실측으로 확인했습니다 (<code>docs/RAW_VIDEO_LIMITS.md</code>).<br><br>그룹 이름이 여기 찍히는 이유: 그룹을 잘못 지정하면 에러 없이 조용히 프레임이 0이 됩니다. 그때 유일한 단서입니다.'],
+        '앱이 붙어 있는 raw 영상 그룹과, 카메라가 이 경로로 <b>실제로 주고 있는</b> 렌즈별 프레임 수입니다.<br><br>이 숫자는 <b>검출을 끄든 켜든 계속 셉니다.</b> 아래 Channels 표의 "실효 fps"는 검출된 프레임만 세기 때문에, 렌즈를 꺼두면 0으로 보입니다 — 그러면 "카메라가 안 준다"와 "우리가 안 센다"가 구별되지 않습니다. 이 행은 검출 이전, 프레임을 받은 그 자리에서 셉니다.<br><br>실측 기준 렌즈당 약 5 fps 이고, 해상도를 낮춰도 프로파일을 바꿔도 안 바뀌었습니다. raw 그룹을 <code>GroupSPMgrVideoRaw3</code> 로 바꾸는 시도는 프레임 0 이었습니다 (<code>docs/RAW_VIDEO_LIMITS.md</code>).<br><br>그룹 이름이 여기 찍히는 이유: 그룹을 잘못 지정하면 에러 없이 조용히 프레임이 0이 됩니다. 그때 유일한 단서입니다.'],
       netchg: ['네트워크 설정 변경',
         '카메라의 네트워크 설정이 마지막으로 바뀐 시각입니다. 포즈 링크가 갑자기 끊겼을 때 <b>여기 시각이 그 직전이면</b> 원인은 앱이 아니라 카메라 설정 쪽입니다.'],
       psent: ['보낸 줄 (누적)',
@@ -642,11 +718,37 @@
 
     // [label, value] or [label, value, helpKey].
     const rows = (el, pairs) => {
+      // An <input> in one of these rows is destroyed and rebuilt by the line
+      // below, so a half-typed value and the caret go with it — and this page
+      // repaints every 2 s, which is faster than anyone types two digits. What
+      // is being edited is therefore saved and put back.
+      //
+      // Handled here rather than at the one call site that has an input: rows()
+      // is what does the damage, so the repair belongs with it, and the next
+      // editable row added anywhere gets it for free instead of rediscovering
+      // the bug.
+      const focused = el.contains(document.activeElement) ? document.activeElement : null;
+      const keep = focused && focused.id
+        ? { id: focused.id, value: focused.value, s: focused.selectionStart, e: focused.selectionEnd }
+        : null;
+
       el.innerHTML = pairs
         .map(([k, v, h]) => `<tr><th>${esc(k)}` +
           (h ? ` <button type="button" class="hint" data-h="${h}" aria-label="${esc(k)} 설명">?</button>` : '') +
           `</th><td class="num">${v}</td></tr>`)
         .join('');
+
+      if (keep) {
+        const again = el.querySelector('#' + keep.id);
+        if (again) {
+          // The typed text wins over the server's, deliberately: the operator is
+          // mid-edit, and the value from the camera is the OLD one they are in
+          // the middle of replacing.
+          again.value = keep.value;
+          again.focus();
+          try { again.setSelectionRange(keep.s, keep.e); } catch (_) { /* number inputs refuse */ }
+        }
+      }
     };
 
     // One popup element for the whole page, anchored on demand. Rebuilt tables
@@ -742,17 +844,64 @@
         : '전부 꺼짐 — 매 프레임 전체를 훑습니다 (2592×1520 기준 170~300ms)';
 
       const p = d.proc;
+
+      // One line per core, aligned so the numbers stack. A bar would need a
+      // width this table does not have, and the point here is comparing two or
+      // four numbers to each other, which digits do fine.
+      const cores = (p) => {
+        const cp = p.core_pct || [];
+        if (!cp.length) return nul;
+        if (cp.every(v => v < 0)) return '<span class="meta">첫 조회 — 다음 Refresh 부터</span>';
+        return cp.map((v, i) => {
+          const label = `<span class="meta">cpu${i}</span>`;
+          if (v < 0) return `${label} <span class="meta">—</span>`;
+          // Capped at 100 by construction, so the thresholds are absolute here
+          // in a way they are not for the app's own figure.
+          const c = v > 85 ? 'bad' : v > 65 ? 'warn' : 'ok';
+          return `${label} <b class="${c}">${v.toFixed(0)} %</b>`;
+        }).join('<br>');
+      };
+
+      // SDK 전달률, 렌즈별. detect 를 꺼도 계속 세므로 "카메라가 안 준다"와
+      // "우리가 안 센다"가 구별된다 — 그 둘이 구별되지 않던 것이 이 행이 생긴
+      // 이유다.
+      const inFps = (d) => {
+        const f = d.video.in_fps || [];
+        if (!f.length || f.every(v => v < 0))
+          return '<span class="meta">전달률 측정 중 — 다음 Refresh 부터</span>';
+        return '<span class="meta">전달 </span>' + f.map((v, i) =>
+          v < 0 ? `<span class="meta">ch${i} —</span>`
+                : `<span class="meta">ch${i}</span> <b>${v.toFixed(1)}</b>`
+        ).join(' <span class="meta">·</span> ') + ' <span class="meta">fps</span>';
+      };
+
       rows($('proc'), [
         ['메모리 (현재)', mb(p.rss_kb), 'rss'],
         ['메모리 (최고점)', mb(p.peak_rss_kb), 'peak'],
         ['CPU 코어', `${p.cores}`, 'cores'],
         ['CPU 누적', `${p.cpu_s.toFixed(2)} s`, 'cpu_s'],
-        ['CPU (직전 갱신 이후)', p.cpu_pct < 0
+        ['앱 CPU 합계', p.cpu_pct < 0
           ? '<span class="meta">첫 조회 — 다음 Refresh 부터</span>'
           : `<b class="${p.cpu_pct > 80 ? 'bad' : p.cpu_pct > 60 ? 'warn' : 'ok'}">${p.cpu_pct.toFixed(1)} %</b>
              <span class="meta">(${p.cpu_window_s.toFixed(0)}s 구간)</span>`, 'cpu_pct'],
-        ['검출 예산', `${d.governor.duty_pct} %`, 'duty'],
-        ['영상 입력', `${esc(d.video.raw_group)} <span class="meta">· 렌즈당 ${d.video.cam_fps} fps</span>`, 'video'],
+        // Whole-camera load, one row per core. Right under the app's own figure
+        // because the two are only readable together: 83% of a wall clock is
+        // alarming next to one saturated core and ordinary next to two
+        // half-idle ones.
+        ['카메라 CPU (코어별)', cores(p), 'core_pct'],
+        // Editable in place. The value that wants changing is wanted while
+        // watching the very numbers next to it — sending it to a settings panel
+        // would mean tuning a load figure without the load figure in view.
+        ['검출 예산', `<input type="number" id="duty" class="num"
+             value="${d.governor.duty_pct}" min="${d.governor.min}" max="${d.governor.max}">
+           <span class="meta">%</span>
+           ${d.governor.duty_pct !== d.governor.default_pct
+              ? `<span class="meta">(기본 ${d.governor.default_pct}, 재시작하면 되돌아감)</span>`
+              : ''}`, 'duty'],
+        // Measured, not asserted. The old row said "렌즈당 5 fps" from a
+        // constant in the C++ and would have kept saying it whatever the camera
+        // did — including through two experiments that changed the raw group.
+        ['영상 입력', `${esc(d.video.raw_group)}<br>` + inFps(d), 'video'],
         ['네트워크 설정 변경', d.network.latest_changed ? esc(d.network.latest_changed) : nul, 'netchg'],
       ]);
 
@@ -950,18 +1099,21 @@
 
     function renderCalib(d) {
       if (tab !== 'calib') return;  // pane is hidden
-      const c = d.calib, s = c.session, b = c.board;
+      const c = d.calib, b = c.board;
+      const sel = ckSel();
+      // 이제 세션은 렌즈마다 하나씩이다. "그" 세션이라는 건 없으므로 고른 렌즈
+      // 것을 보되, 다른 렌즈들이 어디까지 왔는지는 아래 요약 줄이 항상 보여준다 —
+      // 캡처 한 번이 여러 렌즈에 적립되는 설계에서는 그게 핵심 정보다.
+      const S = c.sessions || [];
+      const s = S[sel] || {};
+      const pol = c.session_policy || {target:20, rms_limit:0.8, gates:true};
 
-      // Board fields follow the camera unless someone is typing in them —
-      // overwriting a half-typed value on a 2 s auto-refresh is the fastest way
-      // to make a form unusable.
-      const setIf = (id, v) => { if (document.activeElement !== $(id)) $(id).value = v; };
       setIf('ckSx', b.sx); setIf('ckSy', b.sy);
       setIf('ckSquare', b.square_mm); setIf('ckMarker', b.marker_mm);
       setIf('ckMx', b.margin_x_mm); setIf('ckMy', b.margin_y_mm);
       setIf('ckDict', b.dict);
-      setIf('ckTarget', s.target); setIf('ckRms', s.rms_limit);
-      if (document.activeElement !== $('ckGate')) $('ckGate').checked = s.gates;
+      setIf('ckTarget', pol.target); setIf('ckRms', pol.rms_limit);
+      if (document.activeElement !== $('ckGate')) $('ckGate').checked = pol.gates;
       // The fold's one-line summary reports what the CAMERA has, not what the
       // form says. The two can differ — applying is a separate button and can
       // be refused — and the whole point of a collapsed summary is checking the
@@ -986,19 +1138,23 @@
         ? `<span class="ok">저장 가능</span> <span class="meta">${esc(c.persist.dir)}</span>`
         : `<b class="bad">저장 불가</b> <span class="meta">쓸 수 있는 위치를 못 찾음 (cwd ${esc(c.persist.cwd)}) — 계산은 되지만 재부팅하면 사라집니다</span>`;
 
-      // Who owns the session, and whether the lens you are looking at is it.
-      const sel = ckSel();
-      const busy = s.collecting;
-      $('ckWho').innerHTML = !busy
-        ? '<span class="meta">열린 세션 없음</span>'
-        : (s.ch === sel
-          ? `<b class="ok">이 렌즈가 수집 중</b>`
-          : `<b class="warn">렌즈 ${s.ch + 1} (ch${s.ch}) 가 세션을 잡고 있습니다</b>`);
+      // 렌즈별 현황 한 줄. 어느 렌즈가 아직 모자란지가 이 화면의 핵심이다.
+      const busy = !!s.collecting;
+      const open = S.filter(x => x.collecting).length;
+      $('ckWho').innerHTML =
+        (busy ? '<b class="ok">이 렌즈 수집 중</b>' : '<span class="meta">이 렌즈는 세션 없음</span>') +
+        (open ? ` <span class="meta">· 열린 세션 ${open}개</span>` : '') + ' &nbsp; ' +
+        S.map(x => {
+          const done = x.state === 4;
+          const cls = x.collecting ? (x.views >= pol.target ? 'ok' : 'warn') : (done ? 'ok' : '');
+          const mark = done ? '✓' : (x.collecting ? `${x.views}/${pol.target}` : '—');
+          return `<span class="meta">ch${x.ch}</span> <b class="${cls}">${mark}</b>`;
+        }).join(' <span class="meta">·</span> ');
 
-      const pct = s.target > 0 ? Math.min(100, s.views / s.target * 100) : 0;
+      const pct = pol.target > 0 ? Math.min(100, (s.views||0) / pol.target * 100) : 0;
       $('ckBar').firstElementChild.style.width = pct + '%';
-      $('ckCount').textContent = `${s.views} / ${s.target}`;
-      $('ckState').innerHTML = CS[s.state] +
+      $('ckCount').textContent = `${s.views||0} / ${pol.target}`;
+      $('ckState').innerHTML = CS[s.state||0] +
         (s.last_capture === 2 ? ' <span class="ok">· 직전 캡처 승인</span>'
          : s.last_capture === 3 ? ' <span class="bad">· 직전 캡처 거부</span>' : '') +
         (s.pruned ? ` <span class="meta">· 계산 시 ${s.pruned}뷰 제외됨</span>` : '') +
@@ -1019,18 +1175,18 @@
 
       $('ckFlowHint').innerHTML = s.pending
         ? '<b class="warn">캡처 대기 — 다음 프레임에서 판정합니다</b>'
-        : !busy ? '세션 시작 → 자세 바꿔가며 캡처 → 계산하기 순서입니다.'
-        : (s.views >= s.target ? '<b class="ok">목표 도달 — 계산하기를 누르세요</b>' : '보드를 멈춘 뒤 캡처하세요.');
+        : !busy ? '렌즈를 골라 <b>세션 시작</b>을 렌즈마다 눌러 여러 개를 동시에 열 수 있습니다. 그 뒤 자세를 바꿔가며 캡처 → 렌즈별로 계산하기.'
+        : (s.views >= pol.target ? '<b class="ok">목표 도달 — 계산하기를 누르세요</b>' : '보드를 멈춘 뒤 캡처하세요. 캡처 한 번은 <b>보드가 보이는 모든 렌즈</b>에 적립됩니다.');
 
       // Buttons that cannot do anything are disabled rather than left to fail:
       // the failure would arrive as a reason string two seconds later.
       $('ckStart').disabled = busy;
-      $('ckCapture').disabled = !busy;
+      $('ckCapture').disabled = (open === 0);
       $('ckUndo').disabled = !busy || s.views < 1;
       $('ckCompute').disabled = !busy || s.views < 1;
-      $('ckStop').disabled = !busy;
+      $('ckStop').disabled = (open === 0);
       $('ckStart').className = busy ? '' : 'go';
-      $('ckCompute').className = (busy && s.views >= s.target) ? 'go' : '';
+      $('ckCompute').className = (busy && s.views >= pol.target) ? 'go' : '';
       $('ckStop').className = busy ? 'danger' : '';
 
       // Per-lens results.
@@ -1118,10 +1274,23 @@
 
       $('hgFlowHint').innerHTML = s.collecting
         ? '수집 중 — 이 렌즈는 dynROI가 꺼지고 풀프레임으로 돕니다. 약 0.5fps라 20프레임에 40초쯤 걸립니다.'
-        : na < 4 ? '<b class="warn">마커를 4개 이상 등록해야 수집을 시작할 수 있습니다 (권장 10~20개)</b>'
+        : na < hgLimits().min_fit ? `<b class="warn">마커를 ${hgLimits().min_fit}개 이상 등록해야 수집을 시작할 수 있습니다 (권장 10~20개)</b>`
         : '등록한 마커가 <b>전부 한 프레임에</b> 보여야 그 프레임이 계수됩니다.';
       $('hgStart').disabled = !!s.collecting;
-      $('hgStart').className = (!s.collecting && na >= 4) ? 'go' : '';
+      $('hgStart').className = (!s.collecting && na >= hgLimits().min_fit) ? 'go' : '';
+
+      // Coordinate space toggle. Refused by the camera while an H exists —
+      // flipping the space around a stored matrix produces a matrix and a flag
+      // that disagree, and that pair passes the marker-plane check built to
+      // catch exactly it. Disabled here so the refusal is visible before the
+      // click rather than as a reason two seconds later.
+      if (document.activeElement !== $('hgUndist')) $('hgUndist').checked = !!L.mode_undistorted;
+      $('hgUndist').disabled = !!L.have || (!kHave && !L.mode_undistorted);
+      $('hgUndistHint').innerHTML = L.have
+        ? '<b class="warn">H가 있는 동안은 바꿀 수 없습니다</b> — 좌표공간이 바뀌면 저장된 행렬이 무의미해집니다. 아래 <b>H 지우기</b> 후 다시 계산하세요.'
+        : !kHave
+          ? '<b class="bad">이 렌즈에 K/dist가 없어 undistort로 못 바꿉니다.</b> 캘리브레이션 탭에서 먼저 K를 구하세요.'
+          : 'raw로 피팅하면 <b>시차 보정이 거부됩니다</b>(왜곡이 R·t에 흡수돼 평면 법선이 틀어짐). 특별한 이유가 없으면 켜 두세요.';
 
       // --- LOO residuals ---
       if (!f) {
@@ -1169,7 +1338,8 @@
 
       // --- registered markers ---
       const A = L.anchors || [];
-      $('hgAnchorBrief').innerHTML = `<span class="meta">— 이 렌즈 ${A.length}개 / 최대 24개</span>`;
+      $('hgAnchorBrief').innerHTML =
+        `<span class="meta">— 이 렌즈 ${A.length}개 / 최대 ${hgLimits().max_anchors}개</span>`;
       $('hgAnchors').innerHTML = A.length
         ? '<thead><tr><th>id</th><th>wx (mm)</th><th>wy (mm)</th></tr></thead><tbody>' +
           A.map(a => `<tr><td><b>${a.id}</b></td><td class="num">${a.wx.toFixed(1)}</td>` +
@@ -1183,6 +1353,33 @@
         ? `<b class="${ac.ok ? 'ok' : 'bad'}">${esc(ac.reason)}</b>`
         : (ac && ac.ch === ch && ac.ok ? `<span class="ok">적용됨 — 마커 ${ac.n}개</span>` : '');
 
+      // --- marker plane ---
+      const mp = L.marker_plane || {};
+      setIf('mpMarkerH', d.calib.marker_height_mm);
+      setIf('mpCamH', mp.camera_z_mm || 0);
+      $('mpSave').disabled = !d.calib.persist.ok;
+
+      const mh = d.calib.marker_height_mm || 0;
+      // The gap between measured and derived IS the scale error the measured
+      // value exists to remove, so it is shown as a gap rather than two numbers
+      // the reader has to subtract.
+      const gap = (mp.pose_ok && mp.camera_z_mm > 0)
+        ? ` <span class="meta">· 차이 ${(mp.camera_z_mm - mp.derived_z_mm).toFixed(0)} mm</span>` : '';
+      $('mpState').innerHTML =
+        (mp.ready
+          ? (mh > 0
+              ? `<b class="ok">보정 적용 중</b> <span class="meta">마커 ${mh.toFixed(0)} mm 평면으로 사상합니다</span>`
+              : `<span class="ok">마커 높이 0</span> <span class="meta">— 보정 없음. 마커가 실제로 바닥에 있으면 이게 맞습니다</span>`)
+          : `<b class="bad">보정 불가</b> <span class="meta">${esc(mp.reason || '')}</span>`) +
+        '<br>' +
+        (mp.pose_ok
+          ? `<span class="meta">분해된 카메라 높이</span> <b>${mp.derived_z_mm.toFixed(0)} mm</b>` +
+            `<span class="meta"> · 나디르 (${mp.nadir_mm[0].toFixed(0)}, ${mp.nadir_mm[1].toFixed(0)}) mm</span>` +
+            (mp.camera_z_mm > 0
+              ? ` <span class="meta">· 측정값</span> <b>${mp.camera_z_mm.toFixed(0)} mm</b>${gap}`
+              : ' <span class="meta">· 측정값 없음 (분해값 사용)</span>')
+          : '<span class="meta">카메라 자세를 분해할 수 없습니다 — H와 K가 모두 있어야 하고, H는 undistort 공간이어야 합니다</span>');
+
       // --- H itself ---
       $('hgMatrix').innerHTML = L.have
         ? '<tbody>' + [0, 1, 2].map(r =>
@@ -1192,6 +1389,16 @@
         : '<tbody><tr><td class="meta">이 렌즈에는 H가 없습니다</td></tr></tbody>';
       $('hgSave').disabled = !L.have || !d.calib.persist.ok;
       $('hgClear').disabled = !L.have;
+
+      // Last HG_MAP. The camera keeps it in /status rather than replying only
+      // on the pose link, so a probe fired by curl and one fired here read the
+      // same way.
+      const hm = d.calib.hg_map;
+      $('hgMapOut').innerHTML = (!hm || hm.ch !== ch)
+        ? '<span class="meta">아직 찍은 적 없음</span>'
+        : hm.ok
+          ? `<b class="ok">(${hm.wx_mm.toFixed(1)}, ${hm.wy_mm.toFixed(1)}) mm</b>`
+          : `<b class="bad">${esc(hm.reason)}</b>`;
 
       // --- FOV overlap, computed here rather than on the camera ---
       // §4.7: the status object already carries each lens's detected ids, so the
@@ -1255,6 +1462,11 @@
     // Parse the textarea into "id wx wy" triples, and say what is wrong before
     // the camera has to. The camera refuses the same things — this is only so
     // the answer arrives while the cursor is still in the box.
+    // Straight from /status — see the "limits" block. Hardcoding 24 here meant
+    // raising the camera's cap left the page refusing lists the camera accepts.
+    const hgLimits = () => (lastStatus && lastStatus.calib.limits) ||
+                           { max_anchors: 24, min_fit: 4, min_loo: 5, loo_advisory_below: 8 };
+
     function hgParseAnchors(text) {
       const out = [], seen = {}, errs = [];
       text.split('\n').forEach((line, i) => {
@@ -1269,7 +1481,8 @@
         seen[id] = i + 1;
         out.push({ id, wx, wy });
       });
-      if (out.length > 24) errs.push(`마커가 ${out.length}개입니다 — 최대 24개`);
+      const cap = hgLimits().max_anchors;
+      if (out.length > cap) errs.push(`마커가 ${out.length}개입니다 — 최대 ${cap}개`);
       return { pts: out, errs };
     }
 
@@ -1305,6 +1518,17 @@
         pts.map(p => `${p.id} ${p.wx.toFixed(1)} ${p.wy.toFixed(1)}`).join(' '), e.target);
     });
     $('hgAnchorSave').addEventListener('click', (e) => send(`ANCHOR_SAVE ${hgSel()}`, e.target));
+    // No <ch> on MARKER_HEIGHT: one robot, one marker, one height. See the
+    // command handler for why four copies would be a liability.
+    $('mpMarkerApply').addEventListener('click', (e) =>
+      send(`MARKER_HEIGHT ${(+$('mpMarkerH').value || 0).toFixed(1)}`, e.target));
+    $('mpCamApply').addEventListener('click', (e) =>
+      send(`CAMERA_HEIGHT ${hgSel()} ${(+$('mpCamH').value || 0).toFixed(1)}`, e.target));
+    $('mpSave').addEventListener('click', (e) => send(`MARKER_PLANE_SAVE ${hgSel()}`, e.target));
+    $('hgUndist').addEventListener('change', (e) =>
+      send(`HG_COORD_MODE ${hgSel()} ${e.target.checked ? 1 : 0}`, e.target));
+    $('hgMapGo').addEventListener('click', (e) =>
+      send(`HG_MAP ${hgSel()} ${+$('hgMapX').value || 0} ${+$('hgMapY').value || 0}`, e.target));
     $('hgStart').addEventListener('click', (e) => send(`CALIB_START ${hgSel()}`, e.target));
     $('hgSave').addEventListener('click', (e) => send(`HG_SAVE ${hgSel()}`, e.target));
     $('hgClear').addEventListener('click', (e) => {
@@ -1318,16 +1542,18 @@
     // frame it fills.
     function drawProbe(d) {
       const cv = $('ckCanvas'), ctx = cv.getContext('2d');
-      const s = d.calib.session;
-      const ch = s.collecting ? s.ch : ckSel();
+      // 고른 렌즈의 뷰파인더. 세션이 여러 개 열려 있어도 화면은 하나이므로
+      // "지금 보고 있는 렌즈"가 기준이다.
+      const ch = ckSel();
+      const s = (d.calib.sessions && d.calib.sessions[ch]) || {};
       const lens = d.channels.find(x => x.ch === ch) || {};
       const W = lens.w || 2592, H = lens.h || 1520;
       if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
       ctx.clearRect(0, 0, W, H);
 
-      const pts = d.calib.probe || [];
+      const pts = (d.calib.sessions && d.calib.sessions[ch] && d.calib.sessions[ch].probe) || [];
       ctx.font = 'bold 30px sans-serif';
-      if (!s.collecting) {
+      if (!(d.calib.sessions && d.calib.sessions[ch] && d.calib.sessions[ch].collecting)) {
         ctx.fillStyle = '#9aa0a6';
         ctx.fillText('세션을 시작하면 여기에 보드 코너가 표시됩니다', 16, 40);
         $('ckProbeNote').textContent = '';
@@ -1451,7 +1677,19 @@
       });
       return sum / n;
     }
-    const GRID_RESIDUAL_LIMIT = 4;   // px; good is <1, transposed is ~28
+    // px. Measured on .13 ch1 with the A2 board (2026-08-05):
+    //   correct 7×5  ->  3.05   (2.45 once perspective is fitted out; the rest is
+    //                            lens distortion, k3 = -7.98 on this lens)
+    //   any other    ->  125 .. 190      (5×7, the transpose, gives 155.8)
+    //
+    // So the gap either side of this limit is enormous in one direction and thin
+    // in the other: a correct board sits at 3.05 against a limit of 4. Held more
+    // obliquely, or on a lens with worse distortion, a CORRECT board can trip
+    // this. The limit is where it is because the failure it catches costs an
+    // afternoon and the false alarm costs a glance — but if this starts crying
+    // wolf, raise it rather than removing it. 20 would still separate the two
+    // populations by a factor of six.
+    const GRID_RESIDUAL_LIMIT = 4;
 
     const CALIB_PROBE_S = 1;  // matches CALIB_PROBE_MS in app_config.h
 
@@ -1477,10 +1715,10 @@
       send(`CALIB_K_GATE ${e.target.checked ? 1 : 0}`, null));
 
     $('ckStart').addEventListener('click', (e) => send(`CALIB_K_START ${ckSel()}`, e.target));
-    $('ckStop').addEventListener('click', (e) => send('CALIB_K_STOP', e.target));
+    $('ckStop').addEventListener('click', (e) => send('CALIB_K_STOP', e.target));  // 인자 없음 = 전부 취소
     $('ckCapture').addEventListener('click', (e) => send('CALIB_K_CAPTURE', e.target));
-    $('ckUndo').addEventListener('click', (e) => send('CALIB_K_UNDO', e.target));
-    $('ckCompute').addEventListener('click', (e) => send('CALIB_K_COMPUTE', e.target));
+    $('ckUndo').addEventListener('click', (e) => send(`CALIB_K_UNDO ${ckSel()}`, e.target));
+    $('ckCompute').addEventListener('click', (e) => send(`CALIB_K_COMPUTE ${ckSel()}`, e.target));
     $('ckCh').addEventListener('change', () => { if (lastStatus) renderCalib(lastStatus); });
 
     $('ckLenses').addEventListener('click', (ev) => {
@@ -1512,7 +1750,6 @@
     // /status 가 이미 가진 값을 그대로 쓰고, undistort(보정, 청록)는 그쪽과
     // 똑같이 브라우저가 K/dist 로 직접 계산한다 — 카메라에 K/D 가 없어도(이 앱은
     // 아직 intrinsics 를 이식하지 않았다) 그릴 수 있는 순수 표시용 참고값이다.
-    let lastStatus = null;
     let kCalib = null;  // {fx,fy,cx,cy,dist:[k1,k2,p1,p2,k3]} 또는 null
 
     // RPi 쪽과 동일한 반복해 undistort — Brown-Conrady 역변환.
@@ -1821,6 +2058,21 @@
           if (el) el.disabled = false;
         });
     };
+
+    // Duty is committed on change/Enter, not on every keystroke: typing "80"
+    // passes through "8", and 8 is a legal value that would be applied and then
+    // immediately replaced — leaving the lenses throttled to a tenth for as
+    // long as the second digit took.
+    //
+    // On the #proc table rather than the input, because rows() rebuilds the
+    // table on every refresh and a listener bound to the element would be
+    // thrown away with it.
+    $('proc').addEventListener('change', (ev) => {
+      if (ev.target.id === 'duty') send(`DUTY ${ev.target.value}`, ev.target);
+    });
+    $('proc').addEventListener('keydown', (ev) => {
+      if (ev.target.id === 'duty' && ev.key === 'Enter') ev.target.blur();
+    });
 
     $('chan').addEventListener('click', (ev) => {
       const d = ev.target.closest('button.dyn');

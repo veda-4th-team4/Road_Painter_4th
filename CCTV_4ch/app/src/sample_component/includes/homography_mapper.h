@@ -167,10 +167,92 @@ class HomographyMapper {
                     const char** reason = NULL) const;
 
   // Tape-measured camera height for this lens, 0 = not measured. Persisted
-  // with H because it belongs to the same installation; the command that sets
-  // it arrives with the marker-plane work, so for now this only ever
-  // round-trips a value that came out of a file.
+  // with H because it belongs to the same installation.
   double CameraHeightMm(int ch) const;
+
+  // --- marker plane (parallax correction) ----------------------------------
+
+  /**
+   * H_marker: the homography for the plane the robot's MARKER sits on, not the
+   * floor.
+   *
+   * A homography maps one physical plane. The floor H is fitted from markers
+   * lying on the floor, so projecting a marker mounted 250 mm up through it
+   * puts the robot somewhere it is not — pushed away from the camera's nadir,
+   * by an amount that grows with distance from it:
+   *
+   *     ground = F - (h / Cz) * (F - nadir)
+   *
+   * With a camera 1.5 m up and a marker at 250 mm that is a sixth of the
+   * distance to the nadir. At the far corner of a large work area that is
+   * metres, and it is SYSTEMATIC — averaging frames does not touch it.
+   *
+   * Derived from the floor homography alone, by decomposition:
+   *
+   *     H_w2p = K [r1 r2 t]        (inverse of the stored pixel->world H)
+   *     B     = K^-1 H_w2p          columns b1 b2 b3
+   *     lambda= 1 / |b1|            (the scale homogeneity loses)
+   *     r3    = r1 x r2             the plane normal the floor H cannot see
+   *     H_marker_w2p = K [r1 r2 (h*r3 + t)]
+   *
+   * The floor H carries no information about the third dimension; r3 recovers
+   * it from the orthonormality of a rotation matrix. That is the whole trick.
+   *
+   * REFUSED on a raw-fitted H, and this is not a style rule. K^-1 H assumes a
+   * pinhole camera; with distortion still in the pixels it is absorbed into R
+   * and t, the recovered r3 is tilted, and the correction comes out wrong in a
+   * way that still looks like a correction.
+   *
+   * Ported from cctv_app/src/marker_plane.cpp. What changed for four lenses:
+   * the marker height stays SHARED (one robot, one marker, one height) while
+   * the camera height is PER LENS — same housing, different tilt, different
+   * effective height — and H_marker is cached per lens because the pose path
+   * needs it every frame.
+   */
+  double MarkerHeightMm() const;              // shared across lenses
+  bool   SetMarkerHeightMm(double mm);        // rejects negative / non-finite
+  // 0 clears the measurement and returns to the height the decomposition
+  // implies, which is how an operator undoes a bad entry.
+  bool   SetCameraHeightMm(int ch, double mm);
+
+  // True once this lens has a usable H_marker. False when there is no H, when
+  // the marker height is set but the decomposition refused, or when K is
+  // missing. A marker height of 0 makes this equal to Available().
+  bool MarkerPlaneReady(int ch) const;
+  // Copy the derived H_marker, row-major. False when !MarkerPlaneReady().
+  bool GetMarkerPlane(int ch, double h[9]) const;
+  // Why the last derivation failed on this lens. "" when it succeeded.
+  const char* MarkerPlaneReason(int ch) const;
+
+  /**
+   * The camera pose the floor homography implies: height above the floor and
+   * the nadir (the floor point directly under the camera), in world mm.
+   *
+   * A sanity check with real diagnostic value — an installer who knows the
+   * camera is 1.5 m up can see at a glance whether the decomposition is sane,
+   * and a nadir in the wrong place is the tell-tale of a bad K.
+   */
+  bool CameraPose(int ch, double* height_mm, double* nadir_x_mm,
+                  double* nadir_y_mm, const char** reason) const;
+
+  /**
+   * Raw sensor pixel -> world mm THROUGH THE MARKER PLANE.
+   *
+   * This is what the pose path uses for a marker on the robot. Deliberately
+   * does NOT fall back to the floor matrix when the marker plane is
+   * unavailable: a configured marker height means the operator has said the
+   * marker is off the floor, so floor coordinates are wrong by a known amount,
+   * and silently supplying them is the exact "plausible but wrong" failure the
+   * whole derivation exists to prevent. With the height at 0 the two matrices
+   * are the same object and this is the floor path.
+   */
+  bool PixelToWorldMarker(int ch, float px, float py, double* wx, double* wy,
+                          const char** reason = NULL) const;
+
+  // Persist the shared marker height AND this lens's camera height. Two files,
+  // because the two values have different scopes: marker_plane.txt is shared,
+  // and Cz travels in that lens's homography_ch<N>.txt.
+  bool SaveMarkerPlane(int ch);
 
   // --- registered markers --------------------------------------------------
 
@@ -372,6 +454,17 @@ class HomographyMapper {
   bool LoadOne(int ch);
   bool SaveAnchorsOne(int ch);
   bool LoadAnchorsOne(int ch);
+  bool SaveMarkerHeightFile();
+  bool LoadMarkerHeightFile();
+  // Decompose this lens's floor H into rotation columns and translation, in
+  // world mm. The shared front half of the marker plane and the camera pose —
+  // one copy so the two can never disagree about the same matrix.
+  bool Decompose(int ch, cv::Matx33d* K, cv::Vec3d* r1, cv::Vec3d* r2,
+                 cv::Vec3d* r3, cv::Vec3d* t, const char** reason) const;
+  // Recompute Hm_[ch] from the current H, marker height and camera height.
+  // Called from every path that changes any of the three, so the cache cannot
+  // outlive its inputs.
+  void RefreshMarkerPlane(int ch);
   void PathFor(const char* leaf, char* out, size_t out_size) const;
   // Turn the collected averages into H and its residuals, and close the
   // session. Called from FeedFrame() when the target is reached.
@@ -390,6 +483,27 @@ class HomographyMapper {
   // SetCoordMode() refuses to change it while one does — see there.
   bool    coord_undistorted_[kChannels];
   double  camera_z_mm_[kChannels];     // 0 = not measured
+
+  // Marker height is SHARED: one robot carries one marker at one height. The
+  // camera height above is per lens because tilt differs even in one housing.
+  double  marker_height_mm_;
+  // H_marker, cached. Rebuilt by RefreshMarkerPlane() whenever H, the marker
+  // height or the camera height changes — the pose path maps two points per
+  // marker per frame through this, and deriving it there would put a 3x3
+  // inverse and a decomposition in the frame loop.
+  cv::Mat Hm_[kChannels];
+  bool    hm_valid_[kChannels];
+  // Why Hm_ is not valid, per lens. A literal; "" when it is.
+  const char* hm_reason_[kChannels];
+  // The camera centre the floor H implies, cached alongside Hm_ and produced by
+  // the same decomposition. /status reads this for four lenses on every poll,
+  // and re-deriving it there would be eight 3x3 inversions a second on the
+  // thread the frame path shares — for numbers whose inputs only change when an
+  // operator does something. Sharing one decomposition also stops the height
+  // the page reports from drifting from the height the correction is scaled by.
+  bool        pose_ok_[kChannels];
+  cv::Vec3d   pose_c_[kChannels];       // world mm; [2] is the camera height
+  const char* pose_reason_[kChannels];  // literal; "" when pose_ok_
 
   // Fixed arrays, not vectors: ~2.3 KB total, and it keeps the whole mapper
   // allocation-free, which matters because PixelToWorld() runs in the frame

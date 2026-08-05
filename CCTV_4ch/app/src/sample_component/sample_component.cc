@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <math.h>     // atan2 — CAM_POSE heading
 #include <stdlib.h>   // strtol/strtod — ANCHOR_SET_ALL parses by hand
 #include <string.h>
 #include <sys/stat.h>
@@ -101,6 +102,29 @@ struct JsonBuf {
   }
 };
 
+/**
+ * The marker's centre and its heading reference, in full-frame pixels.
+ *
+ * ONE definition, because two places need it and they must agree exactly: the
+ * collection session averages these points into the fit, and the pose packet
+ * maps them to world millimetres. If the two ever disagree — someone switches
+ * one to the marker-origin corner, say — every reported position carries a
+ * fixed offset of half a marker while the residual table still reads perfect,
+ * because the fit moved with it. That failure was previously prevented by a
+ * comment at each site asking the next editor not to cause it.
+ *
+ * Centre is the mean of the four corners. Heading points at the midpoint of
+ * the top edge (corners 0-1); the angle itself is measured in world space, not
+ * here — see SendPosePackets.
+ */
+void MarkerPoints(const ArucoProcessor::Detection& d, float* cx, float* cy,
+                  float* tx, float* ty) {
+  *cx = (d.corners2d[0].x + d.corners2d[1].x + d.corners2d[2].x + d.corners2d[3].x) * 0.25f;
+  *cy = (d.corners2d[0].y + d.corners2d[1].y + d.corners2d[2].y + d.corners2d[3].y) * 0.25f;
+  if (tx) *tx = (d.corners2d[0].x + d.corners2d[1].x) * 0.5f;
+  if (ty) *ty = (d.corners2d[0].y + d.corners2d[1].y) * 0.5f;
+}
+
 // Resident set size in KB, or 0 if unavailable.
 //
 // getrusage() is used for the CPU times below, but its ru_maxrss is the PEAK,
@@ -124,9 +148,19 @@ SampleComponent::SampleComponent() : SampleComponent(_SampleComponent_Id, "Sampl
 SampleComponent::SampleComponent(ClassID id, const char* name) : Component(id, name) {
 #if ENABLE_STATUS_PAGE
   start_ms_ = epoch_ms();
-  cpu_sample_wall_ms_ = 0;  // 0 = no sample yet, so the first /status reports cpu_pct -1
   cpu_sample_cpu_s_ = 0.0;
+  core_n_ = 0;              // 0 = /proc/stat not read yet; first call reports -1
+  for (int i = 0; i < kMaxCores; ++i) {
+    core_busy_[i] = core_total_[i] = 0;
+    core_pct_[i] = -1.0;
+  }
+  // 0 = no baseline yet, so every rate reports -1 until a full window has run.
+  stats_sample_ms_ = 0;
+  stats_window_s_ = 0.0;
+  cpu_pct_ = -1.0;
+  for (int c = 0; c < kMaxChannels; ++c) in_fps_[c] = -1.0;
 #endif
+  detect_duty_pct_ = DETECT_DUTY_PCT;  // the compiled value is the starting one
   for (int c = 0; c < kMaxChannels; ++c) {
     detect_budget_until_ms_[c] = 0;
     detect_skipped_[c] = 0;
@@ -135,8 +169,10 @@ SampleComponent::SampleComponent(ClassID id, const char* name) : Component(id, n
     recent_n_[c] = 0;
     recent_skipped_[c] = 0;
     memset(recent_skip_[c], 0, sizeof(recent_skip_[c]));
+    pts_offset_min_[c] = LONG_MAX;
+    delivered_[c] = 0;
+    delivered_prev_[c] = 0;
   }
-  pts_offset_min_ = LONG_MAX;
   hg_map_.ch = -1;  // -1 = HG_MAP never run; /status reports null
   hg_map_.px = hg_map_.py = hg_map_.wx = hg_map_.wy = 0.0;
   hg_map_.ok = false;
@@ -322,9 +358,12 @@ bool SampleComponent::HandleHttpRequest(Event* event) {
       // against, so the limit now matches the pose link's 1023 and says so when
       // it is hit.
       std::string line = oas->GetRequestBody();
-      if (line.size() > 1023) {
+      if (line.size() >= POSE_SENDER_MAX_LINE) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "command line too long (max %d bytes)",
+                 POSE_SENDER_MAX_LINE - 1);
         oas->SetStatusCode(413);
-        oas->SetResponseBody("command line too long (max 1023 bytes)");
+        oas->SetResponseBody(msg);
         return false;
       }
 
@@ -426,28 +465,29 @@ std::string SampleComponent::BuildStatusJson() {
     peak_rss_kb = (long)ru.ru_maxrss;  // KB on Linux
   }
 
-  // CPU as a percentage over the gap between this refresh and the previous
-  // one. A cumulative average since start-up would be dominated by whatever
-  // the app did minutes ago and would barely move when something goes wrong
-  // now, which is the opposite of what this page is for. -1 on the first call
-  // (no previous sample to difference against).
-  double cpu_pct = -1.0;
-  const long wall_delta_ms = now_ms - cpu_sample_wall_ms_;
-  if (cpu_sample_wall_ms_ != 0 && wall_delta_ms > 0)
-    cpu_pct = (cpu_s - cpu_sample_cpu_s_) * 1000.0 / (double)wall_delta_ms * 100.0;
-  cpu_sample_wall_ms_ = now_ms;
-  cpu_sample_cpu_s_ = cpu_s;
+  SampleRates(now_ms, cpu_s);
 
   // cores: cpu_pct is measured against wall clock, so it can exceed 100 only
   // if the app is actually allowed to run on more than one core. Reporting the
   // count next to it is what makes that number readable — and it answers
   // whether splitting the channels across schedulers could buy anything.
   j.addf("\"proc\":{\"rss_kb\":%ld,\"peak_rss_kb\":%ld,\"cpu_s\":%.2f,"
-         "\"cpu_pct\":%.1f,\"cpu_window_s\":%.1f,\"cores\":%ld},",
-         current_rss_kb(), peak_rss_kb, cpu_s, cpu_pct, (double)wall_delta_ms / 1000.0,
+         "\"cpu_pct\":%.1f,\"cpu_window_s\":%.1f,\"cores\":%ld,",
+         current_rss_kb(), peak_rss_kb, cpu_s, cpu_pct_, stats_window_s_,
          (long)sysconf(_SC_NPROCESSORS_ONLN));
 
-  j.addf("\"governor\":{\"duty_pct\":%d},", DETECT_DUTY_PCT);
+  // Whole-camera load, one figure per core, measured in the window above. See
+  // the member declaration for why this is not the same thing as cpu_pct.
+  j.addf("\"core_pct\":[");
+  for (int i = 0; i < core_n_; ++i) j.addf("%s%.1f", i ? "," : "", core_pct_[i]);
+  j.addf("]},");
+
+  // duty_pct is the RUNTIME value (DUTY <pct>), not the compiled default, and
+  // the bounds travel with it so the page can build its input without knowing
+  // them. default_pct is carried too: a tuned value that has drifted somewhere
+  // unhelpful is only recognisable next to what it started as.
+  j.addf("\"governor\":{\"duty_pct\":%d,\"min\":%d,\"max\":%d,\"default_pct\":%d},",
+         detect_duty_pct_, kDutyMin, kDutyMax, DETECT_DUTY_PCT);
 
   // The raw group is a LITERAL and has to be kept in step with
   // SampleComponent_manifest_instance_0.json by hand; the manifest is JSON
@@ -464,7 +504,18 @@ std::string SampleComponent::BuildStatusJson() {
   // now say the same thing — the group is very likely not built into this
   // camera's firmware (the SDK header marks it DEF_FULL_RAW, a compile-time
   // switch on the camera side, not something an app declares).
-  j.addf("\"video\":{\"raw_group\":\"GroupSPMgrVideoRaw2\",\"cam_fps\":5},");
+  //
+  // cam_fps used to be the literal 5. It was written when 5 fps had just been
+  // measured, and it was honest then — but a constant cannot go stale visibly,
+  // so it kept asserting 5 through every experiment that might have changed it,
+  // including two that changed the raw group outright. An external review
+  // (docs/CCTV_4CH_LATEST_REVIEW.md 3.1) reached for it as evidence, which is
+  // exactly what a hardcoded measurement invites. It is now the real delivery
+  // rate, differenced from delivered_[] over the shared window above, and -1
+  // until that window has run once.
+  j.addf("\"video\":{\"raw_group\":\"GroupSPMgrVideoRaw2\",\"in_fps\":[");
+  for (int c = 0; c < kMaxChannels; ++c) j.addf("%s%.2f", c ? "," : "", in_fps_[c]);
+  j.addf("],\"in_window_s\":%.1f},", stats_window_s_);
 
   // --- pose link --------------------------------------------------------
   unsigned long sent = 0, dropped = 0;
@@ -493,17 +544,20 @@ std::string SampleComponent::BuildStatusJson() {
     // reads comes from `recent` instead: n frames offered in the window, of
     // which `skipped` were dropped by the governor. Cumulative `skipped` is
     // still here for the long view, but nothing on the page divides by it.
-    j.addf("%s{\"ch\":%d,\"detect\":%s,\"scale\":%d,\"frames\":%lu,\"skipped\":%lu,"
+    // in_n is raw frames DELIVERED by the SDK; frames/skipped are what this app
+    // did with them. Delivered counts even while detection is off, which is the
+    // whole point — see ProcessRawVideo.
+    j.addf("%s{\"ch\":%d,\"detect\":%s,\"scale\":%d,\"in_n\":%lu,\"frames\":%lu,\"skipped\":%lu,"
            "\"recent\":{\"n\":%d,\"skipped\":%d},"
            "\"queue_ms\":%ld,\"age_ms\":%ld,\"w\":%d,\"h\":%d,"
            "\"det_ms\":%.2f,\"markers\":%d,\"calibrating\":%s,",
            (c == 0) ? "" : ",", c, detect_enabled_[c] ? "true" : "false", search_scale_[c],
-           seq_[c], detect_skipped_[c], recent_n_[c], recent_skipped_[c],
+           delivered_[c], seq_[c], detect_skipped_[c], recent_n_[c], recent_skipped_[c],
            last_queue_ms_[c],
            last_frame_ms_[c] ? (now_ms - last_frame_ms_[c]) : -1L,
            last_w_[c], last_h_[c],
            aruco_[c] ? aruco_[c]->lastDetectMs() : -1.0, last_markers_[c],
-           (calib_.ActiveChannel() == c && calib_.Collecting()) ? "true" : "false");
+           calib_.Collecting(c) ? "true" : "false");
 
     // roi is what detect() actually scanned last frame (tracker or manual);
     // manual_roi is the operator's box that SEARCH falls back to. An empty
@@ -581,6 +635,99 @@ std::string SampleComponent::BuildStatusJson() {
 }
 
 /**
+ * Roll every rate on the page, at most once per kStatsWindowMs.
+ *
+ * Split out of BuildStatusJson() because it is measurement, not formatting: it
+ * reads /proc, differences three unrelated counter families and writes six
+ * members, and none of that is easier to follow wedged into the top of a JSON
+ * builder whose remaining 200 lines only format cached results. The one
+ * function that has to stay auditable against the JsonBuf budget should not
+ * also own file I/O.
+ *
+ * Runs on the scheduler thread, like everything else here.
+ */
+void SampleComponent::SampleRates(long now_ms, double cpu_s) {
+  // Every rate on this page is measured here, over ONE window that rolls at
+  // most once a second, and cached until it rolls again. See the declaration of
+  // stats_sample_ms_ for why the window is not simply the gap between two
+  // requests: it used to be, and a second client polling a few tens of
+  // milliseconds behind the first made a healthy lens read 0.0 fps.
+  //
+  // Rates are cumulative-counter differences, so all of them are -1 until a
+  // baseline exists AND a window has elapsed over it. Reporting a number early
+  // would mean reporting one measured over a few milliseconds, which is the
+  // thing this block exists to stop.
+  const bool have_baseline = (stats_sample_ms_ != 0);
+  const long stats_dt_ms = have_baseline ? (now_ms - stats_sample_ms_) : 0;
+  if (!have_baseline || stats_dt_ms >= kStatsWindowMs) {
+  // have_baseline already implies stats_dt_ms >= kStatsWindowMs here.
+  const bool measurable = have_baseline;
+
+  // This app against the wall clock. A cumulative average since start-up
+  // would be dominated by whatever the app did minutes ago and would barely
+  // move when something goes wrong now — the opposite of what this is for.
+  cpu_pct_ = measurable
+                 ? (cpu_s - cpu_sample_cpu_s_) * 1000.0 / (double)stats_dt_ms * 100.0
+                 : -1.0;
+  cpu_sample_cpu_s_ = cpu_s;
+
+  // Raw frames the SDK delivered, per lens. This is the number that answers
+  // "how fast does the camera actually feed us" — see ProcessRawVideo for why
+  // frames+skipped could not.
+  for (int c = 0; c < kMaxChannels; ++c) {
+    in_fps_[c] = measurable ? (double)(delivered_[c] - delivered_prev_[c]) * 1000.0 /
+                                  (double)stats_dt_ms
+                            : -1.0;
+    delivered_prev_[c] = delivered_[c];
+  }
+
+  // Whole-camera load, one figure per core. Read here rather than in a helper
+  // because /proc/stat is cumulative, so the reading and its differencing
+  // belong in one place — and the "nothing to compare against yet" case (-1)
+  // then sits next to the same case for cpu_pct.
+  int n = 0;
+  FILE* f = fopen("/proc/stat", "r");
+  if (f != NULL) {
+    char line[256];
+    while (n < kMaxCores && fgets(line, sizeof(line), f) != NULL) {
+      int idx = -1;
+      unsigned long long v[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+      // "cpuN ..." only. The bare "cpu " aggregate line is skipped: it is the
+      // sum, and the sum of per-core percentages is not a percentage of
+      // anything a person can act on.
+      if (sscanf(line, "cpu%d %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                 &idx, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8],
+                 &v[9]) < 5)
+        continue;
+      if (idx != n) continue;  // out of order or non-contiguous: stop trusting it
+
+      unsigned long long total = 0;
+      for (int k = 0; k < 10; ++k) total += v[k];
+      // Busy = everything that is not idle. iowait (v[4]) counts as idle: the
+      // core is available, it is a disk that is not. Treating it as busy would
+      // make an SD-card write look like computation.
+      const unsigned long long busy = total - (v[3] + v[4]);
+
+      core_pct_[n] = -1.0;
+      if (core_n_ > n && total > core_total_[n]) {
+        const unsigned long long dt = total - core_total_[n];
+        const unsigned long long db = busy - core_busy_[n];
+        core_pct_[n] = (double)db * 100.0 / (double)dt;
+      }
+      core_busy_[n] = busy;
+      core_total_[n] = total;
+      ++n;
+    }
+    fclose(f);
+  }
+  core_n_ = n;
+
+  stats_window_s_ = (double)stats_dt_ms / 1000.0;
+  stats_sample_ms_ = now_ms;
+}
+}
+
+/**
  * The "calib" block of /status.
  *
  * Split out because it is the one part with a shape of its own: a shared board
@@ -626,6 +773,30 @@ void SampleComponent::AppendCalibJson(void* jsonbuf, long now_ms) {
       closedir(d);
     }
   }
+  j.addf("],");
+
+  // Where else this app could have written, and whether any of it is outside
+  // the app directory.
+  //
+  // This exists to answer one question that costs a calibration when it is
+  // guessed wrong: deleting the app with KeepOldSettings unchecked removes the
+  // app directory, and every writable location found so far is inside it. If
+  // the sandbox lets us write anywhere else, the answer is here; if it does
+  // not, that is worth knowing once rather than being rediscovered by losing
+  // something. The camera refuses SSH, so /status is the only window there is.
+  //
+  // `selectable:false` entries are probed and reported but never used —
+  // relocating storage on the strength of a probe would orphan the files
+  // already written somewhere the next boot would not look.
+  j.addf("\"candidates\":[");
+  for (int i = 0; i < calib_.CandidateCount(); ++i) {
+    const IntrinsicsCalib::PersistCandidate& c = calib_.Candidate(i);
+    j.addf("%s{\"path\":\"%s\",\"exists\":%s,\"writable\":%s,\"selectable\":%s,"
+           "\"chosen\":%s}",
+           i ? "," : "", c.path, c.exists ? "true" : "false",
+           c.writable ? "true" : "false", c.selectable ? "true" : "false",
+           c.chosen ? "true" : "false");
+  }
   j.addf("]},");
   j.addf("\"board\":{\"sx\":%d,\"sy\":%d,\"square_mm\":%.2f,\"marker_mm\":%.2f,"
          "\"dict\":%d,\"margin_x_mm\":%.2f,\"margin_y_mm\":%.2f,\"corners\":%d},",
@@ -633,33 +804,46 @@ void SampleComponent::AppendCalibJson(void* jsonbuf, long now_ms) {
          b.dictionary_id, b.outer_margin_x_mm, b.outer_margin_y_mm,
          (b.squares_x - 1) * (b.squares_y - 1));
 
-  const CalibViewQuality& q = calib_.LastQuality();
-  j.addf("\"session\":{\"ch\":%d,\"state\":%d,\"last_capture\":%d,\"collecting\":%s,\"pending\":%s,"
-         "\"views\":%d,\"target\":%d,\"pruned\":%d,\"gates\":%s,"
-         "\"rms\":%.4f,\"rms_limit\":%.3f,\"probe_age_ms\":%ld,",
-         calib_.ActiveChannel(), (int)calib_.State(), (int)calib_.LastCapture(),
-         calib_.Collecting() ? "true" : "false",
-         calib_.CapturePending() ? "true" : "false", calib_.Views(),
-         calib_.TargetViews(), calib_.PrunedViews(), calib_.Gates() ? "true" : "false",
-         calib_.Rms(), calib_.RmsLimit(), calib_.ProbeAgeMs(now_ms));
-  // The rejection reason is the single most useful field on this page — a
-  // capture that does nothing is otherwise indistinguishable from one that was
-  // never received. Escaped as a plain string: it is built here from format
-  // strings and constants, never from anything off the network.
-  j.addf("\"corners\":%d,\"corners_total\":%d,\"coverage\":%.4f,\"sharpness\":%.1f,"
-         "\"move_px\":%.1f,\"reason\":\"%s\"},",
-         q.corners_found, q.corners_total, q.coverage_ratio, q.sharpness,
-         q.mean_move_px, q.reason ? q.reason : "");
+  // One session block per lens, always four. `sessions` is an array now, not a
+  // single object with a `ch` field: with several open at once there is no
+  // "the" session, and a page that reads one would show whichever lens the
+  // camera happened to mention.
+  //
+  // Shared policy (target views, RMS limit, gates) sits outside the array — one
+  // board, one operator, one standard — so that four copies cannot drift.
+  j.addf("\"session_policy\":{\"target\":%d,\"rms_limit\":%.3f,\"gates\":%s},",
+         calib_.TargetViews(), calib_.RmsLimit(), calib_.Gates() ? "true" : "false");
 
-  // Where the board is right now, so the page can draw it. Capped: a 7x5 board
-  // has 24 interior corners, and anything claiming far more is not a board.
-  j.addf("\"probe\":[");
-  const std::vector<cv::Point2f>& pc = calib_.ProbeCorners();
-  const std::vector<int>& pid = calib_.ProbeIds();
-  const size_t np = pc.size() < 96 ? pc.size() : 96;
-  for (size_t i = 0; i < np; ++i)
-    j.addf("%s[%.1f,%.1f,%d]", (i == 0) ? "" : ",", pc[i].x, pc[i].y,
-           (i < pid.size()) ? pid[i] : -1);
+  j.addf("\"sessions\":[");
+  for (int c = 0; c < kMaxChannels; ++c) {
+    const CalibViewQuality& q = calib_.LastQuality(c);
+    j.addf("%s{\"ch\":%d,\"state\":%d,\"last_capture\":%d,\"collecting\":%s,"
+           "\"pending\":%s,\"views\":%d,\"pruned\":%d,\"rms\":%.4f,"
+           "\"probe_age_ms\":%ld,",
+           (c == 0) ? "" : ",", c, (int)calib_.State(c), (int)calib_.LastCapture(c),
+           calib_.Collecting(c) ? "true" : "false",
+           calib_.CapturePending(c) ? "true" : "false", calib_.Views(c),
+           calib_.PrunedViews(c), calib_.Rms(c), calib_.ProbeAgeMs(c, now_ms));
+    // The rejection reason is the single most useful field on this page — a
+    // capture that does nothing is otherwise indistinguishable from one that
+    // was never received. Per lens, because one board pose gets four verdicts.
+    j.addf("\"corners\":%d,\"corners_total\":%d,\"coverage\":%.4f,"
+           "\"sharpness\":%.1f,\"move_px\":%.1f,\"reason\":\"%s\",",
+           q.corners_found, q.corners_total, q.coverage_ratio, q.sharpness,
+           q.mean_move_px, q.reason ? q.reason : "");
+
+    // Where the board is in THIS lens right now, so the page can draw it.
+    // Capped: a 7x5 board has 24 interior corners, and anything claiming far
+    // more is not a board.
+    j.addf("\"probe\":[");
+    const std::vector<cv::Point2f>& pc = calib_.ProbeCorners(c);
+    const std::vector<int>& pid = calib_.ProbeIds(c);
+    const size_t np = pc.size() < 96 ? pc.size() : 96;
+    for (size_t i = 0; i < np; ++i)
+      j.addf("%s[%.1f,%.1f,%d]", (i == 0) ? "" : ",", pc[i].x, pc[i].y,
+             (i < pid.size()) ? pid[i] : -1);
+    j.addf("]}");
+  }
   j.addf("],");
 
   j.addf("\"lenses\":[");
@@ -744,6 +928,36 @@ void SampleComponent::AppendCalibJson(void* jsonbuf, long now_ms) {
     for (int i = 0; i < fp.unusable_n; ++i) j.addf("%s%d", i ? "," : "", fp.unusable_ids[i]);
     j.addf("]},");
 
+    // The derived marker plane, and the camera pose the floor H implies.
+    //
+    // derived_z_mm next to camera_z_mm is the diagnostic pair: one is what the
+    // matrix thinks the camera height is, the other is what somebody measured
+    // with a tape. They should agree, and how far apart they are is how much
+    // scale error the decomposition is carrying — which is the whole reason
+    // CAMERA_HEIGHT exists. A nadir that is nowhere near under the camera is
+    // the tell-tale of a bad K.
+    {
+      double cz = 0.0, nx = 0.0, ny = 0.0;
+      const char* pose_why = "";
+      const bool pose_ok = homography_.CameraPose(c, &cz, &nx, &ny, &pose_why);
+      double hm[9];
+      const bool ready = homography_.GetMarkerPlane(c, hm);
+      j.addf("\"marker_plane\":{\"ready\":%s,\"reason\":\"%s\","
+             "\"camera_z_mm\":%.1f,\"pose_ok\":%s,\"derived_z_mm\":%.1f,"
+             "\"nadir_mm\":[%.1f,%.1f]",
+             ready ? "true" : "false", ready ? "" : homography_.MarkerPlaneReason(c),
+             homography_.CameraHeightMm(c), pose_ok ? "true" : "false",
+             pose_ok ? cz : -1.0, pose_ok ? nx : 0.0, pose_ok ? ny : 0.0);
+      if (ready) {
+        // %.9e for the same reason H gets it: defined only up to scale, so one
+        // matrix spans a wide exponent range and a fixed format flattens the
+        // perspective terms to zero.
+        j.addf(",\"H_marker\":[%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e]",
+               hm[0], hm[1], hm[2], hm[3], hm[4], hm[5], hm[6], hm[7], hm[8]);
+      }
+      j.addf("},");
+    }
+
     // Per-point residuals from the last fit. RAM only — see FitResult for why
     // they are never written to disk.
     //
@@ -769,6 +983,22 @@ void SampleComponent::AppendCalibJson(void* jsonbuf, long now_ms) {
     }
   }
   j.addf("],");
+
+  // The limits the page must not exceed, published rather than duplicated.
+  //
+  // index.html had 24 and 4 written into its own validation, so raising
+  // kMaxAnchors in the header would have left the dashboard refusing a list the
+  // camera would happily accept — with nothing on the camera side to explain
+  // it. Same reasoning as the governor block, which ships its bounds for
+  // exactly this purpose.
+  j.addf("\"limits\":{\"max_anchors\":%d,\"min_fit\":%d,\"min_loo\":%d,"
+         "\"loo_advisory_below\":%d},",
+         HomographyMapper::kMaxAnchors, HomographyMapper::kMinFitAnchors,
+         HomographyMapper::kMinLooAnchors, HomographyMapper::kLooAdvisoryBelow);
+
+  // Marker height is SHARED, so it sits outside the per-lens array. Putting a
+  // copy in each lens's block would invite a page to edit one of them.
+  j.addf("\"marker_height_mm\":%.1f,", homography_.MarkerHeightMm());
 
   // Last ANCHOR_* outcome. See AnchorCmdResult: this is how a rejected marker
   // list becomes visible to whoever sent it, since /cmd answers with this
@@ -827,6 +1057,25 @@ void SampleComponent::ProcessRawVideo(Event* event) {
     const int ch = (int)image->chan_id;
     if (ch < 0 || ch >= kMaxChannels) continue;
 
+    // Every frame the SDK hands over, counted BEFORE any decision this app
+    // makes about it.
+    //
+    // This is the only number that answers "how fast does the camera actually
+    // feed us", and until 2026-08-05 there was no such number. `frames` counts
+    // detections and `skipped` counts what the governor threw away, so their
+    // sum is the delivery rate — but ONLY while detection is on. A lens with
+    // DETECT 0 returns below without touching either counter, so it reads as
+    // 0 fps whether the SDK is sending 5 frames a second or none at all. Three
+    // of the four lenses sat in exactly that state while the raw-fps question
+    // was being argued, which is how a switched-off channel came to look like
+    // evidence about the SDK.
+    //
+    // Placed above the format check would be wrong in the other direction: a
+    // frame in an unexpected format was still delivered, but it is not a frame
+    // this app could ever have used, and mixing the two would hide a format
+    // problem inside a healthy-looking rate.
+    ++delivered_[ch];
+
     // A lens with a calibration session open is doing a different job, and the
     // two switches below do not apply to it:
     //
@@ -838,7 +1087,7 @@ void SampleComponent::ProcessRawVideo(Event* event) {
     //     who is standing there holding a board wait that out — or judging the
     //     capture on a frame from over a second ago — is the wrong trade. The
     //     board probe throttles itself instead (CALIB_PROBE_MS).
-    const bool calibrating = (calib_.ActiveChannel() == ch) && calib_.Collecting();
+    const bool calibrating = calib_.Collecting(ch);
     // A homography collection session on THIS lens. Per channel, unlike the
     // K/dist session: that one is exclusive because a person has to stand in
     // front of the lens holding a board, whereas the markers here are already
@@ -871,10 +1120,16 @@ void SampleComponent::ProcessRawVideo(Event* event) {
     // excess over it is the wait. See the header for why this matters: without
     // it a pose packet reports only its own detect time and looks fresh no
     // matter how far behind the app has fallen.
+    //
+    // Per channel, not shared. One shared minimum assumes the four lenses put
+    // frames into the pipeline with the same delay, and if they do not, the
+    // channel with the shortest path sets the baseline and every other channel
+    // reports its own fixed pipeline offset as queue time — a constant error
+    // that never varies and so never looks like one.
     const long pts_ms = (long)image->pts;
     const long offset = t_frame_ms - pts_ms;
-    if (offset < pts_offset_min_) pts_offset_min_ = offset;
-    const long queue_ms = offset - pts_offset_min_;
+    if (offset < pts_offset_min_[ch]) pts_offset_min_[ch] = offset;
+    const long queue_ms = offset - pts_offset_min_[ch];
     last_queue_ms_[ch] = queue_ms;
 
     // Locate the luma plane. NV12 is Y followed by interleaved UV; we only
@@ -900,13 +1155,13 @@ void SampleComponent::ProcessRawVideo(Event* event) {
     // a session this lens's job IS the board: the operator is standing in
     // front of it holding one, and pose output from it is not being used.
     if (calibrating) {
-      if (calib_.CapturePending()) {
-        calib_.TakePendingCapture(gray);
+      if (calib_.CapturePending(ch)) {
+        calib_.TakePendingCapture(ch, gray);
       } else {
         // Throttled board probe so the page can say "board visible, N corners"
         // and draw where it is. The calibration UI has no photo, so without
         // this, aiming the board would be blind. See CALIB_PROBE_MS.
-        calib_.ProbeIfDue(gray, t_frame_ms);
+        calib_.ProbeIfDue(ch, gray, t_frame_ms);
       }
       // Pose output is suppressed for this lens while calibrating — the same
       // rule the original app used. What it would publish now is a person's
@@ -998,7 +1253,7 @@ void SampleComponent::ProcessRawVideo(Event* event) {
         for (int c = 0; c < kMaxChannels; ++c)
           if (detect_enabled_[c]) ++active;
         if (active < 1) active = 1;
-        const double wait = cost_ms * (100.0 * active / DETECT_DUTY_PCT - 1.0);
+        const double wait = cost_ms * (100.0 * active / detect_duty_pct_ - 1.0);
         detect_budget_until_ms_[ch] = epoch_ms() + (long)(wait > 0.0 ? wait : 0.0);
       }
     }
@@ -1061,14 +1316,8 @@ void SampleComponent::ProcessRawVideo(Event* event) {
       for (size_t i = 0; i < dets.size() && nd < 64; ++i) {
         const ArucoProcessor::Detection& d = dets[i];
         if (d.corners2d.size() < 4) continue;
-        float sx = 0.0f, sy = 0.0f;
-        for (int k = 0; k < 4; ++k) {
-          sx += d.corners2d[k].x;
-          sy += d.corners2d[k].y;
-        }
         ids[nd] = d.id;
-        cxs[nd] = sx * 0.25f;
-        cys[nd] = sy * 0.25f;
+        MarkerPoints(d, &cxs[nd], &cys[nd], NULL, NULL);
         ++nd;
       }
       homography_.FeedFrame(ch, ids, cxs, cys, nd);
@@ -1096,6 +1345,26 @@ void SampleComponent::SendPosePackets(int ch,
                                       long t_capture, long queue_ms) {
   char json[768];
   ++seq_[ch];
+
+  // No server: stop before doing the work, not after.
+  //
+  // The camera is a standalone instrument. Detection, the dashboard, the
+  // calibration sessions and every command all work with the pose link down,
+  // and that is deliberate — the RPi is a consumer of this app, not a
+  // dependency of it. What was NOT deliberate is how much this function kept
+  // spending on output nobody could receive.
+  //
+  // With markers in view that is, per second: ~340 JSON packets formatted and
+  // handed to a sender that drops them, and — since the world coordinates
+  // landed — ~680 undistortPoints + projectPoints round trips to compute
+  // positions that go straight in the bin. All of it on the one thread that
+  // also runs detection, while the operator is looking at a page that has just
+  // become slower for no reason they can see.
+  //
+  // seq_ is still advanced above: it counts FRAMES DETECTED, which is a fact
+  // about this camera and is what /status reports as the effective rate. It
+  // must not depend on whether anyone was listening.
+  if (!pose_sender_is_connected()) return;
 
   const double detMs = aruco_[ch] ? aruco_[ch]->lastDetectMs() : -1.0;
 
@@ -1128,6 +1397,39 @@ void SampleComponent::SendPosePackets(int ch,
                        d.corners2d[0].x, d.corners2d[0].y, d.corners2d[1].x, d.corners2d[1].y,
                        d.corners2d[2].x, d.corners2d[2].y, d.corners2d[3].x, d.corners2d[3].y);
     if (len <= 0 || len >= (int)sizeof(json)) continue;
+
+    // World millimetres, through the MARKER plane — the one place in the frame
+    // path that costs real work, and the reason the whole homography exists.
+    //
+    // Absent, not null, when this lens cannot produce it. A `world` of
+    // {0,0,0} or null reads as a position to anything downstream that is not
+    // reading carefully, and "the robot is at the origin" is a specific and
+    // wrong claim. A missing key cannot be misread that way.
+    //
+    // Raw corner pixels stay on the packet either way. They are the server's
+    // only means of cross-checking the camera's own mapping, and dropping them
+    // once world coordinates existed would make the two impossible to compare
+    // exactly when they disagreed.
+    double wcx = 0.0, wcy = 0.0, wtx = 0.0, wty = 0.0;
+    float cx = 0.0f, cy = 0.0f, tx = 0.0f, ty = 0.0f;
+    MarkerPoints(d, &cx, &cy, &tx, &ty);  // same definition the fit averaged
+
+    if (homography_.PixelToWorldMarker(ch, cx, cy, &wcx, &wcy) &&
+        homography_.PixelToWorldMarker(ch, tx, ty, &wtx, &wty)) {
+      // Both points go to world FIRST, and the angle is measured there.
+      //
+      // Measuring the angle in pixels and rotating it afterwards is the
+      // mistake this ordering exists to prevent: a homography is not a
+      // rotation, so it does not preserve angles. Under perspective a marker
+      // at the edge of the frame is sheared, and its pixel-space heading is
+      // off by an amount that varies with WHERE the robot is — a bias that
+      // moves as the robot drives, which is the hardest kind to notice.
+      const double theta_deg = atan2(wty - wcy, wtx - wcx) * 180.0 / 3.14159265358979323846;
+      const int w = snprintf(json + len - 1, sizeof(json) - (size_t)len + 1,
+                             ",\"world\":{\"x\":%.1f,\"y\":%.1f,\"theta\":%.2f}}",
+                             wcx, wcy, theta_deg);
+      if (w > 0 && (size_t)(len - 1 + w) < sizeof(json)) len = len - 1 + w;
+    }
 
     pose_sender_send_line(json);
   }
@@ -1298,6 +1600,53 @@ bool SampleComponent::SetSearchScale(int ch, int n) {
 }
 
 /** One DETECT ack per channel, same shape as ReportDynRoi(). */
+/**
+ * DUTY <pct> — set the detection budget; DUTY on its own just reports it.
+ *
+ * Global and not per channel because the budget IS shared: the four lenses
+ * divide one thread's time, and the governor already splits it by how many are
+ * switched on. A per-channel duty would be four numbers that only mean anything
+ * added together, and adding to more than 100 would have to be refused — which
+ * is the same constraint expressed less clearly.
+ *
+ * Out-of-range values are refused rather than clamped. Clamping answers "95" to
+ * a request for 150 with no indication that anything was changed, and the
+ * operator walks away believing the machine agreed with them.
+ */
+bool SampleComponent::HandleDuty(const char* cmd) {
+  const char* p = strstr(cmd, "DUTY");
+  if (p == NULL) return false;
+
+  int pct = -1;
+  if (sscanf(p + 4, "%d", &pct) == 1) {  // 4 = strlen("DUTY")
+    if (pct < kDutyMin || pct > kDutyMax) {
+      printf("[ArucoPosePNM] DUTY %d 거부 — %d..%d 범위여야 함 (현재 %d%%)\n", pct,
+             kDutyMin, kDutyMax, detect_duty_pct_);
+    } else {
+      const int old = detect_duty_pct_;
+      detect_duty_pct_ = pct;
+      // Budgets already charged were computed against the OLD duty, so raising
+      // the limit would otherwise not take effect until every channel had
+      // served out a wait set under the stricter rule — up to 1.5 s of looking
+      // like the command did nothing. Clearing them makes the change visible on
+      // the next frame, which is what a person watching the page expects.
+      for (int c = 0; c < kMaxChannels; ++c) detect_budget_until_ms_[c] = 0;
+      printf("[ArucoPosePNM] DUTY %d%% -> %d%%\n", old, pct);
+    }
+    fflush(stdout);
+  }
+
+  ReportDuty();
+  return true;
+}
+
+void SampleComponent::ReportDuty() const {
+  char json[96];
+  snprintf(json, sizeof(json), "{\"type\":\"DUTY\",\"pct\":%d,\"min\":%d,\"max\":%d}",
+           detect_duty_pct_, kDutyMin, kDutyMax);
+  pose_sender_send_control_line(json);
+}
+
 void SampleComponent::ReportDetect() const {
   for (int c = 0; c < kMaxChannels; ++c) {
     char json[128];
@@ -1361,6 +1710,7 @@ bool SampleComponent::DispatchCommand(const char* cmd) {
   if (HandleHomography(cmd)) return true;  // HG_* — likewise
   if (HandleAnchors(cmd)) return true;     // ANCHOR_*
   if (HandleScale(cmd)) return true;
+  if (HandleDuty(cmd)) return true;
   if (HandleDetect(cmd)) return true;
   if (HandleDynRoiIds(cmd)) return true;
   if (HandleDynRoiCh(cmd)) return true;
@@ -1431,7 +1781,15 @@ bool SampleComponent::HandleCalibK(const char* cmd) {
     return true;
   }
   if (strncmp(cmd, "CALIB_K_STOP", 12) == 0) {
-    calib_.Stop();
+    // Named lens, because there can be several open. No argument stops them
+    // all — an operator abandoning a calibration run usually means all of it,
+    // and making them type four commands to do it invites leaving one open.
+    int ch = -1;
+    if (sscanf(cmd + 12, "%d", &ch) == 1) {
+      calib_.Stop(ch);
+    } else {
+      for (int c = 0; c < kMaxChannels; ++c) calib_.Stop(c);
+    }
     return true;
   }
   if (strncmp(cmd, "CALIB_K_CAPTURE", 15) == 0) {
@@ -1439,18 +1797,28 @@ bool SampleComponent::HandleCalibK(const char* cmd) {
     // active lens next delivers one — this handler runs on an HTTP or TCP
     // event and has no image in hand, and capturing a stale copy would grade
     // a pose the operator has already moved out of.
+    // One press arms EVERY open session, so a single board pose is banked by
+    // every lens that can see it. Each lens judges it separately when its own
+    // frame arrives — see IntrinsicsCalib::RequestCapture.
     if (!calib_.RequestCapture(&reason)) calib_.NoteMessage(reason);
     return true;
   }
   if (strncmp(cmd, "CALIB_K_UNDO", 12) == 0) {
-    calib_.UndoLast();
+    int ch = -1;
+    if (sscanf(cmd + 12, "%d", &ch) != 1) return true;
+    calib_.UndoLast(ch);
     return true;
   }
   if (strncmp(cmd, "CALIB_K_COMPUTE", 15) == 0) {
     // Seconds of blocking work on the scheduler thread, and that is the right
     // call: it is explicit, one-shot, and the alternative (a worker thread)
     // would need every calibration field locked for the rest of the app's life.
-    calib_.Compute();
+    int ch = -1;
+    if (sscanf(cmd + 15, "%d", &ch) != 1) {
+      calib_.NoteMessage("사용법: CALIB_K_COMPUTE <ch>");
+      return true;
+    }
+    calib_.Compute(ch);
     return true;
   }
   if (strncmp(cmd, "CALIB_K_CLEAR", 13) == 0) {
@@ -1586,6 +1954,77 @@ bool SampleComponent::HandleHomography(const char* cmd) {
     return true;
   }
 
+  // MARKER_HEIGHT <mm> — how far the robot's marker sits above the floor.
+  //
+  // SHARED, no <ch>: one robot carries one marker at one height. Four copies
+  // would be four things to keep equal, and the lens that disagreed would
+  // report the robot in a slightly different place than its neighbour — a
+  // discrepancy that looks like a calibration error rather than a typo.
+  //
+  // Applying is not saving, as everywhere else here. A mistyped height is then
+  // undone by a restart rather than by remembering what it used to be.
+  if (strncmp(cmd, "MARKER_HEIGHT", 13) == 0) {
+    double mm = -1.0;
+    if (sscanf(cmd + 13, "%lf", &mm) != 1) {
+      printf("[ArucoPosePNM] MARKER_HEIGHT: 사용법 MARKER_HEIGHT <mm>\n");
+      fflush(stdout);
+      return true;
+    }
+    const bool ok = homography_.SetMarkerHeightMm(mm);
+    printf("[ArucoPosePNM] MARKER_HEIGHT %.1f mm %s%s\n", mm, ok ? "적용" : "거부 — ",
+           ok ? "" : homography_.FailReason());
+    fflush(stdout);
+    return true;
+  }
+
+  // CAMERA_HEIGHT <ch> <mm> — the tape-measured height of THIS lens. 0 clears
+  // it and returns to the height the H decomposition implies.
+  //
+  // Per lens, unlike the marker height: the four sensors share a housing but
+  // not a tilt, so their effective heights above the floor differ.
+  //
+  // What this buys: the correction is governed by the ratio h/Cz, and the Cz
+  // that comes out of the decomposition carries whatever scale error residual
+  // distortion left in t. A measured Cz removes that term. What it must NOT do
+  // is move H_floor — see RefreshMarkerPlane(), which scales the marker height
+  // instead for exactly that reason.
+  if (strncmp(cmd, "CAMERA_HEIGHT", 13) == 0) {
+    int ch = -1;
+    double mm = -1.0;
+    if (sscanf(cmd + 13, "%d %lf", &ch, &mm) != 2) {
+      printf("[ArucoPosePNM] CAMERA_HEIGHT: 사용법 CAMERA_HEIGHT <ch> <mm>  (0 = 미측정)\n");
+      fflush(stdout);
+      return true;
+    }
+    const bool ok = homography_.SetCameraHeightMm(ch, mm);
+    printf("[ArucoPosePNM] CAMERA_HEIGHT ch%d %.1f mm %s%s\n", ch, mm,
+           ok ? "적용" : "거부 — ", ok ? "" : homography_.FailReason());
+    fflush(stdout);
+    return true;
+  }
+
+  // MARKER_PLANE_SAVE <ch> — persist the shared marker height and this lens's
+  // camera height. Two files; see HomographyMapper::SaveMarkerPlane().
+  if (strncmp(cmd, "MARKER_PLANE_SAVE", 17) == 0) {
+    int ch = -1;
+    if (sscanf(cmd + 17, "%d", &ch) != 1) return true;
+    const bool ok = homography_.SaveMarkerPlane(ch);
+    printf("[ArucoPosePNM] MARKER_PLANE_SAVE ch%d %s %s\n", ch, ok ? "성공" : "실패",
+           ok ? "" : homography_.FailReason());
+    fflush(stdout);
+    return true;
+  }
+
+  // MARKER_PLANE_QUERY <ch> — the derived plane and the camera pose it implies,
+  // on the pose link. /status carries the same thing; this exists because the
+  // RPi drives the vocabulary over TCP and has no /status to poll.
+  if (strncmp(cmd, "MARKER_PLANE_QUERY", 18) == 0) {
+    int ch = -1;
+    if (sscanf(cmd + 18, "%d", &ch) != 1) return true;
+    ReportMarkerPlane(ch);
+    return true;
+  }
+
   // HG_MAP <ch> <px> <py> — map one raw sensor pixel through this lens's
   // coordinate mode and H, and report the world millimetres.
   //
@@ -1668,20 +2107,20 @@ bool SampleComponent::HandleAnchors(const char* cmd) {
 
     const long ch = strtol(p, &end, 10);
     if (end == p) {
-      SetAnchorResult(-1, 0, false, "ANCHOR_SET_ALL: 채널 번호가 없습니다");
+      SetAnchorResult(-1, false, "ANCHOR_SET_ALL: 채널 번호가 없습니다");
       return true;
     }
     p = end;
     const long want = strtol(p, &end, 10);
     if (end == p) {
-      SetAnchorResult((int)ch, homography_.AnchorCount((int)ch), false,
+      SetAnchorResult((int)ch, false,
                       "ANCHOR_SET_ALL: 마커 개수가 없습니다 "
                       "(ANCHOR_SET_ALL <ch> <개수> <id> <wx> <wy> ...)");
       return true;
     }
     p = end;
     if (want < 0 || want > HomographyMapper::kMaxAnchors) {
-      SetAnchorResult((int)ch, homography_.AnchorCount((int)ch), false,
+      SetAnchorResult((int)ch, false,
                       "ANCHOR_SET_ALL: 마커 개수가 0..24 범위를 벗어났습니다");
       return true;
     }
@@ -1713,7 +2152,7 @@ bool SampleComponent::HandleAnchors(const char* cmd) {
                "ANCHOR_SET_ALL: %ld개를 받기로 했는데 %d개에서 끊겼습니다 "
                "— 명령줄이 잘렸을 수 있습니다",
                want, got);
-      SetAnchorResult((int)ch, homography_.AnchorCount((int)ch), false, why);
+      SetAnchorResult((int)ch, false, why);
       return true;
     }
     while (*p == ' ' || *p == '\t' || *p == '\r') ++p;
@@ -1725,12 +2164,12 @@ bool SampleComponent::HandleAnchors(const char* cmd) {
                "ANCHOR_SET_ALL: %ld개라고 했는데 뒤에 내용이 더 있습니다 "
                "— 개수와 목록이 어긋납니다",
                want);
-      SetAnchorResult((int)ch, homography_.AnchorCount((int)ch), false, why);
+      SetAnchorResult((int)ch, false, why);
       return true;
     }
 
     const bool ok = homography_.SetAnchors((int)ch, list, got);
-    SetAnchorResult((int)ch, ok ? got : homography_.AnchorCount((int)ch), ok,
+    SetAnchorResult((int)ch, ok,
                     ok ? "" : homography_.FailReason());
     if (ok) ReportAnchors((int)ch);
     return true;
@@ -1747,7 +2186,7 @@ bool SampleComponent::HandleAnchors(const char* cmd) {
     int ch = -1;
     if (sscanf(cmd + 11, "%d", &ch) != 1) return true;
     const bool ok = homography_.SaveAnchors(ch);
-    SetAnchorResult(ch, homography_.AnchorCount(ch), ok,
+    SetAnchorResult(ch, ok,
                     ok ? "" : homography_.FailReason());
     return true;
   }
@@ -1758,12 +2197,16 @@ bool SampleComponent::HandleAnchors(const char* cmd) {
 // Record an ANCHOR_* outcome for /status, and echo it to stdout. One place so
 // that no path can report to the log and forget the status object, which is the
 // only one an operator driving this by curl will ever see.
-void SampleComponent::SetAnchorResult(int ch, int n, bool ok, const char* reason) {
+void SampleComponent::SetAnchorResult(int ch, bool ok, const char* reason) {
   anchor_cmd_.ch = ch;
-  anchor_cmd_.n = n;
+  // Read here rather than passed in. Every call site was computing the same
+  // AnchorCount(ch), including one whose ternary existed only to restate it —
+  // and the struct's contract is "what this lens HAS now", which a caller
+  // passing the count it TRIED to set would silently break.
+  anchor_cmd_.n = homography_.AnchorCount(ch);
   anchor_cmd_.ok = ok;
   snprintf(anchor_cmd_.reason, sizeof(anchor_cmd_.reason), "%s", reason ? reason : "");
-  printf("[ArucoPosePNM] ANCHOR ch%d %s (%d개)%s%s\n", ch, ok ? "적용" : "거부", n,
+  printf("[ArucoPosePNM] ANCHOR ch%d %s (%d개)%s%s\n", ch, ok ? "적용" : "거부", anchor_cmd_.n,
          anchor_cmd_.reason[0] ? " — " : "", anchor_cmd_.reason);
   fflush(stdout);
 }
@@ -1778,7 +2221,7 @@ void SampleComponent::SetAnchorResult(int ch, int n, bool ok, const char* reason
  */
 void SampleComponent::ReportAnchors(int ch) const {
   if (ch < 0 || ch >= HomographyMapper::kChannels) return;
-  char json[1024];
+  char json[POSE_SENDER_MAX_LINE];
   int w = snprintf(json, sizeof(json),
                    "{\"type\":\"ANCHORS\",\"ch\":%d,\"n\":%d,\"markers\":[", ch,
                    homography_.AnchorCount(ch));
@@ -1792,6 +2235,40 @@ void SampleComponent::ReportAnchors(int ch) const {
     snprintf(json + w, sizeof(json) - w, "]}");
     pose_sender_send_control_line(json);
   }
+}
+
+void SampleComponent::ReportMarkerPlane(int ch) const {
+  if (ch < 0 || ch >= HomographyMapper::kChannels) return;
+  char json[768];
+  double hm[9];
+  double cz = 0.0, nx = 0.0, ny = 0.0;
+  const char* why = "";
+  const bool pose_ok = homography_.CameraPose(ch, &cz, &nx, &ny, &why);
+  const bool have = homography_.GetMarkerPlane(ch, hm);
+
+  if (!have) {
+    snprintf(json, sizeof(json),
+             "{\"type\":\"MARKER_PLANE\",\"ch\":%d,\"ready\":false,"
+             "\"height_mm\":%.1f,\"reason\":\"%s\"}",
+             ch, homography_.MarkerHeightMm(), homography_.MarkerPlaneReason(ch));
+  } else {
+    // camera_z_mm is what was TAPE-MEASURED (0 = nobody measured); derived_z_mm
+    // is what the matrix implies. Reporting both is the point — they should
+    // agree, and the size of the disagreement is the size of the scale error
+    // the measurement is there to remove.
+    snprintf(json, sizeof(json),
+             "{\"type\":\"MARKER_PLANE\",\"ch\":%d,\"ready\":true,"
+             "\"height_mm\":%.1f,\"camera_z_mm\":%.1f,"
+             "\"derived_z_mm\":%.1f,\"nadir_mm\":[%.1f,%.1f],\"pose_ok\":%s,"
+             "\"H_marker\":[%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e]}",
+             ch, homography_.MarkerHeightMm(), homography_.CameraHeightMm(ch),
+             pose_ok ? cz : -1.0, pose_ok ? nx : 0.0, pose_ok ? ny : 0.0,
+             pose_ok ? "true" : "false",
+             hm[0], hm[1], hm[2], hm[3], hm[4], hm[5], hm[6], hm[7], hm[8]);
+  }
+  printf("[ArucoPosePNM] %s\n", json);
+  fflush(stdout);
+  pose_sender_send_control_line(json);
 }
 
 /**
@@ -1826,11 +2303,10 @@ void SampleComponent::ReportHomography(int ch) const {
 }
 
 void SampleComponent::PollDashboardCommands() {
-  // 1024 to match POST /cmd and the control queue: ANCHOR_SET_ALL with 24
-  // markers is ~620 bytes and would not have fitted in the old 512. Lines that
-  // still do not fit are dropped with a message by pose_sender_poll_command()
-  // rather than trimmed — see there.
-  char cmd[1024];
+  // One budget for every transport — see POSE_SENDER_MAX_LINE. Lines that still
+  // do not fit are dropped with a message by pose_sender_poll_command() rather
+  // than trimmed; see there.
+  char cmd[POSE_SENDER_MAX_LINE];
   while (pose_sender_poll_command(cmd, sizeof(cmd))) {
     if (DispatchCommand(cmd)) continue;
     printf("[ArucoPosePNM] unknown command: %s\n", cmd);

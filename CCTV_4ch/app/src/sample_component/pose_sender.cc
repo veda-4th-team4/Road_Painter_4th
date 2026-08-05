@@ -25,13 +25,7 @@ static struct sockaddr_in g_addr;
 static bool        g_haveAddr = false;
 
 static const int kControlQueueSize = 32;
-// 1024, raised from 512 on 2026-08-05: an ANCHORS reply carrying a full list of
-// 24 markers is ~880 bytes. At 512 the guard in
-// pose_sender_send_control_line() would have DROPPED that reply rather than
-// corrupting it, which is the right failure but still leaves the RPi with no
-// answer to ANCHOR_QUERY on the only lens configurations worth querying.
-// Costs 16 KB of static queue.
-static const int kControlLineSize = 1024;
+static const int kControlLineSize = POSE_SENDER_MAX_LINE;
 static char g_controlQueue[kControlQueueSize][kControlLineSize];
 static int  g_controlHead = 0;
 static int  g_controlCount = 0;
@@ -222,6 +216,26 @@ int pose_sender_poll_command(char* out, int out_len)
 
     if (out == NULL || out_len <= 1)
         return 0;
+
+    // This function drives RECONNECTION, not just reading.
+    //
+    // try_connect() used to be reached only from send_line_now(), i.e. only
+    // while there was something to send. That was fine while the app sent a
+    // pose packet or a heartbeat every frame regardless. It stopped being fine
+    // when SendPosePackets() started returning early with the link down — with
+    // nothing being sent and the control queue empty, nothing would ever have
+    // called try_connect() again and the camera would have stayed offline until
+    // an operator typed a command.
+    //
+    // Here because this is the one transport entry point the frame loop calls
+    // unconditionally, every frame, whether or not anything is happening. The
+    // attempt is rate-limited inside try_connect(), so a dead server costs one
+    // socket() every POSE_RECONNECT_MS and nothing in between.
+    if (g_state == ST_DISCONNECTED)
+        try_connect();
+    if (g_state == ST_CONNECTING)
+        check_connecting();
+
     flush_control_queue();
     if (g_state != ST_CONNECTED) {
         rlen = 0; // stale bytes from a previous connection are meaningless
