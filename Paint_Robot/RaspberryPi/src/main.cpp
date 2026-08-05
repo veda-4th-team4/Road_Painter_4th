@@ -128,9 +128,17 @@ int main(int argc, char **argv) {
                has_pending_path = false;
                net_manager.ClearLatches(); // R-8: Clear any stale command latches from previous path
                std::string phase = net_manager.GetPathPhase();
-               std::cout << "[MAIN] Applying new PATH (phase=" << phase << ")" << std::endl;
+               std::cout << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2000ms for camera settling..." << std::endl;
                if (phase == "draw") {
                    imu_manager.ResetYaw(0.0f); // Reset IMU Yaw to 0 deg when entering draw phase from standstill
+               }
+
+               // Settling delay: Ensure robot is fully still for 2000ms (2s) before sending initial READY for op 0
+               auto start_wait = std::chrono::steady_clock::now();
+               while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - start_wait).count() < 2000) {
+                   robot_comm.SendSetSpeed(0, 0);
+                   std::this_thread::sleep_for(std::chrono::milliseconds(20));
                }
            }
        }
