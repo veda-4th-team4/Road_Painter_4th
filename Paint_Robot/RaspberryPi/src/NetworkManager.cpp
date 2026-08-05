@@ -22,11 +22,12 @@ NetworkManager::NetworkManager(const std::string& ip, uint16_t port)
       has_new_path(false),
       msg_seq(0),
       has_new_cmd(false),
-      align_angle_deg(0.0f),
       has_align_cmd(false),
-      go_signal_received(false),
-      drift_angle_deg(0.0f),
+      has_more_cmd(false),
+      go_op_index(0xFFFFFFFF),
+      has_go_signal(false),
       has_drift_cmd(false),
+      is_hold_active(false),
       current_path_phase("")
 {
     std::memset(&latest_pose, 0, sizeof(Pose_t));
