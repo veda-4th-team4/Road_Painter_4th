@@ -1,0 +1,52 @@
+{
+    "SkeletonPortNumber": "auto",
+    "ContainerName": "ArucoPosePNM",
+    "SchedulerNames": [
+        "EComponents::eScheduler1",
+        "SampleComponentScheduler"
+    ],
+    "RemoteContainerNames": [
+        {
+            "ContainerName": "System",
+            "Address": "localhost",
+            "PortNumber": 8587
+        }
+    ],
+    "RemoteComponentNames": [
+        {
+            "LocalComponentName": "Stub::Dispatcher::OpenAPI",
+            "ContainerName": "System",
+            "RemoteComponentName": "OpenAPIDispatcher"
+        },
+        {
+            "LocalComponentName": "2009004",
+            "ContainerName": "System",
+            "RemoteComponentName": "2009004"
+        },
+        {
+            "LocalComponentName": "OpenPlatform",
+            "ContainerName": "System",
+            "RemoteComponentName": "EComponents::eOpenPlatform"
+        },
+        {
+            "LocalComponentName": "SPMgrVideoRaw_0",
+            "ContainerName": "System",
+            "RemoteComponentName": "SPMgrVideoRaw_0"
+        },
+        {
+            "LocalComponentName": "SPMgrVideoRaw_1",
+            "ContainerName": "System",
+            "RemoteComponentName": "SPMgrVideoRaw_1"
+        },
+        {
+            "LocalComponentName": "SPMgrVideoRaw_2",
+            "ContainerName": "System",
+            "RemoteComponentName": "SPMgrVideoRaw_2"
+        },
+        {
+            "LocalComponentName": "SPMgrVideoRaw_3",
+            "ContainerName": "System",
+            "RemoteComponentName": "SPMgrVideoRaw_3"
+        }
+    ]
+}

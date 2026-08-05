@@ -1,0 +1,1857 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ArucoPosePNM — status</title>
+  <style>
+    :root {
+      --bg: #ffffff; --fg: #1a1a1a; --dim: #6b7280;
+      --line: #e5e7eb; --card: #f9fafb;
+      --ok: #15803d; --bad: #b91c1c; --warn: #a16207;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #16181c; --fg: #e6e6e6; --dim: #9aa0a6;
+        --line: #2c2f36; --card: #1d2025;
+        --ok: #4ade80; --bad: #f87171; --warn: #fbbf24;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 16px;
+      background: var(--bg); color: var(--fg);
+      font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    /* Pinned: this strip carries the two things you must be able to see at any
+       scroll position — that the app is alive, and that the pose link is up.
+       Scrolling down to the channel table to check a lens and losing sight of
+       a link that just dropped is exactly the failure this page exists to
+       catch. Opaque background, or the table scrolls through it. */
+    /* One pinned block: the header and the tab bar. Two separate sticky
+       elements both wanting top:0 would overlap. */
+    #top {
+      position: sticky; top: 0; z-index: 10;
+      background: var(--bg);
+    }
+    header {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      padding: 10px 0 10px;
+    }
+    /* Promoted from the Pose link table. Small, tabular, and always present so
+       its absence is never mistaken for "fine". */
+    .chip {
+      font-size: 12px; padding: 2px 9px; border-radius: 999px;
+      border: 1px solid var(--line); background: var(--card);
+      font-variant-numeric: tabular-nums; white-space: nowrap;
+    }
+    .chip b { font-weight: 600; }
+    .chip.up   { border-color: var(--ok); }
+    .chip.down { border-color: var(--bad); }
+    h1 { font-size: 17px; margin: 0; font-weight: 600; }
+    h2 { font-size: 13px; margin: 20px 0 8px; font-weight: 600;
+         text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+    .grow { flex: 1; }
+    button {
+      font: inherit; font-weight: 500; cursor: pointer;
+      padding: 6px 16px; border-radius: 6px;
+      border: 1px solid var(--line); background: var(--card); color: var(--fg);
+    }
+    button:hover { border-color: var(--dim); }
+    button:disabled { opacity: .5; cursor: default; }
+    .meta { color: var(--dim); font-size: 12px; }
+    label.auto { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+    select { font: inherit; font-size: 12px; padding: 4px 6px; border-radius: 6px;
+             border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+    select:disabled { opacity: .45; }
+    /* Wide content scrolls inside its own box; the page itself never does. */
+    .scroll { overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; min-width: 520px; }
+    th, td {
+      text-align: left; padding: 5px 10px 5px 0;
+      border-bottom: 1px solid var(--line); white-space: nowrap;
+    }
+    th { color: var(--dim); font-weight: 500; }
+    tbody th { width: 160px; }
+    .num { font-variant-numeric: tabular-nums; }
+    .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+    button.toggle {
+      padding: 2px 12px; font-size: 12px; font-weight: 600;
+      min-width: 54px; border-radius: 999px;
+    }
+    button.toggle.on  { color: var(--ok);  border-color: var(--ok); }
+    button.toggle.off { color: var(--dim); }
+    /* Widest label this button ever shows is SEARCH; pin the width to it so the
+       column does not jump every time a lens changes state. */
+    button.toggle.dyn { min-width: 84px; }
+    button.toggle.dyn.searching { color: var(--warn); border-color: var(--warn); }
+    .ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+           padding: 10px 12px; background: var(--card);
+           border: 1px solid var(--line); border-radius: 8px; }
+    .ctl label { display: inline-flex; align-items: center; gap: 5px; }
+    .ctl input[type=number] {
+      font: inherit; font-size: 12px; width: 72px; padding: 4px 6px;
+      border-radius: 6px; border: 1px solid var(--line);
+      background: var(--bg); color: var(--fg);
+    }
+    .ctl textarea {
+      font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line);
+      background: var(--bg); color: var(--fg); resize: vertical;
+    }
+    details.fold summary { cursor: pointer; }
+    .null { color: var(--dim); font-style: italic; }
+
+    /* Help lives behind a marker, not in a column. Written out in full it was
+       three lines of prose per row pushing the numbers off to the right — the
+       explanation is read once, the number is read every refresh. */
+    button.hint {
+      padding: 0; margin-left: 5px; width: 16px; height: 16px; line-height: 14px;
+      font-size: 11px; font-weight: 600; border-radius: 50%;
+      color: var(--dim); background: transparent; vertical-align: middle;
+    }
+    button.hint:hover, button.hint.open { color: var(--fg); border-color: var(--dim); }
+    /* Fixed, and parented to <body> rather than the cell: every table on this
+       page sits in an overflow-x:auto box, which clips absolutely positioned
+       children on BOTH axes — a popup anchored inside the row would be cut off
+       by its own scroll container. */
+    #pop {
+      position: fixed; z-index: 50; display: none;
+      max-width: min(360px, calc(100vw - 24px));
+      padding: 10px 12px; border-radius: 8px;
+      border: 1px solid var(--line); background: var(--card); color: var(--fg);
+      box-shadow: 0 6px 24px rgba(0,0,0,.28);
+      font-size: 12px; line-height: 1.5; white-space: normal;
+    }
+    #pop h4 { margin: 0 0 5px; font-size: 12px; font-weight: 600; }
+
+    /* Tabs sit just under the pinned header and pin with it — switching tabs
+       while scrolled down otherwise leaves you somewhere in the middle of the
+       other pane with no way back but scrolling. */
+    #tabs {
+      display: flex; gap: 6px;
+      border-bottom: 1px solid var(--line);
+      padding: 8px 0 0;
+    }
+    .tab {
+      padding: 6px 16px; border-radius: 8px 8px 0 0;
+      border: 1px solid transparent; background: transparent; color: var(--dim);
+    }
+    .tab:hover { color: var(--fg); }
+    .tab.active {
+      color: var(--fg); background: var(--card);
+      border-color: var(--line); border-bottom-color: var(--card);
+    }
+    section[hidden] { display: none; }
+
+    /* Calibration progress. The bar is the one thing an operator holding a
+       board across the room can read at a glance. */
+    #ckBar { height: 8px; border-radius: 999px; background: var(--line); margin-top: 6px; overflow: hidden; }
+    #ckBar > i { display: block; height: 100%; width: 0; background: var(--ok); transition: width .25s; }
+    #ckProg b { font-variant-numeric: tabular-nums; font-size: 16px; }
+    .ctl label input[type=number] { width: 88px; }
+    .ctl label { flex-direction: column; align-items: flex-start; gap: 2px; }
+    .ctl > label.meta > select { margin-top: 2px; }
+    button.go { border-color: var(--ok); color: var(--ok); }
+    button.danger { border-color: var(--bad); color: var(--bad); }
+    #err { color: var(--bad); margin: 12px 0; display: none; }
+    footer { margin-top: 28px; color: var(--dim); font-size: 12px;
+             border-top: 1px solid var(--line); padding-top: 12px; }
+    code { background: var(--card); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  </style>
+</head>
+
+<body>
+  <div id="top">
+  <header>
+    <h1>ArucoPosePNM</h1>
+    <span class="meta" id="hdr">not loaded</span>
+    <span class="chip" id="hlink" title="포즈 링크(TCP) 연결 상태">link —</span>
+    <span class="chip" id="hsent" title="지금 포즈 링크로 나가는 속도 (줄/초) · 버려진 비율">tx —</span>
+    <span class="chip" id="hcpu" title="직전 갱신 이후 이 앱이 쓴 CPU">cpu —</span>
+    <span class="grow"></span>
+    <span class="meta" id="stamp"></span>
+    <label class="meta auto"><input type="checkbox" id="auto"> 자동</label>
+    <select id="every" class="meta" disabled>
+      <option value="1000">1s</option>
+      <option value="2000" selected>2s</option>
+      <option value="5000">5s</option>
+    </select>
+    <button type="button" id="btn">Refresh</button>
+  </header>
+
+  <!-- Two tabs, not more. Everything in 운영 is the same job — watch it run and
+       adjust it — and the per-lens switches for that job live INSIDE the
+       Channels table (detect, SEARCH scale, dynROI). Splitting "검출" out would
+       put the number and the switch that changes it on different screens.
+       캘리브레이션 is genuinely a different mode: it takes over one lens, stops
+       that lens's pose output, and needs someone standing in front of it. -->
+  <nav id="tabs">
+    <button type="button" class="tab" data-tab="ops">운영</button>
+    <button type="button" class="tab" data-tab="calib">캘리브레이션</button>
+    <button type="button" class="tab" data-tab="hg">호모그래피</button>
+  </nav>
+  </div>
+
+  <div id="err" style="margin-top:14px"></div>
+  <p class="meta">마지막 명령: <code id="sent">—</code>
+    <span id="cmdhint"></span></p>
+
+  <section id="pane-ops">
+  <h2>Process</h2>
+  <div class="scroll"><table><tbody id="proc"></tbody></table></div>
+
+  <h2>Pose link</h2>
+  <div class="scroll"><table><tbody id="pose"></tbody></table></div>
+
+  <h2>dynROI <span class="meta" style="text-transform:none">— 전 렌즈 일괄 (개별 전환은 아래 표에서)</span></h2>
+  <div class="ctl">
+    <button type="button" id="dynon">전부 켜기</button>
+    <button type="button" id="dynoff">전부 끄기</button>
+    <label class="meta">margin <input type="number" id="margin" min="0" max="960" step="10" value="240"> px</label>
+    <label class="meta">max miss <input type="number" id="maxmiss" min="0" max="60" value="4"> frames</label>
+    <span class="meta" id="dynnote"></span>
+  </div>
+
+  <h2>채널 오버레이 <span class="meta" style="text-transform:none">— 좌표만, 실사진 없음</span></h2>
+  <div class="ctl">
+    <label class="meta"><input type="checkbox" id="ovOn" checked> 오버레이 표시</label>
+    <span class="meta" id="ovPick" style="display:flex;gap:10px;flex-wrap:wrap">
+      <label><input type="checkbox" class="ovch" value="0" checked> 1 <span class="meta">(ch0)</span></label>
+      <label><input type="checkbox" class="ovch" value="1"> 2 <span class="meta">(ch1)</span></label>
+      <label><input type="checkbox" class="ovch" value="2"> 3 <span class="meta">(ch2)</span></label>
+      <label><input type="checkbox" class="ovch" value="3"> 4 <span class="meta">(ch3)</span></label>
+    </span>
+    <button type="button" id="ovAll">전부</button>
+    <button type="button" id="ovNone">해제</button>
+    <label class="meta"><input type="checkbox" id="ovUndist"> 보정(undistort) 코너도 표시</label>
+    <span class="meta" id="ovKStatus">K 없음 — raw만 그림</span>
+  </div>
+  <details class="fold" style="margin:6px 0">
+    <summary class="meta">K/dist 붙여넣기 (표시 전용 — 카메라에 전송 안 됨)</summary>
+    <div class="ctl" style="margin-top:6px">
+      <textarea id="ovKText" rows="2" style="flex:1;min-width:280px;font:12px/1.4 monospace"
+        placeholder="K = [[fx,0,cx],[0,fy,cy],[0,0,1]]&#10;dist = [k1,k2,p1,p2,k3]"></textarea>
+      <button type="button" id="ovKLoad">적용</button>
+    </div>
+  </details>
+  <!-- One cell per selected lens. Filled by drawOverlay(); the grid reflows so
+       one lens gets the full width and four fall into 2x2. -->
+  <div id="ovGrid"></div>
+
+  <h2>Channels</h2>
+  <div class="scroll"><table id="chan"></table></div>
+
+  <!-- Pulled out of the table on purpose. Frame size and the detector tuning
+       are settings, not readings: they change only when someone changes them,
+       so they were two permanently-static columns pushing the live numbers off
+       the right edge. Same data, out of the way. -->
+  <details class="fold" style="margin-top:10px">
+    <summary class="meta">렌즈별 상세 — 프레임 크기 · 검출 파라미터 (거의 안 변하는 값)</summary>
+    <div class="scroll" style="margin-top:6px"><table id="chdetail"></table></div>
+  </details>
+
+  </section>
+
+  <section id="pane-calib">
+  <!-- Ported from the RPi dashboard's 캘리브레이션 tab (192.168.0.8:8082).
+       Same commands, same quality gates, same maths — now running entirely on
+       the camera, per lens. What was deliberately left behind: view-image
+       upload to the Pi, the LDC residual-distortion check, named K profiles,
+       and the two hardcoded focal presets. -->
+  <h2>카메라 캘리브레이션 (K/dist)
+    <span class="meta" style="text-transform:none">— 렌즈마다 따로, 카메라에서 직접 계산</span></h2>
+
+  <div class="ctl" style="align-items:flex-start;flex-direction:column;gap:8px">
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px;width:100%">
+      <label class="meta"><b>렌즈</b>
+        <select id="ckCh">
+          <option value="0">1 (ch0)</option><option value="1">2 (ch1)</option>
+          <option value="2">3 (ch2)</option><option value="3">4 (ch3)</option>
+        </select></label>
+      <span class="meta" id="ckWho"></span>
+      <span class="grow"></span>
+      <span class="meta" id="ckPersist"></span>
+    </div>
+    <div id="ckProg" style="width:100%">
+      <div style="display:flex;justify-content:space-between;align-items:baseline">
+        <b id="ckCount">0 / 20</b>
+        <span class="meta" id="ckState">세션을 시작하면 진행 상황이 표시됩니다</span>
+      </div>
+      <div id="ckBar"><i></i></div>
+    </div>
+    <div class="meta" id="ckReason"></div>
+    <div class="meta" id="ckFiles"></div>
+  </div>
+
+  <details class="fold" id="ckTip" style="margin:8px 0">
+    <summary class="meta"><b>보드를 손에 들고 기울여서 — 상하·좌우 30~45°</b></summary>
+    <div class="meta" style="padding:8px 2px 0">
+      책상에 평평히 놓고 밀거나 돌리기만 하면 몇 장을 찍든 정보가 늘지 않아 세션 전체가
+      무효가 됩니다. 품질 게이트는 위치·거리만 보고 <b>각도는 검사하지 않으므로</b> 이 실수를
+      걸러주지 못합니다. 프레임 <b>네 귀퉁이</b>로 밀어 일부가 잘린 뷰, 화면의 <b>30~50%</b>를
+      채우는 가까운 뷰도 꼭 섞으세요.
+    </div>
+  </details>
+
+  <details class="fold" id="ckFoldBoard" style="margin:8px 0">
+    <summary class="meta">ChArUco 보드 규격 <span id="ckBoardBrief"></span></summary>
+    <div class="ctl" style="margin-top:6px;flex-direction:column;align-items:stretch;gap:8px">
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+        <label class="meta">프리셋
+          <select id="ckPreset">
+            <option value="">— 직접 입력 —</option>
+            <option value="a2">A2 7×5 (square 70 / marker 50) DICT_4X4_50</option>
+            <option value="a4">A4 5×7 (square 40 / marker 30) DICT_4X4_50</option>
+          </select></label>
+        <span class="meta">고른 뒤 <b>보드 설정 적용</b>을 눌러야 반영됩니다. K/dist는 보드
+          절대크기와 무관(스케일 불변)하므로 mm는 명목값입니다.</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px">
+        <label class="meta">체스 칸 가로<input type="number" id="ckSx" min="3" value="7"></label>
+        <label class="meta">체스 칸 세로<input type="number" id="ckSy" min="3" value="5"></label>
+        <label class="meta">한 칸 크기 (mm)<input type="number" id="ckSquare" min="1" step="0.1" value="70"></label>
+        <label class="meta">ArUco 검은 크기 (mm)<input type="number" id="ckMarker" min="1" step="0.1" value="50"></label>
+        <label class="meta">바깥 좌우 여백 (mm)<input type="number" id="ckMx" min="0" step="0.1" value="52"></label>
+        <label class="meta">바깥 상하 여백 (mm)<input type="number" id="ckMy" min="0" step="0.1" value="35"></label>
+        <label class="meta">Dictionary<select id="ckDict"></select></label>
+      </div>
+      <div class="meta" id="ckBoardSummary"></div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+        <button type="button" id="ckBoardApply">보드 설정 적용</button>
+        <button type="button" id="ckBoardSave">/mnt에 저장</button>
+        <span class="meta">적용은 RAM에만, 저장해야 재부팅 후에도 남습니다. 4개 렌즈가
+          <b>같은 설정을 공유</b>합니다 — 인쇄물이 한 장이기 때문입니다.</span>
+      </div>
+    </div>
+  </details>
+
+  <div class="ctl" style="margin:8px 0">
+    <label class="meta">목표 뷰 <input type="number" id="ckTarget" min="1" max="200" value="20"></label>
+    <label class="meta">RMS 한계(px) <input type="number" id="ckRms" min="0.1" step="0.1" value="0.8"></label>
+    <button type="button" id="ckSetParams">세션 조건 적용</button>
+    <label class="meta"><input type="checkbox" id="ckGate" checked> 품질 게이트</label>
+    <span class="meta">끄면 품질검사·분산·RMS 통과조건 없이 캡처·계산합니다.</span>
+  </div>
+
+  <div class="ctl" style="margin:8px 0">
+    <button type="button" id="ckStart">세션 시작</button>
+    <button type="button" id="ckCapture">이 자세 캡처</button>
+    <button type="button" id="ckUndo">마지막 뷰 취소</button>
+    <button type="button" id="ckCompute">계산하기</button>
+    <button type="button" id="ckStop">세션 취소</button>
+    <span class="meta" id="ckFlowHint"></span>
+  </div>
+
+  <canvas id="ckCanvas" style="width:100%;height:auto;max-width:800px;border:1px solid var(--line);border-radius:8px;background:var(--card)"></canvas>
+  <p class="meta" id="ckProbeNote"></p>
+
+  <h2>렌즈별 K / dist</h2>
+  <div class="scroll"><table id="ckLenses"></table></div>
+
+  <details class="fold" style="margin:8px 0">
+    <summary class="meta">K/dist 직접 입력 — 외부에서 구한 값 붙여넣기</summary>
+    <div class="ctl" style="margin-top:6px;flex-direction:column;align-items:stretch;gap:8px">
+      <p class="meta" style="margin:0">카메라 밖에서 계산한 값을 그대로 붙여넣고 위에서 고른
+        렌즈에 즉시 적용합니다. 촬영·계산 세션이 필요 없습니다. 적용은 RAM에만 반영되므로
+        <b>아래 표의 저장 버튼</b>을 눌러야 재부팅 후에도 남습니다.</p>
+      <textarea id="ckLoadText" rows="3" style="font:12px/1.4 monospace"
+        placeholder="K = [[1214.26, 0.00, 936.37], [0.00, 1205.86, 528.23], [0.00, 0.00, 1.00]]&#10;dist = [-0.285046, 0.185986, 0.003419, -0.005462, -0.127106]"></textarea>
+      <div><button type="button" id="ckLoadApply">선택한 렌즈에 적용</button></div>
+    </div>
+  </details>
+
+  </section>
+
+  <section id="pane-hg">
+  <!-- 픽셀 -> 월드(mm) 호모그래피. K/dist 탭과 나란히 있지만 별개의 캘리브레이션이다:
+       저쪽은 렌즈의 성질(왜곡)을, 이쪽은 렌즈와 바닥의 관계를 잰다. K 없이도 raw
+       좌표로 H를 구할 수는 있으나 그러면 시차 보정이 거부되므로, 순서는 K 먼저다. -->
+  <h2>호모그래피 (픽셀 → 월드 mm)
+    <span class="meta" style="text-transform:none">— 렌즈마다 따로. 바닥에 붙인 마커로 계산</span></h2>
+
+  <div class="ctl" style="align-items:flex-start;flex-direction:column;gap:8px">
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px;width:100%">
+      <label class="meta"><b>렌즈</b>
+        <select id="hgCh">
+          <option value="0">1 (ch0)</option><option value="1">2 (ch1)</option>
+          <option value="2">3 (ch2)</option><option value="3">4 (ch3)</option>
+        </select></label>
+      <span class="meta" id="hgWho"></span>
+      <span class="grow"></span>
+      <span class="meta" id="hgSpace"></span>
+    </div>
+    <div id="hgProg" style="width:100%">
+      <div style="display:flex;justify-content:space-between;align-items:baseline">
+        <b id="hgCount">0 / 20</b>
+        <span class="meta" id="hgFrames"></span>
+      </div>
+      <div id="hgBar"><i></i></div>
+    </div>
+    <div class="meta" id="hgResult"></div>
+    <!-- 진행률 막대만으로는 부족하다: 가장 흔한 실패가 "마커 하나가 가려져 프레임이
+         전부 버려지는 중"이고, 그때 막대는 0%에서 멈춘 채 이유를 말하지 않는다. -->
+    <div class="meta" id="hgVis"></div>
+  </div>
+
+  <div class="ctl" style="margin:8px 0">
+    <button type="button" id="hgStart">수집 시작 (CALIB_START)</button>
+    <span class="meta" id="hgFlowHint"></span>
+  </div>
+
+  <h2>LOO 잔차 <span class="meta" style="text-transform:none">— 이 H가 실제로 맞는지</span></h2>
+  <div class="meta" id="hgFitSummary"></div>
+  <div class="scroll"><table id="hgFit"></table></div>
+  <details class="fold" style="margin:8px 0">
+    <summary class="meta">두 숫자를 어떻게 읽는가</summary>
+    <div class="meta" style="padding:8px 2px 0">
+      <b>인샘플</b>은 그 점을 포함해 만든 H로 그 점을 재본 값이라, 자기가 공부한 문제로
+      시험을 보는 셈입니다. 잘못 잰 점 하나는 H를 자기 쪽으로 끌어당겨 <b>자기 잔차를 줄이고
+      남의 잔차를 키우므로</b>, 범인이 가장 멀쩡해 보이게 됩니다.<br><br>
+      <b>LOO</b>는 그 점을 <b>빼고</b> 나머지로 만든 H로 그 점을 맞혀본 값입니다. 그래서 둘을
+      같이 봐야 합니다:
+      <table style="margin-top:8px">
+        <tr><th>인샘플</th><th>LOO</th><th>해석</th></tr>
+        <tr><td>큼</td><td>큼</td><td><b class="bad">잘못 실측한 점</b> — 줄자를 다시 대세요</td></tr>
+        <tr><td>작음</td><td>큼</td><td><b class="warn">외곽/고레버리지 점</b> — 빼면 나머지가 그 자리를 못 감싸 외삽이 됩니다. 정상입니다</td></tr>
+        <tr><td>작음</td><td>작음</td><td><b class="ok">좋음</b></td></tr>
+        <tr><td>큼</td><td>작음</td><td>거의 안 나옵니다. 나오면 id 중복이나 좌표 뒤바뀜을 의심하세요</td></tr>
+      </table>
+      <br>점은 <b>자동으로 버리지 않습니다</b> — 지목만 하고 치우는 건 사람이 합니다.
+      조용히 버리면 잘못 잰 줄자가 영원히 잘못 잰 채로 남습니다.
+    </div>
+  </details>
+
+  <h2>등록된 마커</h2>
+  <div class="meta" id="hgAnchorMsg"></div>
+  <div class="scroll"><table id="hgAnchors"></table></div>
+  <details class="fold" id="hgFoldAnchors" style="margin:8px 0">
+    <summary class="meta">마커 등록 / 수정 <span id="hgAnchorBrief"></span></summary>
+    <div class="ctl" style="margin-top:6px;flex-direction:column;align-items:stretch;gap:8px">
+      <p class="meta" style="margin:0">한 줄에 <code>id  wx  wy</code>. 월드 좌표는 <b>mm</b>이고
+        4채널이 <b>같은 좌표계</b>를 가리켜야 합니다. 최대 24개. 이 상자의 내용이 그 렌즈의
+        목록 <b>전체</b>가 됩니다 — 한 줄만 고치더라도 전부 다시 보냅니다.</p>
+      <p class="meta" style="margin:0">앵커와 검증 마커를 나누지 않습니다. 최종 H는 <b>모든 점</b>으로
+        만들고, 정직한 예측오차는 위의 LOO가 냅니다.</p>
+
+      <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end">
+        <label class="meta">배치 프리셋
+          <select id="hgPreset">
+            <option value="">— 직접 입력 —</option>
+            <option value="1x1">폼보드 1장 (900×600) — 앵커 4</option>
+            <option value="2x2">폼보드 2×2 (1800×1200) — 앵커 16</option>
+          </select></label>
+        <!-- 보드를 렌즈마다 옮겨 놓을 때 필요하다. 프리셋 좌표는 보드 좌하단이 원점인데,
+             4채널이 같은 좌표계를 가리키려면 옮긴 만큼을 좌표에 더해야 한다. 안 그러면
+             두 렌즈가 같은 (500,300) 을 바닥의 다른 자리로 보고한다. -->
+        <label class="meta">원점 오프셋 X (mm)<input type="number" id="hgOffX" step="1" value="0"></label>
+        <label class="meta">원점 오프셋 Y (mm)<input type="number" id="hgOffY" step="1" value="0"></label>
+        <button type="button" id="hgPresetApply">표에 채우기</button>
+      </div>
+      <p class="meta" style="margin:0">파이 8083 관리콘솔의 <code>HG_PRESETS</code> 와 <b>같은 값</b>입니다.
+        마커 중심이 판 모서리에서 60 mm 안쪽인 이유: 마커를 모서리에 맞춰 붙이는데 호모그래피가
+        쓰는 기준은 <b>검정 사각형 중심</b>이라 흰 테두리 포함 120 mm의 절반만큼 들어옵니다.
+        id는 위치가 정합니다 — <code>id = 행 × 전체열수 + 열</code>, <b>행 0 = 아래, 열 0 = 왼쪽</b>.
+        축은 <code>x_right_y_up</code>, 원점은 폼보드 좌하단입니다.</p>
+      <p class="meta" style="margin:0"><b>표를 채우기만 합니다 — 카메라로는 아무것도 안 보냅니다.</b>
+        눈으로 확인한 뒤 아래 <b>적용</b>을 눌러야 반영됩니다. 잘못된 배치가 자동으로 들어가면
+        다음 수집이 조용히 엉뚱한 좌표로 피팅합니다.</p>
+      <textarea id="hgAnchorText" rows="8" style="font:12px/1.4 monospace"
+        placeholder="10   0.0     0.0&#10;11  1200.0    0.0&#10;12     0.0  900.0&#10;13  1200.0  900.0&#10;14   600.0  450.0"></textarea>
+      <div class="meta" id="hgAnchorPreview"></div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+        <button type="button" id="hgAnchorApply">이 렌즈에 적용</button>
+        <button type="button" id="hgAnchorLoad">현재 목록 불러오기</button>
+        <button type="button" id="hgAnchorSave">/mnt에 저장</button>
+        <span class="meta">적용은 RAM에만, 저장해야 재부팅 후에도 남습니다.</span>
+      </div>
+    </div>
+  </details>
+
+  <h2>H 행렬</h2>
+  <div class="scroll"><table id="hgMatrix"></table></div>
+  <div class="ctl" style="margin:8px 0">
+    <button type="button" id="hgSave">/mnt에 저장</button>
+    <button type="button" id="hgClear" class="danger">이 렌즈의 H 지우기</button>
+    <span class="meta">지워도 <b>마커 목록은 남습니다</b> — 줄자로 잰 입력이지 H의 산물이 아닙니다.</span>
+  </div>
+
+  <h2>렌즈 간 FOV 겹침</h2>
+  <p class="meta" id="hgOverlap"></p>
+  <p class="meta">폼보드에 마커 하나 붙여서 들고 걸어다니면, 두 렌즈에 동시에 잡히는 구간이
+    여기 뜹니다. 카메라 쪽 추가 코드 없이 <b>이 페이지가 검출 id를 비교</b>해 계산합니다.</p>
+
+  </section>
+
+  <footer>
+    갱신 1회가 앱에 지우는 부담은 <b>실측 약 21ms</b>(2026-08-04, 30회 평균) — 스레드 기준
+    1초 간격이면 ~2%, 2초면 ~1%, 5초면 ~0.4%입니다. 이 중 상태를 만드는 비용은 1ms 미만이고
+    나머지는 SDK 의 요청 배관(인증·직렬화·이벤트 전달) 몫이라 줄일 여지가 없습니다.<br>
+    응답이 늦게 오는 것과는 별개입니다 — 그건 요청이 검출 뒤에서 순서를 기다리는 시간이지
+    카메라가 그만큼 일한 게 아닙니다.<br>
+    자동 갱신은 <b>다른 탭으로 가면 멈추고</b>, 요청이 실패하면 스스로 꺼집니다.<br>
+    이 페이지의 모든 조작은 <b>명령 한 줄</b>로 나가고, 그 명령어는 파이 서버가 포즈
+    링크로 보내는 것과 <b>완전히 동일합니다</b>. 위에 "마지막 명령"으로 찍히는 문자열을
+    그대로 파이에서 보내도 같은 동작을 합니다:<br>
+    <code>curl -X POST --data-binary "DETECT 0 1" http://&lt;파이&gt;:8082/cmd</code><br>
+    현재 명령: <code>DETECT &lt;ch&gt; &lt;0|1&gt;</code> · <code>SCALE &lt;ch&gt; &lt;1-8&gt;</code> ·
+    <code>DYNROI_CH &lt;ch&gt; &lt;0|1&gt; [margin] [maxMiss]</code> ·
+    <code>DYNROI &lt;0|1&gt; [margin] [maxMiss]</code>(전 렌즈) · <code>DYNROI_IDS [id ...]</code><br>
+    <b>실효 fps</b> 는 갱신 사이의 검출 프레임 증가분입니다 — 카메라가 주는 5fps 가 아니라
+    그 렌즈가 실제로 본 횟수라, 예산에 걸려 버려진 만큼 낮게 나옵니다.<br>
+    <b>검출/제공</b> 은 <b>최근 100프레임</b> 기준입니다(5fps 면 약 20초). 켠 뒤 전체 누적이
+    아니라 방금 구간이라, 설정을 바꾸면 바로 따라옵니다 — 누적값은 아래 "렌즈별 상세"에
+    있습니다.<br>
+    <b>대기</b> 는 촬영(<code>pts</code>)부터 검출 시작까지 프레임이 큐에서 기다린 시간입니다.
+    CAM_POSE 의 <code>proc</code> 에는 이 시간이 안 들어가 있어서, 이 값이 크면
+    <b>서버가 보는 좌표는 그만큼 과거의 것</b>입니다. 이제 패킷에도
+    <code>t_capture</code> · <code>queue_ms</code> 로 함께 나갑니다.<br>
+    셸이 필요하면 DebugHelper 의 SSH(포트 55022)를 쓰세요. 앱별 CPU/메모리 총량은
+    카메라 설정의 <code>Open platform &gt; Health</code> 에서도 볼 수 있습니다.
+  </footer>
+
+  <script>
+    // Where /status lives.
+    //
+    // The SDK template hardcoded `pathname.split('/')[5]` as the app id, which
+    // only holds if the page sits at exactly that depth — on this camera it
+    // does not, and the fetch went to /opensdk/undefined/status. Rather than
+    // swap in another magic index, derive candidates and keep the first that
+    // answers: the registered URI is "/status", but the prefix the dispatcher
+    // mounts it under is not documented anywhere we control.
+    //
+    // Probed once on the first refresh, then remembered — later refreshes are
+    // a single request.
+    const origin = window.location.origin;
+    const seg = window.location.pathname.split('/').filter(s => s.length);
+
+    const candidates = (() => {
+      const out = [];
+      const push = (u) => { if (u && out.indexOf(u) < 0) out.push(u); };
+
+      // 1. The SDK template's rule, and the correct one on this camera: the
+      //    page is served at /home/setup/opensdk/html/<app_id>/index.html, so
+      //    the 5th path segment is the app id and the API lives at
+      //    /opensdk/<app_id>/. Verified 2026-08-04 — /opensdk/ArucoPosePNM/status
+      //    answers, while every other prefix below returns 404.
+      const legacy = window.location.pathname.split('/')[5];
+      if (legacy) push(`${origin}/opensdk/${legacy}`);
+
+      // 2. The segment right after "opensdk", whatever depth it sits at. Wrong
+      //    on this camera (it picks "html"), kept only as a fallback in case a
+      //    firmware update changes the layout.
+      const i = seg.indexOf('opensdk');
+      if (i >= 0 && seg[i + 1]) push(`${origin}/opensdk/${seg[i + 1]}`);
+
+      // 2. The directory this page is served from (works if the API is mounted
+      //    alongside the static files).
+      push(origin + window.location.pathname.replace(/\/[^/]*$/, ''));
+
+      // 3. Every ancestor directory, longest first — covers a prefix that
+      //    contains neither "opensdk" nor the page's own folder.
+      for (let n = seg.length - 1; n >= 1; --n) push(`${origin}/${seg.slice(0, n).join('/')}`);
+
+      return out;
+    })();
+
+    let base_uri = null;  // set to the candidate that answered
+
+    const $ = (id) => document.getElementById(id);
+
+    // --- tabs --------------------------------------------------------------
+    // The tab lives in the URL hash so a reload keeps it. Calibration is worked
+    // through over many refreshes, and landing back on 운영 every time would
+    // mean re-selecting the lens and re-opening the board fold on each one.
+    // The hash never reaches the camera — it is not part of an HTTP request —
+    // so this costs nothing on that side.
+    //
+    // Each tab also carries its own refresh interval. The calibration board
+    // probe re-runs about once a second, so anything slower than that shows a
+    // stale viewfinder to someone physically moving a board; the 운영 view has
+    // nothing that changes faster than the camera's 5 fps.
+    const TABS = {
+      ops:   { pane: 'pane-ops',   every: 2000 },
+      calib: { pane: 'pane-calib', every: 1000 },
+      // 1 s because a collection session is the thing worth watching here, and
+      // it advances at roughly 0.5 fps — anything slower and the missing-marker
+      // list is stale exactly while someone is walking over to uncover it.
+      hg:    { pane: 'pane-hg',    every: 1000 },
+    };
+    let tab = 'ops';
+
+    function showTab(name, push) {
+      if (!TABS[name]) name = 'ops';
+      tab = name;
+      for (const t in TABS) $(TABS[t].pane).hidden = (t !== name);
+      document.querySelectorAll('#tabs .tab').forEach(
+        b => b.classList.toggle('active', b.dataset.tab === name));
+      if (push && location.hash !== '#' + name) location.hash = name;
+      // The select shows THIS tab's interval. Each tab remembers its own, and
+      // changing the select rewrites the one for the tab you are on — so the
+      // 1 s the board probe wants does not follow you back to 운영, and a
+      // deliberate 5 s on 운영 is not silently overridden by opening 캘리브레이션.
+      $('every').value = String(TABS[name].every);
+      // Repaint the pane that just became visible: a canvas is not drawn while
+      // its pane is hidden, so switching to it would otherwise show whatever
+      // was on it when it was last visible.
+      if (lastStatus) { renderCalib(lastStatus); renderHg(lastStatus); drawOverlay(); }
+    }
+
+    $('tabs').addEventListener('click', (ev) => {
+      const b = ev.target.closest('button.tab');
+      if (b) showTab(b.dataset.tab, true);
+    });
+    window.addEventListener('hashchange', () => showTab(location.hash.slice(1), false));
+    const esc = (s) => String(s).replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+    const nul = '<span class="null">—</span>';
+
+    // What each Process / Pose link row MEANS — "RSS 41 MB" is only useful
+    // next to "늘기만 하면 누수", and a number nobody can interpret is a number
+    // nobody acts on. Kept here rather than in the render call because it is
+    // static text: render() runs every two seconds under auto-refresh, and
+    // rebuilding these strings each time would be pure waste. A value that
+    // depends on the reading is a function of the status object instead.
+    const HELP = {
+      rss: ['메모리 (현재)',
+        '지금 이 앱이 실제로 점유한 물리 메모리(RSS)입니다. 켠 직후 자리를 잡고 나면 <b>거의 평평해야</b> 정상이고, 갱신할 때마다 꾸준히 올라가기만 하면 누수를 의심할 자리입니다. 렌즈를 켜고 끄면 검출 버퍼만큼 오르내리는 건 정상입니다.'],
+      peak: ['메모리 (최고점)',
+        '켜진 이후 <b>한 번이라도</b> 도달한 최댓값이라 절대 내려가지 않습니다. 현재값과 크게 벌어져 있으면 과거 어느 시점에 크게 썼다는 뜻이고, 카메라가 앱에 허용한 메모리 한도를 얼마나 스쳤는지 보는 값입니다.'],
+      cores: (d) => ['CPU 코어', d.proc.cores > 1
+        ? `이 카메라는 코어가 <b>${d.proc.cores}개</b>라 아래 CPU% 가 100을 넘을 수 있습니다 (100% = 코어 하나를 꽉 씀). 다만 이 앱은 스케줄러 스레드 <b>하나</b>에서 4채널을 모두 처리하므로, 실제로 100을 넘는 일은 거의 없습니다.`
+        : '<b>1코어</b>입니다. 스레드를 늘려도 총 처리량은 그대로고, 아래 CPU% 는 100 이 상한입니다.'],
+      cpu_s: ['CPU 누적',
+        '앱이 켜진 뒤 <b>합계로</b> 쓴 CPU 시간입니다. 절대량이라 "지금" 상태는 말해주지 않습니다 — 실제로 봐야 할 건 아래 "직전 갱신 이후" 쪽입니다.'],
+      cpu_pct: ['CPU (직전 갱신 이후)',
+        '이 페이지를 <b>직전에 갱신한 시점부터 지금까지</b>의 평균 점유율입니다. 켜진 뒤 전체 평균이 아니라 방금 구간이라 설정을 바꾸면 바로 반영됩니다.<br><br>실측 기준: 4렌즈 + dynROI 켬 = 약 48%, dynROI 끔 = 약 73%, 전부 끄면 1% 입니다.'],
+      duty: ['검출 예산',
+        '켜진 렌즈들이 <b>나눠 쓰는</b> CPU 상한입니다. 한 렌즈가 자기 몫을 넘기면 다음 프레임을 그냥 버리고, 그렇게 남긴 여유로 이 페이지와 파이 서버 통신이 항상 응답합니다.<br><br>이게 없던 시절엔 검출이 스레드를 다 잡아먹어서 페이지가 아예 안 떴습니다(502). 렌즈별로 얼마나 버리는지는 아래 Channels 표의 <b>검출/제공</b> 칸에서 봅니다.'],
+      video: ['영상 입력',
+        '앱이 붙어 있는 raw 영상 그룹과, 카메라가 이 경로로 실제로 주는 프레임 수입니다.<br><br><b>렌즈당 5fps 는 카메라 쪽 상한</b>이라 검출을 아무리 빠르게 만들어도 그 이상은 안 올라갑니다. 해상도를 낮춰도, 프로파일을 바꿔도 안 바뀐다는 걸 실측으로 확인했습니다 (<code>docs/RAW_VIDEO_LIMITS.md</code>).<br><br>그룹 이름이 여기 찍히는 이유: 그룹을 잘못 지정하면 에러 없이 조용히 프레임이 0이 됩니다. 그때 유일한 단서입니다.'],
+      netchg: ['네트워크 설정 변경',
+        '카메라의 네트워크 설정이 마지막으로 바뀐 시각입니다. 포즈 링크가 갑자기 끊겼을 때 <b>여기 시각이 그 직전이면</b> 원인은 앱이 아니라 카메라 설정 쪽입니다.'],
+      psent: ['보낸 줄 (누적)',
+        '앱이 켜진 뒤 포즈 링크로 나간 줄의 <b>총합</b>입니다. 절대량이라 지금 흐르고 있는지는 말해주지 않습니다 — 그건 헤더의 <code>tx n/s</code> 가 보여줍니다.<br><br>마커가 잡히면 <b>마커 한 개당 한 줄</b>, 하나도 못 잡으면 "카메라는 살아 있고 마커만 놓쳤다"는 하트비트 한 줄이 나갑니다.'],
+      pserver: ['서버',
+        '좌표를 보내는 대상입니다. 앱에 컴파일된 값이라 바꾸려면 <code>app_config.h</code> 를 고쳐 다시 설치해야 합니다.'],
+      pdrop: ['버린 줄',
+        '보낼 자리가 없어 버린 좌표 줄입니다. 링크가 끊겨 있는 동안 쌓이는 건 정상이고, <b>연결된 상태에서 계속 늘어나면</b> 서버가 받는 속도를 못 따라오고 있다는 뜻입니다.'],
+      pqueue: ['명령 큐',
+        '파이 서버가 보낸 명령 중 아직 처리 안 된 줄 수입니다. 정상이면 0 이고, 계속 쌓이면 검출이 스레드를 붙잡고 있어 명령이 뒤에서 기다리는 상태입니다.'],
+    };
+
+    // [label, value] or [label, value, helpKey].
+    const rows = (el, pairs) => {
+      el.innerHTML = pairs
+        .map(([k, v, h]) => `<tr><th>${esc(k)}` +
+          (h ? ` <button type="button" class="hint" data-h="${h}" aria-label="${esc(k)} 설명">?</button>` : '') +
+          `</th><td class="num">${v}</td></tr>`)
+        .join('');
+    };
+
+    // One popup element for the whole page, anchored on demand. Rebuilt tables
+    // replace the marker buttons on every refresh, so nothing that must survive
+    // a render can live inside a row — the popup keeps its own position and the
+    // delegated handler below finds whichever button exists now.
+    const pop = document.createElement('div');
+    pop.id = 'pop';
+    document.body.appendChild(pop);
+    let popKey = null;
+
+    const closePop = () => {
+      pop.style.display = 'none';
+      popKey = null;
+      document.querySelectorAll('button.hint.open').forEach(b => b.classList.remove('open'));
+    };
+
+    function openPop(btn) {
+      const key = btn.dataset.h;
+      if (popKey === key) { closePop(); return; }   // same marker toggles it shut
+      closePop();
+      let entry = HELP[key];
+      // The reading-dependent ones have nothing to say before the first load.
+      if (typeof entry === 'function') entry = lastStatus ? entry(lastStatus) : null;
+      if (!entry) return;
+      pop.innerHTML = `<h4>${esc(entry[0])}</h4>${entry[1]}`;
+      pop.style.display = 'block';
+
+      // Clamp into the viewport: these markers sit at the left edge of a table
+      // that may itself be scrolled, and near the bottom of the page there is
+      // no room below.
+      const r = btn.getBoundingClientRect();
+      const w = pop.offsetWidth, h = pop.offsetHeight;
+      let x = r.left, y = r.bottom + 6;
+      if (x + w > window.innerWidth - 8) x = window.innerWidth - w - 8;
+      if (y + h > window.innerHeight - 8) y = Math.max(8, r.top - h - 6);
+      pop.style.left = Math.max(8, x) + 'px';
+      pop.style.top = y + 'px';
+      btn.classList.add('open');
+      popKey = key;
+    }
+
+    document.addEventListener('click', (ev) => {
+      const b = ev.target.closest('button.hint');
+      if (b) { ev.stopPropagation(); openPop(b); return; }
+      if (!ev.target.closest('#pop')) closePop();
+    });
+    document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') closePop(); });
+    // Anchored by coordinates, so it has to follow the page or be dismissed.
+    window.addEventListener('scroll', closePop, true);
+    window.addEventListener('resize', closePop);
+
+    const dur = (s) => {
+      if (s < 0) return nul;
+      const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600);
+      const m = Math.floor(s % 3600 / 60), ss = Math.floor(s % 60);
+      return d ? `${d}d ${h}h ${m}m` : h ? `${h}h ${m}m ${ss}s` : m ? `${m}m ${ss}s` : `${ss}s`;
+    };
+
+    const mb = (kb) => kb ? `${(kb / 1024).toFixed(1)} MB <span class="meta">(${kb.toLocaleString()} kB)</span>` : nul;
+
+    // An empty rect means "whole frame" to the detector, so say that rather
+    // than printing 0x0 and making it look broken.
+    const rect = (r) => (!r || !r.w || !r.h) ? '<span class="meta">full frame</span>'
+      : `${r.w}×${r.h} <span class="meta">@ ${r.x},${r.y}</span>`;
+
+    // Per-lens frame counts from the previous render, so the effective rate can
+    // be a rate rather than an average since boot.
+    const prev = {};
+    // Same idea for the pose link: what the header shows is a RATE, taken from
+    // the change since the last refresh.
+    let prevPose = null;
+
+    function render(d) {
+      const now = Date.now();
+      $('hdr').innerHTML =
+        `v${esc(d.app.version)} · built ${esc(d.app.built)} · up ${dur(d.app.uptime_s)}`;
+
+      // Every lens carries the same dynROI settings (the command sets them all
+      // at once), so lens 0 speaks for the group. Only "tracking" differs, and
+      // that is per-lens state rather than a setting — it goes in the table.
+      // dynROI is now per lens, so there is no single state to show here — the
+      // boxes just seed the next command. Fill them from lens 0 unless someone
+      // is typing in them.
+      const dr0 = d.channels[0].dynroi;
+      if (document.activeElement !== $('margin')) $('margin').value = dr0.margin;
+      if (document.activeElement !== $('maxmiss')) $('maxmiss').value = dr0.max_miss;
+      $('dynon').disabled = $('dynoff').disabled = false;
+      const on = d.channels.filter(c => c.dynroi.enabled).length;
+      const tracking = d.channels.filter(c => c.dynroi.tracking).length;
+      $('dynnote').innerHTML = on
+        ? `켜진 렌즈 ${on}개, 그중 추적 중 ${tracking}개 — 켜진 렌즈에서는 <b>추적 상자 밖의 마커가 검출되지 않습니다</b>`
+        : '전부 꺼짐 — 매 프레임 전체를 훑습니다 (2592×1520 기준 170~300ms)';
+
+      const p = d.proc;
+      rows($('proc'), [
+        ['메모리 (현재)', mb(p.rss_kb), 'rss'],
+        ['메모리 (최고점)', mb(p.peak_rss_kb), 'peak'],
+        ['CPU 코어', `${p.cores}`, 'cores'],
+        ['CPU 누적', `${p.cpu_s.toFixed(2)} s`, 'cpu_s'],
+        ['CPU (직전 갱신 이후)', p.cpu_pct < 0
+          ? '<span class="meta">첫 조회 — 다음 Refresh 부터</span>'
+          : `<b class="${p.cpu_pct > 80 ? 'bad' : p.cpu_pct > 60 ? 'warn' : 'ok'}">${p.cpu_pct.toFixed(1)} %</b>
+             <span class="meta">(${p.cpu_window_s.toFixed(0)}s 구간)</span>`, 'cpu_pct'],
+        ['검출 예산', `${d.governor.duty_pct} %`, 'duty'],
+        ['영상 입력', `${esc(d.video.raw_group)} <span class="meta">· 렌즈당 ${d.video.cam_fps} fps</span>`, 'video'],
+        ['네트워크 설정 변경', d.network.latest_changed ? esc(d.network.latest_changed) : nul, 'netchg'],
+      ]);
+
+      // Link state and traffic now live in the header — they are the two
+      // things worth seeing without scrolling. What stays here is the detail
+      // you only look at once you already know something is wrong.
+      const s = d.pose;
+      const drop = s.sent + s.dropped ? (s.dropped / (s.sent + s.dropped) * 100) : 0;
+      $('hlink').className = 'chip ' + (s.connected ? 'up' : 'down');
+      $('hlink').innerHTML = s.connected
+        ? `link <b class="ok">UP</b>` : `link <b class="bad">DOWN</b>`;
+      // A cumulative total answers "has it ever sent anything", which is not a
+      // question anyone has. The one that matters — is data flowing RIGHT NOW —
+      // needs the reader to remember the last number and subtract, so show the
+      // subtraction instead: a stalled link reads 0.0/s immediately, and the
+      // value itself tracks detection (one line per marker, or one heartbeat
+      // per lens when everything is lost). The total moves to the table below,
+      // which is where you look after you already know something is wrong.
+      let rate = null;
+      if (prevPose && now > prevPose.t) {
+        const dt = (now - prevPose.t) / 1000;
+        if (dt >= 0.5) rate = Math.max(0, s.sent - prevPose.sent) / dt;
+      }
+      prevPose = { sent: s.sent, t: now };
+      $('hsent').innerHTML = 'tx ' + (rate === null
+        ? '<span class="meta">—</span>'
+        : `<b class="${rate === 0 ? 'bad' : ''}">${rate.toFixed(1)}/s</b>`) +
+        (drop > 0 ? ` <span class="${drop > 20 ? 'bad' : 'warn'}">-${drop.toFixed(1)}%</span>` : '');
+      $('hcpu').innerHTML = p.cpu_pct < 0 ? 'cpu —'
+        : `cpu <b class="${p.cpu_pct > 80 ? 'bad' : p.cpu_pct > 60 ? 'warn' : 'ok'}">${p.cpu_pct.toFixed(0)}%</b>`;
+
+      rows($('pose'), [
+        ['서버', `${esc(s.server)}:${s.port}`, 'pserver'],
+        ['보낸 줄 (누적)', s.sent.toLocaleString(), 'psent'],
+        ['버린 줄', `<span class="${drop > 20 ? 'warn' : ''}">${s.dropped.toLocaleString()} (${drop.toFixed(1)} %)</span>`, 'pdrop'],
+        ['명령 큐', s.queued, 'pqueue'],
+      ]);
+
+      // Lens number is shown 1-based, matching how the camera labels its four
+      // heads and how SUNAPI counts channels. The raw 0-based id stays visible
+      // next to it and is what every request and every CAM_POSE packet carries
+      // — the two numbering schemes exist, so hiding one of them would make
+      // this page disagree with the RPi dashboard for no gain.
+      const head = ['렌즈', '검출', 'SEARCH 배율', 'dyn ROI', '실효 fps', '검출/제공',
+        '대기', 'last frame', 'detect', 'markers', 'scanned ROI', 'manual ROI'];
+      $('chan').innerHTML =
+        `<thead><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>` +
+        d.channels.map(c => {
+          // age_ms is -1 until the first frame arrives on that lens.
+          // A switched-off lens has no fresh frame by definition — say so
+          // rather than flagging it stale as if something were wrong.
+          // In ms, same unit as 대기/detect on either side of it. Seconds made
+          // this the only column on the row measured differently, so comparing
+          // it against the detect cost meant converting in your head.
+          const stale = c.age_ms < 0 || c.age_ms > 3000;
+          const age = !c.detect ? '<span class="meta">검출 꺼짐</span>'
+            : c.age_ms < 0 ? '<b class="bad">없음</b>'
+            : `<span class="${stale ? 'warn' : 'ok'}">${c.age_ms.toLocaleString()} ms</span>`;
+          const dr = c.dynroi;
+
+          // Effective rate, from the change since the previous render rather
+          // than frames/uptime: an average since start-up would keep showing
+          // the old rate for minutes after a setting changed, which is exactly
+          // when someone is watching this number.
+          const was = prev[c.ch];
+          let fps = '<span class="meta">—</span>';
+          if (was && now > was.t) {
+            const df = c.frames - was.frames, dt = (now - was.t) / 1000;
+            if (df >= 0 && dt >= 0.5)
+              fps = `<b class="${df / dt < 1 ? 'warn' : ''}">${(df / dt).toFixed(1)}</b>`;
+          }
+          // Duty over the last 100 frames the camera offered this lens, not
+          // since start-up: after an hour of running, a lifetime ratio barely
+          // twitches when dynROI is switched on, so it kept reporting the old
+          // behaviour for minutes — precisely while someone was watching to
+          // see whether the switch did anything. ~20 s of history at 5 fps.
+          const rc = c.recent || { n: 0, skipped: 0 };
+          const kept = rc.n - rc.skipped;
+          const dropPct = rc.n ? rc.skipped / rc.n * 100 : 0;
+          const duty = !rc.n ? nul
+            : `<span class="${dropPct > 50 ? 'warn' : ''}">${kept}/${rc.n}</span>` +
+              (rc.skipped ? ` <span class="meta">버림 ${dropPct.toFixed(0)}%</span>` : '');
+
+          // How stale the frame already was when detection started — the part
+          // of the latency that t_frame/proc cannot show. 100 ms is roughly
+          // three frames' worth at 30 fps.
+          const queue = c.queue_ms < 0 ? nul
+            : `<span class="${c.queue_ms > 300 ? 'bad' : c.queue_ms > 100 ? 'warn' : 'ok'}">${c.queue_ms} ms</span>`;
+          return `<tr>
+            <td><b>${c.ch + 1}</b> <span class="meta">ch${c.ch}</span></td>
+            <td><button type="button" class="toggle ${c.detect ? 'on' : 'off'}"
+                        data-ch="${c.ch}" data-next="${c.detect ? 'false' : 'true'}"
+                        title="${c.detect ? '이 렌즈 검출 끄기' : '이 렌즈 검출 켜기'}"
+                >${c.detect ? 'ON' : 'OFF'}</button></td>
+            <td><select class="scale" data-ch="${c.ch}"
+                        title="마커를 못 찾는 동안(SEARCH)만 적용. 추적 중에는 항상 원본 해상도">
+                  ${[1, 2, 4, 8].map(s =>
+                    `<option value="${s}"${s === c.scale ? ' selected' : ''}>${s === 1 ? '원본' : '1/' + s}</option>`).join('')}
+                </select></td>
+            <td><button type="button" class="toggle dyn ${dr.enabled ? (dr.tracking ? 'on' : 'searching') : 'off'}"
+                        data-ch="${c.ch}" data-next="${dr.enabled ? 0 : 1}"
+                        title="${dr.enabled ? '이 렌즈 dynROI 끄기 (전체 프레임을 훑게 됨)' : '이 렌즈 dynROI 켜기 (추적 상자 밖 마커는 못 봄)'}"
+                >${dr.enabled ? (dr.tracking ? 'TRACK' : 'SEARCH') : 'OFF'}</button></td>
+            <td class="num">${fps}</td>
+            <td class="num" title="최근 ${rc.n}프레임 중 실제로 검출한 수 (누적 ${c.frames.toLocaleString()}프레임)">${duty}</td>
+            <td class="num">${queue}</td>
+            <td class="num">${age}</td>
+            <td class="num">${c.det_ms < 0 ? nul : c.det_ms.toFixed(1) + ' ms'}</td>
+            <td class="num">${c.markers}</td>
+            <td class="num">${rect(c.roi)}</td>
+            <td class="num">${rect(c.manual_roi)}</td>
+          </tr>`;
+        }).join('') + '</tbody>';
+
+      // The two static columns, moved out from under the live ones.
+      const dhead = ['렌즈', '프레임 크기', '누적 검출', 'dynROI 설정', '검출기 파라미터'];
+      $('chdetail').innerHTML =
+        `<thead><tr>${dhead.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>` +
+        d.channels.map(c => {
+          const t = c.tune, dr = c.dynroi;
+          return `<tr>
+            <td><b>${c.ch + 1}</b> <span class="meta">ch${c.ch}</span></td>
+            <td class="num">${c.w ? c.w + '×' + c.h : nul}</td>
+            <td class="num">${c.frames.toLocaleString()} <span class="meta">· 버림 ${c.skipped.toLocaleString()}</span></td>
+            <td class="num meta">margin ${dr.margin} · miss ${dr.max_miss}${dr.track_ids.length ? ' · ids ' + dr.track_ids.join(',') : ''}</td>
+            <td class="num meta">${t
+              ? `perim ${t.perim} · ecc ${t.ecc} · thr ${t.thresh} · poly ${t.poly} · scan ${t.scan_passes}×${t.scan_win}`
+              : nul}</td>
+          </tr>`;
+        }).join('') + '</tbody>';
+
+      // Snapshot for the next render's fps calculation.
+      d.channels.forEach(c => { prev[c.ch] = { frames: c.frames, t: now }; });
+
+      lastStatus = d;
+      renderCalib(d);
+      renderHg(d);
+      drawOverlay();
+    }
+
+    // ===== 카메라 캘리브레이션 (K/dist) =====
+    // Ported from the RPi dashboard's 캘리브레이션 tab. Every button below
+    // sends the same CALIB_K_* line the Pi sends, so this page and the server
+    // remain literally interchangeable — the one addition is that START names
+    // a lens, because this camera has four and the original had one.
+    const DICTS = ['DICT_4X4_50', 'DICT_4X4_100', 'DICT_4X4_250', 'DICT_4X4_1000',
+      'DICT_5X5_50', 'DICT_5X5_100', 'DICT_5X5_250', 'DICT_5X5_1000',
+      'DICT_6X6_50', 'DICT_6X6_100', 'DICT_6X6_250', 'DICT_6X6_1000',
+      'DICT_7X7_50', 'DICT_7X7_100', 'DICT_7X7_250', 'DICT_7X7_1000',
+      'DICT_ARUCO_ORIGINAL', 'DICT_APRILTAG_16h5', 'DICT_APRILTAG_25h9',
+      'DICT_APRILTAG_36h10', 'DICT_APRILTAG_36h11'];
+    $('ckDict').innerHTML = DICTS.map((n, i) => `<option value="${i}">${n}</option>`).join('');
+
+    // Values copied verbatim from the RPi dashboard's BOARD_PRESETS
+    // (cctv_calibration_manager/web_gui.py) — these describe real printed
+    // sheets, so guessing them is not an option. K/dist is scale-invariant, so
+    // the mm figures are nominal; the ratios and the dictionary are not.
+    const BOARD_PRESETS = {
+      a2: { sx: 7, sy: 5, square: 70, marker: 50, dict: 0, mx: 52, my: 35 },
+      a4: { sx: 5, sy: 7, square: 40, marker: 30, dict: 0, mx: 5, my: 8.5 },
+    };
+
+    // Live check of what the form currently says, before it is sent. Ported
+    // from the RPi's updateBoardSummary(): it turns the raw numbers into the
+    // things you can actually hold against the printout — quiet zone, pattern
+    // size, paper size — and refuses in the browser what the camera would
+    // refuse anyway. Returns false when the form cannot describe a real board.
+    const DICT_CAP = (d) => d <= 15 ? [50, 100, 250, 1000][d % 4]
+      : [1024, 30, 35, 2320, 587][d - 16];
+
+    function updateBoardSummary() {
+      const sx = num('ckSx'), sy = num('ckSy');
+      const square = num('ckSquare'), marker = num('ckMarker');
+      const mx = num('ckMx'), my = num('ckMy'), dict = num('ckDict');
+      const markerCount = Math.floor(sx * sy / 2);
+      const quiet = (square - marker) / 2;
+      const bw = sx * square, bh = sy * square;
+      const pw = bw + 2 * mx, ph = bh + 2 * my;
+      const valid = sx >= 3 && sy >= 3 && square > 0 && marker > 0 &&
+        marker < square && mx >= 0 && my >= 0 && markerCount <= DICT_CAP(dict);
+      const el = $('ckBoardSummary');
+      el.textContent = valid
+        ? `마커 주변 공백 ${quiet.toFixed(1)}mm · 패턴 ${bw.toFixed(1)}×${bh.toFixed(1)}mm`
+          + ` · 용지 ${pw.toFixed(1)}×${ph.toFixed(1)}mm · 내부 코너 ${(sx - 1) * (sy - 1)}개`
+        : '설정 오류: 치수 조건 또는 Dictionary의 마커 ID 용량을 확인하세요.';
+      el.className = valid ? 'meta' : 'meta bad';
+      $('ckBoardApply').disabled = !valid;
+      return valid;
+    }
+
+    // CS_* from intrinsics_calib.h, in the same order.
+    const CS = ['대기', '수집 중', '캡처 승인', '캡처 거부', '계산 완료', '계산 실패'];
+
+    const ckSel = () => Number($('ckCh').value);
+
+    function renderCalib(d) {
+      if (tab !== 'calib') return;  // pane is hidden
+      const c = d.calib, s = c.session, b = c.board;
+
+      // Board fields follow the camera unless someone is typing in them —
+      // overwriting a half-typed value on a 2 s auto-refresh is the fastest way
+      // to make a form unusable.
+      const setIf = (id, v) => { if (document.activeElement !== $(id)) $(id).value = v; };
+      setIf('ckSx', b.sx); setIf('ckSy', b.sy);
+      setIf('ckSquare', b.square_mm); setIf('ckMarker', b.marker_mm);
+      setIf('ckMx', b.margin_x_mm); setIf('ckMy', b.margin_y_mm);
+      setIf('ckDict', b.dict);
+      setIf('ckTarget', s.target); setIf('ckRms', s.rms_limit);
+      if (document.activeElement !== $('ckGate')) $('ckGate').checked = s.gates;
+      // The fold's one-line summary reports what the CAMERA has, not what the
+      // form says. The two can differ — applying is a separate button and can
+      // be refused — and the whole point of a collapsed summary is checking the
+      // active spec against the printout without opening anything.
+      const drift = b.sx !== num('ckSx') || b.sy !== num('ckSy') ||
+        Math.abs(b.square_mm - num('ckSquare')) > 1e-3 ||
+        Math.abs(b.marker_mm - num('ckMarker')) > 1e-3 || b.dict !== num('ckDict');
+      $('ckBoardBrief').innerHTML =
+        `적용됨: ${b.sx}×${b.sy} · 칸 ${b.square_mm}mm · 마커 ${b.marker_mm}mm · ${DICTS[b.dict] || b.dict}` +
+        (drift ? ' <b class="warn">· 입력값과 다름 (적용 안 됨)</b>' : '');
+      updateBoardSummary();
+
+      // What is on disk, not what we think should be. A stray file here is the
+      // only warning that this app is writing something nobody asked for.
+      const files = c.persist.files || [];
+      const flist = files.length
+        ? files.map(f => `${esc(f.name)} <span class="meta">(${f.bytes}B, ${
+            f.age_s < 120 ? f.age_s + '초 전' : Math.round(f.age_s / 60) + '분 전'})</span>`).join(' · ')
+        : '<span class="meta">없음</span>';
+      $('ckFiles').innerHTML = `저장된 파일 ${files.length}개: ${flist}`;
+      $('ckPersist').innerHTML = c.persist.ok
+        ? `<span class="ok">저장 가능</span> <span class="meta">${esc(c.persist.dir)}</span>`
+        : `<b class="bad">저장 불가</b> <span class="meta">쓸 수 있는 위치를 못 찾음 (cwd ${esc(c.persist.cwd)}) — 계산은 되지만 재부팅하면 사라집니다</span>`;
+
+      // Who owns the session, and whether the lens you are looking at is it.
+      const sel = ckSel();
+      const busy = s.collecting;
+      $('ckWho').innerHTML = !busy
+        ? '<span class="meta">열린 세션 없음</span>'
+        : (s.ch === sel
+          ? `<b class="ok">이 렌즈가 수집 중</b>`
+          : `<b class="warn">렌즈 ${s.ch + 1} (ch${s.ch}) 가 세션을 잡고 있습니다</b>`);
+
+      const pct = s.target > 0 ? Math.min(100, s.views / s.target * 100) : 0;
+      $('ckBar').firstElementChild.style.width = pct + '%';
+      $('ckCount').textContent = `${s.views} / ${s.target}`;
+      $('ckState').innerHTML = CS[s.state] +
+        (s.last_capture === 2 ? ' <span class="ok">· 직전 캡처 승인</span>'
+         : s.last_capture === 3 ? ' <span class="bad">· 직전 캡처 거부</span>' : '') +
+        (s.pruned ? ` <span class="meta">· 계산 시 ${s.pruned}뷰 제외됨</span>` : '') +
+        (s.state === 4 ? ` <b class="ok">RMS ${s.rms.toFixed(3)} px</b>` : '');
+
+      // The reason line. A capture that quietly does nothing is otherwise
+      // indistinguishable from one that never arrived. Coloured by the CAPTURE
+      // outcome, not the session state — the session stays "수집 중" through a
+      // rejection, which is the whole point.
+      const outcome = s.last_capture || 0;
+      const cls = (outcome === 3 || s.state === 5) ? 'bad'
+        : (outcome === 2 || s.state === 4) ? 'ok' : '';
+      $('ckReason').innerHTML = s.reason
+        ? `<span class="${cls}">${esc(s.reason)}</span>` +
+          (s.corners_total ? ` <span class="meta">· 코너 ${s.corners}/${s.corners_total} · 화면점유 ${(s.coverage * 100).toFixed(1)}% · 선명도 ${s.sharpness.toFixed(0)}` +
+            (s.move_px >= 0 ? ` · 기존 뷰와 ${s.move_px.toFixed(0)}px 차이` : '') + '</span>' : '')
+        : '';
+
+      $('ckFlowHint').innerHTML = s.pending
+        ? '<b class="warn">캡처 대기 — 다음 프레임에서 판정합니다</b>'
+        : !busy ? '세션 시작 → 자세 바꿔가며 캡처 → 계산하기 순서입니다.'
+        : (s.views >= s.target ? '<b class="ok">목표 도달 — 계산하기를 누르세요</b>' : '보드를 멈춘 뒤 캡처하세요.');
+
+      // Buttons that cannot do anything are disabled rather than left to fail:
+      // the failure would arrive as a reason string two seconds later.
+      $('ckStart').disabled = busy;
+      $('ckCapture').disabled = !busy;
+      $('ckUndo').disabled = !busy || s.views < 1;
+      $('ckCompute').disabled = !busy || s.views < 1;
+      $('ckStop').disabled = !busy;
+      $('ckStart').className = busy ? '' : 'go';
+      $('ckCompute').className = (busy && s.views >= s.target) ? 'go' : '';
+      $('ckStop').className = busy ? 'danger' : '';
+
+      // Per-lens results.
+      const lh = ['렌즈', 'fx', 'fy', 'cx', 'cy', 'dist (k1,k2,p1,p2,k3)', ''];
+      $('ckLenses').innerHTML =
+        `<thead><tr>${lh.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>` +
+        c.lenses.map(L => L.have ? `<tr>
+            <td><b>${L.ch + 1}</b> <span class="meta">ch${L.ch}</span></td>
+            <td class="num">${L.fx.toFixed(2)}</td>
+            <td class="num">${L.fy.toFixed(2)}</td>
+            <td class="num">${L.cx.toFixed(2)}</td>
+            <td class="num">${L.cy.toFixed(2)}</td>
+            <td class="num meta">${L.dist.map(v => v.toFixed(5)).join(', ')}</td>
+            <td><button type="button" class="ksave" data-ch="${L.ch}"
+                  ${c.persist.ok ? '' : 'disabled'} title="이 렌즈의 K/dist를 카메라에 기록">저장</button>
+              <button type="button" class="kclear danger" data-ch="${L.ch}"
+                  title="이 렌즈의 K/dist를 RAM과 파일에서 지웁니다">지우기</button></td>
+          </tr>` : `<tr>
+            <td><b>${L.ch + 1}</b> <span class="meta">ch${L.ch}</span></td>
+            <td colspan="5" class="meta">아직 캘리브레이션 없음</td><td></td>
+          </tr>`).join('') + '</tbody>';
+
+      drawProbe(d);
+    }
+
+    // ===== 호모그래피 =====
+    // Every control here sends the same ANCHOR_* / CALIB_START / HG_* line the
+    // RPi sends over the pose link, so the page and the server stay
+    // interchangeable — the same rule the K/dist tab follows.
+    const hgSel = () => +$('hgCh').value;
+
+    // Millimetres, one decimal. The camera reports them at that precision
+    // because they are tape measurements, and printing more digits than the
+    // tape can settle invites arguing about noise.
+    const mm = (v) => (v < 0 ? '—' : v.toFixed(1));
+
+    function renderHg(d) {
+      if (tab !== 'hg') return;  // pane is hidden
+      const ch = hgSel();
+      const L = d.calib.homography[ch] || {};
+      const s = L.session || {};
+      const f = L.fit;
+
+      // Which pixel space this lens works in, and whether it can actually map.
+      // "H is present" and "H can be used" are different states: a matrix
+      // fitted in undistorted space is inert until that lens also has K/dist.
+      const kHave = (d.calib.lenses.find(x => x.ch === ch) || {}).have;
+      $('hgSpace').innerHTML = L.have
+        ? `${L.undistorted ? 'undistort' : 'raw'} 좌표로 피팅됨 · ` +
+          (L.mappable ? '<span class="ok">매핑 가능</span>'
+                      : '<b class="bad">매핑 불가 — K/dist 없음</b>')
+        : `다음 피팅 좌표계: <b>${L.mode_undistorted ? 'undistort' : 'raw'}</b>` +
+          (L.mode_undistorted && !kHave
+            ? ' <b class="bad">· 이 렌즈에 K/dist가 없어 수집이 거부됩니다</b>' : '');
+
+      const na = (L.anchors || []).length;
+      $('hgWho').innerHTML = s.collecting
+        ? '<b class="ok">이 렌즈가 수집 중</b>'
+        : (L.have ? '<span class="ok">H 있음</span>'
+                  : `<span class="meta">H 없음 · 마커 ${na}개 등록됨</span>`);
+
+      const pct = s.target > 0 ? Math.min(100, s.good / s.target * 100) : 0;
+      $('hgBar').firstElementChild.style.width = pct + '%';
+      $('hgCount').textContent = `${s.good || 0} / ${s.target || 20}`;
+      // total/max is how much of the timeout is spent. Without it a session
+      // stuck at 0 good frames gives no sense of how long is left.
+      $('hgFrames').textContent = s.collecting
+        ? `프레임 ${s.total} / ${s.max} (타임아웃까지)`
+        : (s.total ? `마지막 세션: ${s.total}프레임 사용` : '');
+
+      $('hgResult').innerHTML = s.result
+        ? `<span class="${s.result === '완료' ? 'ok' : 'bad'}">${esc(s.result)}</span>` : '';
+
+      // The three id lists. missing_ids is the one that earns its place: a bar
+      // frozen at 0% because one marker is covered looks exactly like a bar
+      // frozen at 0% because the lens is aimed wrong.
+      const ids = (a) => (a || []).join(', ');
+      $('hgVis').innerHTML = !s.collecting ? '' :
+        (s.missing_ids && s.missing_ids.length
+          ? `<b class="warn">안 보이는 마커: ${ids(s.missing_ids)}</b> — 가려졌거나 화면 밖입니다. 치우면 바로 이어집니다<br>` : '') +
+        (s.unusable_ids && s.unusable_ids.length
+          ? `<b class="bad">보정 불가 마커: ${ids(s.unusable_ids)}</b> — 검출은 됐지만 왜곡보정이 수렴하지 않는 좌우 가장자리입니다. 안쪽으로 옮기세요<br>` : '') +
+        (s.seen_ids && s.seen_ids.length
+          ? `<span class="ok">보이는 마커: ${ids(s.seen_ids)}</span>` : '');
+
+      $('hgFlowHint').innerHTML = s.collecting
+        ? '수집 중 — 이 렌즈는 dynROI가 꺼지고 풀프레임으로 돕니다. 약 0.5fps라 20프레임에 40초쯤 걸립니다.'
+        : na < 4 ? '<b class="warn">마커를 4개 이상 등록해야 수집을 시작할 수 있습니다 (권장 10~20개)</b>'
+        : '등록한 마커가 <b>전부 한 프레임에</b> 보여야 그 프레임이 계수됩니다.';
+      $('hgStart').disabled = !!s.collecting;
+      $('hgStart').className = (!s.collecting && na >= 4) ? 'go' : '';
+
+      // --- LOO residuals ---
+      if (!f) {
+        $('hgFitSummary').innerHTML = L.have
+          ? '<span class="meta">이 H는 외부에서 주입된 것이라 잔차가 없습니다 — 카메라는 그 H를 만든 점을 모릅니다.</span>'
+          : '<span class="meta">아직 피팅한 적이 없습니다.</span>';
+        $('hgFit').innerHTML = '';
+      } else {
+        // A four-point fit passes through its own four points exactly, so its
+        // in-sample RMSE is ~0 BY CONSTRUCTION — it is not evidence of
+        // anything. Reporting that number without saying so is the single most
+        // misleading thing this page could do: 0.0 mm reads as a perfect
+        // calibration, and the 1x1 board produces exactly four points.
+        const noLoo = !f.loo_valid;
+        $('hgFitSummary').innerHTML =
+          `점 <b>${f.n}</b>개 · 인샘플 RMSE <b>${mm(f.rmse_in_mm)} mm</b>` +
+          (noLoo
+            ? `<br><b class="bad">이 H는 검증되지 않았습니다.</b> 점이 ${f.n}개라 하나를 빼면 ` +
+              '3개만 남아 H가 성립하지 않으므로 LOO를 계산할 수 없습니다. ' +
+              `그리고 4점 피팅은 <b>자기 4점을 정확히 통과</b>하므로 위의 인샘플 ${mm(f.rmse_in_mm)} mm 는 ` +
+              '구조적으로 0에 가깝게 나오는 값이지 <b>정확도의 증거가 아닙니다</b>.' +
+              '<br><span class="meta">폼보드 2×2(16점)로 다시 깔면 LOO가 나옵니다.</span>'
+            : ` · <b class="${f.rmse_loo_mm > 50 ? 'bad' : f.rmse_loo_mm > 20 ? 'warn' : 'ok'}">LOO RMSE ${mm(f.rmse_loo_mm)} mm</b>` +
+              ` · 최대 ${mm(f.max_loo_mm)} mm (id ${f.max_loo_id})` +
+              (f.advisory ? ' <b class="warn">· 참고용 (점 8개 미만이라 폴드마다 사실상 결정계입니다)</b>' : ''));
+
+        // Sorted worst-LOO first: the table exists to be acted on, and the row
+        // worth acting on should not be somewhere in the middle.
+        const pts = f.pts.slice().sort((a, b) => b.loo - a.loo);
+        const verdict = (p) => {
+          if (p.loo < 0) return '<span class="meta">—</span>';
+          const bigIn = p.in > 20, bigLoo = p.loo > 50;
+          if (bigIn && bigLoo) return '<b class="bad">잘못 실측한 점 — 줄자를 다시</b>';
+          if (!bigIn && bigLoo) return '<b class="warn">외곽/고레버리지 — 정상</b>';
+          if (bigIn && !bigLoo) return '<b class="warn">id 중복·좌표 뒤바뀜 의심</b>';
+          return '<span class="ok">좋음</span>';
+        };
+        $('hgFit').innerHTML =
+          '<thead><tr><th>id</th><th>인샘플 (mm)</th><th>LOO (mm)</th><th>해석</th></tr></thead><tbody>' +
+          pts.map(p => `<tr><td><b>${p.id}</b></td>` +
+            `<td class="num">${mm(p.in)}</td>` +
+            `<td class="num">${mm(p.loo)}</td>` +
+            `<td>${verdict(p)}</td></tr>`).join('') + '</tbody>';
+      }
+
+      // --- registered markers ---
+      const A = L.anchors || [];
+      $('hgAnchorBrief').innerHTML = `<span class="meta">— 이 렌즈 ${A.length}개 / 최대 24개</span>`;
+      $('hgAnchors').innerHTML = A.length
+        ? '<thead><tr><th>id</th><th>wx (mm)</th><th>wy (mm)</th></tr></thead><tbody>' +
+          A.map(a => `<tr><td><b>${a.id}</b></td><td class="num">${a.wx.toFixed(1)}</td>` +
+            `<td class="num">${a.wy.toFixed(1)}</td></tr>`).join('') + '</tbody>'
+        : '<tbody><tr><td class="meta">등록된 마커가 없습니다</td></tr></tbody>';
+
+      // The camera's verdict on the last ANCHOR_ command. A refused list leaves
+      // the table unchanged, which on its own reads as "the camera ignored me".
+      const ac = d.calib.anchor_cmd;
+      $('hgAnchorMsg').innerHTML = (ac && ac.ch === ch && ac.reason)
+        ? `<b class="${ac.ok ? 'ok' : 'bad'}">${esc(ac.reason)}</b>`
+        : (ac && ac.ch === ch && ac.ok ? `<span class="ok">적용됨 — 마커 ${ac.n}개</span>` : '');
+
+      // --- H itself ---
+      $('hgMatrix').innerHTML = L.have
+        ? '<tbody>' + [0, 1, 2].map(r =>
+            '<tr>' + [0, 1, 2].map(c =>
+              `<td class="num meta">${L.H[r * 3 + c].toExponential(6)}</td>`).join('') + '</tr>').join('') +
+          '</tbody>'
+        : '<tbody><tr><td class="meta">이 렌즈에는 H가 없습니다</td></tr></tbody>';
+      $('hgSave').disabled = !L.have || !d.calib.persist.ok;
+      $('hgClear').disabled = !L.have;
+
+      // --- FOV overlap, computed here rather than on the camera ---
+      // §4.7: the status object already carries each lens's detected ids, so the
+      // overlap costs no camera code at all — just an intersection.
+      const where = {};
+      d.channels.forEach(c => (c.dets || []).forEach(x => {
+        (where[x.id] = where[x.id] || []).push(c.ch);
+      }));
+      const shared = Object.keys(where).filter(k => where[k].length > 1);
+      $('hgOverlap').innerHTML = shared.length
+        ? shared.map(k => `<b class="ok">id ${k}</b> → 렌즈 ` +
+            where[k].map(c => `${c + 1}(ch${c})`).join(' + ')).join(' · ')
+        : '<span class="meta">지금 두 렌즈에 동시에 잡히는 마커가 없습니다.</span>';
+    }
+
+    // Marker layouts, copied verbatim from the RPi admin console's HG_PRESETS
+    // (Road_Painter_4th/Server/admin_console/cctv.py). These describe real
+    // measured foam board placements, so guessing them is not an option, and
+    // the two copies must not drift — a lens fitted from this table and a
+    // server holding the other one would disagree about where the robot is,
+    // with no error anywhere to say so.
+    //
+    // The 60 mm inset is not a margin: markers are stuck flush to the board
+    // corner, but the homography uses the BLACK square's centre, which sits
+    // half the white border (120/2) inside. The 120 mm gap down the middle of
+    // the 2x2 is the same 60 twice, once per adjoining board.
+    //
+    // id = row * columns + col, row 0 at the BOTTOM, col 0 at the LEFT.
+    const HG_PRESETS = {
+      '1x1': {
+        label: '폼보드 1장 (900×600)',
+        pts: [[0, 60, 60], [1, 840, 60], [2, 60, 540], [3, 840, 540]],
+      },
+      '2x2': {
+        label: '폼보드 2×2 (1800×1200)',
+        pts: [
+          [0, 60, 60],    [1, 840, 60],    [2, 960, 60],    [3, 1740, 60],
+          [4, 60, 540],   [5, 840, 540],   [6, 960, 540],   [7, 1740, 540],
+          [8, 60, 660],   [9, 840, 660],   [10, 960, 660],  [11, 1740, 660],
+          [12, 60, 1140], [13, 840, 1140], [14, 960, 1140], [15, 1740, 1140],
+        ],
+      },
+    };
+
+    $('hgPresetApply').addEventListener('click', () => {
+      const p = HG_PRESETS[$('hgPreset').value];
+      if (!p) { $('hgAnchorPreview').innerHTML = '<b class="warn">배치를 고르세요.</b>'; return; }
+      const ox = +$('hgOffX').value || 0, oy = +$('hgOffY').value || 0;
+      $('hgAnchorText').value =
+        p.pts.map(([id, x, y]) => `${id}\t${(x + ox).toFixed(1)}\t${(y + oy).toFixed(1)}`).join('\n');
+      hgPreview();
+      // Filling the box is not applying it. Said out loud because the table
+      // changing looks like something happened.
+      $('hgAnchorPreview').innerHTML +=
+        `<br><span class="meta">${esc(p.label)} — 표에 채웠습니다. <b>적용</b>을 눌러야 카메라로 갑니다.` +
+        (ox || oy ? ` (원점 오프셋 ${ox}, ${oy} 적용됨)` : '') + '</span>' +
+        (p.pts.length < 5
+          ? '<br><b class="warn">앵커 4개는 LOO 검증이 불가능합니다 — 아래 설명을 보세요.</b>' : '');
+    });
+
+    // Parse the textarea into "id wx wy" triples, and say what is wrong before
+    // the camera has to. The camera refuses the same things — this is only so
+    // the answer arrives while the cursor is still in the box.
+    function hgParseAnchors(text) {
+      const out = [], seen = {}, errs = [];
+      text.split('\n').forEach((line, i) => {
+        const t = line.trim();
+        if (!t || t.startsWith('#')) return;
+        const p = t.split(/[\s,]+/);
+        if (p.length < 3) { errs.push(`${i + 1}행: id wx wy 세 값이 필요합니다`); return; }
+        const id = +p[0], wx = +p[1], wy = +p[2];
+        if (!Number.isInteger(id) || id < 0) { errs.push(`${i + 1}행: id가 0 이상 정수가 아닙니다`); return; }
+        if (!isFinite(wx) || !isFinite(wy)) { errs.push(`${i + 1}행: 좌표가 숫자가 아닙니다`); return; }
+        if (seen[id] !== undefined) { errs.push(`${i + 1}행: id ${id} 가 ${seen[id]}행과 중복입니다`); return; }
+        seen[id] = i + 1;
+        out.push({ id, wx, wy });
+      });
+      if (out.length > 24) errs.push(`마커가 ${out.length}개입니다 — 최대 24개`);
+      return { pts: out, errs };
+    }
+
+    function hgPreview() {
+      const { pts, errs } = hgParseAnchors($('hgAnchorText').value);
+      $('hgAnchorPreview').innerHTML = errs.length
+        ? errs.map(e => `<b class="bad">${esc(e)}</b>`).join('<br>')
+        : pts.length
+          ? `<span class="ok">${pts.length}개 인식됨</span> <span class="meta">— 적용하면 이 렌즈의 목록 전체가 이것으로 바뀝니다</span>`
+          : '<span class="meta">아직 입력이 없습니다</span>';
+      $('hgAnchorApply').disabled = errs.length > 0;
+      return { pts, errs };
+    }
+
+    $('hgAnchorText').addEventListener('input', hgPreview);
+    hgPreview();  // so 적용 starts disabled rather than enabled-and-empty
+    $('hgCh').addEventListener('change', () => { if (lastStatus) renderHg(lastStatus); });
+
+    $('hgAnchorLoad').addEventListener('click', () => {
+      if (!lastStatus) return;
+      const A = lastStatus.calib.homography[hgSel()].anchors || [];
+      $('hgAnchorText').value = A.map(a => `${a.id}\t${a.wx.toFixed(1)}\t${a.wy.toFixed(1)}`).join('\n');
+      hgPreview();
+    });
+
+    $('hgAnchorApply').addEventListener('click', (e) => {
+      const { pts, errs } = hgPreview();
+      if (errs.length) return;
+      // The count goes on the wire ahead of the payload. It is what lets the
+      // camera tell a deliberately short list from a command line that got cut
+      // — a cut lands mid-number and still parses as a valid marker.
+      send(`ANCHOR_SET_ALL ${hgSel()} ${pts.length} ` +
+        pts.map(p => `${p.id} ${p.wx.toFixed(1)} ${p.wy.toFixed(1)}`).join(' '), e.target);
+    });
+    $('hgAnchorSave').addEventListener('click', (e) => send(`ANCHOR_SAVE ${hgSel()}`, e.target));
+    $('hgStart').addEventListener('click', (e) => send(`CALIB_START ${hgSel()}`, e.target));
+    $('hgSave').addEventListener('click', (e) => send(`HG_SAVE ${hgSel()}`, e.target));
+    $('hgClear').addEventListener('click', (e) => {
+      if (!confirm(`렌즈 ${hgSel() + 1} (ch${hgSel()}) 의 H를 RAM과 파일에서 지웁니다.\n등록된 마커 목록은 남습니다.`)) return;
+      send(`HG_CLEAR ${hgSel()}`, e.target);
+    });
+
+    // The board, in coordinates. There is no photo behind it on purpose — a
+    // live snapshot would be 120..290 KB a frame — so this canvas is the whole
+    // viewfinder: it says the board is seen, where it is, and how much of the
+    // frame it fills.
+    function drawProbe(d) {
+      const cv = $('ckCanvas'), ctx = cv.getContext('2d');
+      const s = d.calib.session;
+      const ch = s.collecting ? s.ch : ckSel();
+      const lens = d.channels.find(x => x.ch === ch) || {};
+      const W = lens.w || 2592, H = lens.h || 1520;
+      if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+      ctx.clearRect(0, 0, W, H);
+
+      const pts = d.calib.probe || [];
+      ctx.font = 'bold 30px sans-serif';
+      if (!s.collecting) {
+        ctx.fillStyle = '#9aa0a6';
+        ctx.fillText('세션을 시작하면 여기에 보드 코너가 표시됩니다', 16, 40);
+        $('ckProbeNote').textContent = '';
+        return;
+      }
+      if (!pts.length) {
+        ctx.fillStyle = '#dc3545';
+        ctx.fillText('보드가 보이지 않습니다 — 렌즈 ' + (ch + 1) + ' 앞에 두세요', 16, 40);
+        $('ckProbeNote').innerHTML =
+          `<span class="bad">보드 미검출</span> <span class="meta">· ${(CALIB_PROBE_S).toFixed(0)}초마다 다시 확인합니다</span>`;
+        return;
+      }
+
+      // Bounding box first, so the corner dots draw on top of it.
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const p of pts) {
+        x0 = Math.min(x0, p[0]); y0 = Math.min(y0, p[1]);
+        x1 = Math.max(x1, p[0]); y1 = Math.max(y1, p[1]);
+      }
+      ctx.strokeStyle = '#22d3ee'; ctx.lineWidth = 3; ctx.setLineDash([12, 8]);
+      ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+      ctx.setLineDash([]);
+
+      // Join corners that are neighbours ON THE BOARD, using their ids rather
+      // than their positions. This is what turns a scatter of dots into a
+      // checkable picture: the board is a (sx-1) x (sy-1) grid and id =
+      // row*(sx-1) + col, so if detection is right the lines form a mesh that
+      // stays a mesh under any perspective. A mis-assigned corner shows up as
+      // a line shooting across the board — which is invisible if you only draw
+      // the dots, because a dot is in a plausible place either way.
+      const cols = d.calib.board.sx - 1;
+      const at = new Map(pts.map(p => [p[2], p]));
+      ctx.strokeStyle = 'rgba(34,211,238,0.55)';
+      ctx.lineWidth = 2;
+      for (const [x, y, id] of pts) {
+        if (id < 0) continue;
+        const right = (id % cols !== cols - 1) ? at.get(id + 1) : null;  // not at a row end
+        const down = at.get(id + cols);
+        for (const nb of [right, down]) {
+          if (!nb) continue;
+          ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(nb[0], nb[1]); ctx.stroke();
+        }
+      }
+
+      ctx.font = '22px sans-serif';
+      for (const [x, y, id] of pts) {
+        ctx.fillStyle = '#f59e0b';
+        ctx.beginPath(); ctx.arc(x, y, 7, 0, 7); ctx.fill();
+        if (id >= 0) {
+          ctx.fillStyle = 'rgba(245,158,11,0.85)';
+          ctx.fillText(id, x + 10, y - 8);
+        }
+      }
+
+      const cov = ((x1 - x0) * (y1 - y0)) / (W * H) * 100;
+      ctx.fillStyle = '#22d3ee';
+      ctx.font = 'bold 30px sans-serif';
+      ctx.fillText(`코너 ${pts.length}/${d.calib.board.corners} · 폭 ${(cov).toFixed(1)}%`,
+        x0, Math.max(32, y0 - 12));
+      const resid = gridResidual(pts, cols);
+      const bad = resid !== null && resid > GRID_RESIDUAL_LIMIT;
+      if (bad) {
+        ctx.fillStyle = '#dc3545';
+        ctx.font = 'bold 34px sans-serif';
+        ctx.fillText('격자가 맞지 않습니다 — 보드 설정 확인', 12, H - 20);
+      }
+      $('ckProbeNote').innerHTML = bad
+        ? `<b class="bad">코너는 ${pts.length}개 잡혔지만 격자가 아닙니다</b>` +
+          ` <span class="meta">(격자 오차 ${resid.toFixed(1)}px, 정상은 1px 안팎)</span><br>` +
+          `<span class="bad">보드 <b>가로·세로가 바뀐 것</b>이 가장 흔한 원인입니다 —` +
+          ` ${d.calib.board.sx}×${d.calib.board.sy} 대신 ${d.calib.board.sy}×${d.calib.board.sx} 로 바꿔보세요.</span>` +
+          ` <span class="meta">두 방향은 마커 수도 코너 수도 같아서 숫자로는 구분되지 않습니다.` +
+          ` 그다음 의심은 Dictionary 불일치입니다.</span>`
+        : `<span class="ok">보드 검출됨</span> <span class="meta">· 코너 ${pts.length}/${d.calib.board.corners}` +
+          ` · 화면의 약 ${cov.toFixed(1)}% · 격자 오차 ${resid === null ? '—' : resid.toFixed(2) + 'px'}` +
+          ` · ${s.probe_age_ms < 0 ? '' : (s.probe_age_ms / 1000).toFixed(1) + '초 전 기준'}</span>`;
+    }
+    // Does the detection actually form a grid?
+    //
+    // This check exists because of a failure that cost an afternoon: the board
+    // was 5x7 and the camera was told 7x5. BOTH have 17 markers and 24 interior
+    // corners, so every count on the page agreed — "24/24 코너" looked like a
+    // clean detection while the corners were being placed by a transposed
+    // layout. Nothing numeric caught it; only the drawing looked wrong, and
+    // "looks wrong" is not something you can act on.
+    //
+    // The board is a grid, so under any camera angle the corners fit
+    //     pos(id) = origin + col*u + row*v
+    // to within a pixel or two (a projective view bends this slightly; at these
+    // board sizes the bend stays small). A wrong layout does not come close.
+    // Measured: 0.76 px when right, 28 px when transposed.
+    function gridResidual(pts, cols) {
+      const n = pts.length;
+      if (n < 6) return null;
+      const A = pts.map(([, , id]) => [1, id % cols, Math.floor(id / cols)]);
+      const solve = (b) => {
+        const M = [0, 1, 2].map(i => [0, 1, 2].map(j =>
+          A.reduce((s, a) => s + a[i] * a[j], 0)));
+        const v = [0, 1, 2].map(i => A.reduce((s, a, k) => s + a[i] * b[k], 0));
+        for (let i = 0; i < 3; i++) {
+          let pv = i;
+          for (let r = i; r < 3; r++) if (Math.abs(M[r][i]) > Math.abs(M[pv][i])) pv = r;
+          [M[i], M[pv]] = [M[pv], M[i]]; [v[i], v[pv]] = [v[pv], v[i]];
+          if (!M[i][i]) return null;
+          for (let r = 0; r < 3; r++) {
+            if (r === i) continue;
+            const f = M[r][i] / M[i][i];
+            for (let c = 0; c < 3; c++) M[r][c] -= f * M[i][c];
+            v[r] -= f * v[i];
+          }
+        }
+        return [v[0] / M[0][0], v[1] / M[1][1], v[2] / M[2][2]];
+      };
+      const sx = solve(pts.map(p => p[0])), sy = solve(pts.map(p => p[1]));
+      if (!sx || !sy) return null;
+      let sum = 0;
+      pts.forEach(([x, y], k) => {
+        const c = A[k][1], r = A[k][2];
+        sum += Math.hypot(x - (sx[0] + sx[1] * c + sx[2] * r),
+                          y - (sy[0] + sy[1] * c + sy[2] * r));
+      });
+      return sum / n;
+    }
+    const GRID_RESIDUAL_LIMIT = 4;   // px; good is <1, transposed is ~28
+
+    const CALIB_PROBE_S = 1;  // matches CALIB_PROBE_MS in app_config.h
+
+    $('ckPreset').addEventListener('change', () => {
+      const p = BOARD_PRESETS[$('ckPreset').value];
+      if (!p) return;
+      $('ckSx').value = p.sx; $('ckSy').value = p.sy;
+      $('ckSquare').value = p.square; $('ckMarker').value = p.marker;
+      $('ckDict').value = p.dict; $('ckMx').value = p.mx; $('ckMy').value = p.my;
+      updateBoardSummary();
+    });
+    ['ckSx', 'ckSy', 'ckSquare', 'ckMarker', 'ckMx', 'ckMy', 'ckDict']
+      .forEach(id => $(id).addEventListener('input', updateBoardSummary));
+
+    const num = (id) => Number($(id).value) || 0;
+    $('ckBoardApply').addEventListener('click', (e) => send(
+      `CALIB_K_CONFIG ${num('ckSx')} ${num('ckSy')} ${num('ckSquare')} ${num('ckMarker')} ` +
+      `${num('ckDict')} ${num('ckMx')} ${num('ckMy')}`, e.target));
+    $('ckBoardSave').addEventListener('click', (e) => send('CALIB_K_BOARD_SAVE', e.target));
+    $('ckSetParams').addEventListener('click', (e) =>
+      send(`CALIB_K_SET ${num('ckTarget')} ${num('ckRms')}`, e.target));
+    $('ckGate').addEventListener('change', (e) =>
+      send(`CALIB_K_GATE ${e.target.checked ? 1 : 0}`, null));
+
+    $('ckStart').addEventListener('click', (e) => send(`CALIB_K_START ${ckSel()}`, e.target));
+    $('ckStop').addEventListener('click', (e) => send('CALIB_K_STOP', e.target));
+    $('ckCapture').addEventListener('click', (e) => send('CALIB_K_CAPTURE', e.target));
+    $('ckUndo').addEventListener('click', (e) => send('CALIB_K_UNDO', e.target));
+    $('ckCompute').addEventListener('click', (e) => send('CALIB_K_COMPUTE', e.target));
+    $('ckCh').addEventListener('change', () => { if (lastStatus) renderCalib(lastStatus); });
+
+    $('ckLenses').addEventListener('click', (ev) => {
+      const s = ev.target.closest('button.ksave');
+      if (s) { send(`CALIB_K_SAVE ${s.dataset.ch}`, s); return; }
+      const c = ev.target.closest('button.kclear');
+      // Confirmed because it is the one destructive control on the page and it
+      // cannot be undone from here — the numbers are gone from RAM and disk.
+      if (c && confirm(`렌즈 ${+c.dataset.ch + 1}의 K/dist를 지웁니다. 되돌릴 수 없습니다.`))
+        send(`CALIB_K_CLEAR ${c.dataset.ch}`, c);
+    });
+
+    // Same loose parsing the RPi tab used: pull the numbers out of the pasted
+    // text in order. Anything that is not a 3x3 K and a 5-vector is refused
+    // here rather than sent, so a typo cannot reach a lens.
+    $('ckLoadApply').addEventListener('click', (e) => {
+      const k = parseKText($('ckLoadText').value);
+      if (!k || !k.dist || k.dist.length < 5) {
+        $('err').textContent = 'K/dist 파싱 실패 — "K = [[fx,0,cx],[0,fy,cy],[0,0,1]]" 와 "dist = [k1,k2,p1,p2,k3]" 두 줄이 필요합니다';
+        $('err').style.display = 'block';
+        return;
+      }
+      send(`K_LOAD ${ckSel()} ${k.fx} ${k.fy} ${k.cx} ${k.cy} ${k.dist.slice(0, 5).join(' ')}`, e.target);
+    });
+
+    // ===== 채널 오버레이 — 좌표만, 실사진 없음 =====
+    // RPi 대시보드(192.168.0.8:8082) 마커검출 탭의 캔버스 오버레이를 이식한 것.
+    // 배경 스냅샷만 뺐다: raw 코너(주황) · dynROI 박스(보라 점선) 는 이 앱의
+    // /status 가 이미 가진 값을 그대로 쓰고, undistort(보정, 청록)는 그쪽과
+    // 똑같이 브라우저가 K/dist 로 직접 계산한다 — 카메라에 K/D 가 없어도(이 앱은
+    // 아직 intrinsics 를 이식하지 않았다) 그릴 수 있는 순수 표시용 참고값이다.
+    let lastStatus = null;
+    let kCalib = null;  // {fx,fy,cx,cy,dist:[k1,k2,p1,p2,k3]} 또는 null
+
+    // RPi 쪽과 동일한 반복해 undistort — Brown-Conrady 역변환.
+    // k = 카메라가 가진 렌즈별 K, 없으면 붙여넣은 값.
+    function undistortPixel(u, v, k) {
+      const kc = k || kCalib;
+      if (!kc) return null;
+      const { fx, fy, cx, cy, dist: d } = kc;
+      const k1 = d[0] || 0, k2 = d[1] || 0, p1 = d[2] || 0, p2 = d[3] || 0, k3 = d[4] || 0;
+      const x0 = (u - cx) / fx, y0 = (v - cy) / fy;
+      let x = x0, y = y0;
+      for (let it = 0; it < 10; it++) {
+        const r2 = x * x + y * y;
+        const radial = 1 / (1 + ((k3 * r2 + k2) * r2 + k1) * r2);
+        const dx = 2 * p1 * x * y + p2 * (r2 + 2 * x * x);
+        const dy = p1 * (r2 + 2 * y * y) + 2 * p2 * x * y;
+        x = (x0 - dx) * radial;
+        y = (y0 - dy) * radial;
+      }
+      return [fx * x + cx, fy * y + cy];
+    }
+
+    function drawQuad(ctx, c, col, lw) {
+      ctx.strokeStyle = col; ctx.lineWidth = lw;
+      ctx.beginPath();
+      for (let i = 0; i < 4; i++) { const [x, y] = c[i]; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+      ctx.closePath(); ctx.stroke();
+    }
+    const quadCenter = (c) => [c.reduce((s, p) => s + p[0], 0) / 4, c.reduce((s, p) => s + p[1], 0) / 4];
+
+    // "K = [[fx,0,cx],[0,fy,cy],[0,0,1]]" / "dist = [k1,k2,p1,p2,k3]" 형식 파싱.
+    // RPi 쪽 K 프리셋 붙여넣기와 같은 느슨한 파싱 — 줄 안의 숫자만 순서대로 뽑는다.
+    function parseKText(text) {
+      const nums = (s) => (s.match(/-?\d+\.?\d*(?:[eE][-+]?\d+)?/g) || []).map(Number);
+      const kLine = text.split('\n').find(l => /^\s*K\s*=/.test(l));
+      const dLine = text.split('\n').find(l => /^\s*dist\s*=/.test(l));
+      if (!kLine) return null;
+      const kn = nums(kLine.replace(/^\s*K\s*=/, ''));
+      if (kn.length < 6) return null;
+      const dist = dLine ? nums(dLine.replace(/^\s*dist\s*=/, '')) : [];
+      return { fx: kn[0], cx: kn[2], fy: kn[4], cy: kn[5], dist };
+    }
+
+    // Backing store cap. The old single canvas matched the frame exactly
+    // (2592x1520 = ~15 MB of pixels); four of those is ~63 MB for a picture
+    // that is then scaled down to a few hundred CSS pixels anyway. Drawing in
+    // scaled coordinates costs one ctx.scale() and gives that memory back.
+    const OV_MAX_W = 900;
+
+    // Which lenses to draw. Order is fixed (1..4) rather than click order, so a
+    // cell never moves out from under the pointer when another is toggled.
+    const ovSelected = () =>
+      Array.from(document.querySelectorAll('input.ovch:checked')).map(el => +el.value);
+
+    function drawOverlay() {
+      if (tab !== 'ops') return;   // pane is hidden; nothing to paint onto
+      const grid = $('ovGrid');
+      // 꺼져 있으면 그리지 않는다 — /status 의 dets 는 오버레이 상태와 무관하게
+      // 항상 오지만(카메라 쪽 비용은 고정), 캔버스 그리기 자체는 안 볼 때 건너뛰어
+      // 메인스레드 낭비를 없앤다.
+      if (!$('ovOn').checked || !lastStatus) { grid.style.display = 'none'; return; }
+      grid.style.display = '';
+
+      const chans = ovSelected();
+      // One column for a single lens (it gets the whole width), two otherwise.
+      // Deliberately not auto-fit: three lenses in a 3-wide row on a laptop
+      // makes each one too small to read a marker id in.
+      grid.style.display = 'grid';
+      grid.style.gap = '10px';
+      grid.style.gridTemplateColumns = chans.length <= 1 ? '1fr'
+        : 'repeat(auto-fit, minmax(min(100%, 360px), 1fr))';
+      grid.style.maxWidth = chans.length <= 1 ? '800px' : 'none';
+
+      if (!chans.length) {
+        grid.innerHTML = '<p class="meta">표시할 렌즈를 하나 이상 고르세요.</p>';
+        $('ovKStatus').textContent = '';
+        return;
+      }
+
+      // Reuse cells across refreshes. Rebuilding the markup every second would
+      // throw away each canvas and reallocate its backing store.
+      const want = chans.join(',');
+      if (grid.dataset.for !== want) {
+        grid.dataset.for = want;
+        grid.innerHTML = chans.map(ch => `<figure style="margin:0">
+            <figcaption class="meta" id="ovCap${ch}" style="padding:0 0 4px"></figcaption>
+            <canvas id="ovCanvas${ch}" style="width:100%;height:auto;border:1px solid var(--line);border-radius:8px;background:var(--card)"></canvas>
+          </figure>`).join('');
+      }
+
+      const notes = [];
+      for (const ch of chans) notes.push(drawOne(ch));
+      $('ovKStatus').innerHTML = notes.filter(Boolean).join(' · ');
+    }
+
+    // Draw one lens. Returns a short note about which K it used, or ''.
+    function drawOne(ch) {
+      const c = lastStatus.channels.find(x => x.ch === ch);
+      const cv = $('ovCanvas' + ch), cap = $('ovCap' + ch);
+      if (!c || !cv) return '';
+
+      // Frame pixels -> canvas pixels. Everything below is written in FRAME
+      // coordinates and scaled once here, so the drawing code stays the same as
+      // when the canvas was full resolution.
+      const W = c.w || 2592, H = c.h || 1520;
+      const k = Math.min(1, OV_MAX_W / W);
+      const cw = Math.round(W * k), chh = Math.round(H * k);
+      if (cv.width !== cw || cv.height !== chh) { cv.width = cw; cv.height = chh; }
+      const ctx = cv.getContext('2d');
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, cw, chh);
+      ctx.scale(k, k);
+      // Line widths and text are in frame units, so they shrink with the scale
+      // — divide by k to keep them constant on screen no matter the lens.
+      const px = 1 / k;
+
+      const dr = c.dynroi;
+      cap.innerHTML = `<b>렌즈 ${ch + 1}</b> <span class="meta">ch${ch}</span> · ` +
+        (c.calibrating ? '<span class="warn">캘리브레이션 중 — 마커 검출 정지</span>'
+          : !c.detect ? '<span class="meta">검출 꺼짐</span>'
+          : dr.enabled ? (dr.tracking ? '<span class="ok">TRACK</span>' : '<span class="warn">SEARCH</span>')
+          : '<span class="meta">dynROI 꺼짐</span>') +
+        (c.calibrating ? '' : ` · 마커 ${c.markers}개` +
+          (c.det_ms >= 0 ? ` <span class="meta">· ${c.det_ms.toFixed(0)}ms</span>` : ''));
+
+      // Say it on the canvas too — an empty overlay on a lens that is busy
+      // calibrating means "not looking", not "nothing there".
+      if (c.calibrating) {
+        ctx.fillStyle = '#fbbf24';
+        ctx.font = `bold ${34 * px}px sans-serif`;
+        ctx.fillText('이 렌즈는 캘리브레이션 세션 중입니다', 16, 44 * px);
+      }
+
+      // dynROI 박스 — "다음 프레임에 카메라가 실제로 훑는 범위". 마커보다 먼저
+      // 그려서 코너를 가리지 않게 한다.
+      const r = c.roi;
+      ctx.font = `bold ${26 * px}px sans-serif`;
+      if (r && r.w && r.h) {
+        ctx.strokeStyle = '#a855f7'; ctx.lineWidth = 3 * px; ctx.setLineDash([10 * px, 6 * px]);
+        ctx.strokeRect(r.x, r.y, r.w, r.h);
+        ctx.setLineDash([]);
+        ctx.fillStyle = '#a855f7';
+        const pct = (r.w * r.h) / (W * H) * 100;
+        ctx.fillText(`동적 ROI ${r.w}×${r.h} (${pct.toFixed(1)}%)`, r.x + 6, Math.max(26 * px, r.y - 8));
+      } else if (dr.enabled && !dr.tracking) {
+        ctx.fillStyle = '#dc3545';
+        ctx.fillText('SEARCH — 전체 화면 재탐색 중', 12, 30 * px);
+      }
+
+      // The camera now knows its own K per lens, so use that and treat the
+      // paste box as an override for values that are not on the camera yet.
+      // Before the calibration port this page had no choice but to ask the
+      // operator to paste — that is no longer the normal case.
+      const own = (lastStatus.calib.lenses || []).find(L => L.ch === ch && L.have);
+      const K = own
+        ? { fx: own.fx, fy: own.fy, cx: own.cx, cy: own.cy, dist: own.dist }
+        : kCalib;
+      const note = own ? `<span class="ok">렌즈 ${ch + 1}: 카메라 K</span>`
+        : kCalib ? `<span class="warn">렌즈 ${ch + 1}: 붙여넣은 K</span>`
+        : `<span class="meta">렌즈 ${ch + 1}: K 없음</span>`;
+
+      const showUndist = $('ovUndist').checked && K;
+      for (const det of (c.dets || [])) {
+        const raw = det.c;  // [[x,y],[x,y],[x,y],[x,y]]
+        drawQuad(ctx, raw, '#f59e0b', 3 * px);
+        const [rcx, rcy] = quadCenter(raw);
+        ctx.fillStyle = '#f59e0b';
+        ctx.beginPath(); ctx.arc(rcx, rcy, 6 * px, 0, 7); ctx.fill();
+
+        const idLabel = `id ${det.id}` + (det.approx ? ' (근사·SEARCH)' : '');
+
+        if (showUndist) {
+          const u = raw.map(([x, y]) => undistortPixel(x, y, K));
+          drawQuad(ctx, u, '#22d3ee', 3 * px);
+          ctx.strokeStyle = 'rgba(255,255,255,0.65)'; ctx.lineWidth = px;
+          ctx.setLineDash([4 * px, 4 * px]);
+          for (let i = 0; i < 4; i++) {
+            ctx.beginPath(); ctx.moveTo(raw[i][0], raw[i][1]); ctx.lineTo(u[i][0], u[i][1]); ctx.stroke();
+          }
+          ctx.setLineDash([]);
+          const [ucx, ucy] = quadCenter(u);
+          ctx.fillStyle = '#22d3ee';
+          ctx.beginPath(); ctx.arc(ucx, ucy, 6 * px, 0, 7); ctx.fill();
+          const dpx = Math.hypot(ucx - rcx, ucy - rcy);
+          ctx.fillStyle = '#f59e0b';
+          ctx.fillText(`${idLabel} · Δ${dpx.toFixed(1)}px`, rcx + 10 * px, rcy - 10 * px);
+        } else {
+          ctx.fillStyle = '#f59e0b';
+          ctx.fillText(idLabel, rcx + 10 * px, rcy - 10 * px);
+        }
+      }
+      return note;
+    }
+
+    $('ovOn').addEventListener('change', drawOverlay);
+    $('ovUndist').addEventListener('change', drawOverlay);
+    document.querySelectorAll('input.ovch').forEach(el =>
+      el.addEventListener('change', drawOverlay));
+    const ovSetAll = (on) => {
+      document.querySelectorAll('input.ovch').forEach(el => { el.checked = on; });
+      drawOverlay();
+    };
+    $('ovAll').addEventListener('click', () => ovSetAll(true));
+    $('ovNone').addEventListener('click', () => ovSetAll(false));
+    $('ovKLoad').addEventListener('click', () => {
+      kCalib = parseKText($('ovKText').value);
+      $('ovKStatus').textContent = kCalib
+        ? `K 로드됨 — fx=${kCalib.fx.toFixed(1)} fy=${kCalib.fy.toFixed(1)} cx=${kCalib.cx.toFixed(1)} cy=${kCalib.cy.toFixed(1)}`
+        : '파싱 실패 — "K = [[fx,0,cx],[0,fy,cy],[0,0,1]]" 형식 확인';
+      drawOverlay();
+    });
+
+    const getStatus = (base) =>
+      fetch(base + '/status')
+        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+
+    // Known base -> one request. Unknown -> walk the candidates until one
+    // answers, then remember it.
+    function fetchStatus() {
+      if (base_uri) return getStatus(base_uri);
+      return candidates.reduce(
+        (chain, base) => chain.catch(() => getStatus(base).then(d => { base_uri = base; return d; })),
+        Promise.reject()
+      );
+    }
+
+    function refresh() {
+      const btn = $('btn');
+      btn.disabled = true;
+      $('err').style.display = 'none';
+      return fetchStatus()
+        .then(d => {
+          render(d);
+          $('stamp').textContent = new Date().toLocaleTimeString();
+        })
+        .catch(e => {
+          // Say exactly what was tried — the endpoint prefix is the one thing
+          // here that cannot be read off the source.
+          $('err').innerHTML = '조회 실패' + (e && e.message ? ': ' + esc(e.message) : '') +
+            '<br><span class="meta">page: ' + esc(window.location.pathname) +
+            '<br>tried: ' + candidates.map(c => esc(c + '/status')).join('<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;') +
+            '<br>앱이 Start 상태인지, 이 빌드에 /status 가 포함됐는지도 확인</span>';
+          $('err').style.display = 'block';
+          throw e;  // the auto-refresh loop switches itself off on this
+        })
+        .finally(() => { btn.disabled = false; });
+    }
+
+    // --- auto refresh ------------------------------------------------------
+    // setTimeout scheduled AFTER each response, never setInterval: a refresh
+    // can take over a second when the app is loaded, and a fixed interval
+    // would stack requests that the one scheduler thread then has to work
+    // through — the exact pile-up this page exists to watch for.
+    let autoTimer = null;
+
+    const autoOff = (why) => {
+      clearTimeout(autoTimer);
+      autoTimer = null;
+      $('auto').checked = false;
+      $('every').disabled = true;
+      if (why) $('stamp').textContent = why;
+    };
+
+    function autoTick() {
+      // Nothing to look at on a hidden tab, so do not spend the request.
+      if (document.hidden) { autoTimer = setTimeout(autoTick, 1000); return; }
+      refresh()
+        .then(() => { if ($('auto').checked) autoTimer = setTimeout(autoTick, TABS[tab].every); })
+        .catch(() => autoOff('자동 갱신 중지됨 (요청 실패)'));
+    }
+
+    $('every').addEventListener('change', () => {
+      TABS[tab].every = +$('every').value;
+      // Apply at once rather than after the current wait, which may be 5 s.
+      if ($('auto').checked) { clearTimeout(autoTimer); autoTick(); }
+    });
+
+    $('auto').addEventListener('change', () => {
+      clearTimeout(autoTimer);
+      autoTimer = null;
+      $('every').disabled = !$('auto').checked;
+      if ($('auto').checked) autoTick();
+    });
+
+    // Restart promptly on return instead of waiting out the 1 s idle poll.
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && $('auto').checked && autoTimer === null) autoTick();
+    });
+
+    // Toggling a lens returns the full status, so one round trip both applies
+    // the change and repaints. Delegated, because the buttons are rebuilt on
+    // every render.
+    // One command line, exactly what the pose link sends. The camera's /cmd
+    // and the RPi dashboard's /cmd take the same text, so anything doable here
+    // is doable from the server with the identical string.
+    const send = (cmd, el) => {
+      if (!base_uri) return;
+      if (el) el.disabled = true;
+      $('sent').textContent = cmd;
+      fetch(base_uri + '/cmd', { method: 'POST', body: cmd })
+        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(d => { render(d); $('stamp').textContent = new Date().toLocaleTimeString(); })
+        .catch(e => {
+          $('err').textContent = `"${cmd}" 실패: ${e.message}`;
+          $('err').style.display = 'block';
+          if (el) el.disabled = false;
+        });
+    };
+
+    $('chan').addEventListener('click', (ev) => {
+      const d = ev.target.closest('button.dyn');
+      if (d) { send(`DYNROI_CH ${d.dataset.ch} ${d.dataset.next}`, d); return; }
+      const b = ev.target.closest('button.toggle');
+      if (b) send(`DETECT ${b.dataset.ch} ${b.dataset.next === 'true' ? 1 : 0}`, b);
+    });
+
+    $('chan').addEventListener('change', (ev) => {
+      const s = ev.target.closest('select.scale');
+      if (s) send(`SCALE ${s.dataset.ch} ${s.value}`, s);
+    });
+
+    // dynROI is one setting for every lens, because that is what the DYNROI
+    // command does — it loops over all channels. Kept that way rather than
+    // invented per-channel here, so the page cannot express something the pose
+    // link cannot.
+    // The all-lenses form. DYNROI (no _CH) is the command the RPi already
+    // sends, so this box and the server stay literally interchangeable.
+    const applyAll = (on, el) =>
+      send(`DYNROI ${on ? 1 : 0} ${Number($('margin').value) || 0} ${Number($('maxmiss').value) || 0}`, el);
+
+    $('dynon').addEventListener('click', () => applyAll(true, $('dynon')));
+    $('dynoff').addEventListener('click', () => applyAll(false, $('dynoff')));
+
+    // refresh() rethrows so the auto loop can stop itself; the manual paths
+    // already showed the error, so they just swallow it.
+    $('btn').addEventListener('click', () => refresh().catch(() => {}));
+    showTab(location.hash.slice(1), false);
+    refresh().catch(() => {});  // one load on open
+  </script>
+</body>
+
+</html>
