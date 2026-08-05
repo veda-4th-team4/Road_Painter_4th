@@ -1,6 +1,8 @@
 #include "backend.h"
 #include "videoview.h"
 #include "video_worker.h"
+#include "preview_worker.h"
+#include "channel_tile.h"
 #include "serverclient.h"
 #include "routeplan.h"
 
@@ -146,14 +148,89 @@ Backend::Backend(QObject *parent)
         else
             clearNotice(QStringLiteral("blueprint"));
     });
-    connect(m_client, &ServerClient::hMatrixReceived, this, [this](const QJsonObject &calib) {
+    connect(m_client, &ServerClient::hMatrixReceived, this,
+            [this](int ch, const QJsonObject &calib) {
         if (m_testMode) return;
         if (calib.isEmpty()) {
-            appendLog("H_MATRIX 수신 — calib=null (서버에 보관된 번들 없음)");
+            appendLog(QStringLiteral("H_MATRIX 수신 (CH%1) — calib=null (서버에 보관된 번들 없음)").arg(ch));
+            return;
+        }
+        // 채널별 맵을 항상 최신으로 유지한다. 그리드의 "캘리 됨" 표시와
+        // [작업하기] 가능 여부가 이 맵을 본다.
+        m_calibs[QString::number(ch)] = calib;
+        emit channelChanged();
+
+        // 🔴 지금 보고 있지 않은 채널의 번들로 화면을 갈아엎지 않는다. 관리자 창에서
+        //    CH3 을 캘리하는 동안 CH1 로 작업 중일 수 있는데, 그때 CH3 번들을 적용하면
+        //    화면과 좌표가 통째로 어긋난다 — 그것도 에러 없이 조용히.
+        const int shown = channelMode() ? m_workingCh : ch;
+        if (channelMode() && ch != shown) {
+            appendLog(QStringLiteral("H_MATRIX 수신 (CH%1) — 보관만 함 "
+                                     "(지금 화면은 CH%2)").arg(ch).arg(shown));
             return;
         }
         // 수동 입력과 완전히 같은 경로. K/D 반영과 coord_mode 판정을 건너뛰지 않는다.
-        appendLog("H_MATRIX 수신 — " + applyCalibObject(calib, QStringLiteral("H_MATRIX")));
+        appendLog(QStringLiteral("H_MATRIX 수신 (CH%1) — ").arg(ch)
+                  + applyCalibObject(calib, QStringLiteral("H_MATRIX")));
+    });
+    // LOGIN_OK 의 채널별 번들 맵 (프로토콜 v0.4). 단일 채널 서버면 빈 값이 온다.
+    connect(m_client, &ServerClient::calibChannelsReceived, this,
+            [this](const QJsonObject &calibs, int activeCh) {
+        m_calibs = calibs;
+        if (calibs.isEmpty()) return;
+        QStringList ready;
+        for (int ch = 1; ch <= m_channelCount; ++ch)
+            if (channelCalibrated(ch)) ready << QStringLiteral("CH%1").arg(ch);
+        appendLog(QStringLiteral("LOGIN_OK calibs — 캘리 완료 채널: %1 (서버 활성 CH%2)")
+                      .arg(ready.isEmpty() ? QStringLiteral("없음") : ready.join(", "))
+                      .arg(activeCh));
+        emit channelChanged();
+    });
+    // LOGIN_OK 의 중계 스트림 주소 (선택 필드). 있으면 QSettings 값을 덮는다.
+    //
+    // 카메라가 4채널로 바뀌면서 RTSP 를 카메라에서 직접이 아니라 **중계 서버를 거쳐**
+    // 받는다. 그 주소를 사람이 설정에 손으로 넣는 대신 서버가 로그인 때 알려주는 것이
+    // 운영상 맞다 — 중계 주소가 바뀌어도 클라이언트를 안 건드린다.
+    //
+    // ⚠️ 서버가 안 보내면 **아무것도 하지 않는다.** 지금 서버(v0.3)는 이 필드가 없으므로
+    //    빈 문자열이 오고, 그러면 QSettings 의 relayBase 가 그대로 쓰인다. 중계 주소를
+    //    비워두면 PNO 단일 채널 직결로 돌아가는 것도 그대로다.
+    // ⚠️ cam_ip 의 의미는 건드리지 않는다. 그걸 바꾸면 PNO 경로가 깨진다.
+    connect(m_client, &ServerClient::streamInfoReceived, this,
+            [this](const QString &base, int channels) {
+        if (base.trimmed().isEmpty()) return;          // 서버가 안 준다 → 설정값 유지
+        if (channels > 0 && channels != m_channelCount) {
+            m_channelCount = channels;
+            saveSettings();
+        }
+        if (base.trimmed() == m_relayBase) return;     // 같은 값이면 조용히 넘어간다
+        setRelayBase(base);
+        appendLog(QStringLiteral("LOGIN_OK stream — 중계 주소를 서버 값으로 설정: %1 (%2채널)")
+                      .arg(m_relayBase).arg(m_channelCount));
+    });
+    // 채널 전환 결과. startChannelWork() 가 이미 갖고 있던 번들로 화면을 만들었으므로
+    // 보통은 확인용이지만, 서버에만 있는 최신 번들이 여기서 오는 경우가 있다.
+    connect(m_client, &ServerClient::channelResult, this,
+            [this](bool ok, int ch, const QJsonObject &calib, bool hasCalib,
+                   const QString &reason) {
+        if (!ok) {
+            appendLog(QStringLiteral("CHANNEL_FAIL — %1").arg(reason));
+            setNotice(QStringLiteral("채널 전환을 서버가 거절했습니다 (%1).").arg(reason),
+                      QStringLiteral("error"));
+            return;
+        }
+        if (hasCalib) m_calibs[QString::number(ch)] = calib;
+        emit channelChanged();
+        if (ch != m_workingCh) return;   // 이미 다른 채널로 넘어갔으면 늦은 응답이다
+        if (!hasCalib) {
+            appendLog(QStringLiteral("CHANNEL_OK CH%1 — 서버에 이 채널 캘리브레이션이 없습니다").arg(ch));
+            setNotice(QStringLiteral("CH%1 은 서버에 캘리브레이션이 없습니다. 좌표를 믿을 수 "
+                                     "없으니 관리자 창에서 이 채널을 캘리브레이션하세요.").arg(ch),
+                      QStringLiteral("warn"), QStringLiteral("chcalib"));
+            return;
+        }
+        appendLog(QStringLiteral("CHANNEL_OK CH%1 — ").arg(ch)
+                  + applyCalibObject(calib, QStringLiteral("CH%1").arg(ch)));
     });
     // 도색 완료 — START_DRAW 이후 서버가 주는 유일한 "끝" 신호
     connect(m_client, &ServerClient::drawDone, this, [this]() {
@@ -163,6 +240,25 @@ Backend::Backend(QObject *parent)
         }
         setNotice(QStringLiteral("도색이 완료되었습니다."), QStringLiteral("info"));
         finishJob(QStringLiteral("DRAW_DONE — 도색 완료"));
+    });
+    // 작업 취소 확인. cancelJob() 이 이미 UI 를 정리했으므로 보통은 로그만 남는다.
+    // 관리자 창(ADMIN)이 취소한 경우엔 여기가 유일한 통지라 상태를 여기서 접는다.
+    connect(m_client, &ServerClient::drawAborted, this, [this](bool wasActive) {
+        appendLog(QStringLiteral("DRAW_ABORTED — 서버 경로 폐기 (진행 중이던 작업 %1)")
+                      .arg(wasActive ? QStringLiteral("있음") : QStringLiteral("없음")));
+        if (!m_jobActive) return;   // cancelJob() 이 이미 정리한 정상 경로
+        stopTestProgressSim();
+        m_jobActive = false;
+        m_paintingSeen = false;
+        m_jobElapsedValid = false;
+        m_jobProgress = 0.0;
+        if (m_topView) m_topView->setMissionProgress(0.0);
+        if (m_originalView) m_originalView->setMissionProgress(0.0);
+        updateJobRecord(m_currentJobId, QStringLiteral("중단"), m_jobProgress);
+        setNotice(QStringLiteral("다른 곳(관리자 창)에서 작업이 취소되었습니다."),
+                  QStringLiteral("warn"));
+        emit jobChanged();
+        updatePhase();
     });
     connect(m_client, &ServerClient::drawFailed, this,
             [this](const QString &stage, const QString &reason, const QString &msg) {
@@ -279,15 +375,31 @@ Backend::~Backend()
 {
     stopTestProgressSim();
     if (m_worker) { m_worker->stop(); m_worker->wait(); }
+    // 종료할 때는 실제로 기다린다. 여기서 안 기다리면 QThread 가 살아 있는 채로
+    // 파괴돼 "QThread: Destroyed while thread is still running" 으로 죽는다.
+    // (stopPreviews() 는 UI 응답성 때문에 기다리지 않으므로 여기서 별도로 처리)
+    //
+    // ⚠️ **먼저 전부 stop 을 걸고, 그다음에 기다린다.** 하나씩 stop→wait 을 반복하면
+    //    워커가 4개라 최악의 경우 대기가 4배로 직렬화된다(스트림이 죽어 있으면
+    //    각각 소켓 타임아웃까지 간다). 다 같이 멈추게 해두면 한 번의 대기로 끝난다.
+    for (preview_worker *w : std::as_const(m_previews))
+        if (w) { w->disconnect(); w->stop(); }
+    for (preview_worker *w : std::as_const(m_previews)) {
+        if (!w) continue;
+        // 소멸자(~preview_worker)도 같은 이유로 기다린다 — 여기 값은 그것과 맞춘다.
+        if (!w->wait(7000))
+            qWarning() << "[shutdown] CH" << w->channel() << "미리보기 스레드가 안 끝났습니다";
+    }
+    qDeleteAll(m_previews);
+    m_previews.clear();
 }
 
-void Backend::setKeyboardControl(bool v)
-{
-    if (m_keyboardControl == v) return;
-    m_keyboardControl = v;
-    emit keyboardControlChanged();
-    if (v) appendLog("키보드 로봇 제어 ON");
-}
+// ⚠️ 여기 있던 setKeyboardControl / keyboardControl / m_keyboardControl 은 지웠다.
+//    **아무 데서도 안 쓰였다** — QML 이 이 프로퍼티를 읽지도 쓰지도 않았고, C++ 에서
+//    setter 를 부르는 곳도 없었다. 즉 m_keyboardControl 은 항상 false 였고, 그 값을
+//    조건으로 쓰는 코드도 없어서 켜져도 아무 일이 안 일어났다(로그 한 줄 빼고).
+//    키보드 로봇 제어를 실제로 붙일 때는 "값을 읽어 동작을 가르는 곳"부터 만들 것 —
+//    프로퍼티만 되살리면 똑같이 죽은 코드가 된다.
 
 void Backend::login(const QString &id, const QString &pw)
 {
@@ -300,7 +412,7 @@ void Backend::login(const QString &id, const QString &pw)
         loadHistory();
         emit sessionChanged();
         emit linkStatusChanged();
-        startWorker();
+        enterInitialView();
         appendLog("테스트 모드 로그인");
         updatePhase();
         emit loginSucceeded();
@@ -333,7 +445,8 @@ void Backend::login(const QString &id, const QString &pw)
             // 서버에 등록해둔 카메라 IP 가 있으면 그걸로 RTSP URL 을 조립한다.
             if (!camIp.trimmed().isEmpty())
                 setCamIp(camIp.trimmed());
-            startWorker();
+            // 4채널이면 그리드부터, 아니면 예전처럼 곧바로 작업 화면.
+            enterInitialView();
             appendLog(QString("로그인 성공: %1").arg(id));
             if (m_calibMissing) {
                 setNotice(QStringLiteral("이 현장은 아직 캘리브레이션이 없습니다. 관리자 창(%1)에서 "
@@ -454,8 +567,12 @@ void Backend::setArucoOverlay(bool on)
     m_arucoOverlay = on;
     if (m_originalView) m_originalView->setArucoVisible(on);
     if (m_topView) m_topView->setArucoVisible(on);
+    // 🔴 워커에도 알린다 — 예전에는 뷰의 표시 플래그만 껐고 **검출은 계속 돌았다.**
+    //    끄나 켜나 CPU 를 똑같이 태웠다는 뜻이다. 이제 끄면 검출 자체를 안 한다.
+    if (m_worker) m_worker->setArucoEnabled(on);
     emit arucoChanged();
-    appendLog(on ? "ArUco 마커 표시 켬" : "ArUco 마커 표시 끔");
+    appendLog(on ? QStringLiteral("ArUco 검출 켬")
+                 : QStringLiteral("ArUco 검출 끔 — 검출 자체를 멈춥니다 (로봇 위치는 서버 POSE로 계속 수신)"));
 }
 
 void Backend::setNotice(const QString &text, const QString &level, const QString &key)
@@ -488,13 +605,20 @@ void Backend::logout()
 {
     stopTestProgressSim();
     clearMission();
+    // 미리보기 4개를 먼저 정리한다. 안 하면 로그인 화면 뒤에서 서브스트림 4개가
+    // 계속 돌면서 카메라 세션과 CPU 를 붙잡고 있는다.
+    stopPreviews();
+    m_tiles.clear();
+    m_highlightedCh = 0;
+    m_workingCh = 0;
+    m_calibs = QJsonObject();
+    emit channelChanged();
     if (m_worker) { m_worker->stop(); m_worker->wait(); m_worker->deleteLater(); m_worker = nullptr; }
     m_workerStarted = false;
     m_topView = nullptr;
     m_originalView = nullptr;
 
     if (m_drawing) { m_drawing = false; emit drawingChanged(); }
-    if (m_keyboardControl) { m_keyboardControl = false; emit keyboardControlChanged(); }
     m_estopActive = false;
 
     if (m_client && m_client->isConnected()) m_client->disconnectFromServer();
@@ -588,6 +712,9 @@ void Backend::wireWorker(video_worker *w)
                                  "(카메라 설정 저장·세션 경합 등으로 스트림이 재시작된 경우)"));
     });
     connect(w, &video_worker::arucoDetected, this, &Backend::onAruco);
+    // 워커가 새로 만들어질 때마다(채널 전환·주소 변경) 현재 토글 상태를 물려준다.
+    // 안 하면 껐던 사람이 채널을 바꾸는 순간 검출이 다시 켜진다.
+    w->setArucoEnabled(m_arucoOverlay);
     if (m_topView)
         connect(w, &video_worker::frameReceived, m_topView, &VideoView::onFrame);
     if (m_originalView)
@@ -946,14 +1073,34 @@ void Backend::startPainting()
         startTestProgressSim();
 }
 
-// 진행 중인 작업 중단. 경로 실행 중에는 서버가 수동 STOP 을 무시하므로 ESTOP 을 쓴다.
+// 진행 중인 작업을 **취소**한다 (프로토콜 v0.4 CMD ABORT_DRAW).
+//
+// ⚠️ 예전에는 여기서 ESTOP 만 보냈는데, 그건 일시정지였다. 로컬 상태만 정리되고
+//    서버의 경로 상태(planActive_)와 로봇의 세그먼트 커서는 그대로 남아서:
+//      · [ESTOP 해제]를 누르면 로봇이 멈춘 지점부터 도색을 이어서 재개했고
+//      · 서버는 계속 "실행 중"이라 다음 START_DRAW 를 DRAW_FAIL{busy} 로 거절했다
+//    ABORT_DRAW 는 서버와 로봇이 받아둔 경로를 버리게 하므로 실제로 취소가 된다.
+//    (정지·비상정지 래치까지 이 한 명령이 다 한다 — ESTOP 을 따로 보내지 않는다)
 void Backend::cancelJob()
 {
     if (!m_jobActive) return;
     const double doneSoFar = m_jobProgress;   // 이력에는 중단 시점 진행률을 남긴다
     stopTestProgressSim();
 
-    sendRobotCmd("ESTOP", "작업 중단");
+    // 로봇 상태 표시는 ESTOP 과 같다 — 서버가 로봇에 비상정지 래치를 걸어준다.
+    m_robotStatus = QStringLiteral("작업 취소");
+    m_robotState = QStringLiteral("ESTOPPED");
+    m_estopActive = true;
+    emit robotStatusChanged();
+    if (m_client && !m_testMode) {
+        m_client->sendAbortDraw();
+        appendLog(QStringLiteral("CMD ABORT_DRAW — 서버·로봇의 경로를 폐기"));
+    } else {
+        appendLog(QStringLiteral("[테스트] CMD ABORT_DRAW"));
+    }
+
+    // 서버의 DRAW_ABORTED 를 기다리지 않고 UI 를 먼저 정리한다. 취소는 사용자가
+    // 급할 때 누르는 버튼이라, 서버 왕복 동안 화면이 멈춰 있으면 안 된다.
     m_jobActive = false;
     m_paintingSeen = false;
     m_jobElapsedValid = false;
@@ -963,10 +1110,11 @@ void Backend::cancelJob()
     if (m_originalView) m_originalView->setMissionProgress(0.0);
     updateJobRecord(m_currentJobId, QStringLiteral("중단"), doneSoFar);
     emit jobChanged();
-    setNotice(QStringLiteral("작업을 중단했습니다. 로봇은 비상정지 상태입니다 — "
-                             "다시 움직이려면 ESTOP 해제를 누르세요."),
+    setNotice(QStringLiteral("작업을 취소했습니다. 경로는 폐기되어 ESTOP 해제를 해도 "
+                             "이어서 그리지 않습니다 — 다시 그리려면 [그림그리기 시작]을 "
+                             "누르세요. 로봇을 움직이려면 먼저 ESTOP 해제."),
               QStringLiteral("warn"), QStringLiteral("estop"));
-    appendLog("작업 중단 (ESTOP)");
+    appendLog(QStringLiteral("작업 취소 — 경로 폐기 + 비상정지 래치"));
     updatePhase();
 }
 
@@ -1725,6 +1873,348 @@ void Backend::updatePhase()
     }
 }
 
+// ── 다채널 카메라 (PNM-C16083RVQ, 프로토콜 v0.4) ──────────────────────────
+//
+// 화면은 두 단계다:
+//   [그리드]  2x2 미리보기 4채널 (서브스트림, 마커검출 없음)
+//      │ 타일 클릭 → 하이라이트 + [작업하기] 활성화
+//      ▼ [작업하기]
+//   [작업]    고른 채널 1개만 메인스트림 + 마커검출 + 기존 Qt 기능 전부
+//
+// 핵심은 **작업 화면이 기존 코드 경로를 그대로 탄다**는 것이다. 채널을 고르는
+// 행위 = setRtsp() 를 새 URL 로 부르는 것 + 그 채널의 캘리브레이션을 적용하는 것.
+// 캘리브레이션·ArUco·작도·도면 변환 코드는 한 줄도 안 건드린다.
+
+// 주소는 두 갈래다:
+//   · 중계 있음 → {relayBase}/chN · /chNs   (Server/relay/README.md 와 짝. 여기만
+//                                            바꾸면 안 되고 mediamtx.yml 도 같이)
+//   · 중계 없음 → 카메라 직결 템플릿 ({ch0} 치환, 센서 번호는 0부터)
+// **중계가 있으면 중계가 이긴다.** 서버가 나중에 LOGIN_OK.stream 으로 중계 주소를
+// 주면 직결 템플릿은 저절로 안 쓰이게 된다 — 그때 코드를 고칠 필요가 없다.
+QString Backend::channelUrl(int ch, bool sub) const
+{
+    if (!m_relayBase.isEmpty())
+        return QStringLiteral("%1/ch%2%3").arg(m_relayBase).arg(ch)
+                                          .arg(sub ? QStringLiteral("s") : QString());
+
+    // 직결. ⚠️ 이 카메라에는 저해상도 서브 프로파일이 없어서 sub 여부와 무관하게
+    //    같은 주소가 나간다 (현재 4채널 전부 H.264 1920x1080 15fps 2560kbps GOV 8).
+    //    서브가 생기면 여기서 sub 일 때 다른 템플릿을 쓰도록 갈라주면 된다.
+    QString url = m_channelUrlTemplate;
+    url.replace(QStringLiteral("{ch0}"), QString::number(ch - 1));
+    url.replace(QStringLiteral("{ch}"),  QString::number(ch));
+    return url;
+}
+
+QString Backend::mainUrl(int ch) const { return channelUrl(ch, false); }
+QString Backend::subUrl(int ch)  const { return channelUrl(ch, true);  }
+
+// 지금 영상을 어디서 받는지 한 줄로. ⚠️ 직결 URL 에는 계정이 들어 있으므로
+// 비밀번호를 가린 뒤에 낸다 — 이 문자열은 화면에도 로그에도 나간다.
+static QString maskRtspPassword(const QString &url)
+{
+    // rtsp://user:pass@host/... 에서 pass 만 ***** 로 바꾼다
+    static const QRegularExpression re(QStringLiteral("^(\\w+://[^:/@]+:)([^@/]*)(@)"));
+    QString out = url;
+    const auto m = re.match(out);
+    if (m.hasMatch())
+        out.replace(m.capturedStart(2), m.capturedLength(2), QStringLiteral("*****"));
+    return out;
+}
+
+QString Backend::streamSourceText() const
+{
+    if (!channelMode()) return QStringLiteral("단일 채널 직결");
+    if (!m_relayBase.isEmpty())
+        return QStringLiteral("중계 %1 · 메인 /ch1 … 서브 /ch1s").arg(m_relayBase);
+    return QStringLiteral("카메라 직결 · %1 (서브 없음 — 미리보기도 풀해상도)")
+               .arg(maskRtspPassword(channelUrl(1, false)));
+}
+
+QJsonObject Backend::calibOfChannel(int ch) const
+{
+    return m_calibs.value(QString::number(ch)).toObject();
+}
+
+bool Backend::channelCalibrated(int ch) const
+{
+    return !calibOfChannel(ch).isEmpty();
+}
+
+QVariantList Backend::calibratedChannels() const
+{
+    QVariantList out;
+    for (int ch = 1; ch <= m_channelCount; ++ch)
+        if (channelCalibrated(ch)) out << ch;
+    return out;
+}
+
+void Backend::setRelayBase(const QString &base)
+{
+    QString clean = base.trimmed();
+    // 뒤 슬래시를 남기면 URL 이 "…:8554//ch1" 이 되어 중계가 경로를 못 찾는다.
+    while (clean.endsWith('/')) clean.chop(1);
+    if (clean == m_relayBase) return;
+
+    const bool wasChannelMode = channelMode();
+    m_relayBase = clean;
+    saveSettings();
+
+    if (!channelMode()) {
+        // 중계도 직결 템플릿도 둘 다 비었다 = 4채널 기능 끄기.
+        // 예전 단일 채널 동작으로 즉시 복귀한다. 재빌드가 필요 없는 되돌리기
+        // 수단이라 여기서 확실히 정리해야 한다.
+        stopPreviews();
+        m_highlightedCh = 0;
+        m_workingCh = 0;
+        appendLog(QStringLiteral("중계 주소 해제 — 단일 채널(직결) 동작으로 되돌립니다"));
+        emit channelChanged();
+        if (wasChannelMode) {
+            // 중계 URL 이 걸려 있으면 그대로 되돌아가지 못한다. 직결 주소로 되돌린다.
+            setRtsp(m_directRtspUrl);
+            if (!m_workerStarted) startWorker();
+        }
+        return;
+    }
+
+    if (m_relayBase.isEmpty()) {
+        // 중계만 해제됐고 직결 템플릿은 남아 있다 → 4채널을 **카메라 직결**로 계속한다.
+        // 화면에 떠 있는 스트림이 중계 URL 이면 그대로 두면 안 되므로 다시 잡는다.
+        appendLog(QStringLiteral("중계 주소 해제 — 카메라 직결로 4채널을 계속합니다: %1")
+                      .arg(channelUrl(1, false)));
+        emit channelChanged();
+        // ⚠️ 주소가 바뀌었으므로 미리보기를 **완전히 끊고** 새 주소로 다시 연다.
+        //    startPreviews() 는 이미 워커가 있으면 재개만 하므로, 여기서 안 끊으면
+        //    옛 주소를 계속 보게 된다.
+        stopPreviews();
+        if (m_workingCh > 0) setRtsp(mainUrl(m_workingCh));
+        else                 showChannelGrid();
+        return;
+    }
+
+    appendLog(QStringLiteral("중계 주소 설정: %1 (채널 %2개)")
+                  .arg(m_relayBase).arg(m_channelCount));
+    emit channelChanged();
+    stopPreviews();   // 위와 같은 이유 — 새 주소로 다시 열어야 한다
+    showChannelGrid();
+}
+
+void Backend::registerTile(ChannelTile *tile, int ch)
+{
+    if (!tile || ch <= 0) return;
+    m_tiles.insert(ch, tile);
+    tile->setChannel(ch);
+    tile->setSelected(ch == m_highlightedCh);
+    // QML 이 그리드를 다시 만들면(화면 전환) 타일 객체가 새로 생긴다. 사라진
+    // 타일에 프레임을 밀면 죽으므로, 파괴될 때 등록을 지운다.
+    connect(tile, &QObject::destroyed, this, [this, ch](QObject *o) {
+        if (m_tiles.value(ch) == o) m_tiles.remove(ch);
+    });
+    connect(tile, &ChannelTile::clicked, this, &Backend::highlightChannel,
+            Qt::UniqueConnection);
+}
+
+void Backend::highlightChannel(int ch)
+{
+    if (!channelMode() || ch <= 0 || ch > m_channelCount) return;
+    if (m_highlightedCh == ch) return;
+    m_highlightedCh = ch;
+    for (auto it = m_tiles.constBegin(); it != m_tiles.constEnd(); ++it)
+        if (it.value()) it.value()->setSelected(it.key() == ch);
+    appendLog(QStringLiteral("CH%1 선택 — 캘리브레이션 %2")
+                  .arg(ch)
+                  .arg(channelCalibrated(ch) ? QStringLiteral("있음")
+                                             : QStringLiteral("없음 (작업 불가)")));
+    if (!channelCalibrated(ch))
+        setNotice(QStringLiteral("CH%1 은 아직 캘리브레이션이 없습니다. 관리자 창(%2)에서 "
+                                 "이 채널을 먼저 캘리브레이션하세요.")
+                      .arg(ch).arg(adminConsoleUrl()),
+                  QStringLiteral("warn"), QStringLiteral("chcalib"));
+    else
+        clearNotice(QStringLiteral("chcalib"));
+    emit channelChanged();
+}
+
+void Backend::startChannelWork()
+{
+    if (!canStartChannelWork()) return;
+    const int ch = m_highlightedCh;
+
+    // 미리보기는 **끄지 않고 일시정지**한다. 작업 화면에서 안 보이는 건 맞지만,
+    // 끄면 그리드로 돌아올 때 4채널을 다시 열어야 하고 그게 4.6초다(직렬화 때문).
+    // 일시정지는 grab 만 돌려 세션만 살려두므로 복귀가 즉시다.
+    // 대가가 있는지 실측했다: 메인+미리보기4 동시에도 메인이 15.0fps · p50 67.0ms 로
+    // 단독과 같았다 (2026-08-04 유선). 즉 작업 화면 성능을 깎지 않는다.
+    pausePreviews(true);
+    m_workingCh = ch;
+
+    // 서버에 "이 채널을 본다"고 알린다. 서버가 CCTV 에 중계해 그 채널의 마커를
+    // 잡게 하고, POS 를 이 채널 캘리브레이션으로 변환한다. 이걸 빠뜨리면 영상만
+    // 바뀌고 로봇 위치는 옛 채널 기준이라 조용히 어긋난다.
+    if (m_client && !m_testMode)
+        m_client->sendSelectChannel(ch);
+
+    // 그 채널의 캘리브레이션을 적용한다. 서버 CHANNEL_OK 로도 같은 번들이 오지만,
+    // 왕복을 기다리면 화면이 잠깐 옛 좌표계로 떠 있게 된다 — 갖고 있으면 먼저 쓴다.
+    const QJsonObject calib = calibOfChannel(ch);
+    if (!calib.isEmpty()) {
+        appendLog(QStringLiteral("CH%1 캘리브레이션 적용 — ").arg(ch)
+                  + applyCalibObject(calib, QStringLiteral("CH%1").arg(ch)));
+        clearNotice(QStringLiteral("chcalib"));
+    } else {
+        // 막지는 않는다(위 canStartChannelWork 주석 참고). 대신 좌표를 믿으면 안
+        // 된다는 것을 확실히 남긴다 — 이 상태로 그린 도면은 엉뚱한 곳에 칠해진다.
+        m_calibMissing = true;
+        emit calibChanged();
+        appendLog(QStringLiteral("⚠️ CH%1 캘리브레이션 없음 — 좌표를 믿을 수 없습니다 "
+                                 "(영상 확인·수동 조작만 하세요)").arg(ch));
+        setNotice(QStringLiteral("CH%1 은 캘리브레이션이 없습니다. 도면 좌표가 맞지 않으므로 "
+                                 "관리자 창(%2)에서 이 채널을 먼저 캘리브레이션하세요.")
+                      .arg(ch).arg(adminConsoleUrl()),
+                  QStringLiteral("warn"), QStringLiteral("chcalib"));
+    }
+
+    // ← 여기가 이 설계의 핵심. setRtsp() 가 워커 교체와 뷰 재연결을 전부 한다.
+    //    채널 전환은 그 함수를 다른 URL 로 부르는 것 이상이 아니다.
+    setRtsp(mainUrl(ch));
+    if (!m_workerStarted) startWorker();
+
+    appendLog(QStringLiteral("CH%1 작업 시작 — 메인스트림 + 마커검출").arg(ch));
+    emit channelChanged();
+    updatePhase();
+}
+
+void Backend::showChannelGrid()
+{
+    if (!channelMode()) return;
+    if (m_jobActive) {
+        setNotice(QStringLiteral("작업이 진행 중입니다. 먼저 취소한 뒤 채널을 바꾸세요."),
+                  QStringLiteral("warn"));
+        return;
+    }
+    m_workingCh = 0;
+    // 작업용 메인스트림을 끊는다. 안 끊으면 그리드(4채널) 위에 메인 디코드가
+    // 계속 얹혀 돈다 — 서브 프로파일이 없어진 뒤로는 그리드 자체가 1080p 4장이라
+    // 이걸 안 끊으면 5장을 동시에 디코딩하게 된다.
+    if (m_worker) {
+        video_worker *old = m_worker;
+        m_worker = nullptr;
+        m_workerStarted = false;
+        old->disconnect();
+        connect(old, &QThread::finished, old, &QObject::deleteLater);
+        old->stop();
+    }
+    if (m_frameWatch) m_frameWatch->stop();
+    startPreviews();
+    appendLog(QStringLiteral("채널 목록으로 — 미리보기 %1채널").arg(m_channelCount));
+    emit channelChanged();
+    updatePhase();
+}
+
+// 수동 새로고침. 자동 재접속이 있는데도 이게 필요한 이유는 backend.h 주석 참고.
+void Backend::refreshStreams()
+{
+    if (m_workingCh > 0) {
+        // 작업 화면 — 메인스트림만 다시 연다. 미리보기는 일시정지 상태 그대로 둔다.
+        appendLog(QStringLiteral("새로고침 — CH%1 메인스트림을 다시 엽니다").arg(m_workingCh));
+        setRtsp(mainUrl(m_workingCh));
+        if (!m_workerStarted) startWorker();
+        return;
+    }
+    if (!channelMode()) {
+        appendLog(QStringLiteral("새로고침 — 스트림을 다시 엽니다"));
+        setRtsp(m_rtspUrl);
+        if (!m_workerStarted) startWorker();
+        return;
+    }
+    // 그리드 — 4채널을 전부 끊고 다시 연다 (약 4.6초)
+    appendLog(QStringLiteral("새로고침 — 미리보기 %1채널을 다시 엽니다 (몇 초 걸립니다)")
+                  .arg(m_channelCount));
+    stopPreviews();
+    startPreviews();
+}
+
+void Backend::pausePreviews(bool on)
+{
+    for (preview_worker *w : std::as_const(m_previews))
+        if (w) w->setPaused(on);
+    if (!m_previews.isEmpty())
+        appendLog(on ? QStringLiteral("미리보기 일시정지 (세션은 유지 — 복귀가 즉시입니다)")
+                     : QStringLiteral("미리보기 재개"));
+}
+
+void Backend::startPreviews()
+{
+    if (!channelMode()) return;
+    // 이미 돌고 있으면 **다시 열지 않는다.** 작업 화면에서 돌아온 경우가 이쪽인데,
+    // 여기서 stop→start 를 하면 채널당 1.1초 x 4채널 직렬 = 4.6초를 그대로 낸다.
+    // ⚠️ 단, 채널 수가 달라졌으면 재개하면 안 된다 — m_channelCount 는 서버의
+    //    LOGIN_OK.stream 으로 **런타임에 바뀔 수 있다**(streamInfoReceived 참고).
+    //    그대로 재개하면 채널이 늘어도 옛 개수만 보이고, 줄면 없는 채널을 계속 문다.
+    if (!m_previews.isEmpty()) {
+        if (m_previews.size() == m_channelCount) {
+            pausePreviews(false);
+            return;
+        }
+        appendLog(QStringLiteral("채널 수가 %1 → %2 로 바뀌어 미리보기를 다시 엽니다")
+                      .arg(m_previews.size()).arg(m_channelCount));
+        stopPreviews();
+    }
+    for (int ch = 1; ch <= m_channelCount; ++ch) {
+        auto *w = new preview_worker(ch, subUrl(ch), this);
+        connect(w, &preview_worker::frameReceived, this,
+                [this](int c, const QImage &img) {
+            if (ChannelTile *t = m_tiles.value(c)) t->onFrame(img);
+        });
+        connect(w, &preview_worker::liveChanged, this, [this](int c, bool live) {
+            if (ChannelTile *t = m_tiles.value(c)) t->setLive(live);
+        });
+        connect(w, &preview_worker::openFailed, this,
+                [this](int c, const QString &url) {
+            if (ChannelTile *t = m_tiles.value(c)) t->setFailed(true);
+            appendLog(QStringLiteral("CH%1 미리보기 연결 실패 — %2 "
+                                     "(자동 재시도는 하지 않습니다: 계정 잠김 방지)")
+                          .arg(c).arg(url));
+        });
+        // 백프레셔 해제는 **맨 마지막에** 연결한다 — 큐드 연결은 연결 순서대로
+        // 배달되므로, 타일이 프레임을 다 그린 뒤에야 "소비했다"고 알리게 된다.
+        connect(w, &preview_worker::frameReceived, this, [w]() { w->frameConsumed(); });
+        m_previews.append(w);
+        w->start();
+    }
+}
+
+void Backend::stopPreviews()
+{
+    for (preview_worker *w : std::as_const(m_previews)) {
+        if (!w) continue;
+        // ⚠️ 여기서 wait() 하지 않는다. 캡처 스레드는 죽은 RTSP 주소에서 수 초씩
+        //    막혀 있을 수 있고, 그동안 GUI 스레드가 통째로 멈춘다 — 채널을 눌렀는데
+        //    앱이 굳는 증상이 된다. 종료만 요청하고 스스로 끝나면 정리되게 넘긴다.
+        w->disconnect();
+        connect(w, &QThread::finished, w, &QObject::deleteLater);
+        w->stop();
+    }
+    m_previews.clear();
+    for (auto it = m_tiles.constBegin(); it != m_tiles.constEnd(); ++it)
+        if (it.value()) it.value()->setLive(false);
+}
+
+// 로그인 직후 어디로 갈지. 4채널이면 그리드부터, 아니면 예전처럼 바로 작업 화면.
+void Backend::enterInitialView()
+{
+    // 테스트 모드는 카메라·서버 없이 도면만 그려보는 용도다. 중계도 당연히 없으므로
+    // 그리드를 띄우면 4칸이 전부 "연결 실패"인 화면에 갇힌다.
+    if (channelMode() && !m_testMode) {
+        m_workingCh = 0;
+        m_highlightedCh = 0;
+        startPreviews();
+        emit channelChanged();
+    } else {
+        startWorker();
+    }
+}
+
 void Backend::startTestProgressSim()
 {
     if (!m_testProgressTimer) return;
@@ -1863,6 +2353,10 @@ void Backend::setRtsp(const QString &url)
 {
     if (url.isEmpty() || url == m_rtspUrl) return;
     m_rtspUrl = url;
+    // 중계 주소(…/chN)는 "돌아갈 직결 주소"가 아니다. 이걸 같이 덮으면 중계를
+    // 껐을 때 되돌아갈 PNO 주소가 사라진다 (m_directRtspUrl 선언부 주석 참고).
+    if (m_relayBase.isEmpty() || !url.startsWith(m_relayBase))
+        m_directRtspUrl = url;
     emit rtspChanged();
     if (!m_worker) return;
 
@@ -2027,9 +2521,14 @@ QString Backend::applyCalibObject(const QJsonObject &raw, const QString &source)
             if (m.imgW > 0 && m_frameW > 0 && (m.imgW != m_frameW || m.imgH != m_frameH)) {
                 appendLog(QStringLiteral("⚠️ 캘리브 해상도 %1×%2 ≠ 영상 %3×%4 — 좌표가 맞지 않습니다")
                               .arg(m.imgW).arg(m.imgH).arg(m_frameW).arg(m_frameH));
-                setNotice(QStringLiteral("캘리브레이션 해상도와 카메라 영상 해상도가 다릅니다. "
-                                         "카메라 프로파일을 %1×%2 로 되돌리세요.")
-                              .arg(m.imgW).arg(m.imgH),
+                // ⚠️ "프로파일을 되돌리세요" 라고만 쓰지 않는다. 해상도를 **일부러**
+                //    바꾸는 경우가 있어서(16:9 모니터에 맞춰 2592x1520 → 1920x1080 으로
+                //    바꾼 2026-08-04 처럼) 그때는 되돌리는 게 아니라 캘리브레이션을
+                //    새 해상도로 다시 잡는 것이 맞다. 둘 다 제시해야 조작자가 고른다.
+                setNotice(QStringLiteral("캘리브레이션은 %1×%2 기준인데 영상은 %3×%4 입니다. "
+                                         "카메라 프로파일을 %1×%2 로 되돌리거나, "
+                                         "캘리브레이션을 %3×%4 로 다시 잡아야 합니다.")
+                              .arg(m.imgW).arg(m.imgH).arg(m_frameW).arg(m_frameH),
                           QStringLiteral("warn"), QStringLiteral("calibsize"));
             } else {
                 clearNotice(QStringLiteral("calibsize"));
@@ -2247,9 +2746,20 @@ void Backend::loadSettings()
     // 되돌아가는데, 그 IP 에 카메라가 없으면 "왜 영상이 안 나오지" 로만 보인다.
     // 서버가 LOGIN_OK.cam_ip 를 주면 그 값이 이걸 덮는다.
     const QString savedUrl = s.value("camera/rtspUrl").toString().trimmed();
-    if (!savedUrl.isEmpty()) m_rtspUrl = savedUrl;
+    if (!savedUrl.isEmpty()) m_rtspUrl = m_directRtspUrl = savedUrl;
     const QString savedIp = s.value("camera/ip").toString().trimmed();
     if (!savedIp.isEmpty()) m_camIp = savedIp;
+
+    // 4채널 중계 주소. 🔴 **비어 있는 것이 기본값**이고, 비면 위 단일 채널 경로만
+    // 돈다 — PNM 은 아직 시도 단계라 언제든 PNO 직결로 되돌아갈 수 있어야 한다.
+    m_relayBase = s.value("camera/relayBase").toString().trimmed();
+    while (m_relayBase.endsWith('/')) m_relayBase.chop(1);
+    // 중계 없이 카메라에 직결할 때의 채널 URL 템플릿. 기본값은 현장 4채널 카메라다.
+    // ⚠️ 여기를 **비우면** 4채널 기능이 꺼지고 단일 채널 직결로 돌아간다
+    //    (relayBase 도 비어 있을 때). 재빌드 없는 되돌리기 수단이다.
+    if (s.contains("camera/channelUrlTemplate"))
+        m_channelUrlTemplate = s.value("camera/channelUrlTemplate").toString().trimmed();
+    m_channelCount = qBound(1, s.value("camera/channelCount", 4).toInt(), 8);
 }
 
 void Backend::saveSettings() const
@@ -2261,8 +2771,11 @@ void Backend::saveSettings() const
     s.setValue("ui/simSpeed", m_simSpeedFactor);
     s.setValue("camera/lensCorrection", m_lensOn);
     s.setValue("ui/robotVisible", m_robotVisible);
-    s.setValue("camera/rtspUrl", m_rtspUrl);
+    s.setValue("camera/rtspUrl", m_directRtspUrl);   // 중계 주소가 아니라 직결 주소
     s.setValue("camera/ip", m_camIp);
+    s.setValue("camera/relayBase", m_relayBase);
+    s.setValue("camera/channelUrlTemplate", m_channelUrlTemplate);
+    s.setValue("camera/channelCount", m_channelCount);
 }
 
 // ── 로봇 속도 ────────────────────────────────────────────────────────

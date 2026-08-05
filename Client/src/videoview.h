@@ -265,8 +265,8 @@ private:
     bool m_pendingUndoValid = false;
 
     bool m_isTopView = false;
-    // TopView 워프 스로틀 — warpPerspective 는 GUI 스레드에서 돈다 (아래 onFrame 주석 참고)
-    QElapsedTimer m_tvThrottle;
+    // ⚠️ m_tvThrottle(TopView 워프 12fps 제한)은 지웠다 — 실측 1.23ms/frame 이라
+    //    제한할 이유가 없었다. onFrame() 주석 참고.
     // 렌즈 보정 — 켜져 있고 계수가 있을 때만 remap 경로를 탄다
     camcalib::Model m_cam;
     bool m_lensOn = false;

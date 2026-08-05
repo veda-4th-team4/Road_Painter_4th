@@ -6,10 +6,17 @@
 #include <QFont>
 
 #include "backend.h"
+#include "video_worker.h"
 
 int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
+
+    // ⚠️ RTSP 캡처 옵션은 **여기서 딱 한 번** 세팅한다. qputenv 는 프로세스 전역이라
+    //    워커(본 화면 1 + 미리보기 4)가 각자 부르면 서로 덮어쓴다. OpenCV 는 이 값을
+    //    VideoCapture::open() 시점에 읽으므로, 워커가 만들어지기 전이면 된다.
+    //    FFmpeg 버전별 타임아웃 옵션 이름 차이도 이 함수가 처리한다.
+    video_worker::applyFfmpegCaptureOptions();
     app.setApplicationName("Road Painter");
     // QSettings 저장 위치를 고정한다 (펜 오프셋 등 기구 설정)
     app.setOrganizationName("RoadPainter");

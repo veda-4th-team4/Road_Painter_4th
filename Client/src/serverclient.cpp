@@ -182,6 +182,25 @@ void ServerClient::sendCmd(const QString &cmd)
     sendJson("CMD", p);
 }
 
+// ESTOP 만 보내던 예전 "작업 중단"은 사실 일시정지였다 — 서버의 경로 상태도
+// 로봇의 세그먼트 커서도 남아서, RESUME 한 번이면 도색이 멈춘 지점부터 재개됐다.
+// 이 명령을 받으면 서버와 로봇이 받아둔 경로를 버린다 (프로토콜 v0.4).
+void ServerClient::sendAbortDraw()
+{
+    sendCmd(QStringLiteral("ABORT_DRAW"));
+}
+
+// CMD 에 ch 를 같이 싣는다 (프로토콜 v0.4). sendCmd 를 재사용하지 않는 이유는
+// payload 에 필드가 하나 더 붙기 때문이고, 그 하나 때문에 sendCmd 시그니처에
+// 채널 인자를 달면 채널과 무관한 호출 20곳이 다 지저분해진다.
+void ServerClient::sendSelectChannel(int ch)
+{
+    QJsonObject p;
+    p["cmd"] = QStringLiteral("SELECT_CHANNEL");
+    p["ch"] = ch;
+    sendJson("CMD", p);
+}
+
 
 // 로그인 상태에서만 동작한다. 서버는 IP 형식을 검사하지 않으므로 검증은 Qt 몫.
 void ServerClient::sendSetCamIp(const QString &camIp)
@@ -221,6 +240,20 @@ void ServerClient::dispatch(const QJsonObject &msg)
         // calib 가 null 이면 캘리브레이션 미완료 → 관리자 창 안내 대상
         const QJsonValue calibVal = payload.value("calib");
         const bool hasCalib = calibVal.isObject() && !calibVal.toObject().isEmpty();
+        // 채널별 맵을 loginResult **보다 먼저** 흘린다 — Backend 가 로그인 처리
+        // 안에서 채널 화면을 띄우는데, 그때 이 맵이 이미 있어야 "어느 채널이
+        // 캘리 됐는지"를 그리드에 바로 표시할 수 있다.
+        // v0.3 서버는 calibs 를 안 보내므로 빈 오브젝트가 나가고, 그러면
+        // channelMode 가 꺼진 단일 채널 경로라 아무도 안 본다.
+        emit calibChannelsReceived(payload.value("calibs").toObject(),
+                                   payload.value("active_ch").toInt(1));
+        // 중계 스트림 주소도 같은 이유로 loginResult 보다 먼저 흘린다 — Backend 가
+        // 로그인 처리 안에서 채널 화면을 띄우므로 그때 주소가 이미 있어야 한다.
+        // ⚠️ 서버가 안 보내면 빈 문자열이 나가고 Backend 가 아무것도 안 한다
+        //    (QSettings 값 유지). v0.3 서버에서도 기존 동작이 그대로다.
+        const QJsonObject stream = payload.value("stream").toObject();
+        emit streamInfoReceived(stream.value("base").toString(),
+                                stream.value("channels").toInt(0));
         emit loginResult(true, payload.value("id").toString(),
                          calibVal.toObject(), hasCalib,
                          payload.value("cam_ip").toString(), QString());
@@ -247,7 +280,19 @@ void ServerClient::dispatch(const QJsonObject &msg)
         if (calib.isEmpty() && payload.contains("H")) {
             calib = QJsonObject{ { "H", payload.value("H") } };
         }
-        emit hMatrixReceived(calib);
+        // 평면 스키마는 payload 자체가 번들이라 여기서 calib 가 비어 있다.
+        // 그 경우 payload 를 그대로 번들로 본다 (Backend 가 정규화한다).
+        if (calib.isEmpty() && payload.contains("H_floor"))
+            calib = payload;
+        // ch 없으면 1 (단일 채널 카메라·v0.3 서버 하위호환)
+        emit hMatrixReceived(payload.value("ch").toInt(1), calib);
+    } else if (type == "CHANNEL_OK") {
+        const QJsonObject calib = payload.value("calib").toObject();
+        emit channelResult(true, payload.value("ch").toInt(), calib,
+                           !calib.isEmpty(), QString());
+    } else if (type == "CHANNEL_FAIL") {
+        emit channelResult(false, 0, QJsonObject(), false,
+                           payload.value("reason").toString());
     } else if (type == "BLUEPRINT_OK") {
         emit blueprintAck(payload.value("points").toInt(),
                           payload.value("paint").toBool(),
@@ -258,6 +303,8 @@ void ServerClient::dispatch(const QJsonObject &msg)
         emit camIpResult(false, QString(), payload.value("reason").toString());
     } else if (type == "DRAW_DONE") {
         emit drawDone();
+    } else if (type == "DRAW_ABORTED") {
+        emit drawAborted(payload.value("was_active").toBool());
     } else if (type == "DRAW_FAIL") {
         emit drawFailed(payload.value("stage").toString(),
                         payload.value("reason").toString(),
