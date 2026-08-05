@@ -51,14 +51,15 @@ bool NetworkManager::Init() {
     }
     SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
 
-    // 2. Configure TLS certificate verification (Fallback to VERIFY_NONE for dev/test servers)
-    std::string cert_path = "server.crt";
-    if (SSL_CTX_load_verify_locations(ssl_ctx, cert_path.c_str(), nullptr) == 1) {
-        std::cout << "[NetworkManager] Loaded local server.crt certificate." << std::endl;
-    } else {
-        std::cout << "[NetworkManager] Warning: server.crt not found in working dir. Running TLS in DEV mode (VERIFY_NONE)." << std::endl;
+    // 2. Load the Vision Server self-signed certificate (server.crt Pinning)
+    std::string cert_path = "server.crt"; // Must be in the execution path
+    if (SSL_CTX_load_verify_locations(ssl_ctx, cert_path.c_str(), nullptr) != 1) {
+        std::cerr << "[NetworkManager] Error: Failed to load server.crt certificate." << std::endl;
+        SSL_CTX_free(ssl_ctx);
+        ssl_ctx = nullptr;
+        return false;
     }
-    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, nullptr);
+    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, nullptr);
 
     // 3. Create standard TCP socket
     client_fd = socket(AF_INET, SOCK_STREAM, 0);
