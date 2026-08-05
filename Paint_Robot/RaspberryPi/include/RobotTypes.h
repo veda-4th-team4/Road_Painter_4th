@@ -73,16 +73,40 @@ typedef struct {
 } Waypoint_t;
 
 /**
- * @brief Segment structure containing path operation sequence (v0.3).
+ * @brief Segment (Operation) structure containing path operation sequence (Protocol v2).
  */
 typedef struct {
-    std::string op;       // "MOVE", "TURN", "NOZZLE", or "ARC"
-    float dist_m;         // for MOVE or ARC (arc length)
-    float angle_deg;      // for TURN or ARC
-    float radius_m;       // for ARC (curve radius R_paint)
-    std::string direction;// for ARC ("left" or "right")
-    bool paint;           // for MOVE or ARC
-    float heading_deg;    // Target heading orientation (v0.3)
+    uint32_t op_index{0};  // Global unique operation index (0-based)
+    std::string op;        // "move", "turn", "nozzle", or "arc" (lowercase)
+    std::string role;      // "path" or "offset" (metadata)
+    float dist_m{0.0f};    // for move (positive = forward, negative = reverse)
+    float angle_deg{0.0f}; // for turn (+ = CW right) or arc (positive size)
+    float radius_m{0.0f};  // for arc (robot center radius R_c)
+    std::string direction; // for arc ("left" or "right")
+    bool down{false};      // for nozzle (true = lower/paint ON, false = raise/paint OFF)
 } Segment_t;
+
+/**
+ * @brief Server feedback command structures carrying op_index (Protocol v2).
+ */
+typedef struct {
+    uint32_t op_index;
+    float angle_deg;
+} AlignCmd_t;
+
+typedef struct {
+    uint32_t op_index;
+    float dist_m;
+} MoreCmd_t;
+
+typedef struct {
+    uint32_t op_index;
+    float angle_deg;
+} DriftCmd_t;
+
+typedef struct {
+    bool hold;
+    std::string reason;
+} HoldCmd_t;
 
 #endif /* __ROBOT_TYPES_H__ */

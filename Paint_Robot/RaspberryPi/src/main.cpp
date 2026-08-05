@@ -134,14 +134,19 @@ int main(int argc, char **argv) {
            }
        }
 
-      // 4. Check DRIFT feedback from server (~5Hz)
-      float drift_angle = 0.0f;
-      if (net_manager.GetDriftCorrection(drift_angle)) {
-          // Server-driven DRIFT logging
-          if (path_follower.IsTurning()) {
-              std::cout << "[MAIN] [DRIFT IGNORED] Robot is currently executing a turn." << std::endl;
-          } else {
-              std::cout << "[MAIN] [DRIFT] Server drift correction received: " << drift_angle << " deg" << std::endl;
+      // 4. Check HOLD state and DRIFT feedback from server (~2.5Hz)
+      bool hold_active = net_manager.IsHoldActive();
+      if (hold_active) {
+          static bool hold_logged = false;
+          if (!hold_logged) {
+              std::cout << "[MAIN] HOLD active (pos lost). Pausing robot movement..." << std::endl;
+              hold_logged = true;
+          }
+      } else {
+          static bool hold_logged = false;
+          if (hold_logged) {
+              std::cout << "[MAIN] HOLD released. Resuming autonomous path execution." << std::endl;
+              hold_logged = false;
           }
       }
 
@@ -149,39 +154,51 @@ int main(int argc, char **argv) {
       Msg_SetSpeed_t target_speed = {0, 0};
       uint8_t nozzle_on = manual_override ? manual_nozzle : auto_nozzle;
 
-      if (manual_override) {
-          target_speed = manual_speed;
+      if (manual_override || hold_active) {
+          target_speed = hold_active ? Msg_SetSpeed_t{0, 0} : manual_speed;
       } else if (!path_follower.IsPathFinished()) {
           Segment_t current_seg;
           if (path_follower.GetCurrentSegment(current_seg)) {
-              uint32_t seg_idx = static_cast<uint32_t>(path_follower.GetCurrentSegmentIndex());
+              uint32_t active_op_index = current_seg.op_index;
 
-              if (current_seg.op == "NOZZLE") {
-                  auto_nozzle = current_seg.paint ? 1 : 0;
+              // Check DRIFT feedback matching active op_index
+              float drift_angle = 0.0f;
+              if (net_manager.GetDriftCorrection(active_op_index, drift_angle)) {
+                  if (path_follower.IsTurning()) {
+                      std::cout << "[MAIN] [DRIFT IGNORED] Robot is currently executing a turn." << std::endl;
+                  } else {
+                      std::cout << "[MAIN] [DRIFT] Server drift correction received for op " 
+                                << active_op_index << ": " << drift_angle << " deg" << std::endl;
+                  }
+              }
+
+              if (current_seg.op == "nozzle") {
+                  auto_nozzle = current_seg.down ? 1 : 0;
                   robot_comm.SendControlNozzle(auto_nozzle);
-                  std::cout << "[MAIN NOZZLE] NOZZLE set (down=" << (auto_nozzle ? "true" : "false") << ")" << std::endl;
+                  std::cout << "[MAIN NOZZLE] Op " << active_op_index 
+                            << " set (down=" << (current_seg.down ? "true" : "false") << ")" << std::endl;
                   std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                  net_manager.SendReady(seg_idx);
+                  net_manager.SendReady(active_op_index);
                   path_follower.AdvanceSegment();
-              } else if (current_seg.op == "MOVE" || current_seg.op == "TURN" || current_seg.op == "ARC") {
-                  if (ready_seg_sent != seg_idx) {
-                      net_manager.SendReady(seg_idx);
-                      ready_seg_sent = seg_idx;
+              } else if (current_seg.op == "move" || current_seg.op == "turn" || current_seg.op == "arc") {
+                  if (ready_seg_sent != active_op_index) {
+                      net_manager.SendReady(active_op_index);
+                      ready_seg_sent = active_op_index;
                       waiting_for_go = true;
                       robot_comm.SendSetSpeed(0, 0);
-                      std::cout << "[MAIN] Sent READY for segment " << seg_idx << " (" << current_seg.op 
+                      std::cout << "[MAIN] Sent READY for op " << active_op_index << " (" << current_seg.op 
                                 << "), waiting for GO/ALIGN/MORE..." << std::endl;
                   }
 
                   if (waiting_for_go) {
                       // Check for ALIGN micro-rotation request
                       float align_deg = 0.0f;
-                      if (net_manager.GetAlignCommand(align_deg)) {
+                      if (net_manager.GetAlignCommand(active_op_index, align_deg)) {
                           if (!path_follower.IsTurning()) {
                               // Protocol rule: positive angle = turn right (CW) -> StartTurn(-align_deg)
                               float robot_turn_deg = -align_deg;
-                              std::cout << "[MAIN ALIGN] Executing ALIGN micro-turn: server=" << align_deg 
-                                        << " deg -> robot=" << robot_turn_deg << " deg" << std::endl;
+                              std::cout << "[MAIN ALIGN] Executing ALIGN micro-turn for op " << active_op_index
+                                        << ": server=" << align_deg << " deg -> robot=" << robot_turn_deg << " deg" << std::endl;
                               Msg_Status_t status_snap{};
                               if (robot_comm.GetLatestStatus(status_snap)) {
                                   path_follower.StartTurn(robot_turn_deg, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
@@ -191,9 +208,10 @@ int main(int argc, char **argv) {
 
                       // Check for MORE micro-distance request
                       float more_dist = 0.0f;
-                      if (net_manager.GetMoreCommand(more_dist)) {
+                      if (net_manager.GetMoreCommand(active_op_index, more_dist)) {
                           if (!path_follower.IsMovingStraight() && !path_follower.IsTurning()) {
-                              std::cout << "[MAIN MORE] Executing MORE micro-move: " << more_dist << " m" << std::endl;
+                              std::cout << "[MAIN MORE] Executing MORE micro-move for op " << active_op_index
+                                        << ": " << more_dist << " m" << std::endl;
                               Msg_Status_t status_snap{};
                               if (robot_comm.GetLatestStatus(status_snap)) {
                                   path_follower.StartMove(more_dist, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
@@ -216,7 +234,7 @@ int main(int argc, char **argv) {
                                       std::this_thread::sleep_for(std::chrono::milliseconds(20));
                                   }
 
-                                  net_manager.SendReady(seg_idx);
+                                  net_manager.SendReady(active_op_index);
                               }
                           }
                       }
@@ -238,14 +256,15 @@ int main(int argc, char **argv) {
                                       std::this_thread::sleep_for(std::chrono::milliseconds(20));
                                   }
 
-                                  net_manager.SendReady(seg_idx);
+                                  net_manager.SendReady(active_op_index);
                               }
                           }
                       }
 
-                      // Check for GO signal
-                      if (net_manager.CheckAndClearGoSignal()) {
-                          std::cout << "[MAIN] GO signal received! Starting " << current_seg.op << " segment " << seg_idx << std::endl;
+                      // Check for GO signal matching active_op_index
+                      if (net_manager.CheckAndClearGoSignal(active_op_index)) {
+                          std::cout << "[MAIN] GO signal received for op " << active_op_index 
+                                    << " (" << current_seg.op << ")" << std::endl;
                           waiting_for_go = false;
                       }
                   }
@@ -256,18 +275,18 @@ int main(int argc, char **argv) {
                           int32_t l_steps = static_cast<int32_t>(status_snap.left_steps);
                           int32_t r_steps = static_cast<int32_t>(status_snap.right_steps);
 
-                          if (current_seg.op == "MOVE") {
+                          if (current_seg.op == "move") {
                               if (!path_follower.IsMovingStraight()) {
                                   path_follower.StartMove(current_seg.dist_m, l_steps, r_steps);
                               }
 
                               float imu_yaw = imu_manager.GetYaw();
                               if (path_follower.UpdateMove(l_steps, r_steps, target_speed, nozzle_on, imu_yaw)) {
-                                  std::cout << "[MAIN MOVE] Segment " << seg_idx << " complete." << std::endl;
-                                  net_manager.SendReady(seg_idx);
+                                  std::cout << "[MAIN MOVE] Op " << active_op_index << " complete." << std::endl;
+                                  net_manager.SendReady(active_op_index);
                                   path_follower.AdvanceSegment();
                               }
-                          } else if (current_seg.op == "TURN") {
+                          } else if (current_seg.op == "turn") {
                               if (!path_follower.IsTurning()) {
                                   // Protocol rule: positive angle = turn right (CW) -> StartTurn(-angle_deg)
                                   float robot_turn_deg = -current_seg.angle_deg;
@@ -275,18 +294,19 @@ int main(int argc, char **argv) {
                               }
 
                               if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
-                                  std::cout << "[MAIN TURN] In-place turn (" << current_seg.angle_deg << " deg) complete." << std::endl;
-                                  net_manager.SendReady(seg_idx);
+                                  std::cout << "[MAIN TURN] Op " << active_op_index << " in-place turn (" 
+                                            << current_seg.angle_deg << " deg) complete." << std::endl;
+                                  net_manager.SendReady(active_op_index);
                                   path_follower.AdvanceSegment();
                               }
-                          } else if (current_seg.op == "ARC") {
+                          } else if (current_seg.op == "arc") {
                               if (!path_follower.IsMovingStraight()) {
                                   path_follower.StartArc(current_seg.radius_m, current_seg.angle_deg, current_seg.direction, l_steps, r_steps);
                               }
 
                               if (path_follower.UpdateArc(l_steps, r_steps, target_speed)) {
-                                  std::cout << "[MAIN ARC] Arc segment complete." << std::endl;
-                                  net_manager.SendReady(seg_idx);
+                                  std::cout << "[MAIN ARC] Op " << active_op_index << " arc complete." << std::endl;
+                                  net_manager.SendReady(active_op_index);
                                   path_follower.AdvanceSegment();
                               }
                           }

@@ -45,11 +45,11 @@ public:
     bool SendStatus(const Msg_Status_t& status);
 
     /**
-     * @brief Sends READY handshake message to server before starting a MOVE segment.
-     * @param seg_index The segment index (0-based) about to be executed.
+     * @brief Sends READY handshake message to server before starting an op.
+     * @param op_index The global operation index (0-based) about to be executed.
      * @return true if successfully sent.
      */
-    bool SendReady(uint32_t seg_index);
+    bool SendReady(uint32_t op_index);
 
     /**
      * @brief Transmits PATH_DONE completion message to vision server when a path is finished.
@@ -59,31 +59,29 @@ public:
     bool SendPathDone(const std::string& phase);
 
     /**
-     * @brief Thread-safely fetches the latest received ALIGN angle correction.
-     * @param out_angle_deg Output float to store the micro-rotation angle (deg).
-     * @return true if an ALIGN command is available.
+     * @brief Thread-safely fetches the latest received ALIGN angle correction matching active op_index.
      */
-    bool GetAlignCommand(float& out_angle_deg);
+    bool GetAlignCommand(uint32_t active_op_index, float& out_angle_deg);
 
     /**
-     * @brief Thread-safely fetches the latest received MORE distance correction.
-     * @param out_dist_m Output float to store the micro-distance adjustment (m).
-     * @return true if a MORE command is available.
+     * @brief Thread-safely fetches the latest received MORE distance correction matching active op_index.
      */
-    bool GetMoreCommand(float& out_dist_m);
+    bool GetMoreCommand(uint32_t active_op_index, float& out_dist_m);
 
     /**
-     * @brief Checks if a GO signal was received and clears it.
-     * @return true if GO signal was received.
+     * @brief Checks if a GO signal matching active op_index was received and clears it.
      */
-    bool CheckAndClearGoSignal();
+    bool CheckAndClearGoSignal(uint32_t active_op_index);
 
     /**
-     * @brief Thread-safely fetches the latest DRIFT angle correction feedback.
-     * @param out_angle_deg Output float to store the drift angle (deg).
-     * @return true if a DRIFT update is available.
+     * @brief Thread-safely fetches the latest DRIFT angle correction feedback matching active op_index.
      */
-    bool GetDriftCorrection(float& out_angle_deg);
+    bool GetDriftCorrection(uint32_t active_op_index, float& out_angle_deg);
+
+    /**
+     * @brief Checks if HOLD emergency pause from server is currently active.
+     */
+    bool IsHoldActive();
 
     /**
      * @brief Gets the phase of the current path ("approach" or "draw").
@@ -142,20 +140,24 @@ private:
     std::string latest_cmd;
     bool has_new_cmd;
 
-    // v0.3 Protocol state variables
+    // Protocol v2 state variables with op_index transaction locking
     std::mutex align_mutex;
-    float align_angle_deg;
-    bool has_align_cmd;
+    AlignCmd_t latest_align_cmd;
+    bool has_align_cmd{false};
 
     std::mutex more_mutex;
-    float more_dist_m;
-    bool has_more_cmd;
+    MoreCmd_t latest_more_cmd;
+    bool has_more_cmd{false};
 
-    std::atomic<bool> go_signal_received;
+    std::mutex go_mutex;
+    uint32_t go_op_index{0xFFFFFFFF};
+    bool has_go_signal{false};
 
     std::mutex drift_mutex;
-    float drift_angle_deg;
-    bool has_drift_cmd;
+    DriftCmd_t latest_drift_cmd;
+    bool has_drift_cmd{false};
+
+    std::atomic<bool> is_hold_active{false};
 
     /**
      * @brief Background worker loop to read incoming data from socket.
