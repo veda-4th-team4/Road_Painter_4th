@@ -156,9 +156,11 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
     return true;
   }
 
-  // Pure straight move in progress (stop-and-pivot alignment handles DRIFT corrections)
+  // Straight move in progress with continuous differential steering for DRIFT feedback
   float target_v = 0.05f; // 5 cm/s straight velocity
-  float target_w = 0.0f;  // Pure linear move without differential steering wobble
+  // Protocol v2 sign convention: positive drift_offset_deg = turn right (CW) -> negative angular velocity (w)
+  float drift_rad = drift_offset_deg * (3.14159265f / 180.0f);
+  float target_w = -0.5f * drift_rad; // P-gain 0.5 for smooth steering correction
 
   out_speed = velocity_to_sps(target_v, target_w);
   out_nozzle_on = current_seg.paint ? 1 : 0;

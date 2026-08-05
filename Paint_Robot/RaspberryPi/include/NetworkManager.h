@@ -79,6 +79,11 @@ public:
     bool GetDriftCorrection(uint32_t active_op_index, float& out_angle_deg);
 
     /**
+     * @brief Thread-safely clears all pending command latches upon receiving a new PATH.
+     */
+    void ClearLatches();
+
+    /**
      * @brief Checks if HOLD emergency pause from server is currently active.
      */
     bool IsHoldActive();

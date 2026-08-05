@@ -260,6 +260,17 @@ bool NetworkManager::GetDriftCorrection(uint32_t active_op_index, float& out_ang
     return true;
 }
 
+void NetworkManager::ClearLatches() {
+    std::lock_guard<std::mutex> l1(align_mutex);
+    std::lock_guard<std::mutex> l2(more_mutex);
+    std::lock_guard<std::mutex> l3(go_mutex);
+    std::lock_guard<std::mutex> l4(drift_mutex);
+    has_align_cmd = false;
+    has_more_cmd = false;
+    has_go_signal = false;
+    has_drift_cmd = false;
+}
+
 bool NetworkManager::IsHoldActive() {
     return is_hold_active.load();
 }
