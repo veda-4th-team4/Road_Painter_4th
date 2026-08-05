@@ -123,6 +123,7 @@ uint32_t PathFollower::CalculateMoveSteps(float dist_m) const {
 void PathFollower::StartMove(float dist_m, int32_t start_left_steps,
                              int32_t start_right_steps) {
   is_moving_straight = true;
+  move_dist_m = dist_m;
   move_target_steps = CalculateMoveSteps(dist_m);
   move_start_left_steps = start_left_steps;
   move_start_right_steps = start_right_steps;
@@ -152,8 +153,8 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
     return true;
   }
 
-  // Straight move in progress with continuous differential steering for DRIFT feedback
-  float target_v = 0.05f; // 5 cm/s straight velocity
+  // Straight move velocity (positive dist_m -> +0.05m/s forward, negative dist_m -> -0.05m/s reverse)
+  float target_v = (move_dist_m >= 0.0f) ? 0.05f : -0.05f;
   // Protocol v2 sign convention: positive drift_offset_deg = turn right (CW) -> negative angular velocity (w)
   float drift_rad = drift_offset_deg * (3.14159265f / 180.0f);
   float target_w = -0.5f * drift_rad; // P-gain 0.5 for smooth steering correction
