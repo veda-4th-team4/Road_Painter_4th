@@ -21,6 +21,10 @@
 //   --origin <x,y>  사각형 시작 꼭짓점 (기본 0,0)
 //   --id / --pw     로그인 계정 (기본 test / 1234)
 //   --no-program    program 없이 points+paint만 전송 (서버 직접 생성 폴백 검증)
+//   --arc <R>       사각형 대신 반지름 R의 반원(ARC) 하나를 도색 (기본 끄기)
+//                   -> 서버가 R_robot = sqrt(R^2 - 0.155^2)로 바꿔 보내는지,
+//                      그 결과 펜이 반지름 R의 호를 그리는지 검증
+//                      (docs/PROTOCOL_v2_ROBOT.md §5.4 / §11 남은항목 1)
 //   --port <n>      서버 포트 (기본 9000)
 #include "tls_client.hpp"
 #include <cmath>
@@ -44,6 +48,7 @@ int main(int argc, char** argv) {
     double side = 0.20, ox = 0, oy = 0;
     std::string id = "test", pw = "1234";
     bool noProgram = false;
+    double arcR = 0;  // > 0 이면 사각형 대신 반원 도색
 
     int ai = 2;
     if (argc > 2 && argv[2][0] != '-') crt = argv[ai++];
@@ -55,6 +60,7 @@ int main(int argc, char** argv) {
         else if (a == "--id" && ai + 1 < argc) id = argv[++ai];
         else if (a == "--pw" && ai + 1 < argc) pw = argv[++ai];
         else if (a == "--no-program") noProgram = true;
+        else if (a == "--arc" && ai + 1 < argc) arcR = atof(argv[++ai]);
         else if (a == "--port" && ai + 1 < argc) port = atoi(argv[++ai]);
         else { fprintf(stderr, "알 수 없는 옵션: %s\n", a.c_str()); return 1; }
     }
@@ -89,14 +95,43 @@ int main(int argc, char** argv) {
         program.push_back({{"op", "NOZZLE"}, {"v", 4}, {"down", false}});
     }
 
+    // ----- 반원 도면 (--arc): 원점에서 출발해 오른쪽으로 180도 돈다 -----
+    // 펜은 (ox,oy)에서 (ox, oy-2R)까지 반지름 R의 반원을 그려야 한다.
+    // 서버가 radius_m을 sqrt(R^2 - d^2)로 바꿔 보내는지, 그 결과 펜 자취의
+    // 반지름이 R로 나오는지가 검증 대상이다 (§5.4).
+    if (arcR > 0) {
+        v = {{ox, oy}, {ox, oy - 2 * arcR}};
+        points = json::array();
+        for (auto& p : v) points.push_back({p[0], p[1]});
+        paint = json::array({false, true});
+        program = json::array();
+        if (!noProgram) {
+            program.push_back({{"op", "ARC"},
+                               {"v", 0},
+                               {"radius_m", arcR},
+                               {"angle_deg", 180.0},
+                               {"direction", "right"},
+                               {"paint", true},
+                               {"heading_deg", 0.0}});
+        }
+    }
+
     TlsLink qt("QT");
     if (!qt.connect(ip, port, crt, "QT")) return 1;
 
-    tlogf("QT", "사각형 한 변 %.3fm, 시작 (%.3f, %.3f)%s", side, ox, oy,
-          noProgram ? " [program 없음 - 서버 생성 폴백]" : "");
-    tlogf("QT", "기대 펜 자취(도면 꼭짓점): (%.3f,%.3f) (%.3f,%.3f) (%.3f,%.3f) "
-          "(%.3f,%.3f) -> 시작점 복귀",
-          v[0][0], v[0][1], v[1][0], v[1][1], v[2][0], v[2][1], v[3][0], v[3][1]);
+    if (arcR > 0) {
+        tlogf("QT", "반원 도면: 반지름 %.3fm, 시작 (%.3f, %.3f) -> (%.3f, %.3f)",
+              arcR, v[0][0], v[0][1], v[1][0], v[1][1]);
+        tlogf("QT", "기대: 서버가 로봇에 radius_m=%.4f 전송, 펜 자취 반지름 %.3f "
+              "(호 길이 %.3fm)",
+              std::sqrt(arcR * arcR - 0.155 * 0.155), arcR, M_PI * arcR);
+    } else {
+        tlogf("QT", "사각형 한 변 %.3fm, 시작 (%.3f, %.3f)%s", side, ox, oy,
+              noProgram ? " [program 없음 - 서버 생성 폴백]" : "");
+        tlogf("QT", "기대 펜 자취(도면 꼭짓점): (%.3f,%.3f) (%.3f,%.3f) (%.3f,%.3f) "
+              "(%.3f,%.3f) -> 시작점 복귀",
+              v[0][0], v[0][1], v[1][0], v[1][1], v[2][0], v[2][1], v[3][0], v[3][1]);
+    }
 
     // 수신 스레드: 서버 응답을 그대로 찍고, 진행 단계를 자동으로 이어간다
     std::thread rx([&] {

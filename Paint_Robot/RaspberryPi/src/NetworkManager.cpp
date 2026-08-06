@@ -22,11 +22,12 @@ NetworkManager::NetworkManager(const std::string& ip, uint16_t port)
       has_new_path(false),
       msg_seq(0),
       has_new_cmd(false),
-      align_angle_deg(0.0f),
       has_align_cmd(false),
-      go_signal_received(false),
-      drift_angle_deg(0.0f),
+      has_more_cmd(false),
+      go_op_index(0xFFFFFFFF),
+      has_go_signal(false),
       has_drift_cmd(false),
+      is_hold_active(false),
       current_path_phase("")
 {
     std::memset(&latest_pose, 0, sizeof(Pose_t));
@@ -202,10 +203,10 @@ bool NetworkManager::SendStatus(const Msg_Status_t& status) {
     return ssl_send_line(status_msg.dump());
 }
 
-bool NetworkManager::SendReady(uint32_t seg_index) {
+bool NetworkManager::SendReady(uint32_t op_index) {
     if (!is_connected || !ssl_connection) return false;
 
-    json ready_payload = {{"seg", seg_index}};
+    json ready_payload = {{"op_index", op_index}};
     json ready_msg = {
         {"type", "READY"},
         {"seq", ++msg_seq},
@@ -229,24 +230,50 @@ bool NetworkManager::SendPathDone(const std::string& phase) {
     return ssl_send_line(path_done_msg.dump());
 }
 
-bool NetworkManager::GetAlignCommand(float& out_angle_deg) {
+bool NetworkManager::GetAlignCommand(uint32_t active_op_index, float& out_angle_deg) {
     std::lock_guard<std::mutex> lock(align_mutex);
-    if (!has_align_cmd) return false;
-    out_angle_deg = align_angle_deg;
+    if (!has_align_cmd || latest_align_cmd.op_index != active_op_index) return false;
+    out_angle_deg = latest_align_cmd.angle_deg;
     has_align_cmd = false;
     return true;
 }
 
-bool NetworkManager::CheckAndClearGoSignal() {
-    return go_signal_received.exchange(false);
+bool NetworkManager::GetMoreCommand(uint32_t active_op_index, float& out_dist_m) {
+    std::lock_guard<std::mutex> lock(more_mutex);
+    if (!has_more_cmd || latest_more_cmd.op_index != active_op_index) return false;
+    out_dist_m = latest_more_cmd.dist_m;
+    has_more_cmd = false;
+    return true;
 }
 
-bool NetworkManager::GetDriftCorrection(float& out_angle_deg) {
+bool NetworkManager::CheckAndClearGoSignal(uint32_t active_op_index) {
+    std::lock_guard<std::mutex> lock(go_mutex);
+    if (!has_go_signal || go_op_index != active_op_index) return false;
+    has_go_signal = false;
+    return true;
+}
+
+bool NetworkManager::GetDriftCorrection(uint32_t active_op_index, float& out_angle_deg) {
     std::lock_guard<std::mutex> lock(drift_mutex);
-    if (!has_drift_cmd) return false;
-    out_angle_deg = drift_angle_deg;
+    if (!has_drift_cmd || latest_drift_cmd.op_index != active_op_index) return false;
+    out_angle_deg = latest_drift_cmd.angle_deg;
     has_drift_cmd = false;
     return true;
+}
+
+void NetworkManager::ClearLatches() {
+    std::lock_guard<std::mutex> l1(align_mutex);
+    std::lock_guard<std::mutex> l2(more_mutex);
+    std::lock_guard<std::mutex> l3(go_mutex);
+    std::lock_guard<std::mutex> l4(drift_mutex);
+    has_align_cmd = false;
+    has_more_cmd = false;
+    has_go_signal = false;
+    has_drift_cmd = false;
+}
+
+bool NetworkManager::IsHoldActive() {
+    return is_hold_active.load();
 }
 
 std::string NetworkManager::GetPathPhase() {
@@ -281,44 +308,45 @@ bool NetworkManager::GetLatestCommand(std::string& out_cmd) {
 }
 
 void NetworkManager::rx_loop() {
-    std::string buffer;
+    std::string rx_buffer;
     std::string line;
 
-    while (rx_alive) {
-        if (ssl_read_line(buffer, line)) {
-            if (line.empty()) continue;
+    while (is_connected) {
+        if (ssl_read_line(rx_buffer, line)) {
             parse_incoming_data(line);
         } else {
-            std::cerr << "[NetworkManager] SSL socket connection closed or error occurred." << std::endl;
-            is_connected = false;
-            rx_alive = false;
+            usleep(10000); // 10ms CPU sleep
         }
     }
 }
 
 bool NetworkManager::ssl_read_line(std::string& buf, std::string& line) {
-    for (;;) {
-        auto pos = buf.find('\n');
+    char char_buf[512];
+    int bytes_read = SSL_read(ssl_connection, char_buf, sizeof(char_buf) - 1);
+    if (bytes_read > 0) {
+        char_buf[bytes_read] = '\0';
+        buf += char_buf;
+
+        size_t pos = buf.find('\n');
         if (pos != std::string::npos) {
             line = buf.substr(0, pos);
             buf.erase(0, pos + 1);
             return true;
         }
-        
-        char temp_buf[1024];
-        int bytes_read = SSL_read(ssl_connection, temp_buf, sizeof(temp_buf) - 1);
-        if (bytes_read <= 0) return false;
-
-        temp_buf[bytes_read] = '\0';
-        buf.append(temp_buf, bytes_read);
+    } else {
+        int err = SSL_get_error(ssl_connection, bytes_read);
+        if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+            std::cout << "[NetworkManager] SSL read disconnected/failed with code: " << err << std::endl;
+            is_connected = false;
+        }
     }
+    return false;
 }
 
 bool NetworkManager::ssl_send_line(const std::string& raw_json_message) {
-    if (!ssl_connection) return false;
+    if (!is_connected || !ssl_connection) return false;
 
     std::string raw_data = raw_json_message + "\n";
-
     std::lock_guard<std::mutex> lock(write_mutex);
     int bytes_written = SSL_write(ssl_connection, raw_data.data(), static_cast<int>(raw_data.size()));
     return bytes_written > 0;
@@ -335,66 +363,86 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
             current_path.clear();
             current_path_phase = payload.value("phase", "draw");
             
-            // Read segment array from nested "segments" key
-            auto segments = payload.value("segments", json::array());
-            for (const auto& seg : segments) {
-                if (seg.is_object()) {
-                    Segment_t segment;
-                    segment.op = seg.value("op", "");
-                    segment.dist_m = seg.value("dist_m", 0.0f);
-                    segment.angle_deg = seg.value("angle_deg", 0.0f);
-                    segment.radius_m = seg.value("radius_m", 0.0f);
-                    segment.direction = seg.value("direction", "left");
-                    segment.paint = seg.value("paint", false);
-                    if (seg.contains("down")) {
-                        segment.paint = seg.value("down", false);
+            // Read ops array (Protocol v2 ops array, fallback to segments)
+            json ops_array = payload.contains("ops") ? payload["ops"] : payload.value("segments", json::array());
+            for (const auto& item : ops_array) {
+                if (item.is_object()) {
+                    Segment_t seg;
+                    seg.op_index = item.value("op_index", 0U);
+                    seg.op = item.value("op", "");
+                    seg.role = item.value("role", "path");
+                    seg.dist_m = item.value("dist_m", 0.0f);
+                    seg.angle_deg = item.value("angle_deg", 0.0f);
+                    seg.radius_m = item.value("radius_m", 0.0f);
+                    seg.direction = item.value("direction", "left");
+                    seg.down = item.value("down", false);
+                    if (item.contains("paint")) {
+                        seg.down = item.value("paint", false);
                     }
-                    segment.heading_deg = seg.value("heading_deg", 0.0f);
-                    current_path.push_back(segment);
+                    current_path.push_back(seg);
                 }
             }
             has_new_path = true;
-            std::cout << "[NetworkManager] Path update (phase=" << current_path_phase 
-                      << "): " << current_path.size() << " segments received." << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] PATH update (phase=" << current_path_phase 
+                      << "): " << current_path.size() << " ops received." << std::endl;
             for (size_t i = 0; i < current_path.size(); ++i) {
                 const auto& s = current_path[i];
-                std::cout << "  [Seg " << i << "] op=" << s.op 
+                std::cout << "  [Op " << s.op_index << "] op=" << s.op 
+                          << " | role=" << s.role
                           << " | dist_m=" << s.dist_m 
                           << " | angle_deg=" << s.angle_deg 
                           << " | radius_m=" << s.radius_m
                           << " | dir=" << s.direction
-                          << " | heading_deg=" << s.heading_deg 
-                          << " | paint=" << (s.paint ? "true" : "false") << std::endl;
+                          << " | down=" << (s.down ? "true" : "false") << std::endl;
             }
 
         } else if (type == "ALIGN") {
+            uint32_t idx = payload.value("op_index", 0U);
             float angle = payload.value("angle_deg", 0.0f);
-            std::cout << "[NetworkManager] Received ALIGN: " << angle << " deg" << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Received ALIGN (op_index=" << idx << "): " << angle << " deg" << std::endl;
             std::lock_guard<std::mutex> lock(align_mutex);
-            align_angle_deg = angle;
+            latest_align_cmd = {idx, angle};
             has_align_cmd = true;
 
+        } else if (type == "MORE") {
+            uint32_t idx = payload.value("op_index", 0U);
+            float dist = payload.value("dist_m", 0.0f);
+            std::cout << GetTimestampStr() << "[NetworkManager] Received MORE (op_index=" << idx << "): " << dist << " m" << std::endl;
+            std::lock_guard<std::mutex> lock(more_mutex);
+            latest_more_cmd = {idx, dist};
+            has_more_cmd = true;
+
         } else if (type == "GO") {
-            std::cout << "[NetworkManager] Received GO signal from server." << std::endl;
-            go_signal_received = true;
+            uint32_t idx = payload.value("op_index", 0U);
+            std::cout << GetTimestampStr() << "[NetworkManager] Received GO (op_index=" << idx << ")" << std::endl;
+            std::lock_guard<std::mutex> lock(go_mutex);
+            go_op_index = idx;
+            has_go_signal = true;
 
         } else if (type == "DRIFT") {
+            uint32_t idx = payload.value("op_index", 0U);
             float angle = payload.value("angle_deg", 0.0f);
-            std::cout << "[NetworkManager] Received DRIFT feedback: " << angle << " deg" << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Received DRIFT (op_index=" << idx << "): " << angle << " deg" << std::endl;
             std::lock_guard<std::mutex> lock(drift_mutex);
-            drift_angle_deg = angle;
+            latest_drift_cmd = {idx, angle};
             has_drift_cmd = true;
 
+        } else if (type == "HOLD") {
+            bool hold = payload.value("hold", false);
+            std::string reason = payload.value("reason", "");
+            std::cout << GetTimestampStr() << "[NetworkManager] Received HOLD: " << (hold ? "PAUSE" : "RESUME") << " (reason: " << reason << ")" << std::endl;
+            is_hold_active.store(hold);
+
         } else if (type == "ACK") {
-            std::cout << "[NetworkManager] Received ACK from server: " << payload.value("msg", "") << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Received ACK from server: " << payload.value("msg", "") << std::endl;
         } else if (type == "CMD") {
             std::string cmd = payload.value("cmd", "");
-            std::cout << "[NetworkManager] Received CMD from server: " << cmd << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Received CMD from server: " << cmd << std::endl;
             std::lock_guard<std::mutex> lock(cmd_mutex);
             latest_cmd = cmd;
             has_new_cmd = true;
         } else {
-            std::cout << "[NetworkManager] Unknown message type: " << type << std::endl;
+            std::cout << GetTimestampStr() << "[NetworkManager] Unknown message type: " << type << std::endl;
         }
     } catch (const std::exception& e) {
         std::cerr << "[NetworkManager] Parsing exception: " << e.what() << " on data: " << line << std::endl;
