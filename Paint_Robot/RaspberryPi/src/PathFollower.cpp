@@ -58,10 +58,11 @@ void PathFollower::SetDriftOffset(float offset_deg) {
 }
 
 uint32_t PathFollower::CalculateTurnSteps(float angle_deg) const {
-  // 90 deg = 2032.24 pulses (with K_slip = 1.01)
-  // 0.1 deg resolution: 2.258044 pulses per 0.1 deg (22.58044 pulses/deg)
-  float abs_angle = std::fabs(angle_deg);
-  float steps = abs_angle * 22.58044f;
+  // Turn angle with 1.030f (+3%) hardware calibration factor
+  float turn_circ = M_PI * wheelbase_m;
+  float arc_len = turn_circ * (std::fabs(angle_deg) * 1.030f / 360.0f);
+  float wheel_circ = M_PI * wheel_diameter_m;
+  float steps = (arc_len / wheel_circ) * steps_per_rev * gear_ratio;
   return static_cast<uint32_t>(std::round(steps));
 }
 
@@ -113,9 +114,8 @@ bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps,
 }
 
 uint32_t PathFollower::CalculateMoveSteps(float dist_m) const {
-  // 3200 steps/rev, 66mm wheel diameter -> C = pi * 0.066 = 0.20734515 m
-  // 3200 / 0.20734515 = 15433.09 steps/meter (~15.433 steps/mm)
-  float abs_dist = std::fabs(dist_m);
+  // Straight move distance with 1.010f (+1%) hardware calibration factor
+  float abs_dist = std::fabs(dist_m) * 1.010f;
   float steps = abs_dist * 15433.09f;
   return static_cast<uint32_t>(std::round(steps));
 }
