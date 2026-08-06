@@ -36,4 +36,12 @@ set(ARC_TEST_SOURCES
 add_executable(arc_test ${ARC_TEST_SOURCES})
 target_link_libraries(arc_test wiringPi pthread)
 
+# 4) Hardware Distance & Angle Calibration Test Tool
+set(CALIB_TEST_SOURCES
+    src/calibration_test.cpp
+    src/SerialManager.cpp
+)
+add_executable(calibration_test ${CALIB_TEST_SOURCES})
+target_link_libraries(calibration_test wiringPi pthread)
+
 

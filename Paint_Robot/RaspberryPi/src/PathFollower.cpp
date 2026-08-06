@@ -123,15 +123,16 @@ uint32_t PathFollower::CalculateMoveSteps(float dist_m) const {
 void PathFollower::StartMove(float dist_m, int32_t start_left_steps,
                              int32_t start_right_steps) {
   is_moving_straight = true;
+  move_dist_m = dist_m;
   move_target_steps = CalculateMoveSteps(dist_m);
   move_start_left_steps = start_left_steps;
   move_start_right_steps = start_right_steps;
-  std::cout << "[PathFollower] StartMove: target dist=" << dist_m
+  std::cout << GetTimestampStr() << "[PathFollower] StartMove: target dist=" << dist_m
             << " m | target_steps=" << move_target_steps << std::endl;
 }
 
 bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
-                              Msg_SetSpeed_t &out_speed, uint8_t &out_nozzle_on,
+                              Msg_SetSpeed_t &out_speed,
                               float imu_yaw_deg) {
   if (!is_moving_straight)
     return true;
@@ -142,78 +143,32 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
   uint32_t delta_right = static_cast<uint32_t>(std::abs(diff_right));
   uint32_t progress_steps = (delta_left + delta_right) / 2;
 
-  Segment_t current_seg;
-  GetCurrentSegment(current_seg);
-
   if (progress_steps >= move_target_steps) {
     // Move target reached
     out_speed.left_sps = 0;
     out_speed.right_sps = 0;
-    out_nozzle_on = 0;
     is_moving_straight = false;
-    std::cout << "[PathFollower] Move completed! Reached " << progress_steps
+    std::cout << GetTimestampStr() << "[PathFollower] Move completed! Reached " << progress_steps
               << "/" << move_target_steps << " steps." << std::endl;
     return true;
   }
 
-  // Pure straight move in progress (stop-and-pivot alignment handles DRIFT corrections)
-  float target_v = 0.05f; // 5 cm/s straight velocity
-  float target_w = 0.0f;  // Pure linear move without differential steering wobble
+  // Straight move velocity (positive dist_m -> +0.05m/s forward, negative dist_m -> -0.05m/s reverse)
+  float target_v = (move_dist_m >= 0.0f) ? 0.05f : -0.05f;
+  // Protocol v2 sign convention: positive drift_offset_deg = turn right (CW) -> negative angular velocity (w)
+  float drift_rad = drift_offset_deg * (3.14159265f / 180.0f);
+  float target_w = -0.5f * drift_rad; // P-gain 0.5 for smooth steering correction
 
   out_speed = velocity_to_sps(target_v, target_w);
-  out_nozzle_on = current_seg.paint ? 1 : 0;
 
   static int move_log_count = 0;
   if (++move_log_count % 10 == 0) {
-    std::cout << "[PathFollower MOVE] Progress: " << progress_steps << "/"
+    std::cout << GetTimestampStr() << "[PathFollower MOVE] Progress: " << progress_steps << "/"
               << move_target_steps << " steps | IMU Yaw: " << imu_yaw_deg
               << " deg | Server Drift: " << drift_offset_deg
               << " deg -> Target SPS (L: " << out_speed.left_sps
               << ", R: " << out_speed.right_sps << ")" << std::endl;
   }
-
-  return false;
-}
-
-void PathFollower::StartOffsetMove(float dist_m, int32_t start_left_steps,
-                                   int32_t start_right_steps) {
-  is_moving_straight = true;
-  offset_move_dist = dist_m;
-  move_target_steps = CalculateMoveSteps(std::abs(dist_m));
-  move_start_left_steps = start_left_steps;
-  move_start_right_steps = start_right_steps;
-  std::cout << "[PathFollower Offset] StartOffsetMove: dist=" << dist_m
-            << " m | target_steps=" << move_target_steps << std::endl;
-}
-
-bool PathFollower::UpdateOffsetMove(int32_t cur_left_steps,
-                                    int32_t cur_right_steps,
-                                    Msg_SetSpeed_t &out_speed,
-                                    uint8_t &out_nozzle_on) {
-  if (!is_moving_straight)
-    return true;
-
-  int32_t diff_left = cur_left_steps - move_start_left_steps;
-  int32_t diff_right = cur_right_steps - move_start_right_steps;
-  uint32_t delta_left = static_cast<uint32_t>(std::abs(diff_left));
-  uint32_t delta_right = static_cast<uint32_t>(std::abs(diff_right));
-  uint32_t progress_steps = (delta_left + delta_right) / 2;
-
-  if (progress_steps >= move_target_steps) {
-    out_speed.left_sps = 0;
-    out_speed.right_sps = 0;
-    out_nozzle_on = 0;
-    is_moving_straight = false;
-    std::cout << "[PathFollower Offset] Offset move completed! Reached "
-              << progress_steps << "/" << move_target_steps << " steps."
-              << std::endl;
-    return true;
-  }
-
-  // Determine direction (+0.05m/s forward or -0.05m/s backward)
-  float target_v = (offset_move_dist >= 0.0f) ? 0.05f : -0.05f;
-  out_speed = velocity_to_sps(target_v, 0.0f);
-  out_nozzle_on = 0; // Spray OFF during offset positioning
 
   return false;
 }
@@ -224,10 +179,7 @@ void PathFollower::StartArc(float radius_m, float angle_deg,
   is_arc = true;
   bool is_left = (direction == "left");
 
-  // Pythagorean corrected robot wheel center radius: R_robot = sqrt(R_paint^2 +
-  // 0.155^2)
-  float r_robot =
-      std::sqrt(radius_m * radius_m + NOZZLE_OFFSET_M * NOZZLE_OFFSET_M);
+  float r_robot = radius_m;
   float r_left =
       is_left ? (r_robot - wheelbase_m / 2.0f) : (r_robot + wheelbase_m / 2.0f);
   float r_right =
@@ -275,38 +227,7 @@ bool PathFollower::UpdateArc(int32_t cur_l_steps, int32_t cur_r_steps,
   return false;
 }
 
-void PathFollower::Update(const Pose_t &current_pose, Msg_SetSpeed_t &out_speed,
-                          uint8_t &out_nozzle_on) {
-  if (path.empty() || current_waypoint_idx >= path.size()) {
-    // No path active, send stop command
-    out_speed.left_sps = 0;
-    out_speed.right_sps = 0;
-    out_nozzle_on = 0;
-    return;
-  }
 
-  // Process segment-based operations (MOVE and TURN)
-  const auto &current_seg = path[current_waypoint_idx];
-  float target_v = 0.0f;
-  float target_w = 0.0f;
-
-  if (current_seg.op == "MOVE") {
-    target_v = 0.05f; // 5 cm/s straight speed
-    // Apply DRIFT angle correction: positive angle = clockwise drift -> turn
-    // left
-    target_w = -drift_offset_deg * 0.05f;
-    out_nozzle_on = current_seg.paint ? 1 : 0;
-  } else if (current_seg.op == "TURN") {
-    target_v = 0.0f;
-    // Positive angle_deg means left turn (positive angular velocity), negative
-    // is right turn
-    target_w = (current_seg.angle_deg > 0.0f) ? 0.2f : -0.2f;
-    out_nozzle_on = 0;
-  }
-
-  // Kinematic translation to steps-per-second
-  out_speed = velocity_to_sps(target_v, target_w);
-}
 
 Msg_SetSpeed_t PathFollower::velocity_to_sps(float v, float w) {
   Msg_SetSpeed_t speed_cmd;

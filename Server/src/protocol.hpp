@@ -34,27 +34,53 @@
 //       - 서버는 로그인 사용자를 1명만 기억한다(currentUser_). ADMIN이 로그인한 뒤
 //         QT가 다른 계정으로 로그인하면 저장 대상이 QT 쪽으로 바뀐다.
 //
+// ============================================================================
+// [서버 <-> 로봇] 🔴 프로토콜 v2 (server-driven) - 규격 전문은
+//   docs/PROTOCOL_v2_ROBOT.md. 아래는 요약이고, 어긋나면 그 문서가 정본이다.
+//
+//   v1과 달라진 핵심 4가지:
+//     1. 각도 부호     : 로봇에 나가는 모든 각도가 "양수 = 오른쪽으로 틀어라"
+//                        (서버 내부는 여전히 CCW 양수. 송신 직전에만 뒤집는다)
+//     2. 펜 오프셋 보정: 서버가 ±0.155m move op을 경로에 끼워 넣는다.
+//                        로봇은 자체 보정을 하지 않는다 (하면 이중 보정)
+//     3. 핸드셰이크    : 모든 op마다 READY -> GO. MOVE 앞에서만이 아니다
+//     4. 피드백        : ALIGN / MORE(신설) / DRIFT
+// ============================================================================
+//
 // [서버 -> 로봇]
-//   PATH   payload: {"phase":"approach"|"draw", "segments":[
-//              {"op":"TURN","angle_deg":-90},            // 제자리 회전 (+: 좌회전, -: 우회전)
-//              {"op":"MOVE","dist_m":2.0,"paint":true,   // 직진 (paint: 도색 구간 표시)
-//               "heading_deg":35.0},                     // 이 직진의 목표 절대각도 (정렬용, 로봇은 무시 가능)
-//              {"op":"NOZZLE","down":true},               // 노즐 내림/올림 (노즐 제어는 이 op만)
-//              {"op":"ARC","dist_m":0.628,"radius_m":0.20, // 곡선(원호) 주행 (2026-07-29 추가)
-//               "angle_deg":180,"direction":"right"} ]}    // radius_m: 도면 곡선 반지름, direction: 회전 방향
+//   PATH   payload: {"phase":"approach"|"draw", "ops":[
+//              {"op":"turn","role":"path","angle_deg":-90.0,"op_index":0},
+//                                                    // 제자리 회전 (+: 우회전)
+//              {"op":"move","role":"offset","dist_m":0.155,"op_index":1},
+//                                                    // 직진 (음수 = 후진)
+//              {"op":"nozzle","role":"offset","down":true,"op_index":2},
+//              {"op":"arc","role":"path","radius_m":0.476,"angle_deg":180.0,
+//               "direction":"right","radius_draw_m":0.5,"op_index":3} ]}
 //     - 로봇은 좌표를 모르므로 경로는 동작 명령 시퀀스로 전달.
 //     - PATH가 오면 기존 경로 즉시 폐기하고 새 경로로 교체 (TCP가 순서 보장).
-//     - phase="approach": 도면 시작점까지 이동(전부 paint=false) + 첫 도색 방향으로
-//       회전까지. 끝나면 로봇은 PATH_DONE을 보내고 그 자리에서 대기한다.
-//       마지막 TURN에는 heading_deg가 실려 READY 정렬 확인 가능.
-//     - phase="draw": 접근 완료(PATH_DONE) 직후 서버가 자동으로 보내는 도색
-//       경로(전부 paint=true). Qt가 버튼을 한 번 더 누르는 절차는 없다.
-//       로봇은 이 PATH를 받는 순간 IMU 현재 방향을 0도로 세팅하고 주행 시작.
-//   ALIGN  payload: {"angle_deg": -2.5}   // READY 응답: 출발 전 미세 회전 보정
-//   GO     payload: {}                    // READY 응답: 정렬 OK, 다음 동작 진행
-//   DRIFT  payload: {"angle_deg": 2.0}    // 주행(직진) 중 지속 각도 피드백 (~5Hz)
-//     - 가려는 방향이 0도 기준. 시계방향(오른쪽)으로 틀어져 있으면 양수,
-//       반시계(왼쪽)면 음수. 값 = 좌회전으로 보정해야 할 양 (ALIGN과 동일 규약).
+//     - op_index는 경로 전체에 0부터 빈틈없이. 새 PATH를 받으면 다시 0부터.
+//     - 🔴 role은 관측용 메타데이터다. 로봇은 읽지 않으며 값에 따라 동작을
+//       바꾸지 않는다. 로봇 실행부에 role 분기가 생기면 그 자체가 버그다.
+//     - move에는 paint 필드가 없다. 노즐 상태를 바꾸는 것은 nozzle op뿐이다.
+//     - arc.radius_m은 "로봇 마커 중심"이 그려야 할 반지름(서버가 이미 펜
+//       오프셋을 반영한 실행값)이다. 로봇은 여기에 자기 보정을 더하지 않는다.
+//       정지 조건도 펜 기준 호 길이가 아니라 radius_m x θ_rad다.
+//       radius_draw_m은 참고용(도면상 펜 자취 반지름) - 로봇은 무시한다.
+//     - phase="approach": 도면 시작점까지 이동 + 첫 도색 방향 회전. 오프셋
+//       보정 op만 없고 ALIGN/MORE/DRIFT는 전부 적용된다.
+//     - phase="draw": 접근 완료(PATH_DONE) 직후 서버가 자동으로 이어 보낸다.
+//   GO     payload: {"op_index":n}         // READY 응답: op n을 실행하라
+//   ALIGN  payload: {"op_index":n, "angle_deg":±d}
+//     - 제자리 미세 회전 후 "같은 op_index로 READY를 다시" 보낸다.
+//   MORE   payload: {"op_index":n, "dist_m":±m}
+//     - 현재 방향으로 전/후진(음수=후진) 후 "같은 op_index로 READY를 다시".
+//   DRIFT  payload: {"op_index":n, "angle_deg":±d}
+//     - 직진 주행 "중" 각도 보정. READY로 응답하지 않는다 (fire-and-forget).
+//     - 로봇 거동은 연속 조향(멈추지 않고 좌우 바퀴 속도차로 흡수)으로 정했다.
+//   HOLD   payload: {"hold":true|false, "reason":"pos_lost"}
+//     - true: 실행 중인 op 도중이라도 즉시 정지 (op을 포기하지는 않는다)
+//       false: 멈춘 지점에서 같은 op을 남은 거리/각도부터 이어서 수행
+//     - HOLD 중에는 서버가 GO/ALIGN/MORE/DRIFT를 일절 보내지 않는다.
 //   CMD    payload: {"cmd": ...}  (응답 불필요, fire-and-forget)
 //     - 이벤트: "ESTOP" | "RESUME" | "CALIB_START"
 //     - 수동 조작(조이스틱, 누르는 동안 이동 / STOP=뗌, 이동량 없음):
@@ -67,21 +93,24 @@
 //     - painting: 노즐 동작 여부 (지금 도색 중인지)
 //     - 2초 이내 간격으로 주기 전송 필수 = 하트비트 겸용.
 //     - 서버는 로봇에게서 10초간 무수신이면 연결 끊김으로 간주하고 세션 종료.
-//   READY  payload: {"seg": 3}
-//     - 출발 전 정렬 확인: TURN을 마치고 MOVE를 시작하기 직전에 정지 상태로 전송.
-//       seg = segments 배열에서 곧 실행할 MOVE의 인덱스 (0부터).
-//     - 서버가 CCTV 마커로 잰 실제 각도와 그 MOVE의 heading_deg를 비교해서
-//       오차 > 2도면 ALIGN{angle_deg}(미세 회전 후 다시 READY),
-//       오차 <= 2도(또는 4회 반복 초과)면 GO{} 응답. GO를 받으면 직진 시작.
-//       (임계값/횟수 실제값은 router.hpp의 kAlignThresholdDeg/kAlignMaxTries)
+//   READY  payload: {"op_index": 3}
+//     - 🔴 op_index = "이제부터 실행하려는" op의 index다 (완료한 op이 아니다).
+//     - 모든 op 앞에서 정지 상태로 전송한다 (v1처럼 MOVE 앞에서만이 아니다).
+//     - 서버 응답은 GO / ALIGN / MORE 중 정확히 하나다. ALIGN/MORE를 받으면
+//       그 동작을 수행하고 "같은 op_index로 READY를 다시" 보낸다. GO를 받아야만
+//       다음 op으로 넘어간다.
+//     - 서버 응답은 최악 (feedback_wait_ms + STATUS 주기)만큼 늦다. 로봇은
+//       READY에 자체 타임아웃을 걸어 임의로 출발하면 안 된다.
+//     - 자기가 기다리는 index와 다른 GO/ALIGN/MORE/DRIFT는 조용히 버릴 것
+//       (지연 도착한 이전 경로의 응답이 새 경로를 움직이는 것을 막는다).
 //   PATH_DONE payload: {"phase":"approach"|"draw"}
-//     - 받은 PATH의 마지막 세그먼트까지 수행을 마쳤을 때 1회 전송 (2026-07-27 추가).
+//     - 받은 PATH의 마지막 op까지 수행을 마쳤을 때 1회 전송. 마지막 op을 마친
+//       뒤에는 READY{N}을 보내지 않는다 (PATH_DONE이 그 자리를 대신한다).
 //       phase는 방금 끝낸 PATH의 phase를 그대로 되돌려준다.
 //     - phase="approach" -> 서버가 곧바로 도색 PATH를 이어 보낸다 (Qt 개입 없음).
 //       phase="draw"     -> 서버가 경로 상태를 정리하고 QT에 DRAW_DONE을 통지한다.
 //     - 서버는 자기 상태로 단계를 판단하므로 phase가 없거나 어긋나도 동작한다
-//       (어긋나면 WARN 로그만 남김). 이탈 재계획으로 PATH가 교체된 경우에는
-//       "마지막으로 받은 PATH"를 끝냈을 때 보내면 된다.
+//       (어긋나면 WARN 로그만 남김).
 //
 // [QT -> 서버]
 //   REGISTER payload: {"id":"user1","pw":"...","cam_ip":"192.168.0.31"}
@@ -121,13 +150,12 @@
 //       넘긴다 (2026-07-28 구조 변경). 없으면 종전대로 서버가 points로 직접
 //       생성한다(하위호환).
 //
-//     ⚠️ pen_offset_m 필드는 폐지됐다 (2026-07-28). 펜 오프셋 보정은 로봇이
-//     TURN 실행 시 자기 하드웨어 상수(실측 155mm)로 전적으로 담당한다 - 서버/Qt
-//     둘 다 관여하지 않는다. 서버는 이 값을 router.hpp의 kPenOffsetM 상수로만
-//     갖고 있고, 오직 이탈 판정 여유값 계산에만 쓴다 (path_planner.hpp
-//     distToActiveSegment 참고 - 도면은 펜 자취인데 pose는 마커 중심이라 정상
-//     주행에도 구간 끝에서 상시 d가 벌어지는 것을 상쇄). 로봇의 실제 오프셋이
-//     바뀌면 이 상수도 같이 고쳐야 한다 - 자동 동기화되지 않는다.
+//     ⚠️ pen_offset_m 필드는 폐지됐다 (2026-07-28). 값 자체는 서버가
+//     params().pen_offset_m으로 들고 있다 (config/params.json에서 조정).
+//     🔴 v2에서 보정 주체가 바뀌었다: 로봇이 아니라 **서버**가 program을 로봇
+//     op으로 변환하면서 ±0.155m move op을 끼워 넣는다 (ops_builder.hpp
+//     buildDrawOps). Qt는 종전대로 도면 그대로의 논리 동작만 보내면 되고,
+//     로봇은 자체 보정을 하지 않는다 - 하면 이중 보정이 된다.
 //
 //   [program op 규약 - Qt 입력값 그대로, 서버는 손대지 않고 중계]
 //     MOVE   {"dist_m":±m, "paint":bool, "heading_deg":deg, "v":꼭짓점idx}
@@ -140,53 +168,38 @@
 //     ARC    {"dist_m":m, "radius_m":m, "angle_deg":deg, "direction":"left"|"right",
 //             "paint":bool, "heading_deg":deg, "v":꼭짓점idx}   (2026-07-29 신설)
 //       - 곡선(원호) 주행. 알파벳 'D'/'O', 도로 곡선 표지 도색용.
-//       - dist_m = 호 길이(S = R·θ_rad), radius_m = 도면 상의 곡선 반지름(양수).
-//       - 로봇은 155mm 후방 노즐 오프셋을 자기 피타고라스 공식
-//         (R_robot = sqrt(radius_m² + 0.155²))으로 자율 보정한다 - TURN과
-//         동일하게 Qt/서버는 도면 그대로의 값만 주고 관여하지 않는다.
+//       - radius_m = 도면 상의 곡선 반지름(= 펜 자취 반지름, 양수).
+//         dist_m(호 길이)은 서버가 쓰지 않는다 - v2 로봇 arc의 정지 조건은
+//         "바퀴중심 기준" radius_m x θ_rad라 펜 기준 호 길이와 다르기 때문.
+//       - 🔴 서버가 R_robot = sqrt(radius_m² - 0.155²)로 바꿔서 로봇에 보낸다
+//         (docs/PROTOCOL_v2_ROBOT.md §5.4). Qt는 도면 그대로의 값만 주면 된다.
+//       - paint=true인 ARC의 radius_m이 params().min_paint_radius_m보다 작으면
+//         서버가 도면을 거부한다 (DRAW_FAIL reason="arc_too_tight"). 노즐이
+//         그릴 수 있는 최소 원의 반지름이 곧 펜 오프셋 0.155m이기 때문.
 //     공통 v     : 필수. 이 op가 "출발하는" 도면 꼭짓점 index.
-//       서버 buildRecovery가 "꼭짓점 k로 복귀 후 재개할 op"을 v >= k 인 첫 op으로
-//       찾으므로, 도착 꼭짓점이 아니라 출발 꼭짓점이어야 복귀 지점에서 떠나는
-//       MOVE가 잡힌다. 없으면 서버가 program 전체를 거부한다(폴백으로 직접 생성).
+//       v2에서는 MORE(주행 거리 보정)의 목표 좌표를 여기서 얻는다: 방금 끝낸
+//       주행 op의 "도착" 꼭짓점 = 그다음 op의 v. 추측항법으로 누적하지 않고
+//       Qt가 준 좌표만 쓰므로 오차가 쌓이지 않는다. 없으면 서버가 도면을
+//       거부한다 (DRAW_FAIL reason="bad_program").
 //     heading_deg는 "로봇이 바라보는 절대 방위"다. 전진 중에는 진행 방향과
 //     같지만 후진 op에서는 180도 다르다 - pose의 theta(마커 앞변 기준)와
 //     직접 비교되므로 바라보는 방향이어야 맞다.
 //
-//   🔴 [노즐 제어의 단일 결정권 = NOZZLE op] (2026-07-28 확정)
-//     로봇의 노즐 상태를 바꾸는 것은 오직 NOZZLE op이다. MOVE.paint는 참고용
-//     표시이고, 그것만 보고 노즐을 내리거나 올리면 안 된다.
-//     - 규약이 둘이면(NOZZLE op / MOVE.paint) 로봇 실행부가 "둘 중 뭘 믿나"를
-//       분기해야 하고, 팀마다 다르게 구현될 여지가 생긴다. 하나로 못박는다.
-//     - 경로의 시작은 항상 "노즐 올라간 상태"이고 끝도 NOZZLE up이다. 접근
-//       (phase=approach) 경로에는 NOZZLE이 아예 없는데, 전부 paint=false라
-//       내릴 일이 없고 직전 경로가 NOZZLE up으로 끝났기 때문이다.
-//     - 서버가 program 없이 직접 만드는 경로(하위호환)에도 서버가 NOZZLE을
-//       끼워 넣는다 (path_planner.hpp withNozzleOps). 예전에는 이 경로에
-//       NOZZLE이 없어, NOZZLE만 보는 로봇은 노즐을 영영 못 내렸다.
-//     - 🔴 NOZZLE은 반드시 down/up이 번갈아 나온다 (2026-07-29 확정). 같은
-//       상태가 연속으로 두 번 오지 않는다 - down 다음은 무조건 up, up 다음은
-//       무조건 down. 예: ㄷ자로 세로 획 두 개를 그릴 때, 첫 획 끝나고 NOZZLE up
-//       한 번 -> (도색 없는 이동+회전) -> 다음 획 시작 직전 NOZZLE down 한 번.
-//       이동 구간에서 "이미 올라가 있다"고 NOZZLE up을 또 보내지 않는다.
-//       Qt program도, 서버가 만드는 폴백(withNozzleOps)도 이 규칙을 지킨다 -
-//       withNozzleOps는 애초에 상태가 실제로 바뀔 때만 op을 끼워 넣으므로
-//       자동으로 성립한다.
+//   🔴 [Qt NOZZLE op은 서버가 버린다] (v2 변경)
+//     노즐 타이밍은 펜 오프셋 보정 op과 한 몸이라(노즐 down = 중심이 꼭짓점보다
+//     a 앞) 서버가 전부 다시 만든다. Qt는 종전 형식대로 NOZZLE을 넣어 보내도
+//     되고 빼도 된다 - 서버가 무시한다. 로봇에 나가는 nozzle op은 여전히
+//     down/up이 번갈아 나오며(그 규약은 유지), move에는 paint 필드가 없다.
 //
-//     여기 없는 것: pivot 필드, 펜 보정 서브스텝(후진/전진), 속도(speed_mps/
-//     speed_dps). 전부 Qt도 서버도 모르거나 관여하지 않는 값이라 program에
-//     안 들어간다 - 로봇이 TURN을 실행할 때 자기 하드웨어 영역에서 알아서
-//     처리한다(2026-07-28 최종 확정). 서버 buildRecovery도 이제 "v >= k인
-//     첫 op"만 찾는 단순 검색이다 - pivot을 걸러낼 이유가 없어졌다.
+//     여기 없는 것: pivot 필드, 펜 보정 서브스텝, 속도(speed_mps/speed_dps).
+//     Qt도 서버도 모르거나 관여하지 않는 값이라 program에 안 들어간다.
 //
-//   [회전 중 DRIFT 억제 - 로봇 담당 (2026-07-28 확정)]
-//     서버는 로봇이 지금 TURN을 실행 중인지 모른다. alignSegIdx_는 로봇이 READY를
-//     보낼 때만 갱신되는데 로봇은 MOVE 앞에서만 READY를 보내므로, TURN을 도는
-//     동안에도 서버는 직전 MOVE 목표각을 기준으로 DRIFT를 계속 쏜다(실측 최대
-//     -40도). 그대로 두면 로봇이 자기 회전과 서버 보정이 싸운다.
-//     🔴 서버가 "지금 TURN 중"임을 알려주는 신호를 새로 만들지 않기로 했다 -
-//     이탈 감시(POS 기반 진행 커서)는 alignSegIdx_와 무관하게 로봇 실제 위치만
-//     보고 판단하므로 서버가 회전 여부를 몰라도 다른 기능에 영향이 없다.
-//     로봇이 자기 상태(IsTurning() 등)로 TURN 실행 중엔 들어오는 DRIFT를 무시.
+//   [회전 중 DRIFT 억제 - v2에서는 서버가 안다]
+//     v1은 로봇이 MOVE 앞에서만 READY를 보내 서버가 "지금 TURN 중"을 알 수 없었고,
+//     그래서 회전 중에도 직전 MOVE 목표각 기준 DRIFT를 계속 쏘았다(실측 최대
+//     -40도). v2는 모든 op마다 READY/GO가 오가므로 서버가 실행 중인 op을 정확히
+//     안다 - DRIFT는 role="path"인 move를 실행 중일 때만 나간다. turn/arc/
+//     오프셋 move 중에는 서버가 아예 보내지 않으므로 로봇 쪽 필터가 필요 없다.
 //
 // [서버 -> QT]
 //   STATUS : 그대로 중계 (모니터링용)
@@ -233,10 +246,13 @@
 //     - CCTV는 절대 좌표 변환하지 말 것 (undistort도 하지 말 것).
 //       서버가 undistort(P=K 동등) -> H_marker -> pose 계산까지 담당.
 //     - 테스트용으로 {"x","y","theta_deg"}(바닥 미터 좌표)도 허용
-//     -> POSE를 QT 전송 (POS 원본은 중계하지 않음) + 계획 경로에서 0.3m 초과
-//        이탈 시 재계획 PATH 전송 (최소 3초 간격)
-//     - 로봇에는 중계하지 않음: 로봇은 좌표를 모르며(PATH 참고), 위치 보정은
-//       서버가 각도로 변환해 ALIGN/DRIFT로만 내려준다
+//     -> POSE를 QT 전송 (POS 원본은 중계하지 않음)
+//     - 로봇에는 중계하지 않음: 로봇은 좌표를 모르며(PATH 참고), 위치/각도 보정은
+//       서버가 ALIGN/MORE/DRIFT로만 내려준다
+//     - ⚠️ "0.3m 이상 이탈 시 복귀 PATH 재전송"은 v2에서 폐지됐다. 보정 수단은
+//       ALIGN/MORE/DRIFT 세 가지뿐이다.
+//     - 마지막 채택 POS로부터 params().pos_lost_ms가 지나면 서버가 로봇에
+//       HOLD{hold:true}를 보내 즉시 세운다 (복구되면 HOLD{hold:false}).
 #include <nlohmann/json.hpp>
 #include <atomic>
 #include <string>
@@ -250,6 +266,7 @@ inline json makeMsg(const std::string& type, const json& payload) {
 }
 
 // PATH 메시지 생성. phase: "approach"(시작점 접근) | "draw"(도색 경로)
-inline json makePathMsg(const json& segments, const std::string& phase) {
-    return makeMsg("PATH", {{"phase", phase}, {"segments", segments}});
+// ⚠️ v2에서 배열 필드명이 segments -> ops로 바뀌었다.
+inline json makePathMsg(const json& ops, const std::string& phase) {
+    return makeMsg("PATH", {{"phase", phase}, {"ops", ops}});
 }

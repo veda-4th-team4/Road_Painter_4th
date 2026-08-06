@@ -9,6 +9,7 @@
 // 실행 전: ./gen_cert.sh <서버IP> 로 certs/server.crt, server.key 생성
 // 콘솔 명령: path / estop / resume / calib / who / quit
 #include "log.hpp"
+#include "params.hpp"
 #include "protocol.hpp"
 #include "router.hpp"
 #include "tls_server.hpp"
@@ -45,6 +46,11 @@ int main(int argc, char** argv) {
             port = 9000;
         }
         logf("[INFO] Road-Painter TLS 서버 시작 (포트 %d)", port);
+        // 튜닝 파라미터(임계값/주기/기하)를 파일에서 읽는다. 코드에 박아두지
+        // 않는 이유는 현장에서 값 하나 바꾸려고 재컴파일하지 않기 위해서다.
+        // 경로는 두번째 인자로 덮어쓸 수 있다 (드라이런용 대체 설정 등).
+        // 스레드가 뜨기 전에 한 번만 로드하고, 이후로는 읽기 전용이다.
+        loadParams(argc > 2 ? argv[2] : "config/params.json");
         gpServer = std::make_unique<TlsServer>(port, "certs/server.crt", "certs/server.key");
         Router router(*gpServer);
         gpServer->setHandler([&](const std::string& role, const json& msg) {
@@ -74,13 +80,25 @@ int main(int argc, char** argv) {
             std::string cmd;
             while (!gShutdown && std::getline(std::cin, cmd)) {
                 if (cmd == "path") {
-                    // 테스트 경로: 2m 직진(도색) -> 우회전 90도 -> 1m 직진(도색)
-                    json segs = json::parse(R"([
-                        {"op":"MOVE","dist_m":2.0,"paint":true},
-                        {"op":"TURN","angle_deg":-90},
-                        {"op":"MOVE","dist_m":1.0,"paint":true}
+                    // 테스트 경로 (프로토콜 v2 ops): 2m 직진 도색 -> 우회전 90도
+                    // -> 1m 직진 도색. 오프셋 보정 op까지 손으로 적어둔 것이라
+                    // 서버가 생성하는 경로와 형태가 같다.
+                    // ⚠️ 이 경로는 Router를 거치지 않아 서버가 activeMeta_를
+                    //   모른다 - READY에는 GO만 나가고 ALIGN/MORE/DRIFT는 없다.
+                    json ops = json::parse(R"([
+                        {"op":"move","role":"offset","dist_m":0.155,"op_index":0},
+                        {"op":"nozzle","role":"offset","down":true,"op_index":1},
+                        {"op":"move","role":"path","dist_m":2.0,"op_index":2},
+                        {"op":"nozzle","role":"offset","down":false,"op_index":3},
+                        {"op":"move","role":"offset","dist_m":-0.155,"op_index":4},
+                        {"op":"turn","role":"path","angle_deg":90.0,"op_index":5},
+                        {"op":"move","role":"offset","dist_m":0.155,"op_index":6},
+                        {"op":"nozzle","role":"offset","down":true,"op_index":7},
+                        {"op":"move","role":"path","dist_m":1.0,"op_index":8},
+                        {"op":"nozzle","role":"offset","down":false,"op_index":9},
+                        {"op":"move","role":"offset","dist_m":-0.155,"op_index":10}
                     ])");
-                    bool ok = gpServer->sendTo("ROBOT", makePathMsg(segs, "draw"));
+                    bool ok = gpServer->sendTo("ROBOT", makePathMsg(ops, "draw"));
                     logf("[INFO] PATH 전송 %s", ok ? "성공" : "실패");
                 } else if (cmd == "estop") {
                     gpServer->sendTo("ROBOT", makeMsg("CMD", {{"cmd", "ESTOP"}}));
