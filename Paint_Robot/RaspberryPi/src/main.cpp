@@ -63,16 +63,39 @@ int main(int argc, char **argv) {
       // 1. Run network loop to check sockets and reconnect if needed
       net_manager.Process();
 
-      // 2. Handle incoming CMD (ESTOP / RESUME / Manual Controls) relay to STM32
+      // 2. Handle incoming CMD (ESTOP / RESUME / ABORT_DRAW / Manual Controls) relay to STM32
       std::string cmd;
       if (net_manager.GetLatestCommand(cmd)) {
-          std::cout << "[MAIN] Relaying command to STM32: " << cmd << std::endl;
+          std::cout << GetTimestampStr() << "[MAIN] Processing server CMD: " << cmd << std::endl;
           if (cmd == "ESTOP") {
               robot_comm.SendEmergencyStop(0x01);
               manual_override = true;
               manual_speed = {0, 0};
               manual_nozzle = 0;
+              auto_nozzle = 0;
               robot_comm.SendControlNozzle(0);
+              path_follower.SetPath({});
+              has_pending_path = false;
+              pending_path.clear();
+              waiting_for_go = false;
+              ready_seg_sent = 0xFFFFFFFF;
+              path_done_sent = false;
+              net_manager.ClearLatches();
+          } else if (cmd == "ABORT_DRAW" || cmd == "CANCEL_DRAW" || cmd == "STOP") {
+              std::cout << GetTimestampStr() << "[MAIN] [ABORT] Aborting active path execution and stopping robot." << std::endl;
+              manual_override = false;
+              manual_speed = {0, 0};
+              manual_nozzle = 0;
+              auto_nozzle = 0;
+              robot_comm.SendSetSpeed(0, 0);
+              robot_comm.SendControlNozzle(0);
+              path_follower.SetPath({});
+              has_pending_path = false;
+              pending_path.clear();
+              waiting_for_go = false;
+              ready_seg_sent = 0xFFFFFFFF;
+              path_done_sent = false;
+              net_manager.ClearLatches();
           } else if (cmd == "RESUME") {
               robot_comm.SendClearEStop();
               manual_override = false;
@@ -90,11 +113,6 @@ int main(int argc, char **argv) {
           } else if (cmd == "TURN_RIGHT") {
               manual_override = true;
               manual_speed = {300, -300};
-          } else if (cmd == "STOP") {
-              manual_override = true;
-              manual_speed = {0, 0};
-              manual_nozzle = 0;
-              robot_comm.SendControlNozzle(0);
           } else if (cmd == "NOZZLE_DOWN" || cmd == "PAINT_ON") {
               manual_nozzle = 1;
               robot_comm.SendControlNozzle(1);
