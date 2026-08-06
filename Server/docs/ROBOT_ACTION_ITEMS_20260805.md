@@ -24,8 +24,14 @@
 | R-8 | `op_index` 대조 후 불일치는 버릴 것 | **P2** | `NetworkManager.cpp:378-400` | 지연 응답이 새 경로를 움직인다 |
 | R-9 | 노즐 대기 500ms → 1000ms | **P2** | `main.cpp:163` | 실측에 맞출 것 |
 | R-10 | ARC 로그 문구 정정 | **P3** | `PathFollower.cpp:204` | 동작은 맞고 문구만 오해를 부른다 |
+| **R-11** | **`ABORT_DRAW` 구현** | **🔴 P0** | `main.cpp:70-104` (없음) | **[작업 중단] 버튼이 로봇을 못 멈춘다** |
 
 **R-1 ~ R-4만 고치면 일단 움직인다.** R-5 ~ R-7까지 해야 문서대로 동작한다.
+
+> 🔴 **R-11은 2026-08-06 추가분이며, 위 R-1~R-10과 성격이 다르다.**
+> 나머지가 "v2로 옮기면서 맞춰야 할 것"이라면 R-11은 **지금 현장에서 이미
+> 깨져 있는 안전 결함**이다. QT는 v0.4 기준으로 이미 `ABORT_DRAW`를 보내고
+> 있는데 로봇이 그 명령을 모른다.
 
 ---
 
@@ -269,6 +275,117 @@ std::cout << "[PathFollower ARC] StartArc: R_robot=" << radius_m
 
 ---
 
+## R-11. 🔴 `ABORT_DRAW` 구현 (P0, 2026-08-06 추가)
+
+### 지금 무슨 일이 벌어지고 있나
+
+**QT의 [작업 중단] 버튼을 누르면 화면은 "작업 취소 / ESTOPPED"로 바뀌는데
+로봇은 계속 도색한다.**
+
+체인이 이렇게 끊겨 있다:
+
+| 단계 | 코드 | 상태 |
+|---|---|---|
+| QT | `backend.cpp` `cancelJob()` | `ABORT_DRAW` **하나만** 보낸다. `ESTOP`은 **안 보낸다** |
+| 서버 | `router.cpp` `fromQt` CMD | ✅ 2026-08-06 구현 완료 (경로 폐기 + 로봇 중계) |
+| **로봇** | `main.cpp:70-104` | ❌ **`ABORT_DRAW` 분기가 없다** |
+
+로봇의 CMD 처리는 `if (cmd == "ESTOP") ... else if (cmd == "RESUME") ...` 형태의
+문자열 체인이고, **어느 분기에도 안 걸렸을 때의 기본 동작이 없다.** 그래서
+`ABORT_DRAW`는 조용히 버려진다.
+
+> ⚠️ QT가 `ESTOP`을 따로 보내지 않는 것은 **의도된 설계**다. 두 개로 나누면
+> 순서가 뒤바뀌거나 하나가 누락됐을 때 "섰는데 경로가 살아있는" 어중간한
+> 상태가 생긴다. `ABORT_DRAW` 하나가 정지·래치·폐기를 전부 책임진다.
+> (`server_PROTOCOL.md` v0.4 절 참고)
+
+### `ESTOP`과 무엇이 다른가
+
+| | `ESTOP` | `ABORT_DRAW` |
+|---|---|---|
+| 모터·노즐 즉시 정지 | O | O |
+| 비상정지 래치 (`RESUME` 필요) | O | O |
+| **받아둔 경로** | **유지** — `RESUME`하면 멈춘 op부터 이어서 달림 | **폐기** — `RESUME`해도 아무 데도 안 감 |
+
+즉 **`ESTOP`은 일시정지, `ABORT_DRAW`는 취소**다.
+
+### 구현 요청
+
+`main.cpp`의 CMD 체인에 분기 하나를 추가하면 된다. `ESTOP`이 하는 일을 전부
+하고, 거기에 **경로 버퍼 비우기**를 더한다:
+
+```cpp
+} else if (cmd == "ABORT_DRAW") {
+    // 1) ESTOP과 동일: 모터 정지 + 노즐 올림 + 비상정지 래치
+    robot_comm.SendEmergencyStop(0x01);
+    manual_override = true;
+    manual_speed = {0, 0};
+    manual_nozzle = 0;
+    robot_comm.SendControlNozzle(0);
+
+    // 2) 여기부터가 ESTOP과 다른 부분 — 받아둔 경로를 버린다.
+    //    RESUME 후에 자동 주행이 되살아나면 안 된다.
+    path_follower.ClearPath();     // ⚠️ 아래 참고 - 현재 없는 함수다
+    has_pending_path = false;      // 아직 적용 안 한 PATH도 버린다
+    waiting_for_go = false;
+    ready_seg_sent = 0xFFFFFFFF;
+    path_done_sent = true;         // 3) PATH_DONE을 보내지 않기 위해
+    net_manager.ClearLatches();    // 남아있는 ALIGN/MORE/GO/DRIFT 래치 제거
+}
+```
+
+**세 가지만 지켜주면 된다:**
+
+1. **경로 버퍼를 비운다** — op 커서, `PATH_DONE` 전송 대기, 노즐 오프셋
+   서브시퀀스 상태까지 전부 초기화
+2. **`PATH_DONE`을 보내지 않는다** — 끝낸 게 아니라 버린 것이다.
+   보내면 서버가 "접근 완료"로 오해해 곧바로 도색 경로를 내려보낸다
+3. **`ClearLatches()`를 반드시 부른다** — 이미 R-8에서 만들어 둔 함수다
+   (`NetworkManager.cpp:264`). 취소 직전에 도착해 있던 `GO`가 래치에 남아
+   있으면, 취소 직후 그게 소비되면서 로봇이 한 op을 더 실행한다
+
+### ⚠️ `PathFollower::ClearPath()`가 지금 없다
+
+`PathFollower.h`에 `SetPath()`와 `IsPathFinished()`는 있지만 **경로를 비우는
+함수가 없다.** 추가가 필요하다:
+
+```cpp
+// PathFollower.h
+void ClearPath();
+
+// PathFollower.cpp
+void PathFollower::ClearPath() {
+    path.clear();
+    current_waypoint_idx = 0;
+    drift_offset_deg = 0.0f;
+    is_turning = false;
+    is_moving_straight = false;
+    is_arc = false;              // v2에서 추가된 상태 - 같이 비울 것
+}
+```
+
+> 참고: `feature/pnm` 브랜치에 같은 이름의 함수가 이미 있었다
+> (`PathFollower.h:32`). v2로 넘어오면서 빠진 것이라, 그 구현을 그대로 가져다
+> `is_arc`만 추가하면 된다.
+
+### 다음 작업은 어떻게 시작되나
+
+서버가 **새 `PATH`를 보내는 것**으로 시작한다. 로봇은 평소처럼 새 경로로
+교체하면 된다 — `ABORT_DRAW` 이후 로봇이 먼저 뭔가를 보낼 필요는 없다.
+
+### 검증 방법
+
+로봇 없이도 확인할 수 있다 (부록 B의 `robot_sim` 사용):
+
+1. `START_DRAW`로 도색을 시작시킨다
+2. 도색 중간에 QT에서 [작업 중단]을 누른다
+3. **기대**: 로봇 로그에 `ABORT_DRAW` 수신이 찍히고 모터가 선다.
+   이후 `RESUME`을 해도 **아무 데도 가지 않는다**
+4. **기대**: 서버 로그에 `[INFO] CMD ABORT_DRAW -> ROBOT (실행 중이던 경로 폐기)`
+5. **기대**: 다시 [그림그리기 시작]을 누르면 `DRAW_FAIL{busy}` 없이 처음부터 진행된다
+
+---
+
 ## 부록 A. 서버가 보내는 실제 경로 예시
 
 도면 `points = [[0,0],[2,0],[2,1.5]]`, 전 구간 도색일 때 서버가 실제로 만드는
@@ -366,6 +483,7 @@ v2 서버 드라이런에서 반지름 0.5m 반원을 실제로 그려본 결과
 | 2 | 모터 드라이버 좌우 역방향 동시 구동 가능 여부 | 호 최소 반지름의 하한을 결정한다 |
 | 3 | 미세회전 오버슛 실측 (현재 1틱 ≈ 1.42° 추정) | 줄일 수 있으면 `align_threshold_deg`를 4°에서 내린다 |
 | 4 | `PathFollower.h`의 `NOZZLE_OFFSET_M` 현재 값 | 서버 `pen_offset_m`(0.155)과 **반드시 같아야 한다.** 자동 동기화되지 않는다 |
+| 5 | **R-11 반영 예정 시점** | 그때까지 [작업 중단] 버튼이 로봇을 못 세운다. 현장 시연 전에는 반드시 들어가야 한다 |
 
 서버 쪽 임계값·주기는 전부 `Server/config/params.json`에 있고 **서버 재시작만으로 바뀐다**
 (재컴파일 불필요). 현장에서 조정이 필요하면 값만 알려주면 된다.

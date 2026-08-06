@@ -38,8 +38,10 @@
 #include "params.hpp"
 #include "path_planner.hpp"
 #include "protocol.hpp"
+#include "stream_cfg.hpp"
 #include "tls_server.hpp"
 #include "user_store.hpp"
+#include <map>
 #include <mutex>
 
 class Router {
@@ -62,6 +64,16 @@ private:
     void handleLogin(const json& payload, const std::string& replyRole);
     // 캘리브레이션 번들 수신 처리 (CCTV/ADMIN 공용): 저장 + Qt 중계
     void handleHMatrix(const json& msg);
+
+    // ----- 채널 (v0.4, router_channel.cpp) -----
+    // 지금 보고 있는 채널의 캘리브레이션. 그 채널이 미캘리면 valid=false인 빈 값.
+    // 🔴 pose 계산은 반드시 이걸 거칠 것 - 채널마다 H가 달라 좌표계가 다르다.
+    const Calib& activeCalib() const;
+    // SELECT_CHANNEL: 작업 채널 전환. CCTV로 중계 + QT에 CHANNEL_OK/FAIL 회신.
+    void selectChannel(const json& payload, const json& msg);
+    // 진행 중인 도색 작업을 취소한다 (CMD ABORT_DRAW).
+    // ESTOP과 달리 "받아둔 경로를 버린다" - 반환값은 실제로 취소할 게 있었는지.
+    bool abortDraw();
 
     // ----- 로봇 핸드셰이크 (§3, §6) -----
     // READY 수신. 판정이 필요 없는 boundary면 즉시 GO, 필요하면 대기 창을 연다.
@@ -98,7 +110,17 @@ private:
     TlsServer& srv_;
     UserStore users_;          // id/pw/H행렬 영속 저장소
     std::string currentUser_;  // 로그인된 사용자 (단일 사용자 가정)
-    Calib calib_;      // 캘리브레이션 (현재 세션. raw는 calib_.raw)
+    // 중계 스트림 설정 파일 경로. 로그인마다 다시 읽으므로 값은 들고 있지 않는다
+    // (stream_cfg.hpp loadStreamCfg 주석 - 서버 재시작 없이 주소를 바꾸기 위함).
+    static constexpr const char* kStreamCfgFile = "config/stream.json";
+    // 채널별 캘리브레이션 (v0.4). 채널마다 H가 다르므로 하나로 합칠 수 없다.
+    // 단일 채널 현장은 키가 1 하나뿐인 맵으로 그대로 동작한다 (channelOf가
+    // ch 없는 payload를 1로 읽어주므로 구버전 CCTV/QT도 수정 없이 붙는다).
+    std::map<int, Calib> calibs_;
+    int activeChannel_ = kMinChannel;  // 지금 작업 중인 채널 (SELECT_CHANNEL로 전환)
+    // 직전에 "활성 채널이 아니라서" 버린 POS의 채널. 같은 채널이 계속 들어올 때
+    // 로그를 한 번만 남기기 위한 것 - POS는 15~30Hz라 매번 찍으면 로그가 덮인다.
+    int lastIgnoredPosCh_ = 0;
     json blueprint_;   // Qt가 보낸 도면 원본
     json lastStatus_;  // 로봇 최신 상태
     json lastPos_;     // CCTV 최신 마커 검출 원본 (픽셀)
