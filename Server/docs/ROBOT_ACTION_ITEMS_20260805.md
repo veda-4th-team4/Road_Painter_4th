@@ -360,13 +360,43 @@ void PathFollower::ClearPath() {
     drift_offset_deg = 0.0f;
     is_turning = false;
     is_moving_straight = false;
+    // 노즐 오프셋 서브무브는 is_moving_straight 의 목표와 별도로 추적된다.
+    // 여기서 안 비우면 다음 StartOffsetMove 가 방금 취소한 값과 비교하게 된다.
+    offset_move_dist = 0.0f;
     is_arc = false;              // v2에서 추가된 상태 - 같이 비울 것
+    std::cout << "[PathFollower] Path discarded (ABORT_DRAW)." << std::endl;
 }
 ```
 
-> 참고: `feature/pnm` 브랜치에 같은 이름의 함수가 이미 있었다
-> (`PathFollower.h:32`). v2로 넘어오면서 빠진 것이라, 그 구현을 그대로 가져다
-> `is_arc`만 추가하면 된다.
+> 참고: `feature/pnm` 브랜치(`Paint_Robot/RaspberryPi/src/PathFollower.cpp`)에
+> `is_arc` 필드만 빼고 동일한 구현이 이미 있었다 — 위 코드가 그것이다.
+> v2로 넘어오면서 함수 자체가 빠졌다.
+
+`main.cpp`의 CMD 처리(R-11 본문의 예시)도 `feature/pnm`에 실제 구현이 있었다.
+v2에 이미 있는 `auto_nozzle`/`NozzleSubSeq`(`main.cpp:55,60`)까지 그대로
+맞아떨어지므로, 본문 예시보다 이쪽이 더 정확하다 — **아래를 기준으로 쓸 것**:
+
+```cpp
+} else if (cmd == "ABORT_DRAW") {
+    // ESTOP과 같은 정지+래치이되, 경로까지 버린다는 게 핵심 차이.
+    // ESTOP만으로는 세그먼트 커서가 살아남아 RESUME 한 번으로 도색이
+    // 멈춘 지점부터 되살아났다 - 시작한 작업을 취소할 방법이 없었다.
+    robot_comm.SendEmergencyStop(0x01);
+    manual_override = true;
+    manual_speed = {0, 0};
+    manual_nozzle = 0;
+    auto_nozzle = 0;
+    robot_comm.SendControlNozzle(0);
+
+    path_follower.ClearPath();
+    waiting_for_go = false;
+    ready_seg_sent = 0xFFFFFFFF;
+    nozzle_sub_seq = NozzleSubSeq::OFFSET_MOVE;
+    // PATH_DONE은 보내지 않는다 - 끝낸 게 아니라 버린 것이다.
+    // ClearPath() 이후 IsPathFinished()가 true가 되므로, 그 값으로
+    // PATH_DONE 전송 여부를 판단하는 코드가 있다면 우회 처리할 것.
+}
+```
 
 ### 다음 작업은 어떻게 시작되나
 
