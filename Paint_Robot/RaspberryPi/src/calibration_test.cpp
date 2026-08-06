@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
             }
 
             int32_t start_l = static_cast<int32_t>(start_status.left_steps);
-            int32_t start_r = static_cast<int32_t>(start_status.right_status_or_steps ? start_status.right_steps : start_status.right_steps);
+            int32_t start_r = static_cast<int32_t>(start_status.right_steps);
 
             int16_t speed_sps = (dist_m >= 0.0f) ? 771 : -771; // 5 cm/s straight move
             std::cout << GetTimestampStr() << "[CALIB MOVE] Command: " << dist_m << " m (" << (dist_m * 100.0f) << " cm)\n";
