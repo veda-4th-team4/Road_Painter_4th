@@ -5,7 +5,8 @@ CXX      ?= g++
 CXXFLAGS += -std=c++17 -O2 -Wall -Iinclude -Isrc -pthread
 LDLIBS   += -lssl -lcrypto -pthread
 
-SRCS = src/main.cpp src/tls_server.cpp src/router.cpp src/user_store.cpp
+SRCS = src/main.cpp src/tls_server.cpp src/router.cpp src/router_channel.cpp \
+       src/user_store.cpp
 
 server: $(SRCS) src/*.hpp
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $@ $(LDLIBS)
@@ -48,6 +49,13 @@ tap_dump: tools/tap_dump.cpp tools/tls_client.hpp
 cctv_pose: tools/cctv_pose.cpp tools/tls_client.hpp
 	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
 
+# 채널별 캘리브레이션 저장 회귀 테스트 (프로토콜 v0.4).
+# 현장에 이미 배포된 users.json/calib_latest.json 의 예전 형식이 채널 1로 계속
+# 읽히는지, 채널 하나를 저장할 때 다른 채널이 날아가지 않는지 확인한다.
+# 전부 "틀려도 에러가 안 나고 캘리만 조용히 사라지는" 종류라 테스트로 못박아 둔다.
+calib_channel_test: tools/calib_channel_test.cpp src/user_store.cpp src/*.hpp
+	$(CXX) $(CXXFLAGS) tools/calib_channel_test.cpp src/user_store.cpp -o tools/$@ $(LDLIBS)
+
 clean:
-	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose
+	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose tools/calib_channel_test
 .PHONY: clean sim

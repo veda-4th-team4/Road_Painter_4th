@@ -13,6 +13,9 @@ config/*.yaml
 # 전역 캘리브레이션 슬롯 (계정과 분리된 최신 번들 - user_store.cpp)
 config/calib_latest.json
 
+# 중계 RTSP 베이스 주소 (현장마다 다름 - stream.json.example 을 복사해 채운다)
+config/stream.json
+
 # 사용자 계정 데이터 (비번 해시 포함) - 절대 커밋 금지
 # users.json* : 뒤에 * 필요 - 백업본(users.json.bak-*)도 해시가 그대로라 같이 걸러야 함
 # (users.json 단독 패턴은 .bak-* 변형을 안 잡아서 실제로 새 나갈 뻔한 적 있음)
@@ -36,3 +39,6 @@ draw_test
 drive_test
 tap_dump
 cctv_pose
+
+#채널별 캘리브레이션 회귀 테스트 (프로토콜 v0.4)
+calib_channel_test
