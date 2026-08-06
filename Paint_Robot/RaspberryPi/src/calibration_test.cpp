@@ -21,7 +21,7 @@ constexpr float TURN_ANGLE_CALIB_FACTOR = 1.000f;
 
 // 3. 로봇 기구학 규격 상수 (Robot Physical Parameters)
 constexpr float WHEEL_DIAMETER_M = 0.066f;  // 바퀴 지름 (66mm = 0.066m)
-constexpr float WHEELBASE_M      = 0.285f;  // 차축 거리 (285mm = 0.285m)
+constexpr float WHEELBASE_M      = 0.166f;  // 차축 거리 (166mm = 0.166m)
 constexpr float GEAR_RATIO       = 1.0f;    // 기어비 1:1
 constexpr uint16_t STEPS_PER_REV = 3200;    // 1회전당 스텝수 (3200 steps/rev)
 
