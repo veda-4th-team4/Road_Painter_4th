@@ -164,7 +164,8 @@ inline double naiveTravel(const QList<QList<QPointF>> &paths, const QList<bool> 
 //   start/hasStart : 로봇의 현재 위치 (모르면 hasStart=false — 첫 도형은 작도 순서 유지)
 //   tolM           : 경로 단순화 허용 오차 (기본 1cm = 서버가 버리는 최소 이동거리)
 inline Route plan(const QList<QList<QPointF>> &paths, const QList<bool> &closed,
-                  QPointF start, bool hasStart, double tolM = 0.01)
+                  QPointF start, bool hasStart, double tolM = 0.01,
+                  const QList<bool> &preservePoints = {})
 {
     Route r;
 
@@ -173,7 +174,12 @@ inline Route plan(const QList<QList<QPointF>> &paths, const QList<bool> &closed,
     QList<bool> shapeClosed;
     QList<int> origIndex;
     for (int i = 0; i < paths.size(); ++i) {
-        QList<QPointF> s = simplify(paths[i], tolM);
+        // 원호 판정에 필요한 샘플을 일반 RDP로 줄이면 같은 원도 입력 점 수에 따라
+        // ARC 1개, ARC 여러 개, MOVE 무더기로 바뀐다. 호출자가 하나의 원호임을 이미
+        // 확인한 경로는 점 순서를 그대로 보존한다.
+        QList<QPointF> s = preservePoints.value(i, false)
+                         ? paths[i]
+                         : simplify(paths[i], tolM);
         if (s.size() < 2) continue;
         shape.append(s);
         shapeClosed.append(closed.value(i, false) && s.size() > 2);

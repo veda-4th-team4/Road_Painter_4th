@@ -18,10 +18,10 @@ Item {
 
     // 4채널 미리보기 화면인가. 중계 주소가 없으면(단일 채널) 언제나 false 라
     // 예전 화면만 뜬다 — PNM 을 안 쓰는 현장은 아무것도 달라지지 않는다.
-    // (테스트 모드는 중계가 없으므로 4채널 화면을 띄우지 않는다 — Backend 쪽에서도
-    //  enterInitialView() 가 같은 판단을 한다)
+    // 테스트 모드도 실제 CCTV 영상을 확인할 수 있어야 하므로 같은 채널 그리드를 쓴다.
+    // 서버 명령만 생략하고 RTSP 선택·미리보기 흐름은 일반 모드와 동일하다.
     readonly property bool channelGridMode:
-        Backend.channelMode && !Backend.testMode && Backend.workingChannel === 0
+        Backend.channelMode && Backend.workingChannel === 0
 
     function captureLayout() {
         defaultLayout = {
@@ -821,11 +821,8 @@ Item {
                     + "작도할 때 로봇이 도면을 가리면 끄세요.\n"
                     + "표시만 꺼지고 위치 수신·진행률 계산은 그대로 돕니다."
             }
-            // ⚠️ 여기 있던 `곡선ARC ON/OFF` 칩은 지웠다.
-            //    곡선은 **항상 ARC op** 으로 보낸다 (프로토콜 v0.3). 끌 이유가 없다:
-            //    동작 수가 4~10배 줄고, 로봇에는 arc_test.cpp 로 검증된 원호 주행
-            //    코드가 이미 있다(피타고라스 보정 + 좌우 바퀴 차동 속도).
-            //    남은 건 main.cpp 의 op 분기에 ARC 를 연결하는 일뿐이다.
+            // 곡선은 도면 기하가 원호 허용오차를 만족할 때 ARC로 보낸다.
+            // 서버 v2가 실행 반지름과 펜 오프셋을 로봇 op으로 변환한다.
         ]
 
         Item {
@@ -1814,9 +1811,9 @@ Item {
 
                         Text {
                             width: parent.width
-                            text: "양수 = 좌회전, 음수 = 우회전 · 이 시퀀스가 그대로 로봇에 갑니다\n"
+                            text: "양수 = 좌회전, 음수 = 우회전 · Qt가 서버에 보내는 도면 기준 논리 동작\n"
                                   + "흐린 칸 = 칠하지 않는 이동, 초록 = 노즐, 보라 = 곡선(ARC) · "
-                                  + "꼭짓점 펜 보정은 로봇이 자체 수행"
+                                  + "펜 오프셋·노즐 타이밍·실행 반지름은 서버/로봇이 변환"
                             color: Theme.muted
                             font.pixelSize: 10
                             font.family: Theme.fontFamily
@@ -1981,11 +1978,10 @@ Item {
                         height: 38
                         danger: true
                         outline: true
-                        text: "작업 취소"
+                        text: "비상 정지"
                         visible: Backend.jobActive
                         ToolTip.visible: hovered
-                        // ESTOP 과 뭐가 다른지가 이 버튼의 존재 이유다 — 툴팁으로 못박는다
-                        ToolTip.text: "경로를 폐기하고 로봇을 세웁니다 (ESTOP 은 일시정지라 해제하면 이어서 그립니다)"
+                        ToolTip.text: "로봇을 즉시 정지합니다. 현재 서버는 실행 중 경로 폐기를 지원하지 않습니다."
                         onClicked: cancelConfirmPopup.open()
                     }
                     AppButton {
@@ -2122,7 +2118,7 @@ Item {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 text: "누르는 즉시 로봇이 시작점으로 이동하고, 도착하면 이어서 도색까지 "
-                    + "자동으로 진행됩니다. 잠깐 세우려면 ESTOP, 아예 그만두려면 [작업 취소]."
+                    + "자동으로 진행됩니다. 급히 세워야 하면 [비상 정지]를 누르세요."
                 color: Theme.sub
                 font.pixelSize: 13
                 font.family: Theme.fontFamily
@@ -2179,12 +2175,12 @@ Item {
         contentItem: Column {
             width: 340
             spacing: 14
-            Text { text: "작업 취소"; color: Theme.text; font.pixelSize: 16; font.bold: true; font.family: Theme.fontFamily }
+            Text { text: "비상 정지"; color: Theme.text; font.pixelSize: 16; font.bold: true; font.family: Theme.fontFamily }
             Text {
                 width: parent.width
                 wrapMode: Text.WordWrap
-                text: "진행 중인 작업을 취소하고 로봇을 세웁니다. 경로가 폐기되므로 "
-                    + "[ESTOP 해제]를 눌러도 이어서 그리지 않습니다."
+                text: "로봇을 즉시 정지합니다. 현재 서버는 실행 중인 경로를 폐기하는 "
+                    + "명령을 지원하지 않습니다."
                 color: Theme.sub
                 font.pixelSize: 13
                 font.family: Theme.fontFamily
@@ -2192,10 +2188,8 @@ Item {
             Text {
                 width: parent.width
                 wrapMode: Text.WordWrap
-                // 도면은 서버에 남는다 (프로토콜 v0.4 ABORT_DRAW) — 다시 그릴 때
-                // [경로 전송]부터 할 필요가 없다는 것을 알려준다.
-                text: "도면은 서버에 그대로 남습니다. 다시 그리려면 [ESTOP 해제] 후 "
-                    + "[그림그리기 시작]을 누르면 처음부터 다시 진행됩니다."
+                text: "ESTOP을 해제하면 로봇에 남은 경로가 재개될 수 있습니다. "
+                    + "완전한 작업 취소는 서버·로봇의 경로 폐기 명령이 추가된 뒤에만 가능합니다."
                 color: Theme.muted
                 font.pixelSize: 12
                 font.family: Theme.fontFamily
@@ -2206,7 +2200,7 @@ Item {
                 AppButton { text: "계속 진행"; onClicked: cancelConfirmPopup.close() }
                 AppButton {
                     danger: true
-                    text: "작업 취소"
+                    text: "비상 정지"
                     onClicked: { cancelConfirmPopup.close(); Backend.cancelJob() }
                 }
             }
@@ -2536,12 +2530,12 @@ Item {
                     width: parent.width
                     spacing: 8
                     AppButton {
-                        text: topPane.view.showLabels ? "치수·회전 라벨: 켬" : "치수·회전 라벨: 끔"
+                        text: topPane.view.showLabels ? "치수·회전값 표시: 켬" : "치수·회전값 표시: 끔"
                         accent: topPane.view.showLabels
                         onClicked: topPane.view.showLabels = !topPane.view.showLabels
                     }
                     Text {
-                        text: "점이 많은 경로에서는 자동으로 접힙니다"
+                        text: "표시 전용 · 경로에는 영향 없음"
                         color: Theme.muted
                         font.pixelSize: 10
                         font.family: Theme.fontFamily

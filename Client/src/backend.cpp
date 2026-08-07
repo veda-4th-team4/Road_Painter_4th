@@ -33,7 +33,7 @@ constexpr qint64 kPoseWaitWarnMs = 5000;
 // **바닥 평면에서의 수평거리**다 — POSE 가 이미 바닥 투영 좌표이므로 같은 평면에서 뺀다.
 // (마커는 로봇 높이 140mm 위에 있지만, 그 시차 보정은 **서버**가 하고 QT 로는 이미
 //  바닥에 투영된 값이 온다. 여기서 높이를 다시 계산하면 이중 보정이 된다.)
-// ⚠️ **표시 전용이다.** 전송 좌표에는 절대 반영하지 않는다 — 오프셋 보정은 로봇 RPi 몫.
+// ⚠️ **표시 전용이다.** 전송 좌표에는 절대 반영하지 않는다. 실행 보정은 서버/로봇 몫.
 constexpr double kPenOffsetM = 0.155;
 // 테스트 시뮬레이션 틱. 40ms = 25fps — 4cm 후진처럼 짧은 동작도 여러 프레임에 걸친다.
 constexpr int kSimTickMs = 40;
@@ -147,6 +147,12 @@ Backend::Backend(QObject *parent)
                       QStringLiteral("warn"), QStringLiteral("blueprint"));
         else
             clearNotice(QStringLiteral("blueprint"));
+        // START_DRAW는 서버가 program까지 정상 접수했다는 ACK 뒤에만 허용한다.
+        // 전송 직후 true로 두면 arc_too_tight/bad_program 응답과 경합해 빈 도면을
+        // 시작할 수 있다.
+        m_blueprintSent = match;
+        emit jobChanged();
+        updatePhase();
     });
     connect(m_client, &ServerClient::hMatrixReceived, this,
             [this](int ch, const QJsonObject &calib) {
@@ -213,12 +219,14 @@ Backend::Backend(QObject *parent)
     connect(m_client, &ServerClient::channelResult, this,
             [this](bool ok, int ch, const QJsonObject &calib, bool hasCalib,
                    const QString &reason) {
+        m_channelAckPending = false;
         if (!ok) {
             appendLog(QStringLiteral("CHANNEL_FAIL — %1").arg(reason));
             setNotice(QStringLiteral("채널 전환을 서버가 거절했습니다 (%1).").arg(reason),
                       QStringLiteral("error"));
             return;
         }
+        clearNotice(QStringLiteral("channel-sync"));
         if (hasCalib) m_calibs[QString::number(ch)] = calib;
         emit channelChanged();
         if (ch != m_workingCh) return;   // 이미 다른 채널로 넘어갔으면 늦은 응답이다
@@ -925,7 +933,23 @@ int Backend::pathPointCount() const
 routeplan::Route Backend::buildRoute(const QList<QList<QPointF>> &paths,
                                      const QList<bool> &closed) const
 {
-    return routeplan::plan(paths, closed, QPointF(m_poseX, m_poseY), m_poseValid);
+    QList<bool> preservePoints;
+    preservePoints.reserve(paths.size());
+    for (int i = 0; i < paths.size(); ++i) {
+        QList<QPointF> run = paths[i];
+        if (closed.value(i, false) && run.size() >= 3)
+            run.append(run.first());
+
+        motionprogram::detail::Circle fit;
+        double sweep = 0.0;
+        bool left = true;
+        const bool oneArc = run.size() >= 5
+                         && motionprogram::detail::arcFits(
+                                run, 0, run.size() - 1, fit, sweep, left);
+        preservePoints.append(oneArc);
+    }
+    return routeplan::plan(paths, closed, QPointF(m_poseX, m_poseY), m_poseValid,
+                           0.01, preservePoints);
 }
 
 // 계획 결과를 사람이 읽을 수 있게 로그로 남긴다 — "왜 이 순서로 도는가"를
@@ -999,13 +1023,32 @@ void Backend::commitDrawing()
     const QList<QPointF> &blueprint = route.pts;
     if (blueprint.size() < 2) { appendLog("작도된 경로가 없습니다."); return; }
 
-    // 동작 시퀀스는 **Qt 가 만들어 그대로 보낸다** (2026-07-28 설계 변경).
-    // 경로는 불변이고 실시간성이 필요 없다 — 서버는 저장·중계하고 CCTV 보정만 한다.
-    // 그래서 화면의 미리보기가 곧 실행본이 된다.
-    // ⚠️ 펜 오프셋은 넘기지 않는다. program 은 **도면 그대로**의 논리 동작이고,
-    //    꼭짓점 보정은 로봇이 자기 하드웨어 상수로 알아서 한다 (프로토콜 2026-07-28).
+    // Qt는 노즐이 바닥에 그려야 하는 논리 동작을 만든다. 서버 v2는 이 program을
+    // 로봇 op으로 변환하며 부호, 펜 오프셋, 노즐 타이밍과 ARC 실행 반지름을 보정한다.
+    // ⚠️ 펜 오프셋은 넘기지 않는다. program은 도면 그대로의 논리 동작이다.
     const QList<motionprogram::Op> program =
         motionprogram::build(blueprint, route.paint, m_speeds);
+
+    double tightRadiusM = 0.0;
+    const int tightOp = motionprogram::firstTooTightPaintArc(program, &tightRadiusM);
+    if (tightOp >= 0) {
+        const QString msg = QStringLiteral(
+            "곡선 반지름 %1 mm는 현재 서버·로봇의 최소 도색 반지름 %2 mm보다 작습니다. "
+            "도형을 키우거나 곡선을 수정하세요.")
+            .arg(tightRadiusM * 1000.0, 0, 'f', 1)
+            .arg(motionprogram::kServerConfirmedMinPaintRadiusM * 1000.0, 0, 'f', 0);
+        appendLog(QStringLiteral("BLUEPRINT 전송 차단 — ARC #%1, %2")
+                      .arg(tightOp + 1).arg(msg));
+        setNotice(msg, QStringLiteral("error"), QStringLiteral("blueprint"));
+        m_blueprintSent = false;
+        emit jobChanged();
+        updatePhase();
+        return;
+    }
+
+    // 이전 도면 ACK를 새 도면에 재사용하지 않는다. 실제 서버 접수 확인은
+    // blueprintAck 핸들러가 다시 true로 만든다.
+    m_blueprintSent = m_testMode;
 
     if (m_testMode) {
         appendLog(QString("[테스트] BLUEPRINT 전송 생략 (%1점 / 동작 %2개) — 서버 저장 시뮬레이션")
@@ -1040,7 +1083,7 @@ void Backend::commitDrawing()
     m_routePaint = route.paint;
     m_travelLengthM = route.travelM;
     m_program = program;
-    m_blueprintSent = true;
+    // 실서버에서는 BLUEPRINT_OK가 올 때까지 false다. 테스트 모드만 위에서 true.
 
     m_topView->clearPath();
     if (m_originalView) m_originalView->setOverlayPaths({}, {});
@@ -1073,48 +1116,29 @@ void Backend::startPainting()
         startTestProgressSim();
 }
 
-// 진행 중인 작업을 **취소**한다 (프로토콜 v0.4 CMD ABORT_DRAW).
-//
-// ⚠️ 예전에는 여기서 ESTOP 만 보냈는데, 그건 일시정지였다. 로컬 상태만 정리되고
-//    서버의 경로 상태(planActive_)와 로봇의 세그먼트 커서는 그대로 남아서:
-//      · [ESTOP 해제]를 누르면 로봇이 멈춘 지점부터 도색을 이어서 재개했고
-//      · 서버는 계속 "실행 중"이라 다음 START_DRAW 를 DRAW_FAIL{busy} 로 거절했다
-//    ABORT_DRAW 는 서버와 로봇이 받아둔 경로를 버리게 하므로 실제로 취소가 된다.
-//    (정지·비상정지 래치까지 이 한 명령이 다 한다 — ESTOP 을 따로 보내지 않는다)
+// server-driven-v2에는 ABORT_DRAW 계약이 없다. ESTOP은 즉시 요청하되,
+// 서버와 로봇에 남은 경로를 폐기할 수 없으므로 로컬 작업 상태도 유지한다.
 void Backend::cancelJob()
 {
     if (!m_jobActive) return;
-    const double doneSoFar = m_jobProgress;   // 이력에는 중단 시점 진행률을 남긴다
-    stopTestProgressSim();
 
-    // 로봇 상태 표시는 ESTOP 과 같다 — 서버가 로봇에 비상정지 래치를 걸어준다.
-    m_robotStatus = QStringLiteral("작업 취소");
+    m_robotStatus = QStringLiteral("비상 정지");
     m_robotState = QStringLiteral("ESTOPPED");
     m_estopActive = true;
     emit robotStatusChanged();
-    if (m_client && !m_testMode) {
-        m_client->sendAbortDraw();
-        appendLog(QStringLiteral("CMD ABORT_DRAW — 서버·로봇의 경로를 폐기"));
-    } else {
-        appendLog(QStringLiteral("[테스트] CMD ABORT_DRAW"));
+    if (m_testMode) {
+        stopTestProgressSim();
+        appendLog(QStringLiteral("[테스트] ESTOP — 경로 실행 일시정지"));
+    } else if (m_client) {
+        m_client->sendCmd(QStringLiteral("ESTOP"));
+        appendLog(QStringLiteral("CMD ESTOP — server-driven-v2는 실행 경로 폐기 미지원"));
     }
 
-    // 서버의 DRAW_ABORTED 를 기다리지 않고 UI 를 먼저 정리한다. 취소는 사용자가
-    // 급할 때 누르는 버튼이라, 서버 왕복 동안 화면이 멈춰 있으면 안 된다.
-    m_jobActive = false;
-    m_paintingSeen = false;
-    m_jobElapsedValid = false;
-    m_jobProgress = 0.0;
-    m_phase = "idle";
-    if (m_topView) m_topView->setMissionProgress(0.0);
-    if (m_originalView) m_originalView->setMissionProgress(0.0);
-    updateJobRecord(m_currentJobId, QStringLiteral("중단"), doneSoFar);
-    emit jobChanged();
-    setNotice(QStringLiteral("작업을 취소했습니다. 경로는 폐기되어 ESTOP 해제를 해도 "
-                             "이어서 그리지 않습니다 — 다시 그리려면 [그림그리기 시작]을 "
-                             "누르세요. 로봇을 움직이려면 먼저 ESTOP 해제."),
+    setNotice(QStringLiteral("로봇을 비상 정지했습니다. 현재 서버는 실행 중 경로 폐기를 "
+                             "지원하지 않아 작업은 취소되지 않았습니다. ESTOP을 해제하면 "
+                             "남은 경로가 재개될 수 있습니다."),
               QStringLiteral("warn"), QStringLiteral("estop"));
-    appendLog(QStringLiteral("작업 취소 — 경로 폐기 + 비상정지 래치"));
+    emit jobChanged();
     updatePhase();
 }
 
@@ -1656,7 +1680,7 @@ double Backend::progressAlongPath(const QPointF &pose) const
 // ⚠️ 진행률·시작점 도착 판정은 **보정 안 한 POSE(마커)** 를 그대로 쓴다. 서버가 이탈
 //    감시를 하는 기준도 같은 POSE 라, 여기서만 다른 점을 쓰면 두 판정이 어긋난다.
 // ⚠️ 155mm 를 반영해서 로봇에 보내지 않는다. QT 는 도면 그대로만 낸다. 오프셋 보정은
-//    로봇 RPi 전담이다(`pen_offset_m` 은 2026-07-28 프로토콜에서 폐지).
+//    서버 v2/로봇 전담이다(`pen_offset_m`은 Qt 프로토콜에서 폐지).
 void Backend::pushPoseToView(bool valid)
 {
     if (!m_topView) return;
@@ -2051,8 +2075,21 @@ void Backend::startChannelWork()
     // 서버에 "이 채널을 본다"고 알린다. 서버가 CCTV 에 중계해 그 채널의 마커를
     // 잡게 하고, POS 를 이 채널 캘리브레이션으로 변환한다. 이걸 빠뜨리면 영상만
     // 바뀌고 로봇 위치는 옛 채널 기준이라 조용히 어긋난다.
-    if (m_client && !m_testMode)
+    const quint64 requestSerial = ++m_channelRequestSerial;
+    m_channelAckPending = m_client && !m_testMode;
+    if (m_channelAckPending) {
         m_client->sendSelectChannel(ch);
+        QTimer::singleShot(2000, this, [this, ch, requestSerial]() {
+            if (!m_channelAckPending || requestSerial != m_channelRequestSerial
+                || ch != m_workingCh) return;
+            m_channelAckPending = false;
+            appendLog(QStringLiteral("SELECT_CHANNEL CH%1 응답 없음 — 영상만 전환됨").arg(ch));
+            setNotice(QStringLiteral("CH%1 영상은 열렸지만 서버의 채널 전환 응답이 없습니다. "
+                                     "좌표 피드백 채널은 확인되지 않았으므로 자동 주행을 "
+                                     "시작하지 마세요.").arg(ch),
+                      QStringLiteral("error"), QStringLiteral("channel-sync"));
+        });
+    }
 
     // 그 채널의 캘리브레이션을 적용한다. 서버 CHANNEL_OK 로도 같은 번들이 오지만,
     // 왕복을 기다리면 화면이 잠깐 옛 좌표계로 떠 있게 된다 — 갖고 있으면 먼저 쓴다.
@@ -2088,10 +2125,13 @@ void Backend::showChannelGrid()
 {
     if (!channelMode()) return;
     if (m_jobActive) {
-        setNotice(QStringLiteral("작업이 진행 중입니다. 먼저 취소한 뒤 채널을 바꾸세요."),
+        setNotice(QStringLiteral("작업이 진행 중이라 채널을 바꿀 수 없습니다. 현재 서버는 "
+                                 "실행 중 경로 폐기를 지원하지 않으므로 작업 완료를 기다리세요."),
                   QStringLiteral("warn"));
         return;
     }
+    ++m_channelRequestSerial;
+    m_channelAckPending = false;
     m_workingCh = 0;
     // 작업용 메인스트림을 끊는다. 안 끊으면 그리드(4채널) 위에 메인 디코드가
     // 계속 얹혀 돈다 — 서브 프로파일이 없어진 뒤로는 그리드 자체가 1080p 4장이라
@@ -2203,9 +2243,9 @@ void Backend::stopPreviews()
 // 로그인 직후 어디로 갈지. 4채널이면 그리드부터, 아니면 예전처럼 바로 작업 화면.
 void Backend::enterInitialView()
 {
-    // 테스트 모드는 카메라·서버 없이 도면만 그려보는 용도다. 중계도 당연히 없으므로
-    // 그리드를 띄우면 4칸이 전부 "연결 실패"인 화면에 갇힌다.
-    if (channelMode() && !m_testMode) {
+    // 테스트 모드도 실제 CCTV 영상과 채널 선택을 검증할 수 있어야 한다. 서버 연결과
+    // 채널 선택 명령은 계속 생략하지만 RTSP 미리보기 경로는 일반 모드와 공유한다.
+    if (channelMode()) {
         m_workingCh = 0;
         m_highlightedCh = 0;
         startPreviews();
@@ -2227,9 +2267,9 @@ void Backend::startTestProgressSim()
         return;
     }
     // 시퀀스가 **도면 그대로**(펜 기준)라 재생기도 노즐을 그대로 따라간다.
-    // 오프셋은 로봇이 자기 안에서 흡수하므로 재생기는 관여하지 않는다.
+    // 오프셋은 서버/로봇 실행 단계의 책임이므로 논리 경로 재생기는 관여하지 않는다.
     m_sim.load(prog, motionprogram::approachCenter(pts),
-               motionprogram::approachHeadingDeg(pts));
+               motionprogram::approachHeadingDeg(prog, pts));
     m_simPhase = m_sim.phaseText();
     m_simRunning = true;
     emit simChanged();
@@ -2584,12 +2624,8 @@ QString Backend::applyCalibObject(const QJsonObject &raw, const QString &source)
 // ⚠️ 여기 있던 setArcEnabled / m_arcEnabled 는 지웠다.
 //    곡선은 **항상 ARC op** 으로 보낸다 — 켜고 끌 대상이 아니다.
 //      · 동작 수가 4~10배 줄어든다 (O: 49 → 4, STOP: 157 → 25).
-//      · 로봇에 원호 주행 코드가 **이미 있고 실측 검증됐다** (arc_test.cpp):
-//          R_robot = √(R_paint² + 0.155²)                  ← 노즐 오프셋 보정
-//          r_left/right = R_robot ∓ 0.364/2                ← 트랙 폭
-//          목표 스텝 = |r_wheel · θ| · 15433.09 pulses/m
-//          바퀴 속도 = 771.65 · (r_wheel / R_robot)         ← 동시 도착
-//    남은 작업은 로봇 main.cpp 의 op 분기에 이 로직을 연결하는 것뿐이다.
+// 서버 v2에서 ARC 실행 반지름과 바퀴 제어는 서버/로봇 계약의 책임이다.
+// Qt는 도면 반지름, 스윕, 방향과 정확한 진입 접선만 제공한다.
 
 // TopView 배경에 렌즈 보정을 적용할지 토글한다.
 // 끄면 예전 동작(호모그래피만)이라, 같은 화면에서 켜고 끄며 어느 쪽이 잘 펴지는지
@@ -2849,4 +2885,4 @@ QString Backend::planTimeText() const
 // ⚠️ 여기 있던 setPenOffsetMm / setPenOffsetFromServer 는 지웠다.
 //    program 이 펜 프레임 그대로 나가게 되면서(2026-07-28 프로토콜, pen_offset_m 폐지)
 //    이 값은 전송에도, 시퀀스 생성에도, 시뮬레이션에도 쓰이지 않는 순수 잔재였다.
-//    펜 오프셋 보정은 로봇 전담이다.
+//    펜 오프셋 보정은 서버 v2/로봇 전담이다.

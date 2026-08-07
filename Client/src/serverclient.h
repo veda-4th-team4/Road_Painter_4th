@@ -55,8 +55,8 @@ public:
     //   paint: 점마다 "직전 점 → 이 점" 구간을 칠하는지. 도형 사이 이동 구간을
     //          false 로 표시해 로봇이 펜을 든 채 지나가게 한다.
     //          비워서 보내면 서버는 예전처럼 전 구간 도색으로 취급한다(하위 호환).
-    //   program: 로봇이 그대로 실행할 동작 시퀀스 (Qt 가 생성).
-    //          비워 보내면 서버가 예전처럼 직접 만든다(하위 호환).
+    //   program: Qt가 만든 도면 기준 논리 동작. 서버 v2가 로봇 op으로 변환한다.
+    //          비워 보내면 서버가 points에서 논리 동작을 직접 만든다(하위 호환).
     //   ⚠️ pen_offset_m 인자는 없앴다 — 2026-07-28 프로토콜에서 폐지된 필드다.
     void sendBlueprint(const QList<QPointF> &meterPoints,
                        const QList<bool> &paint = QList<bool>(),

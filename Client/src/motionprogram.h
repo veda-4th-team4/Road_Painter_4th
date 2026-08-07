@@ -1,25 +1,20 @@
 #pragma once
-// ── 도면 폴리라인 → 로봇이 그대로 실행할 동작 시퀀스 ────────────────────────
+// ── 도면 폴리라인 → 서버에 전달할 논리 동작 시퀀스 ──────────────────────────
 //
-// 2026-07-28 설계 변경: 동작 시퀀스를 **Qt 가 만들어 서버에 박아 넣는다.**
-// 경로는 한 번 정해지면 불변이고 실시간성이 필요 없다. 서버는 이 프로그램을
-// 저장·중계하고 CCTV 피드백(ALIGN/DRIFT/이탈 재계획)만 담당한다.
-// 이렇게 하면 화면의 "로봇 동작 시퀀스" 미리보기가 곧 실행본이라 미리보기와 실제
-// 주행이 어긋날 수가 없다.
+// Qt는 노즐이 바닥에 그려야 하는 도면 기하만 만든다. 서버 v2가 이 시퀀스를 로봇
+// op으로 변환하면서 부호 반전, 펜 오프셋 이동, 노즐 타이밍, ARC 실행 반지름을 맡는다.
+// Qt가 서버/로봇의 기구 보정을 미리 섞으면 이중 보정이 되므로 금지한다.
 //
-// ── 🔴 펜(노즐) 오프셋은 여기서 다루지 않는다 (2026-07-28 최종 확정) ──
+// ── 🔴 펜(노즐) 오프셋은 여기서 다루지 않는다 ──
 // 예전에는 이 파일이 꼭짓점마다 "노즐 올림 → 후진 d → 회전 → 전진 d" 를 끼워 넣고
 // 맨 앞에 lead-in MOVE +d 를 넣었다. 지금은 **전부 뺐다.**
 //
-//   근거: SERVER_PROTOCOL v0.3 §program op 규약 —
-//     "Qt 는 'A에서 B까지 3m 직진, 90° 좌회전, B에서 C까지 0.5m 직진'처럼
-//      도면 그대로만 만들면 된다. 꼭짓점에서 로봇이 내부적으로 무엇을 하든
-//      그건 로봇 하드웨어 안에서만 일어나고 program 에는 안 드러난다."
-//     "펜 오프셋 보정 = 로봇 전담으로 확정. BLUEPRINT.pen_offset_m 은 폐지."
+//   근거: feature/server-driven-v2 Server/src/ops_builder.hpp.
+//   Qt program은 도면 그대로이고, 서버가 buildDrawOps()에서 로봇 실행 op으로 바꾼다.
 //
 //   왜: 후진/재전진 거리는 '정확히 d' 여야 성립하는데, 그 정밀도를 가진 쪽(로봇의
 //   스텝·모터)과 값을 만드는 쪽(Qt)이 분리돼 있으면 둘 다 손해다. 로봇은 이미
-//   자기 상수(155mm)와 오프셋 이동 상태머신을 갖고 있다.
+//   155mm 상수와 오프셋 이동 상태머신은 최신 서버 설정과 로봇 실행부의 책임이다.
 //
 // ── 🔴 속도도 프로토콜에 없다 ──
 // Op::speed 는 **화면 미리보기와 예상 소요시간 계산용 로컬 값**이다. 전송하지
@@ -42,6 +37,9 @@ namespace motionprogram {
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kRadToDeg = 180.0 / kPi;
 constexpr double kDegToRad = kPi / 180.0;
+// 서버·로봇팀이 모터 토크와 바깥 바퀴 SPS를 기준으로 확정한 도색 ARC 하한.
+// 추후 LOGIN_OK가 min_paint_radius_m을 제공하면 이 상수 대신 서버 값을 사용한다.
+constexpr double kServerConfirmedMinPaintRadiusM = 0.200;
 
 // 로봇 속도. 도색 중에는 도료가 고르게 깔려야 해서 이동할 때보다 느리다.
 // ⚠️ 전송하지 않는다 — 미리보기/예상시간 전용.
@@ -59,7 +57,9 @@ struct Op {
     double angle = 0.0;    // deg — Turn 회전각(양수=좌회전) / Arc 스윕각(항상 양수)
     double radius = 0.0;   // m — Arc 도면상 곡선 반지름 (양수)
     bool arcLeft = true;   // Arc — 좌회전(CCW)인가
-    double heading = 0.0;  // deg — 이 op 를 마쳤을 때 로봇이 **바라보는** 절대 방위
+    // 서버 v2 입력 기준의 도면 방위(CCW+): MOVE=진행 방향, TURN=회전 후 방향,
+    // ARC=호 진입 접선. ARC 종료 방향은 heading +/- angle로 서버가 계산한다.
+    double heading = 0.0;
     bool paint = false;    // Move/Arc — 이 구간을 칠하는가 (표시용, 노즐 제어 아님)
     bool down = false;     // Nozzle — 내리는가
     int vertex = 0;        // 이 op 가 "떠나는" 도면 꼭짓점 index (프로토콜 `v`, 필수)
@@ -102,9 +102,19 @@ inline Circle fitCircle(const QList<QPointF> &pts, int a, int b)
     Circle out;
     const int n = b - a + 1;
     if (n < 3) return out;
+    // 월드 원점에서 멀리 떨어진 큰 도형도 안정적으로 풀도록 평균점을 원점으로 옮긴다.
+    // 원래 좌표를 그대로 정규방정식에 넣으면 x²/y² 항이 커져 위치에 따라 피팅 결과가
+    // 달라질 수 있다.
+    double mx = 0.0, my = 0.0;
+    for (int i = a; i <= b; ++i) {
+        mx += pts[i].x();
+        my += pts[i].y();
+    }
+    mx /= n;
+    my /= n;
     double sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, sxz = 0, syz = 0, sz = 0;
     for (int i = a; i <= b; ++i) {
-        const double x = pts[i].x(), y = pts[i].y();
+        const double x = pts[i].x() - mx, y = pts[i].y() - my;
         const double z = x * x + y * y;
         sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
         sxz += x * z; syz += y * z; sz += z;
@@ -131,7 +141,7 @@ inline Circle fitCircle(const QList<QPointF> &pts, int a, int b)
     const double cx = -D / 2.0, cy = -E / 2.0;
     const double rr = cx * cx + cy * cy - F;
     if (rr <= 1e-12) return out;
-    out.c = QPointF(cx, cy);
+    out.c = QPointF(cx + mx, cy + my);
     out.r = std::sqrt(rr);
     out.ok = true;
     return out;
@@ -145,10 +155,13 @@ inline bool arcFits(const QList<QPointF> &pts, int a, int b, Circle &fit, double
     if (!fit.ok) return false;
     // 글자 획의 곡선은 생각보다 작다 — 높이 300mm 짜리 'D' 의 배는 반지름 40~80mm 다.
     // 예전 하한 50mm 는 그걸 통째로 걸러내서 'D' 가 MOVE 무더기로 나갔다.
-    if (fit.r < 0.02 || fit.r > 5.0) return false;           // 2cm~5m
+    // 5m 상한은 작업장/로봇의 제한이 아니라 임의의 피팅 제한이었다. 반지름이
+    // 5.00m에서 5.01m가 되는 순간 ARC 1개가 모든 MOVE로 바뀌므로 제거한다.
+    if (!std::isfinite(fit.r) || fit.r < 0.02) return false;
 
-    // 반지름 잔차 — 2mm 또는 반지름의 2% 중 큰 값
-    const double tol = std::max(0.002, fit.r * 0.02);
+    // 반지름 잔차 — 1mm 또는 반지름의 0.5% 중 큰 값. 이전 2%는 완만한 타원도
+    // 원 하나로 흡수해 도면과 실행 경로가 달라졌다. ARC 감소보다 기하 보존이 우선이다.
+    const double tol = std::max(0.001, fit.r * 0.005);
     for (int i = a; i <= b; ++i)
         if (std::abs(QLineF(fit.c, pts[i]).length() - fit.r) > tol) return false;
 
@@ -279,6 +292,9 @@ inline QList<Op> build(const QList<QPointF> &pts, const QList<bool> &paint,
                 const bool wantDown = paint.value(i, true);
                 const double t0 = detail::tangentDeg(best, pts[v], bestLeft);
                 const double t1 = detail::tangentDeg(best, pts[bestEnd], bestLeft);
+                // 서버 접근 단계가 첫 op의 heading으로 이미 정렬한다. 첫 호 앞에서
+                // 첫 현(chord)→접선 차이를 TURN으로 또 보내면 그 각도를 두 번 돈다.
+                if (i == 1) cur = t0;
                 turnAndNozzle(t0, wantDown, v);
                 Op a; a.kind = Op::Arc;
                 a.radius = best.r;
@@ -287,7 +303,7 @@ inline QList<Op> build(const QList<QPointF> &pts, const QList<bool> &paint,
                 a.dist = best.r * bestSweep * kDegToRad;   // S = R·θ
                 a.paint = wantDown;
                 a.speed = spd.moveFor(wantDown);
-                a.heading = t1;
+                a.heading = t0;                              // 서버 v2: ARC 진입 접선
                 a.vertex = v;
                 out << a;
                 cur = t1;
@@ -319,7 +335,7 @@ inline QList<Op> build(const QList<QPointF> &pts, const QList<bool> &paint,
 }
 
 // 서버가 접근(approach) 단계에서 로봇을 세워야 할 자리 = 도면 시작점 그대로.
-// 펜 오프셋 보정은 로봇이 자기 상수로 알아서 한다 (Qt·서버 관여 없음).
+// 펜 오프셋 이동은 서버가 draw op을 만들 때 별도로 삽입한다.
 inline QPointF approachCenter(const QList<QPointF> &pts)
 {
     return pts.value(0);
@@ -330,6 +346,29 @@ inline double approachHeadingDeg(const QList<QPointF> &pts)
     if (pts.size() < 2) return 0.0;
     const QPointF v = pts[1] - pts[0];
     return std::atan2(v.y(), v.x()) * kRadToDeg;
+}
+
+// 실제 서버 접근 정렬은 program에서 처음 발견한 heading_deg를 쓴다. 특히 ARC는
+// 첫 두 점의 현 방향이 아니라 정확한 진입 접선이어야 한다.
+inline double approachHeadingDeg(const QList<Op> &ops, const QList<QPointF> &pts)
+{
+    if (!ops.isEmpty()) return ops.first().heading;
+    return approachHeadingDeg(pts);
+}
+
+// 서버 v2가 BLUEPRINT를 거부할 도색 ARC를 전송 전에 찾는다. 기구 보정은 하지 않고
+// 현재 서버 입력 한계만 같은 값으로 검사한다. 반환값은 op index, 없으면 -1.
+inline int firstTooTightPaintArc(const QList<Op> &ops, double *radiusM = nullptr,
+                                 double minRadiusM = kServerConfirmedMinPaintRadiusM)
+{
+    for (int i = 0; i < ops.size(); ++i) {
+        const Op &o = ops[i];
+        if (o.kind == Op::Arc && o.paint && o.radius + 1e-9 < minRadiusM) {
+            if (radiusM) *radiusM = o.radius;
+            return i;
+        }
+    }
+    return -1;
 }
 
 // 실제 주행 거리 합 (후진 포함, 절댓값). 예상 시간 계산용.
