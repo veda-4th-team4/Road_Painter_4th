@@ -56,6 +56,7 @@ class Backend : public QObject
     //    (m_poseTheta 자체는 그 경로에서 계속 쓰인다 — 멤버는 남아 있다)
 
     Q_PROPERTY(bool jobActive READ jobActive NOTIFY jobChanged)
+    Q_PROPERTY(bool abortPending READ abortPending NOTIFY jobChanged)
     // ⚠️ blueprintSent 프로퍼티도 지웠다 — QML 은 이걸 직접 안 읽고 canStart 를 본다.
     //    (m_blueprintSent 는 canStart 안에서 계속 쓰인다)
     Q_PROPERTY(bool manualEnabled READ manualEnabled NOTIFY jobChanged)
@@ -175,6 +176,7 @@ public:
     bool poseValid() const { return m_poseValid; }
 
     bool jobActive() const { return m_jobActive; }
+    bool abortPending() const { return m_abortPending; }
     // 경로 실행(접근+도색) 중에는 서버가 QT 수동조작을 무시한다 → UI도 잠근다
     bool manualEnabled() const { return !m_jobActive; }
     bool canEditMission() const {
@@ -208,10 +210,14 @@ public:
 
     // ── 다채널 ────────────────────────────────────────────────────────────
     // 4채널 기능은 **주소를 만들 방법이 있을 때** 켜진다 — 중계 주소든 직결
-    // 템플릿이든 하나만 있으면 된다. 둘 다 비우면 예전 단일 채널 동작으로 돌아간다
-    // (재빌드 없이 되돌리는 탈출구라, 이 조건은 유지해야 한다).
+    // 템플릿이든 하나만 있으면 된다. 단 `{ip}` 직결 템플릿은 cam_ip까지 있어야
+    // 유효하다. 둘 다 비우면 예전 단일 채널 동작으로 돌아간다.
     bool channelMode() const
-    { return !m_relayBase.isEmpty() || !m_channelUrlTemplate.isEmpty(); }
+    {
+        const bool directReady = !m_channelUrlTemplate.isEmpty()
+            && (!m_channelUrlTemplate.contains(QStringLiteral("{ip}")) || !m_camIp.isEmpty());
+        return !m_relayBase.isEmpty() || directReady;
+    }
     QString relayBase() const { return m_relayBase; }
     // 지금 어디서 영상을 받고 있는지 한 줄로. 중계인지 카메라 직결인지 화면에
     // 보여주기 위한 것 — relayBase 만 표시하면 직결일 때 빈칸이라 "설정이 안 됐나"
@@ -298,8 +304,8 @@ public:
     Q_INVOKABLE int  pathPointCount() const;
     Q_INVOKABLE void commitDrawing();     // BLUEPRINT 전송 → 로봇 접근 단계
     Q_INVOKABLE void startPainting();     // CMD START_DRAW → 도색 시작
-    // 현재 서버 v2에는 경로 폐기 명령이 없다. 실행 중에는 ESTOP만 요청하고
-    // 실제로 취소되지 않은 작업을 UI에서 폐기한 것처럼 표시하지 않는다.
+    // ABORT_DRAW를 보내고 DRAW_ABORTED를 받은 뒤에만 로컬 작업 상태를 종료한다.
+    // 즉시 일시정지하는 ESTOP은 별도 버튼(toggleEstop)으로 유지한다.
     Q_INVOKABLE void cancelJob();
     Q_INVOKABLE void editMission();       // 전송한 경로를 다시 편집 상태로
     Q_INVOKABLE void finishDrawing();
@@ -408,6 +414,7 @@ private:
     QList<motionprogram::Op> currentProgram() const;
     void beginPainting();
     void finishJob(const QString &reason);
+    void completeAbort(bool wasActive, bool requestedHere);
     void onPose(double x, double y, double thetaDeg);
     // 수신 POSE(=ArUco 마커)를 탑뷰 두 겹(섀시·노즐)으로 나눠 넘긴다. 정의부 주석 참고.
     void pushPoseToView(bool valid);
@@ -490,12 +497,13 @@ private:
     int m_brightness = 0, m_contrast = 0, m_sharpen = 0, m_saturation = 0;
 
     // ── 다채널 (PNM-C16083RVQ) ────────────────────────────────────────────
-    // 🔴 비어 있으면 4채널 기능 전체가 꺼지고 위 m_rtspUrl 직결 경로만 돈다.
-    //    앱 안에서 급히 되돌릴 때는 설정에서 이 칸을 비우면 된다 (재빌드 불필요).
+    // 비어 있으면 직결 템플릿+cam_ip로 4채널을 계속한다. 단일 채널로 완전히
+    // 돌아가려면 relayBase와 channelUrlTemplate을 모두 비워야 한다.
     //    QSettings: camera/relayBase, camera/channelCount
     QString m_relayBase;
     // 🔴 중계 없이 **카메라에 직결**할 때 쓰는 채널 URL 템플릿.
-    //    치환: {ch0} = 0부터 센 채널번호, {ch} = 1부터 센 채널번호.
+    //    치환: {ip} = LOGIN_OK.cam_ip, {ch0} = 0부터 센 채널번호,
+    //    {ch} = 1부터 센 채널번호.
     //    한화 멀티센서 경로는 **센서 번호가 0부터**다 — 웹 UI 의 CH1 이 `0` 이다.
     //    (2026-08-04 원시 DESCRIBE 로 0~3 전부 200 OK 확인)
     //    중계(m_relayBase)가 설정돼 있으면 **중계가 이긴다**. 즉 나중에 서버가
@@ -506,7 +514,7 @@ private:
     //    현재 프로파일(2026-08-04): 4채널 전부 H.264 1920x1080 15fps 2560kbps GOV 8.
     //    16:9 모니터에 맞춘 값이고, 2592x1520(2026-08-04 이전) 대비 픽셀 47% 감소.
     QString m_channelUrlTemplate =
-        QStringLiteral("rtsp://admin:5hanwha!@192.168.0.13:554/{ch0}/H.264/media.smp");
+        QStringLiteral("rtsp://admin:5hanwha!@{ip}:554/{ch0}/H.264/media.smp");
     int m_channelCount = 4;
     int m_highlightedCh = 0;   // 클릭한 채널 (0 = 없음)
     int m_workingCh = 0;       // 작업 중인 채널 (0 = 그리드 화면)
@@ -540,6 +548,7 @@ private:
     int m_peerRobot = -1, m_peerCctv = -1;
 
     bool m_jobActive = false;      // START_DRAW ~ DRAW_DONE 사이 (접근+도색 전체)
+    bool m_abortPending = false;   // ABORT_DRAW 전송 후 DRAW_ABORTED 대기
     bool m_blueprintSent = false;  // 도면이 서버에 저장돼 있는가
     bool m_paintingSeen = false;   // 이번 작업에서 STATUS.painting=true 를 본 적 있는가
     double m_jobProgress = 0.0;

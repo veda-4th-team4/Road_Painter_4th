@@ -1978,10 +1978,11 @@ Item {
                         height: 38
                         danger: true
                         outline: true
-                        text: "비상 정지"
+                        text: Backend.abortPending ? "취소 요청 중…" : "작업 취소"
                         visible: Backend.jobActive
+                        enabled: !Backend.abortPending
                         ToolTip.visible: hovered
-                        ToolTip.text: "로봇을 즉시 정지합니다. 현재 서버는 실행 중 경로 폐기를 지원하지 않습니다."
+                        ToolTip.text: "서버와 로봇의 현재 실행 경로를 폐기합니다. 즉시 정지는 아래 ESTOP을 사용하세요."
                         onClicked: cancelConfirmPopup.open()
                     }
                     AppButton {
@@ -2175,12 +2176,11 @@ Item {
         contentItem: Column {
             width: 340
             spacing: 14
-            Text { text: "비상 정지"; color: Theme.text; font.pixelSize: 16; font.bold: true; font.family: Theme.fontFamily }
+            Text { text: "작업 취소"; color: Theme.text; font.pixelSize: 16; font.bold: true; font.family: Theme.fontFamily }
             Text {
                 width: parent.width
                 wrapMode: Text.WordWrap
-                text: "로봇을 즉시 정지합니다. 현재 서버는 실행 중인 경로를 폐기하는 "
-                    + "명령을 지원하지 않습니다."
+                text: "현재 작업을 중단하고 서버와 로봇이 실행 중인 경로를 폐기합니다."
                 color: Theme.sub
                 font.pixelSize: 13
                 font.family: Theme.fontFamily
@@ -2188,8 +2188,8 @@ Item {
             Text {
                 width: parent.width
                 wrapMode: Text.WordWrap
-                text: "ESTOP을 해제하면 로봇에 남은 경로가 재개될 수 있습니다. "
-                    + "완전한 작업 취소는 서버·로봇의 경로 폐기 명령이 추가된 뒤에만 가능합니다."
+                text: "취소 응답을 받은 뒤 같은 도면을 다시 시작하거나 경로를 수정할 수 있습니다. "
+                    + "위험 상황에서 즉시 멈춰야 할 때는 별도의 ESTOP 버튼을 사용하세요."
                 color: Theme.muted
                 font.pixelSize: 12
                 font.family: Theme.fontFamily
@@ -2200,7 +2200,7 @@ Item {
                 AppButton { text: "계속 진행"; onClicked: cancelConfirmPopup.close() }
                 AppButton {
                     danger: true
-                    text: "비상 정지"
+                    text: "작업 취소"
                     onClicked: { cancelConfirmPopup.close(); Backend.cancelJob() }
                 }
             }
