@@ -10,12 +10,21 @@
       --bg: #ffffff; --fg: #1a1a1a; --dim: #6b7280;
       --line: #e5e7eb; --card: #f9fafb;
       --ok: #15803d; --bad: #b91c1c; --warn: #a16207;
+      /* Four lens series. Chosen to stay apart for the common red-green
+         deficiencies too, since the lens number is the only other way to tell
+         them apart and it is not on the line itself. */
+      --l0: #2563eb; --l1: #ea580c; --l2: #059669; --l3: #db2777;
+      --okfill: #15803d;  --okink: #ffffff;
+      --wnfill: #a16207;  --wnink: #ffffff;
     }
     @media (prefers-color-scheme: dark) {
       :root {
         --bg: #16181c; --fg: #e6e6e6; --dim: #9aa0a6;
         --line: #2c2f36; --card: #1d2025;
         --ok: #4ade80; --bad: #f87171; --warn: #fbbf24;
+        --l0: #60a5fa; --l1: #fb923c; --l2: #34d399; --l3: #f472b6;
+        --okfill: #22c55e;  --okink: #06210f;
+        --wnfill: #d97706;  --wnink: #1c1206;
       }
     }
     * { box-sizing: border-box; }
@@ -88,12 +97,32 @@
       padding: 2px 12px; font-size: 12px; font-weight: 600;
       min-width: 54px; border-radius: 999px;
     }
-    button.toggle.on  { color: var(--ok);  border-color: var(--ok); }
+    /* Filled, not outlined. Outline-only meant ON and OFF differed by a thin
+       1 px edge and a text colour — across four rows that is a difference you
+       have to look for, and "is dynROI on?" is the question this page gets
+       asked most. Filled reads from across the desk. */
+    button.toggle.on  { background: var(--okfill); color: var(--okink);
+                        border-color: var(--okfill); }
     button.toggle.off { color: var(--dim); }
     /* Widest label this button ever shows is SEARCH; pin the width to it so the
        column does not jump every time a lens changes state. */
     button.toggle.dyn { min-width: 84px; }
-    button.toggle.dyn.searching { color: var(--warn); border-color: var(--warn); }
+    button.toggle.dyn.searching { background: var(--wnfill); color: var(--wnink);
+                                  border-color: var(--wnfill); }
+    /* The bulk buttons carry state too: pressing 전부 켜기 and having nothing
+       visibly change was indistinguishable from the command failing. */
+    button.state.active { background: var(--okfill); color: var(--okink);
+                          border-color: var(--okfill); }
+    button.state.active.neg { background: var(--dim); color: var(--bg);
+                              border-color: var(--dim); }
+    /* One chip per lens, next to the bulk control, so the current state is
+       readable without scrolling down to the table. */
+    .dchip { font-size: 11px; font-weight: 600; padding: 2px 8px;
+             border-radius: 999px; border: 1px solid var(--line);
+             white-space: nowrap; }
+    .dchip.trk  { background: var(--okfill); color: var(--okink); border-color: var(--okfill); }
+    .dchip.srch { background: var(--wnfill); color: var(--wnink); border-color: var(--wnfill); }
+    .dchip.noc  { color: var(--dim); }
     .ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
            padding: 10px 12px; background: var(--card);
            border: 1px solid var(--line); border-radius: 8px; }
@@ -160,6 +189,22 @@
     .ctl label input[type=number] { width: 88px; }
     .ctl label { flex-direction: column; align-items: flex-start; gap: 2px; }
     .ctl > label.meta > select { margin-top: 2px; }
+    /* Fixed height rather than an aspect ratio: this sits directly above the
+       Channels table and a chart that grows with the window width would push
+       the table it explains off the screen on a wide monitor. */
+    #fpsWrap { border: 1px solid var(--line); border-radius: 8px;
+               background: var(--card); padding: 8px 10px 4px; }
+    #fpsSvg { display: block; width: 100%; height: 210px; }
+    #fpsBar { display: flex; flex-wrap: wrap; align-items: center;
+              gap: 6px 14px; margin-bottom: 4px; }
+    /* Clicking a lens hides its two lines, so four overlaid series can be
+       reduced to the pair actually being compared. */
+    .lgd { display: inline-flex; align-items: center; gap: 5px;
+           font-size: 12px; cursor: pointer; user-select: none;
+           font-variant-numeric: tabular-nums; }
+    .lgd i { width: 16px; height: 3px; border-radius: 2px; flex: none; }
+    .lgd.off { opacity: .35; }
+    .lgd b { font-weight: 600; }
     button.go { border-color: var(--ok); color: var(--ok); }
     button.danger { border-color: var(--bad); color: var(--bad); }
     #err { color: var(--bad); margin: 12px 0; display: none; }
@@ -214,12 +259,36 @@
 
   <h2>dynROI <span class="meta" style="text-transform:none">— 전 렌즈 일괄 (개별 전환은 아래 표에서)</span></h2>
   <div class="ctl">
-    <button type="button" id="dynon">전부 켜기</button>
-    <button type="button" id="dynoff">전부 끄기</button>
+    <button type="button" class="state" id="dynon">전부 켜기</button>
+    <button type="button" class="state neg" id="dynoff">전부 끄기</button>
     <label class="meta">margin <input type="number" id="margin" min="0" max="960" step="10" value="240"> px</label>
     <label class="meta">max miss <input type="number" id="maxmiss" min="0" max="60" value="4"> frames</label>
-    <span class="meta" id="dynnote"></span>
   </div>
+  <!-- Above the note, not inside it: this is the reading, the sentence is the
+       explanation, and the two were competing for the same gray line. -->
+  <div id="dynchips" style="display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 0"></div>
+  <div class="meta" id="dynnote" style="margin:4px 0 0"></div>
+
+  <!-- Which markers the ROI box is built from. The command and the status
+       field both already existed (DYNROI_IDS / dynroi.track_ids); only the
+       input was missing, so this adds no camera code.
+       NOT an output filter: markers that fall inside the box are still
+       detected and still leave over the pose link. Said in the hint, because
+       "특정 id만" reads like a filter and is not one. -->
+  <div class="ctl" style="margin-top:6px">
+    <label class="meta">추적 id
+      <input type="text" id="dynids" placeholder="비우면 전체" style="width:180px"></label>
+    <button type="button" id="dynidsApply">적용</button>
+    <button type="button" id="dynidsAll">전체로</button>
+    <button type="button" class="hint" data-h="dynids" aria-label="추적 id 설명">?</button>
+  </div>
+  <div class="meta" id="dynidsNow" style="margin:4px 0 0"></div>
+  <!-- Two separate lines on purpose. dynidsWarn is rebuilt by render() from
+       the camera's state; a typing mistake belongs to the box, not to the
+       camera, and putting it in the same element meant the next auto refresh
+       erased it while the cursor was still in the field. -->
+  <div id="dynidsErr" style="margin:4px 0 0"></div>
+  <div id="dynidsWarn" style="margin:4px 0 0"></div>
 
   <h2>채널 오버레이 <span class="meta" style="text-transform:none">— 좌표만, 실사진 없음</span></h2>
   <div class="ctl">
@@ -248,7 +317,29 @@
   <div id="ovGrid"></div>
 
   <h2>Channels</h2>
-  <div class="scroll"><table id="chan"></table></div>
+
+  <!-- Above the table, not below: the table is the current reading and this is
+       how it got there, and the question people bring to this page ("did that
+       switch do anything?") is answered by the shape, not by the number. -->
+  <div id="fpsWrap">
+    <div id="fpsBar">
+      <b style="font-size:12px">실효 fps 추이</b>
+      <button type="button" class="hint" data-h="fpschart" aria-label="실효 fps 추이 설명">?</button>
+      <span class="grow"></span>
+      <label class="meta">범위
+        <select id="fpsWin">
+          <option value="60">1분</option>
+          <option value="120" selected>2분</option>
+          <option value="300">5분</option>
+          <option value="900">15분</option>
+        </select></label>
+    </div>
+    <svg id="fpsSvg" viewBox="0 0 1000 210"
+         role="img" aria-label="렌즈별 실효 fps 시계열"></svg>
+    <div id="fpsLegend" style="display:flex;flex-wrap:wrap;gap:4px 16px;margin:2px 0 4px"></div>
+  </div>
+
+  <div class="scroll" style="margin-top:10px"><table id="chan"></table></div>
 
   <!-- Pulled out of the table on purpose. Frame size and the detector tuning
        are settings, not readings: they change only when someone changes them,
@@ -311,6 +402,7 @@
             <option value="">— 직접 입력 —</option>
             <option value="a2">A2 7×5 (square 70 / marker 50) DICT_4X4_50</option>
             <option value="a4">A4 5×7 (square 40 / marker 30) DICT_4X4_50</option>
+            <option value="b57">5×7 square 70 / marker 50 DICT_4X4_50</option>
           </select></label>
         <span class="meta">고른 뒤 <b>보드 설정 적용</b>을 눌러야 반영됩니다. K/dist는 보드
           절대크기와 무관(스케일 불변)하므로 mm는 명목값입니다.</span>
@@ -350,6 +442,11 @@
     <button type="button" id="ckStop">세션 취소</button>
     <span class="meta" id="ckFlowHint"></span>
   </div>
+
+  <!-- The camera's answer to the last CALIB_K_* / K_LOAD press. Until now the
+       camera kept this string and nothing published it, so a refused command
+       and an accepted one looked exactly the same on this page. -->
+  <div class="meta" id="ckMsg"></div>
 
   <canvas id="ckCanvas" style="width:100%;height:auto;max-width:800px;border:1px solid var(--line);border-radius:8px;background:var(--card)"></canvas>
   <p class="meta" id="ckProbeNote"></p>
@@ -424,29 +521,6 @@
     <p class="meta" style="margin:6px 0 0">마커가 없어도 사슬 전체를 확인할 수 있는 유일한 수단입니다.
       화면 좌우 가장자리를 찍으면 왜곡보정이 수렴하지 않는 영역이 어디까지인지 직접 보입니다.
       <b>이 값은 바닥 평면(H) 기준</b>입니다 — 마커 평면이 아닙니다.</p>
-  </details>
-
-  <h2>LOO 잔차 <span class="meta" style="text-transform:none">— 이 H가 실제로 맞는지</span></h2>
-  <div class="meta" id="hgFitSummary"></div>
-  <div class="scroll"><table id="hgFit"></table></div>
-  <details class="fold" style="margin:8px 0">
-    <summary class="meta">두 숫자를 어떻게 읽는가</summary>
-    <div class="meta" style="padding:8px 2px 0">
-      <b>인샘플</b>은 그 점을 포함해 만든 H로 그 점을 재본 값이라, 자기가 공부한 문제로
-      시험을 보는 셈입니다. 잘못 잰 점 하나는 H를 자기 쪽으로 끌어당겨 <b>자기 잔차를 줄이고
-      남의 잔차를 키우므로</b>, 범인이 가장 멀쩡해 보이게 됩니다.<br><br>
-      <b>LOO</b>는 그 점을 <b>빼고</b> 나머지로 만든 H로 그 점을 맞혀본 값입니다. 그래서 둘을
-      같이 봐야 합니다:
-      <table style="margin-top:8px">
-        <tr><th>인샘플</th><th>LOO</th><th>해석</th></tr>
-        <tr><td>큼</td><td>큼</td><td><b class="bad">잘못 실측한 점</b> — 줄자를 다시 대세요</td></tr>
-        <tr><td>작음</td><td>큼</td><td><b class="warn">외곽/고레버리지 점</b> — 빼면 나머지가 그 자리를 못 감싸 외삽이 됩니다. 정상입니다</td></tr>
-        <tr><td>작음</td><td>작음</td><td><b class="ok">좋음</b></td></tr>
-        <tr><td>큼</td><td>작음</td><td>거의 안 나옵니다. 나오면 id 중복이나 좌표 뒤바뀜을 의심하세요</td></tr>
-      </table>
-      <br>점은 <b>자동으로 버리지 않습니다</b> — 지목만 하고 치우는 건 사람이 합니다.
-      조용히 버리면 잘못 잰 줄자가 영원히 잘못 잰 채로 남습니다.
-    </div>
   </details>
 
   <h2>등록된 마커</h2>
@@ -530,6 +604,31 @@
     </div>
   </details>
 
+  <h2>LOO 잔차 <span class="meta" style="text-transform:none">— 이 H가 실제로 맞는지</span></h2>
+  <div class="meta" id="hgFitSummary"></div>
+  <div class="scroll"><table id="hgFit"></table></div>
+  <details class="fold" style="margin:8px 0">
+    <summary class="meta">두 숫자를 어떻게 읽는가</summary>
+    <div class="meta" style="padding:8px 2px 0">
+      <b>인샘플</b>은 그 점을 포함해 만든 H로 그 점을 재본 값이라, 자기가 공부한 문제로
+      시험을 보는 셈입니다. 잘못 잰 점 하나는 H를 자기 쪽으로 끌어당겨 <b>자기 잔차를 줄이고
+      남의 잔차를 키우므로</b>, 범인이 가장 멀쩡해 보이게 됩니다.<br><br>
+      <b>LOO</b>는 그 점을 <b>빼고</b> 나머지로 만든 H로 그 점을 맞혀본 값입니다. 그래서 둘을
+      같이 봐야 합니다:
+      <table style="margin-top:8px">
+        <tr><th>인샘플</th><th>LOO</th><th>해석</th></tr>
+        <tr><td>큼</td><td>큼</td><td><b class="bad">잘못 실측한 점</b> — 줄자를 다시 대세요</td></tr>
+        <tr><td>작음</td><td>큼</td><td><b class="warn">외곽/고레버리지 점</b> — 빼면 나머지가 그 자리를 못 감싸 외삽이 됩니다. 정상입니다</td></tr>
+        <tr><td>작음</td><td>작음</td><td><b class="ok">좋음</b></td></tr>
+        <tr><td>큼</td><td>작음</td><td>거의 안 나옵니다. 나오면 id 중복이나 좌표 뒤바뀜을 의심하세요</td></tr>
+      </table>
+      <br>점은 <b>자동으로 버리지 않습니다</b> — 지목만 하고 치우는 건 사람이 합니다.
+      조용히 버리면 잘못 잰 줄자가 영원히 잘못 잰 채로 남습니다.
+    </div>
+  </details>
+
+
+
   <h2>H 행렬</h2>
   <div class="scroll"><table id="hgMatrix"></table></div>
   <div class="ctl" style="margin:8px 0">
@@ -539,9 +638,18 @@
   </div>
 
   <h2>렌즈 간 FOV 겹침</h2>
-  <p class="meta" id="hgOverlap"></p>
-  <p class="meta">폼보드에 마커 하나 붙여서 들고 걸어다니면, 두 렌즈에 동시에 잡히는 구간이
-    여기 뜹니다. 카메라 쪽 추가 코드 없이 <b>이 페이지가 검출 id를 비교</b>해 계산합니다.</p>
+  <!-- Was one run-on line of "id 5 → 렌즈 1+2 · id 6 → …". That answers the
+       wrong question: what someone walking a marker around wants to know is
+       WHICH PAIR OF LENSES overlaps and how solidly, not which id happened to
+       be shared. Ids are the evidence, so they stay — one row per pair, with
+       the count first because that is what gets compared. -->
+  <div id="hgOverlapSeen" class="meta" style="margin:0 0 6px"></div>
+  <div id="hgOverlapEmpty" style="margin:0 0 6px"></div>
+  <div class="scroll"><table id="hgOverlap"></table></div>
+  <p class="meta" style="margin-top:8px">폼보드에 마커 하나 붙여서 들고 걸어다니면, 두 렌즈에
+    동시에 잡히는 구간이 여기 뜹니다. 카메라 쪽 추가 코드 없이 <b>이 페이지가 검출 id를 비교</b>해
+    계산합니다. 마커를 겹침 구간에 <b>가만히 두고</b> 숫자가 흔들리지 않는지 보세요 — 경계에
+    걸치면 한쪽이 깜빡입니다.</p>
 
   </section>
 
@@ -704,6 +812,10 @@
         '켜진 렌즈들이 <b>나눠 쓰는</b> CPU 상한입니다. 한 렌즈가 자기 몫을 넘기면 다음 프레임을 그냥 버리고, 그렇게 남긴 여유로 이 페이지와 파이 서버 통신이 항상 응답합니다.<br><br>이게 없던 시절엔 검출이 스레드를 다 잡아먹어서 페이지가 아예 안 떴습니다(502). 렌즈별로 얼마나 버리는지는 아래 Channels 표의 <b>검출/제공</b> 칸에서 봅니다.<br><br><b>여기서 바로 고칠 수 있습니다</b>(<code>DUTY &lt;%&gt;</code>). 올리면 검출이 빨라지고 이 페이지의 응답 여유가 줄어듭니다. 저장되지 않으므로 <b>재시작하면 기본값으로 돌아갑니다</b> — 튜닝 값이 살아남아 "페이지가 안 뜨는데 이유가 화면에 없는" 상태가 되지 않게 일부러 그렇게 했습니다.<br><br>다만 올리기 전에 <b>dynROI 부터 켜 보세요.</b> 지금 한 번 검출에 250 ms 가 드는 건 마커를 잡고도 매 프레임 화면 전체를 훑기 때문입니다. dynROI 가 걸리면 7 ms 급으로 떨어져서 예산에 아예 안 닿습니다 — 예산을 90 으로 올려도 0.6→1.0 fps 정도지만, dynROI 는 카메라 상한인 5 fps 까지 갑니다.'],
       video: ['영상 입력',
         '앱이 붙어 있는 raw 영상 그룹과, 카메라가 이 경로로 <b>실제로 주고 있는</b> 렌즈별 프레임 수입니다.<br><br>이 숫자는 <b>검출을 끄든 켜든 계속 셉니다.</b> 아래 Channels 표의 "실효 fps"는 검출된 프레임만 세기 때문에, 렌즈를 꺼두면 0으로 보입니다 — 그러면 "카메라가 안 준다"와 "우리가 안 센다"가 구별되지 않습니다. 이 행은 검출 이전, 프레임을 받은 그 자리에서 셉니다.<br><br>실측 기준 렌즈당 약 5 fps 이고, 해상도를 낮춰도 프로파일을 바꿔도 안 바뀌었습니다. raw 그룹을 <code>GroupSPMgrVideoRaw3</code> 로 바꾸는 시도는 프레임 0 이었습니다 (<code>docs/RAW_VIDEO_LIMITS.md</code>).<br><br>그룹 이름이 여기 찍히는 이유: 그룹을 잘못 지정하면 에러 없이 조용히 프레임이 0이 됩니다. 그때 유일한 단서입니다.'],
+      fpschart: ['실효 fps 추이',
+        '위 Channels 표의 "실효 fps"를 시간축에 쌓은 것입니다. 표는 <b>지금 값</b>이고 이 그래프는 <b>어떻게 거기까지 왔는지</b>라, dynROI 나 SEARCH 배율을 바꾼 뒤 실제로 달라졌는지 보는 데 씁니다.<br><br>세는 것은 <b>검출한 프레임</b>입니다. 카메라가 준 프레임 수는 세지 않으므로, 렌즈를 꺼두면 여기서는 0으로 떨어집니다 — "카메라가 안 준다"와 "우리가 안 센다"의 구별은 위쪽 <b>영상 입력</b> 행과 아래 표의 <b>검출/제공</b> 칸에서 합니다.<br><br><b>선이 끊긴 구간</b>은 값이 0이었다는 뜻이 아니라 <b>표본이 없다</b>는 뜻입니다. 이 페이지는 응답이 온 뒤에 다음 갱신을 잡고 탭이 숨겨져 있으면 아예 건너뛰므로, 브라우저를 다른 탭에 두고 오면 그만큼 구멍이 납니다. 이어 붙이면 없던 데이터를 있는 것처럼 보여주게 되어 일부러 끊습니다.<br><br>기록은 <b>이 브라우저 안에만</b> 있습니다. 새로고침하면 사라집니다 — 카메라 쪽에 이력을 쌓으면 앱 메모리를 계속 먹고 <code>/status</code> 도 무거워져서, 실시간 튜닝용으로 보는 값이라 브라우저에 두었습니다.'],
+      dynids: ['추적 id',
+        'dynROI 가 <b>어느 마커를 기준으로 상자를 잡을지</b>입니다. 비우면 보이는 마커 <b>전부</b>를 감쌉니다.<br><br><b>검출 필터가 아닙니다.</b> 상자 안에 들어온 다른 마커는 그대로 검출되고 그대로 포즈 링크로 나갑니다. 좁아진 상자 때문에 <i>결과적으로</i> 주변만 보게 되는 것뿐입니다.<br><br><b>왜 쓰나</b>: 캘리 보드까지 같이 잡히면 상자가 그 전부를 감싸느라 사실상 전체 프레임이 됩니다. 로봇 마커만 지정하면 상자가 확 줄어 검출 시간이 떨어지고 실효 fps 가 올라갑니다 — 위 그래프에서 바로 보입니다.<br><br><b>주의</b>: dynROI 는 <b>전 렌즈 일괄</b>이라 여기 넣은 id 는 네 렌즈에 모두 적용됩니다. 그 마커가 안 보이는 렌즈는 <code>SEARCH</code> 에서 못 벗어나 매 프레임 전체를 훑습니다 — 아래 경고가 그걸 말해줍니다.<br><br>입력은 <code>5, 12</code> · <code>5 12</code> 아무 형식이나 받습니다. 비우고 <b>적용</b> 하거나 <b>전체로</b> 를 누르면 인자 없는 <code>DYNROI_IDS</code> 가 나가 전체로 돌아갑니다.'],
       netchg: ['네트워크 설정 변경',
         '카메라의 네트워크 설정이 마지막으로 바뀐 시각입니다. 포즈 링크가 갑자기 끊겼을 때 <b>여기 시각이 그 직전이면</b> 원인은 앱이 아니라 카메라 설정 쪽입니다.'],
       psent: ['보낸 줄 (누적)',
@@ -818,9 +930,228 @@
     // Per-lens frame counts from the previous render, so the effective rate can
     // be a rate rather than an average since boot.
     const prev = {};
+    // Same samples the 실효 fps column computes, kept instead of thrown away.
+    // Per lens: { t, det } from c.frames. Capped so a page left open overnight
+    // cannot grow without bound; 15 min at the fastest interval is ~900
+    // samples, which is also the longest window offered.
+    const hist = {};
+    const HIST_MAX = 1200;
+    const fpsHidden = new Set();   // lens numbers the legend has switched off
     // Same idea for the pose link: what the header shows is a RATE, taken from
     // the change since the last refresh.
     let prevPose = null;
+
+    // The raw group each lens is bound to, as DECLARED by the manifest — the
+    // camera cannot read its own manifest, so this is a label, not a reading.
+    // Collapsed to one line when all four agree, spelled out per lens when they
+    // do not: an experiment that moves one lens to another group is exactly
+    // when a single shared string starts lying, and it lies about the one lens
+    // being looked at.
+    function rawGroup(d) {
+      const g = d.video.raw_group;
+      const arr = Array.isArray(g) ? g : [g];
+      const same = arr.every(x => x === arr[0]);
+      return same
+        ? esc(arr[0])
+        : arr.map((x, i) => `<span class="meta">렌즈${i + 1}</span> ${esc(x)}`).join(' · ');
+    }
+
+    // Raw callbacks entered, and how many yielded no image. Shown only when the
+    // second is non-zero or nothing has arrived at all — in the normal case it
+    // is noise, and in the abnormal case it is the whole answer.
+    function rawEvents(d) {
+      const v = d.video, n = v.raw_events, bad = v.raw_no_image;
+      if (n === undefined) return '';
+      if (n === 0) return '<br><b class="bad">raw 이벤트 0건</b> <span class="meta">— 콜백 자체가 호출되지 않음</span>';
+      if (bad > 0) return `<br><b class="warn">이벤트 ${n.toLocaleString()}건 중 ${bad.toLocaleString()}건이 이미지 없음</b>`;
+      return `<span class="meta"> · 이벤트 ${n.toLocaleString()}건</span>`;
+    }
+
+    // What the whole pipeline is FOR, per lens, in one cell.
+    //
+    // The operations table was twelve columns of detection throughput with
+    // nothing on it about whether a lens can turn what it detects into world
+    // millimetres. That state existed only on the homography tab, one lens at a
+    // time behind a selector — so "why is the server getting no position from
+    // lens 3" was a question you answered on a different tab, four clicks in,
+    // having first guessed which lens to look at.
+    //
+    // Every field read here is already in /status; this joins them and ranks
+    // them WORST FIRST, because only the first unmet condition is actionable —
+    // a lens with no H does not also need telling that its marker plane is
+    // unavailable.
+    function worldState(d, ch) {
+      const c = (d.channels || []).find(x => x.ch === ch) || {};
+      const L = (d.calib.homography || [])[ch] || {};
+      const mp = L.marker_plane || {};
+      const mh = d.calib.marker_height_mm || 0;
+
+      // Sessions first. Both of them change what this lens is doing on purpose,
+      // and an operator who has just started one should see the cause rather
+      // than its symptom.
+      if (c.calibrating)
+        return ['<span class="warn">K 세션</span>',
+          '내부 캘리브레이션 수집 중 — 이 렌즈의 마커 검출·좌표 송출이 멈춰 있습니다'];
+      if ((L.session || {}).collecting)
+        return ['<span class="warn">H 수집</span>',
+          '호모그래피 수집 중 — 좌표 송출은 계속되지만 dynROI가 꺼지고 풀해상도로 돕니다'];
+
+      if (L.k_stale)
+        return ['<b class="bad">K 바뀜</b>',
+          'H를 피팅한 뒤 이 렌즈의 K/dist가 교체됐습니다. 좌표는 계속 나가지만 그 H는 ' +
+          '없어진 렌즈 파라미터로 맞춘 것이라 검증된 값이 아닙니다 — 다시 피팅하세요'];
+      if (!L.have)
+        return ['<span class="meta">H 없음</span>',
+          '이 렌즈는 호모그래피가 없습니다 — CAM_POSE에 픽셀만 실려 나갑니다'];
+      if (!L.mappable)
+        return ['<b class="bad">매핑 불가</b>',
+          'undistort 공간에서 피팅된 H인데 이 렌즈에 K/dist가 없습니다'];
+      if (!mp.ready)
+        return ['<b class="bad">평면 불가</b>', mp.reason || '마커 평면을 유도할 수 없습니다'];
+      if (mh <= 0)
+        return ['<span class="warn">월드 (h=0)</span>',
+          '마커 높이가 0이라 시차 보정 없이 바닥 평면으로 사상합니다. 마커가 차체 위에 ' +
+          '있다면 나디르에서 멀어지는 방향으로 계통 오차가 남습니다'];
+      return ['<b class="ok">월드</b>', `마커 ${mh.toFixed(0)} mm 평면으로 사상 중`];
+    }
+
+    // ===== 실효 fps 추이 =====
+    // Hand-drawn SVG on purpose: the camera serves this page itself and there
+    // is no route out to a CDN, so a charting library would have to be vendored
+    // into the .cap for four polylines.
+    function drawFps() {
+      const svg = $('fpsSvg');
+      if (!svg) return;
+      const now = Date.now();
+      const win = +$('fpsWin').value * 1000;
+      const t0 = now - win, t1 = now;
+
+      // The viewBox is resized to the element's real pixel width rather than
+      // being a fixed box scaled to fit: the height is pinned by CSS, so a
+      // fixed viewBox would have to stretch horizontally, and stretching is
+      // applied to the tick labels too. 1:1 units mean the text stays the size
+      // it says it is at every window width.
+      const H = 210, L = 40, R = 12, T = 10, B = 22;
+      const W = Math.max(360, Math.round(svg.clientWidth || 1000));
+      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      const X = (t) => L + (t - t0) / (t1 - t0) * (W - L - R);
+      const Y = (v) => T + (1 - v / ymax) * (H - T - B);
+
+      const chs = Object.keys(hist).map(Number).sort((a, b) => a - b);
+
+      // Y range from what is actually on screen, floored at 6 so the camera's
+      // measured ~5 fps ceiling stays visible as a position rather than
+      // filling the box whenever it is the only thing running.
+      let peak = 0;
+      chs.forEach(ch => {
+        if (fpsHidden.has(ch)) return;
+        hist[ch].forEach(s => {
+          if (s.t >= t0 && s.det != null) peak = Math.max(peak, s.det);
+        });
+      });
+      const ymax = Math.max(6, Math.ceil(peak * 1.15));
+
+      // A missing sample is not a zero. The page schedules the next refresh
+      // only after the current one answers and skips hidden tabs entirely, so
+      // gaps are routine — joining across one would draw a rate nobody
+      // measured. 3x the configured interval, floored at 3 s.
+      const gapMs = Math.max(3000, (TABS[tab] ? TABS[tab].every : 2000) * 3);
+
+      const segments = (arr, key) => {
+        const out = [];
+        let cur = [], lastT = 0;
+        for (const s of arr) {
+          if (s.t < t0) continue;
+          const v = s[key];
+          if (v == null) { if (cur.length) { out.push(cur); cur = []; } continue; }
+          if (cur.length && s.t - lastT > gapMs) { out.push(cur); cur = []; }
+          cur.push([s.t, v]);
+          lastT = s.t;
+        }
+        if (cur.length) out.push(cur);
+        return out;
+      };
+
+      let g = '';
+
+      // Grid: three levels only. More lines than that and the four series stop
+      // being the most visible thing in the box.
+      [0, ymax / 2, ymax].forEach(v => {
+        const y = Y(v).toFixed(1);
+        g += `<line x1="${L}" y1="${y}" x2="${W - R}" y2="${y}" `
+          + `stroke="var(--line)" stroke-width="1"/>`
+          + `<text x="${L - 6}" y="${y}" text-anchor="end" dominant-baseline="middle" `
+          + `font-size="11" fill="var(--dim)">${v % 1 ? v.toFixed(1) : v}</text>`;
+      });
+
+      // Time axis labelled backwards from now, because "40 s ago" is what the
+      // question is; a wall clock would have to be read and subtracted.
+      const secs = win / 1000;
+      [0, 0.25, 0.5, 0.75, 1].forEach(f => {
+        const t = t0 + win * f, x = X(t).toFixed(1);
+        const lab = f === 1 ? '지금' : '-' + Math.round(secs * (1 - f)) + 's';
+        g += `<line x1="${x}" y1="${T}" x2="${x}" y2="${H - B}" `
+          + `stroke="var(--line)" stroke-width="1" opacity=".5"/>`
+          + `<text x="${x}" y="${H - B + 14}" text-anchor="${f === 0 ? 'start' : f === 1 ? 'end' : 'middle'}" `
+          + `font-size="11" fill="var(--dim)">${lab}</text>`;
+      });
+
+      let plotted = 0;
+      chs.forEach(ch => {
+        if (fpsHidden.has(ch)) return;
+        const col = `var(--l${ch % 4})`;
+        segments(hist[ch], 'det').forEach(seg => {
+          plotted++;
+          if (seg.length === 1) {
+            // A lone sample between two gaps has no line to draw; without
+            // this it would silently vanish.
+            g += `<circle cx="${X(seg[0][0]).toFixed(1)}" cy="${Y(seg[0][1]).toFixed(1)}" `
+              + `r="2" fill="${col}"/>`;
+            return;
+          }
+          const pts = seg.map(([t, v]) => `${X(t).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+          g += `<polyline points="${pts}" fill="none" stroke="${col}" `
+            + `stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+        });
+      });
+
+      if (!plotted) {
+        g += `<text x="${(L + W - R) / 2}" y="${(T + H - B) / 2}" text-anchor="middle" `
+          + `font-size="12" fill="var(--dim)">표본을 모으는 중… (갱신 2회 이상 필요)</text>`;
+      }
+      svg.innerHTML = g;
+
+      // Legend doubles as the current-value readout and as the on/off switch,
+      // so the colours never have to be matched against the table by eye.
+      $('fpsLegend').innerHTML = (lastStatus ? lastStatus.channels : [])
+        .map(c => {
+          const h = hist[c.ch] || [];
+          const last = h.length ? h[h.length - 1] : null;
+          const fresh = last && now - last.t < gapMs;
+          const val = fresh && last.det != null ? last.det.toFixed(1) : '—';
+          return `<span class="lgd${fpsHidden.has(c.ch) ? ' off' : ''}" data-ch="${c.ch}"`
+            + ` title="렌즈 ${c.ch + 1} 숨기기/보이기">`
+            + `<i style="background:var(--l${c.ch % 4})"></i>`
+            + `렌즈 ${c.ch + 1} <b>${val}</b></span>`;
+        }).join('');
+    }
+
+    $('fpsLegend').addEventListener('click', (ev) => {
+      const el = ev.target.closest('.lgd');
+      if (!el) return;
+      const ch = +el.dataset.ch;
+      if (fpsHidden.has(ch)) fpsHidden.delete(ch); else fpsHidden.add(ch);
+      drawFps();
+    });
+    // Redraw at once instead of waiting out the refresh interval, which is up
+    // to 5 s and makes the control feel broken.
+    $('fpsWin').addEventListener('change', drawFps);
+    // The viewBox is in pixels now, so a resize is a re-layout, not a rescale.
+    let fpsResize = null;
+    window.addEventListener('resize', () => {
+      clearTimeout(fpsResize);
+      fpsResize = setTimeout(drawFps, 120);
+    });
 
     function render(d) {
       const now = Date.now();
@@ -836,10 +1167,87 @@
       const dr0 = d.channels[0].dynroi;
       if (document.activeElement !== $('margin')) $('margin').value = dr0.margin;
       if (document.activeElement !== $('maxmiss')) $('maxmiss').value = dr0.max_miss;
+      // send() disables the button it was given and only re-enables it on
+      // failure, relying on render() to rebuild the control. These four are
+      // static markup, so nothing rebuilds them — without this line they stay
+      // dead after the first successful click.
+      // send() disables the button it was given and only re-enables it on
+      // failure, relying on render() to rebuild the control. These four are
+      // static markup, so nothing rebuilds them — without this line they stay
+      // dead after the first successful click.
       $('dynon').disabled = $('dynoff').disabled = false;
+      $('dynidsApply').disabled = $('dynidsAll').disabled = false;
       const on = d.channels.filter(c => c.dynroi.enabled).length;
       const tracking = d.channels.filter(c => c.dynroi.tracking).length;
-      $('dynnote').innerHTML = on
+      // Current tracked ids, per lens: the command sets all four at once, but
+      // nothing guarantees they stayed that way (the RPi sends the same
+      // command), so this reports what each lens actually holds.
+      const idsOf = (c) => (c.dynroi.track_ids || []);
+      const allSame = d.channels.every(c =>
+        idsOf(c).join(',') === idsOf(d.channels[0]).join(','));
+      $('dynidsNow').innerHTML = '현재 — ' + (allSame
+        ? (idsOf(d.channels[0]).length
+            ? `<b>${idsOf(d.channels[0]).join(', ')}</b>`
+            : '<b>전체</b> <span class="meta">(보이는 마커 모두를 감쌈)</span>')
+        : d.channels.map(c => `렌즈 ${c.ch + 1} <b>${idsOf(c).length ? idsOf(c).join(',') : '전체'}</b>`).join(' · '));
+
+      // Seed the box from the camera, but never while it is being typed in.
+      if (document.activeElement !== $('dynids'))
+        $('dynids').value = idsOf(d.channels[0]).join(', ');
+
+      // The failure this catches: a tracked id that no lens can see leaves
+      // dynROI in SEARCH forever, scanning full frames. fps collapses and
+      // nothing on the page says why — the id is right there in the box
+      // looking correct.
+      const want = idsOf(d.channels[0]);
+      const warn = [];
+      if (want.length) {
+        const seenBy = (id) => d.channels
+          .filter(c => (c.dets || []).some(x => x.id === id))
+          .map(c => c.ch + 1);
+        want.forEach(id => {
+          const w = seenBy(id);
+          if (!w.length)
+            warn.push(`<b class="bad">⚠ id ${id}</b> 는 지금 <b>어느 렌즈에도</b> 안 보입니다 — 그 렌즈들은 SEARCH 에서 못 벗어납니다`);
+          else if (w.length < d.channels.filter(c => c.detect).length)
+            warn.push(`<span class="warn">⚠ id ${id}</span> 는 <b>렌즈 ${w.join(', ')}</b> 에만 보입니다 — 나머지는 계속 전체를 훑습니다`);
+        });
+      }
+      $('dynidsWarn').innerHTML = warn.map(x => `<div class="meta">${x}</div>`).join('');
+
+      // Per-lens state, in the same three words the table uses. TRACK and
+      // SEARCH are not the same thing and the difference is the whole point:
+      // SEARCH is still scanning the full frame, so a row of green-looking
+      // "on" lenses that are all searching is the worst case, not the good one.
+      $('dynchips').innerHTML = d.channels.map(c => {
+        const dr = c.dynroi;
+        const cls = !dr.enabled ? 'noc' : dr.tracking ? 'trk' : 'srch';
+        const lab = !dr.enabled ? 'OFF' : dr.tracking ? 'TRACK' : 'SEARCH';
+        const why = !dr.enabled ? '이 렌즈는 매 프레임 전체를 훑습니다'
+          : dr.tracking ? '추적 상자 안만 검출합니다 (가장 빠름)'
+          : '아직 마커를 못 잡아 전체를 훑는 중입니다';
+        return `<span class="dchip ${cls}" title="${esc(why)}">렌즈 ${c.ch + 1} ${lab}</span>`;
+      }).join('');
+
+      // The bulk buttons show which state the lenses are actually in, so a
+      // click that did nothing is visible as a button that did not light up.
+      const allOn = d.channels.every(c => c.dynroi.enabled);
+      const allOff = d.channels.every(c => !c.dynroi.enabled);
+      $('dynon').classList.toggle('active', allOn);
+      $('dynoff').classList.toggle('active', allOff);
+
+      // Enabled but tracking nothing is the trap: the switches all read ON and
+      // the cost is identical to OFF, because SEARCH still scans the whole
+      // frame. Nothing on the page said so — you had to notice that every
+      // badge was amber rather than green.
+      $('dynnote').innerHTML = (on && tracking === 0)
+        ? `<b class="bad">${on}개 켜져 있지만 하나도 추적 중이 아닙니다</b> — SEARCH 는 ` +
+          `<b>전체 프레임을 훑습니다</b>. 지금 비용은 꺼둔 것과 같습니다. ` +
+          `마커가 보이는지, 추적 id 가 맞는지 확인하세요`
+        : !allOn && !allOff
+        ? `<b class="warn">렌즈마다 다릅니다</b> — 아래 표에서 개별로 바뀐 상태입니다. ` +
+          `켜진 렌즈에서는 <b>추적 상자 밖의 마커가 검출되지 않습니다</b>`
+        : on
         ? `켜진 렌즈 ${on}개, 그중 추적 중 ${tracking}개 — 켜진 렌즈에서는 <b>추적 상자 밖의 마커가 검출되지 않습니다</b>`
         : '전부 꺼짐 — 매 프레임 전체를 훑습니다 (2592×1520 기준 170~300ms)';
 
@@ -875,9 +1283,39 @@
         ).join(' <span class="meta">·</span> ') + ' <span class="meta">fps</span>';
       };
 
+      // RSS alone cannot tell a leak from allocator slack — freed memory stays
+      // resident until the allocator gives the pages back, so a climbing RSS
+      // and a flat one are both consistent with either. The split does answer
+      // it: heap_in_use is what the app is still holding, heap_free is what the
+      // allocator has spare. in_use climbing while free stays flat is a real
+      // leak; both climbing together is fragmentation. Those two rows are the
+      // whole reason mallinfo2 is called, and the page showed neither.
+      const heap = (p) => {
+        if (p.heap_in_use_kb === undefined) return nul;
+        return `<span class="meta">사용중</span> <b>${mb(p.heap_in_use_kb)}</b>` +
+          ` <span class="meta">· 여유</span> ${mb(p.heap_free_kb)}` +
+          `<br><span class="meta">사용중이 늘고 여유가 그대로면 실누수, 같이 늘면 단편화</span>`;
+      };
+      // Where per-frame growth comes from, split at the OpenCV call. Measured
+      // 2026-08-05: ~12.5 KB/frame inside detectMarkers and exactly 0 in
+      // everything this app does afterwards, which is why the leak is not
+      // fixable here. Kept on the page so a future OpenCV upgrade can be
+      // checked by looking rather than by re-running the investigation.
+      const leak = (p) => {
+        const h = p.heap_probe;
+        if (!h || !h.n) return '<span class="meta">측정 중 — 프레임 10개마다 1회</span>';
+        const per = (b) => (b / h.n / 1024).toFixed(1);
+        const d0 = +per(h.detect_b), r0 = +per(h.rest_b);
+        return `<span class="meta">검출</span> <b class="${d0 > 1 ? 'warn' : 'ok'}">${d0} KB</b>` +
+          ` <span class="meta">· 그 외</span> <b class="${r0 > 1 ? 'warn' : 'ok'}">${r0} KB</b>` +
+          ` <span class="meta">/프레임 (표본 ${h.n})</span>`;
+      };
+
       rows($('proc'), [
         ['메모리 (현재)', mb(p.rss_kb), 'rss'],
         ['메모리 (최고점)', mb(p.peak_rss_kb), 'peak'],
+        ['힙 (실누수 판별)', heap(p), 'heap'],
+        ['프레임당 힙 증가', leak(p), 'leak'],
         ['CPU 코어', `${p.cores}`, 'cores'],
         ['CPU 누적', `${p.cpu_s.toFixed(2)} s`, 'cpu_s'],
         ['앱 CPU 합계', p.cpu_pct < 0
@@ -897,11 +1335,19 @@
            <span class="meta">%</span>
            ${d.governor.duty_pct !== d.governor.default_pct
               ? `<span class="meta">(기본 ${d.governor.default_pct}, 재시작하면 되돌아감)</span>`
-              : ''}`, 'duty'],
+              : ''}
+           <!-- The duty is divided by however many lenses are really
+                searching, so the per-lens share is the number that explains
+                the fps in the table below. Showing 60% alone made a lens at
+                15% look broken. -->
+           ${d.governor.active > 0
+              ? `<br><span class="meta">검색 중인 렌즈 ${d.governor.active}개로 나눠
+                   → 렌즈당 <b>${d.governor.share_pct.toFixed(1)}%</b></span>`
+              : '<br><span class="meta">아직 한 프레임도 청구되지 않음</span>'}`, 'duty'],
         // Measured, not asserted. The old row said "렌즈당 5 fps" from a
         // constant in the C++ and would have kept saying it whatever the camera
         // did — including through two experiments that changed the raw group.
-        ['영상 입력', `${esc(d.video.raw_group)}<br>` + inFps(d), 'video'],
+        ['영상 입력', rawGroup(d) + '<br>' + inFps(d) + rawEvents(d), 'video'],
         ['네트워크 설정 변경', d.network.latest_changed ? esc(d.network.latest_changed) : nul, 'netchg'],
       ]);
 
@@ -945,8 +1391,16 @@
       // next to it and is what every request and every CAM_POSE packet carries
       // — the two numbering schemes exist, so hiding one of them would make
       // this page disagree with the RPi dashboard for no gain.
-      const head = ['렌즈', '검출', 'SEARCH 배율', 'dyn ROI', '실효 fps', '검출/제공',
-        '대기', 'last frame', 'detect', 'markers', 'scanned ROI', 'manual ROI'];
+      // 월드 sits third, next to the switches rather than out past the timings:
+      // it is the only column that says whether this lens is doing its job at
+      // all, and a column nobody scrolls to is a column nobody reads.
+      // 프레임대기 and 예산대기 are two different waits that both used to be
+      // called 대기: the first is how stale the frame was when we got it (the
+      // camera/queue), the second is idle the governor is deliberately
+      // enforcing (us). Telling them apart is the difference between "the
+      // pipeline is backed up" and "this is working as configured".
+      const head = ['렌즈', '검출', '월드', 'SEARCH 배율', 'dyn ROI', '실효 fps', '검출/제공',
+        '프레임대기', '예산대기', 'last frame', 'detect', 'markers', 'scanned ROI', 'manual ROI'];
       $('chan').innerHTML =
         `<thead><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>` +
         d.channels.map(c => {
@@ -990,12 +1444,23 @@
           // three frames' worth at 30 fps.
           const queue = c.queue_ms < 0 ? nul
             : `<span class="${c.queue_ms > 300 ? 'bad' : c.queue_ms > 100 ? 'warn' : 'ok'}">${c.queue_ms} ms</span>`;
+
+          // Idle the governor is still enforcing on this lens. A positive
+          // number here next to a low 실효 fps is the answer to "why is this
+          // lens slow" — it is not slow, it is being held. 0 or below means it
+          // will detect on the next frame that arrives.
+          const budget = c.budget_ms === undefined ? nul
+            : c.budget_ms <= 0 ? '<span class="ok">—</span>'
+            : `<span class="meta">${c.budget_ms.toLocaleString()} ms</span>`;
+
+          const ws = worldState(d, c.ch);
           return `<tr>
             <td><b>${c.ch + 1}</b> <span class="meta">ch${c.ch}</span></td>
             <td><button type="button" class="toggle ${c.detect ? 'on' : 'off'}"
                         data-ch="${c.ch}" data-next="${c.detect ? 'false' : 'true'}"
                         title="${c.detect ? '이 렌즈 검출 끄기' : '이 렌즈 검출 켜기'}"
                 >${c.detect ? 'ON' : 'OFF'}</button></td>
+            <td title="${esc(ws[1])}">${ws[0]}</td>
             <td><select class="scale" data-ch="${c.ch}"
                         title="마커를 못 찾는 동안(SEARCH)만 적용. 추적 중에는 항상 원본 해상도">
                   ${[1, 2, 4, 8].map(s =>
@@ -1008,6 +1473,7 @@
             <td class="num">${fps}</td>
             <td class="num" title="최근 ${rc.n}프레임 중 실제로 검출한 수 (누적 ${c.frames.toLocaleString()}프레임)">${duty}</td>
             <td class="num">${queue}</td>
+            <td class="num">${budget}</td>
             <td class="num">${age}</td>
             <td class="num">${c.det_ms < 0 ? nul : c.det_ms.toFixed(1) + ' ms'}</td>
             <td class="num">${c.markers}</td>
@@ -1017,7 +1483,11 @@
         }).join('') + '</tbody>';
 
       // The two static columns, moved out from under the live ones.
-      const dhead = ['렌즈', '프레임 크기', '누적 검출', 'dynROI 설정', '검출기 파라미터'];
+      // 누적 전달 sits next to 누적 검출 because the pair is what separates "the
+      // camera stopped sending" from "we stopped detecting". They are equal
+      // only while detection is on; with it off, delivered keeps climbing and
+      // the other two freeze, and that gap was previously invisible here.
+      const dhead = ['렌즈', '프레임 크기', '누적 전달', '누적 검출', 'dynROI 설정', '검출기 파라미터'];
       $('chdetail').innerHTML =
         `<thead><tr>${dhead.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>` +
         d.channels.map(c => {
@@ -1025,6 +1495,7 @@
           return `<tr>
             <td><b>${c.ch + 1}</b> <span class="meta">ch${c.ch}</span></td>
             <td class="num">${c.w ? c.w + '×' + c.h : nul}</td>
+            <td class="num">${c.in_n === undefined ? nul : c.in_n.toLocaleString()}</td>
             <td class="num">${c.frames.toLocaleString()} <span class="meta">· 버림 ${c.skipped.toLocaleString()}</span></td>
             <td class="num meta">margin ${dr.margin} · miss ${dr.max_miss}${dr.track_ids.length ? ' · ids ' + dr.track_ids.join(',') : ''}</td>
             <td class="num meta">${t
@@ -1033,10 +1504,31 @@
           </tr>`;
         }).join('') + '</tbody>';
 
-      // Snapshot for the next render's fps calculation.
-      d.channels.forEach(c => { prev[c.ch] = { frames: c.frames, t: now }; });
+      // Append this render's rates to the history, then snapshot for the next
+      // one. Both use the same prev[] entry, so the sample the chart plots and
+      // the number in the table above are computed from the identical pair of
+      // readings — they cannot disagree.
+      d.channels.forEach(c => {
+        const was = prev[c.ch];
+        if (was && now > was.t) {
+          const dt = (now - was.t) / 1000;
+          if (dt >= 0.5) {
+            // The counter goes backwards if the app restarted under us — drop
+            // the sample rather than plotting a negative rate.
+            const df = c.frames - was.frames;
+            const h = hist[c.ch] || (hist[c.ch] = []);
+            h.push({ t: now, det: df >= 0 ? df / dt : null });
+            if (h.length > HIST_MAX) h.splice(0, h.length - HIST_MAX);
+          }
+        }
+        prev[c.ch] = { frames: c.frames, t: now };
+      });
 
       lastStatus = d;
+      // After lastStatus, not before: the legend reads its lens list and its
+      // current values from it, and running earlier would label every redraw
+      // with the previous refresh's numbers.
+      drawFps();
       renderCalib(d);
       renderHg(d);
       drawOverlay();
@@ -1062,6 +1554,12 @@
     const BOARD_PRESETS = {
       a2: { sx: 7, sy: 5, square: 70, marker: 50, dict: 0, mx: 52, my: 35 },
       a4: { sx: 5, sy: 7, square: 40, marker: 30, dict: 0, mx: 5, my: 8.5 },
+      // The second physical board in use (2026-08-05): same square/marker as
+      // the A2 sheet but the portrait layout. It is listed because it is real,
+      // not because a preset is needed to find it — the 배치 적합도 numbers
+      // under the viewfinder name whichever board is actually in front of the
+      // lens, and the swap button applies it.
+      b57: { sx: 5, sy: 7, square: 70, marker: 50, dict: 0, mx: 35, my: 52 },
     };
 
     // Live check of what the form currently says, before it is sent. Ported
@@ -1154,6 +1652,12 @@
       const pct = pol.target > 0 ? Math.min(100, (s.views||0) / pol.target * 100) : 0;
       $('ckBar').firstElementChild.style.width = pct + '%';
       $('ckCount').textContent = `${s.views||0} / ${pol.target}`;
+      // Refusals and confirmations share one line, told apart by wording rather
+      // than by colour — the camera sends a sentence, not a status code, and
+      // guessing severity from its text would mislabel the ones it got wrong.
+      const cmsg = d.calib.message || '';
+      $('ckMsg').innerHTML = cmsg ? `<b>${esc(cmsg)}</b>` : '';
+
       $('ckState').innerHTML = CS[s.state||0] +
         (s.last_capture === 2 ? ' <span class="ok">· 직전 캡처 승인</span>'
          : s.last_capture === 3 ? ' <span class="bad">· 직전 캡처 거부</span>' : '') +
@@ -1193,7 +1697,24 @@
       const lh = ['렌즈', 'fx', 'fy', 'cx', 'cy', 'dist (k1,k2,p1,p2,k3)', ''];
       $('ckLenses').innerHTML =
         `<thead><tr>${lh.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>` +
-        c.lenses.map(L => L.have ? `<tr>
+        c.lenses.map(L => {
+          // The value the last save replaced, shown as a second line under the
+          // current one. Deliberately the full row of numbers and not a bare
+          // "되돌리기 가능": deciding whether to step back means comparing the
+          // two, and a revert taken blind is how the bad calibration gets put
+          // back a second time.
+          const rev = L.prev ? `<button type="button" class="krevert" data-ch="${L.ch}"
+                  ${c.persist.ok ? '' : 'disabled'}
+                  title="직전 저장 이전의 값으로 되돌립니다. 다시 누르면 원래대로 — 두 값을 맞바꾸는 것이라 어느 쪽도 사라지지 않습니다">되돌리기</button>` : '';
+          const prevRow = L.prev ? `<tr class="prev">
+            <td class="meta">↩ 이전</td>
+            <td class="num meta">${L.prev.fx.toFixed(2)}</td>
+            <td class="num meta">${L.prev.fy.toFixed(2)}</td>
+            <td class="num meta">${L.prev.cx.toFixed(2)}</td>
+            <td class="num meta">${L.prev.cy.toFixed(2)}</td>
+            <td class="num meta">${L.prev.dist.map(v => v.toFixed(5)).join(', ')}</td>
+            <td></td></tr>` : '';
+          return (L.have ? `<tr>
             <td><b>${L.ch + 1}</b> <span class="meta">ch${L.ch}</span></td>
             <td class="num">${L.fx.toFixed(2)}</td>
             <td class="num">${L.fy.toFixed(2)}</td>
@@ -1202,12 +1723,15 @@
             <td class="num meta">${L.dist.map(v => v.toFixed(5)).join(', ')}</td>
             <td><button type="button" class="ksave" data-ch="${L.ch}"
                   ${c.persist.ok ? '' : 'disabled'} title="이 렌즈의 K/dist를 카메라에 기록">저장</button>
+              ${rev}
               <button type="button" class="kclear danger" data-ch="${L.ch}"
-                  title="이 렌즈의 K/dist를 RAM과 파일에서 지웁니다">지우기</button></td>
+                  title="이 렌즈의 K/dist를 RAM과 파일에서 지웁니다. 이전 값은 남습니다">지우기</button></td>
           </tr>` : `<tr>
             <td><b>${L.ch + 1}</b> <span class="meta">ch${L.ch}</span></td>
-            <td colspan="5" class="meta">아직 캘리브레이션 없음</td><td></td>
-          </tr>`).join('') + '</tbody>';
+            <td colspan="5" class="meta">아직 캘리브레이션 없음</td>
+            <td>${rev}</td>
+          </tr>`) + prevRow;
+        }).join('') + '</tbody>';
 
       drawProbe(d);
     }
@@ -1237,7 +1761,16 @@
       $('hgSpace').innerHTML = L.have
         ? `${L.undistorted ? 'undistort' : 'raw'} 좌표로 피팅됨 · ` +
           (L.mappable ? '<span class="ok">매핑 가능</span>'
-                      : '<b class="bad">매핑 불가 — K/dist 없음</b>')
+                      : '<b class="bad">매핑 불가 — K/dist 없음</b>') +
+          // Said here as well as in the operations table, because this is the
+          // tab holding the button that fixes it. The residual table below is
+          // the specific danger: it was measured against the old K and still
+          // reads as proof that this matrix is good.
+          (L.k_stale
+            ? '<br><b class="bad">⚠ 이 H를 피팅한 뒤 K/dist가 바뀌었습니다</b> ' +
+              '<span class="meta">— 좌표는 계속 나가지만 없어진 렌즈 파라미터로 맞춘 ' +
+              '행렬이고, 아래 잔차도 그 때 잰 값입니다. 수집을 다시 돌리세요.</span>'
+            : '')
         : `다음 피팅 좌표계: <b>${L.mode_undistorted ? 'undistort' : 'raw'}</b>` +
           (L.mode_undistorted && !kHave
             ? ' <b class="bad">· 이 렌즈에 K/dist가 없어 수집이 거부됩니다</b>' : '');
@@ -1407,11 +1940,49 @@
       d.channels.forEach(c => (c.dets || []).forEach(x => {
         (where[x.id] = where[x.id] || []).push(c.ch);
       }));
-      const shared = Object.keys(where).filter(k => where[k].length > 1);
-      $('hgOverlap').innerHTML = shared.length
-        ? shared.map(k => `<b class="ok">id ${k}</b> → 렌즈 ` +
-            where[k].map(c => `${c + 1}(ch${c})`).join(' + ')).join(' · ')
-        : '<span class="meta">지금 두 렌즈에 동시에 잡히는 마커가 없습니다.</span>';
+
+      // What each lens can see right now. Without this line, "겹침 없음" and
+      // "그 렌즈는 검출이 꺼져 있음" look identical, and the second one is not
+      // a finding about the FOV at all.
+      $('hgOverlapSeen').innerHTML = '지금 보이는 마커 — ' + d.channels.map(c => {
+        const n = (c.dets || []).length;
+        if (!c.detect) return `<b>렌즈 ${c.ch + 1}</b> <span class="warn">검출 꺼짐</span>`;
+        return `<b>렌즈 ${c.ch + 1}</b> ${n ? `<span class="ok">${n}개</span>` : '0개'}`;
+      }).join(' · ');
+
+      // An id seen by three lenses is an overlap of all three PAIRS, so the
+      // pair is the unit, not the id — pairing here rather than listing ids
+      // keeps a marker in a triple corner from reading as one relationship.
+      const pairs = {};
+      Object.keys(where).forEach(id => {
+        const chs = where[id].slice().sort((a, b) => a - b);
+        for (let i = 0; i < chs.length; i++)
+          for (let j = i + 1; j < chs.length; j++)
+            (pairs[chs[i] + ',' + chs[j]] = pairs[chs[i] + ',' + chs[j]] || []).push(+id);
+      });
+      // Most-shared pair first: with four lenses there can be six rows, and the
+      // one worth reading is the one with the most markers in common.
+      const rows = Object.keys(pairs)
+        .map(k => ({ chs: k.split(',').map(Number), ids: pairs[k].sort((a, b) => a - b) }))
+        .sort((a, b) => b.ids.length - a.ids.length);
+
+      const anyDet = d.channels.some(c => c.detect);
+      const anyMarker = d.channels.some(c => (c.dets || []).length);
+      $('hgOverlapEmpty').innerHTML = rows.length ? ''
+        : !anyDet
+          ? '<b class="warn">렌즈 검출이 전부 꺼져 있습니다</b> <span class="meta">— 겹침을 판단할 수 없습니다. 운영 탭에서 켜세요.</span>'
+        : !anyMarker
+          ? '<b class="warn">지금 어느 렌즈에도 마커가 안 보입니다</b> <span class="meta">— 겹침 이전의 문제입니다.</span>'
+          : '<span class="meta">마커는 보이지만 <b>두 렌즈에 동시에</b> 잡히는 것은 없습니다.</span>';
+
+      $('hgOverlap').innerHTML = !rows.length ? '' :
+        '<thead><tr><th>렌즈 쌍</th><th>공통 마커</th><th>id</th></tr></thead><tbody>' +
+        rows.map(r => `<tr>
+          <td><b>렌즈 ${r.chs[0] + 1} + ${r.chs[1] + 1}</b>
+              <span class="meta">ch${r.chs[0]}·ch${r.chs[1]}</span></td>
+          <td class="num"><b class="ok">${r.ids.length}</b></td>
+          <td class="num meta">${r.ids.join(', ')}</td>
+        </tr>`).join('') + '</tbody>';
     }
 
     // Marker layouts, copied verbatim from the RPi admin console's HG_PRESETS
@@ -1614,22 +2185,51 @@
       ctx.fillText(`코너 ${pts.length}/${d.calib.board.corners} · 폭 ${(cov).toFixed(1)}%`,
         x0, Math.max(32, y0 - 12));
       const resid = gridResidual(pts, cols);
-      const bad = resid !== null && resid > GRID_RESIDUAL_LIMIT;
+      // Which way round is the board? The camera answers this from the MARKER
+      // centres, which never pass through the ChArUco corner interpolation and
+      // so cannot be bent by a wrong board setting. The corner-grid number
+      // above cannot answer it — a wrong orientation can still produce a
+      // convincing grid, which is how a correct 5×7 came to be "fixed" to 7×5.
+      //
+      // There are two physical boards in this project with transposed layouts.
+      // Every count on this page is identical for the pair, so this is the only
+      // thing on screen that can say which one the lens is looking at.
+      const bf = s.board_fit || {};
+      const fit = bf.rms, fitT = bf.rms_transposed;
+      const measurable = fit >= 0 && fitT >= 0;
+      // A factor of three, when the real gap measures ~170x (2.07 vs 350 px on
+      // .13). Anything inside that is not a transposed board, it is noise.
+      const transposed = measurable && fitT * 3 < fit;
+
+      const bad = transposed || (!measurable && resid !== null && resid > GRID_RESIDUAL_LIMIT);
       if (bad) {
         ctx.fillStyle = '#dc3545';
         ctx.font = 'bold 34px sans-serif';
-        ctx.fillText('격자가 맞지 않습니다 — 보드 설정 확인', 12, H - 20);
+        ctx.fillText(transposed ? '보드 가로·세로가 바뀌었습니다'
+                                : '격자가 맞지 않습니다 — 보드 설정 확인', 12, H - 20);
       }
-      $('ckProbeNote').innerHTML = bad
+
+      const b = d.calib.board;
+      const fitLine = measurable
+        ? `<span class="meta">배치 적합도 ${b.sx}×${b.sy} <b class="${transposed ? 'bad' : 'ok'}">${fit.toFixed(1)}px</b>` +
+          ` · ${b.sy}×${b.sx} <b class="${transposed ? 'ok' : ''}">${fitT.toFixed(1)}px</b> (작을수록 맞음)</span>`
+        : `<span class="meta">배치 적합도 — 마커가 5개 이상 보여야 판정됩니다</span>`;
+
+      $('ckProbeNote').innerHTML = transposed
+        ? `<b class="bad">이 보드는 ${b.sy}×${b.sx} 입니다</b>` +
+          ` <span class="meta">— 지금 설정은 ${b.sx}×${b.sy} 라 코너가 엉뚱한 자리에 찍힙니다.</span><br>` +
+          fitLine + `<br>` +
+          `<button type="button" id="ckSwapXY" data-sx="${b.sy}" data-sy="${b.sx}">` +
+          `${b.sy}×${b.sx} 로 바꾸기</button>` +
+          ` <span class="meta">누르면 적용만 됩니다 — 확인 후 <b>보드 설정 저장</b>을 따로 누르세요.</span>`
+        : bad
         ? `<b class="bad">코너는 ${pts.length}개 잡혔지만 격자가 아닙니다</b>` +
-          ` <span class="meta">(격자 오차 ${resid.toFixed(1)}px, 정상은 1px 안팎)</span><br>` +
-          `<span class="bad">보드 <b>가로·세로가 바뀐 것</b>이 가장 흔한 원인입니다 —` +
-          ` ${d.calib.board.sx}×${d.calib.board.sy} 대신 ${d.calib.board.sy}×${d.calib.board.sx} 로 바꿔보세요.</span>` +
-          ` <span class="meta">두 방향은 마커 수도 코너 수도 같아서 숫자로는 구분되지 않습니다.` +
-          ` 그다음 의심은 Dictionary 불일치입니다.</span>`
-        : `<span class="ok">보드 검출됨</span> <span class="meta">· 코너 ${pts.length}/${d.calib.board.corners}` +
-          ` · 화면의 약 ${cov.toFixed(1)}% · 격자 오차 ${resid === null ? '—' : resid.toFixed(2) + 'px'}` +
-          ` · ${s.probe_age_ms < 0 ? '' : (s.probe_age_ms / 1000).toFixed(1) + '초 전 기준'}</span>`;
+          ` <span class="meta">(격자 오차 ${resid.toFixed(1)}px)</span><br>` + fitLine +
+          ` <span class="meta">· 마커가 더 보이도록 보드를 화면 안으로 넣으면 배치를 판정할 수 있습니다.</span>`
+        : `<span class="ok">보드 검출됨</span> <span class="meta">· 코너 ${pts.length}/${b.corners}` +
+          ` · 화면의 약 ${cov.toFixed(1)}%` +
+          ` · ${s.probe_age_ms < 0 ? '' : (s.probe_age_ms / 1000).toFixed(1) + '초 전 기준'}</span><br>` +
+          fitLine;
     }
     // Does the detection actually form a grid?
     //
@@ -1693,6 +2293,22 @@
 
     const CALIB_PROBE_S = 1;  // matches CALIB_PROBE_MS in app_config.h
 
+    // One-click transpose. Delegated on the note's parent because the note is
+    // rebuilt on every refresh, and it only sets the form + sends the config —
+    // saving stays a separate press, so a misjudged swap cannot reach /mnt on
+    // its own.
+    document.addEventListener('click', (ev) => {
+      const b = ev.target.closest('#ckSwapXY');
+      if (!b) return;
+      $('ckSx').value = b.dataset.sx;
+      $('ckSy').value = b.dataset.sy;
+      // Margins describe the same sheet turned 90 degrees, so they swap too.
+      const mx = $('ckMx').value; $('ckMx').value = $('ckMy').value; $('ckMy').value = mx;
+      updateBoardSummary();
+      send(`CALIB_K_CONFIG ${num('ckSx')} ${num('ckSy')} ${num('ckSquare')} ` +
+           `${num('ckMarker')} ${num('ckDict')} ${num('ckMx')} ${num('ckMy')}`, b);
+    });
+
     $('ckPreset').addEventListener('change', () => {
       const p = BOARD_PRESETS[$('ckPreset').value];
       if (!p) return;
@@ -1724,10 +2340,14 @@
     $('ckLenses').addEventListener('click', (ev) => {
       const s = ev.target.closest('button.ksave');
       if (s) { send(`CALIB_K_SAVE ${s.dataset.ch}`, s); return; }
+      // Not confirmed, unlike 지우기: this swaps the two values rather than
+      // discarding either, so pressing it by mistake costs one more press.
+      const r = ev.target.closest('button.krevert');
+      if (r) { send(`CALIB_K_REVERT ${r.dataset.ch}`, r); return; }
       const c = ev.target.closest('button.kclear');
-      // Confirmed because it is the one destructive control on the page and it
-      // cannot be undone from here — the numbers are gone from RAM and disk.
-      if (c && confirm(`렌즈 ${+c.dataset.ch + 1}의 K/dist를 지웁니다. 되돌릴 수 없습니다.`))
+      // Confirmed because it is the one destructive control on the page. The
+      // previous value survives it, so the warning says what actually goes.
+      if (c && confirm(`렌즈 ${+c.dataset.ch + 1}의 현재 K/dist를 지웁니다.\n(직전 저장 이전의 값은 남아서 되돌리기로 꺼낼 수 있습니다.)`))
         send(`CALIB_K_CLEAR ${c.dataset.ch}`, c);
     });
 
@@ -2097,6 +2717,46 @@
 
     $('dynon').addEventListener('click', () => applyAll(true, $('dynon')));
     $('dynoff').addEventListener('click', () => applyAll(false, $('dynoff')));
+
+    // Accept "5, 12" / "5 12" / "5,12" alike — the box is typed into by hand
+    // and refusing a comma would be a rule with no reason behind it.
+    // Deduplicated and sorted so the same set always sends the same string.
+    const parseIds = (text) => {
+      const bad = [];
+      const ids = text.split(/[\s,]+/).filter(Boolean).map(t => {
+        const n = Number(t);
+        if (!Number.isInteger(n) || n < 0) { bad.push(t); return null; }
+        return n;
+      }).filter(n => n !== null);
+      return { ids: [...new Set(ids)].sort((a, b) => a - b), bad };
+    };
+
+    const sendIds = (text, el) => {
+      const { ids, bad } = parseIds(text);
+      if (bad.length) {
+        $('dynidsErr').innerHTML =
+          `<div class="meta"><b class="bad">숫자가 아닌 값: ${bad.map(esc).join(', ')}</b> — 보내지 않았습니다</div>`;
+        return;
+      }
+      $('dynidsErr').innerHTML = '';
+      // No argument means "all lenses, every marker" — the same command the
+      // RPi sends, so this box and the server stay interchangeable.
+      send(ids.length ? `DYNROI_IDS ${ids.join(' ')}` : 'DYNROI_IDS', el);
+    };
+
+    $('dynidsApply').addEventListener('click',
+      () => sendIds($('dynids').value, $('dynidsApply')));
+    $('dynidsAll').addEventListener('click', () => {
+      $('dynids').value = '';
+      sendIds('', $('dynidsAll'));
+    });
+    // Enter in the box applies, like every other single-field control here.
+    // Clear the complaint as soon as the text changes: leaving it up while
+    // the value it described is gone makes a fixed box look still-broken.
+    $('dynids').addEventListener('input', () => { $('dynidsErr').innerHTML = ''; });
+    $('dynids').addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); sendIds($('dynids').value, null); }
+    });
 
     // refresh() rethrows so the auto loop can stop itself; the manual paths
     // already showed the error, so they just swallow it.

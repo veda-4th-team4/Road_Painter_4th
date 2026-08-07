@@ -7,6 +7,7 @@
 #include <stdlib.h>   // strtol/strtod — ANCHOR_SET_ALL parses by hand
 #include <string.h>
 #include <sys/stat.h>
+#include <malloc.h>          // mallinfo2, mallopt, malloc_trim — see heap_bytes()
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -140,12 +141,40 @@ long current_rss_kb() {
   if (got != 2) return 0;
   return (long)((resident_pages * (unsigned long)sysconf(_SC_PAGESIZE)) / 1024UL);
 }
+
+// What the C library says about the heap, as opposed to what the kernel says
+// about resident pages.
+//
+// RSS alone cannot tell a leak from an allocator holding on: freed memory stays
+// resident until the allocator decides to give it back, so "RSS is climbing"
+// describes both. These two numbers separate them:
+//
+//   in_use   — bytes currently handed out to the program. Climbing means the
+//              program is genuinely holding more. That is a leak.
+//   free     — bytes the allocator owns but has not returned to the kernel.
+//              Climbing while in_use is flat means fragmentation or arena
+//              growth, and the program is fine.
+//
+// Measured on .13 (2026-08-05): RSS rose ~1.1 KB per detected frame with
+// detection on and was FLAT with it off, over 30+ minutes with no plateau. That
+// isolated it to the detection path but could not say which of the two it was —
+// which is what this exists to answer.
+void heap_bytes(unsigned long* in_use, unsigned long* freed) {
+  struct mallinfo2 mi = mallinfo2();
+  if (in_use) *in_use = (unsigned long)mi.uordblks;
+  if (freed) *freed = (unsigned long)mi.fordblks;
+}
 #endif  // ENABLE_STATUS_PAGE
 }
 
 SampleComponent::SampleComponent() : SampleComponent(_SampleComponent_Id, "SampleComponent") {}
 
 SampleComponent::SampleComponent(ClassID id, const char* name) : Component(id, name) {
+  // Outside the ENABLE_STATUS_PAGE guard: the frame path increments these
+  // whether or not the page exists, so leaving them uninitialised in a build
+  // without the page would be reading indeterminate values.
+  raw_events_ = 0;
+  raw_no_image_ = 0;
 #if ENABLE_STATUS_PAGE
   start_ms_ = epoch_ms();
   cpu_sample_cpu_s_ = 0.0;
@@ -156,13 +185,37 @@ SampleComponent::SampleComponent(ClassID id, const char* name) : Component(id, n
   }
   // 0 = no baseline yet, so every rate reports -1 until a full window has run.
   stats_sample_ms_ = 0;
+  last_trim_ms_ = 0;
+  heap_probe_seq_ = 0;
+  heap_probe_n_ = 0;
+  heap_detect_bytes_ = 0;
+  heap_rest_bytes_ = 0;
   stats_window_s_ = 0.0;
   cpu_pct_ = -1.0;
   for (int c = 0; c < kMaxChannels; ++c) in_fps_[c] = -1.0;
 #endif
+  // Keep glibc from opening a heap arena per thread.
+  //
+  // OpenCV's detector runs work through parallel_for_, and glibc gives each
+  // thread that allocates its own arena — up to 8 x cores of them. Every arena
+  // keeps its own free lists and its own trailing slack, so a workload that
+  // allocates and frees the same amount forever still grows its resident set as
+  // the arenas multiply and fragment. That is the shape measured here: RSS
+  // climbing ~1.1 KB per detected frame while the program's own live data did
+  // not change.
+  //
+  // 2 rather than 1 because this app really does allocate from more than one
+  // thread and a single arena would serialise them on a lock; the cost of that
+  // lands on the one scheduler thread everything already shares.
+  //
+  // Costs nothing to be wrong about: if arenas were never the problem, this
+  // changes nothing except a small amount of allocator contention.
+  mallopt(M_ARENA_MAX, 2);
+
   detect_duty_pct_ = DETECT_DUTY_PCT;  // the compiled value is the starting one
   for (int c = 0; c < kMaxChannels; ++c) {
     detect_budget_until_ms_[c] = 0;
+    last_delivery_ms_[c] = 0;
     detect_skipped_[c] = 0;
     last_queue_ms_[c] = -1;  // -1 = not measured yet
     recent_head_[c] = 0;
@@ -173,6 +226,7 @@ SampleComponent::SampleComponent(ClassID id, const char* name) : Component(id, n
     delivered_[c] = 0;
     delivered_prev_[c] = 0;
   }
+  governor_active_ = 0;  // 0 = no frame charged yet; /status reports null
   hg_map_.ch = -1;  // -1 = HG_MAP never run; /status reports null
   hg_map_.px = hg_map_.py = hg_map_.wx = hg_map_.wy = 0.0;
   hg_map_.ok = false;
@@ -471,10 +525,21 @@ std::string SampleComponent::BuildStatusJson() {
   // if the app is actually allowed to run on more than one core. Reporting the
   // count next to it is what makes that number readable — and it answers
   // whether splitting the channels across schedulers could buy anything.
-  j.addf("\"proc\":{\"rss_kb\":%ld,\"peak_rss_kb\":%ld,\"cpu_s\":%.2f,"
+  // heap_in_use_kb next to rss_kb is what makes a rising RSS diagnosable:
+  // in_use climbing is the program holding more (a leak), in_use flat while RSS
+  // climbs is the allocator holding more (fragmentation). See heap_bytes().
+  unsigned long heap_used = 0, heap_free = 0;
+  heap_bytes(&heap_used, &heap_free);
+  j.addf("\"proc\":{\"rss_kb\":%ld,\"peak_rss_kb\":%ld,\"heap_in_use_kb\":%lu,"
+         "\"heap_free_kb\":%lu,\"cpu_s\":%.2f,"
          "\"cpu_pct\":%.1f,\"cpu_window_s\":%.1f,\"cores\":%ld,",
-         current_rss_kb(), peak_rss_kb, cpu_s, cpu_pct_, stats_window_s_,
+         current_rss_kb(), peak_rss_kb, heap_used / 1024UL, heap_free / 1024UL,
+         cpu_s, cpu_pct_, stats_window_s_,
          (long)sysconf(_SC_NPROCESSORS_ONLN));
+  // Bytes per probed frame, split. Whichever of the two keeps climbing is where
+  // to look; the other one is exonerated.
+  j.addf("\"heap_probe\":{\"n\":%lu,\"detect_b\":%lld,\"rest_b\":%lld},",
+         heap_probe_n_, heap_detect_bytes_, heap_rest_bytes_);
 
   // Whole-camera load, one figure per core, measured in the window above. See
   // the member declaration for why this is not the same thing as cpu_pct.
@@ -486,8 +551,14 @@ std::string SampleComponent::BuildStatusJson() {
   // the bounds travel with it so the page can build its input without knowing
   // them. default_pct is carried too: a tuned value that has drifted somewhere
   // unhelpful is only recognisable next to what it started as.
-  j.addf("\"governor\":{\"duty_pct\":%d,\"min\":%d,\"max\":%d,\"default_pct\":%d},",
-         detect_duty_pct_, kDutyMin, kDutyMax, DETECT_DUTY_PCT);
+  // `active` is what the duty is being divided BY, so it is the difference
+  // between "60% and my lens is slow" and "60% split four ways, which is 15%
+  // each, and that is the number you are looking at". Without it the split is
+  // guesswork from the outside.
+  j.addf("\"governor\":{\"duty_pct\":%d,\"min\":%d,\"max\":%d,\"default_pct\":%d,"
+         "\"active\":%d,\"share_pct\":%.1f},",
+         detect_duty_pct_, kDutyMin, kDutyMax, DETECT_DUTY_PCT, governor_active_,
+         governor_active_ > 0 ? (double)detect_duty_pct_ / governor_active_ : -1.0);
 
   // The raw group is a LITERAL and has to be kept in step with
   // SampleComponent_manifest_instance_0.json by hand; the manifest is JSON
@@ -513,7 +584,29 @@ std::string SampleComponent::BuildStatusJson() {
   // exactly what a hardcoded measurement invites. It is now the real delivery
   // rate, differenced from delivered_[] over the shared window above, and -1
   // until that window has run once.
-  j.addf("\"video\":{\"raw_group\":\"GroupSPMgrVideoRaw2\",\"in_fps\":[");
+  // raw_group is DECLARED, not observed: it mirrors the manifest, which this
+  // app cannot read at runtime. Keep it in sync with
+  // manifests/SampleComponent_manifest_instance_0.json by hand — there is no
+  // second source of truth to check it against, which is exactly why it says
+  // what it is rather than pretending to be a measurement.
+  //
+  // Per channel rather than one string because it stopped being one value the
+  // moment ch0 was moved to another group to test it (2026-08-05), and a
+  // single shared string then described three lenses correctly and lied about
+  // the fourth — the one being looked at. All four are back on Raw2 now; the
+  // shape stays so the next such test is one edit, not a refactor.
+  // ONE place to edit when a lens is moved to another group, so the label and
+  // the manifest cannot drift in two files at once.
+  static const char* const kRawGroup[kMaxChannels] = {
+      "GroupSPMgrVideoRaw2", "GroupSPMgrVideoRaw2",
+      "GroupSPMgrVideoRaw2", "GroupSPMgrVideoRaw2"};
+  j.addf("\"video\":{\"raw_group\":[");
+  for (int c = 0; c < kMaxChannels; ++c) j.addf("%s\"%s\"", c ? "," : "", kRawGroup[c]);
+  // raw_events / raw_no_image are the pair that tells "no event arrived" apart
+  // from "an event arrived and yielded nothing". Cumulative since start-up,
+  // not a rate: the question they answer is whether the number is zero.
+  j.addf("],\"raw_events\":%lu,\"raw_no_image\":%lu,\"in_fps\":[",
+         raw_events_, raw_no_image_);
   for (int c = 0; c < kMaxChannels; ++c) j.addf("%s%.2f", c ? "," : "", in_fps_[c]);
   j.addf("],\"in_window_s\":%.1f},", stats_window_s_);
 
@@ -550,14 +643,29 @@ std::string SampleComponent::BuildStatusJson() {
     j.addf("%s{\"ch\":%d,\"detect\":%s,\"scale\":%d,\"in_n\":%lu,\"frames\":%lu,\"skipped\":%lu,"
            "\"recent\":{\"n\":%d,\"skipped\":%d},"
            "\"queue_ms\":%ld,\"age_ms\":%ld,\"w\":%d,\"h\":%d,"
-           "\"det_ms\":%.2f,\"markers\":%d,\"calibrating\":%s,",
+           "\"det_ms\":%.2f,\"markers\":%d,\"calibrating\":%s,"
+           // Milliseconds of governor-enforced idle still owed on this lens.
+           // The channel table's "대기" column is queue_ms — how stale the frame
+           // was — which is a different thing that happens to share the word,
+           // and neither of them answered "is the governor holding this lens
+           // back right now, and for how much longer". Negative means the lens
+           // is free to detect on the next frame that arrives.
+           "\"budget_ms\":%ld,",
            (c == 0) ? "" : ",", c, detect_enabled_[c] ? "true" : "false", search_scale_[c],
            delivered_[c], seq_[c], detect_skipped_[c], recent_n_[c], recent_skipped_[c],
            last_queue_ms_[c],
            last_frame_ms_[c] ? (now_ms - last_frame_ms_[c]) : -1L,
            last_w_[c], last_h_[c],
            aruco_[c] ? aruco_[c]->lastDetectMs() : -1.0, last_markers_[c],
-           calib_.Collecting(c) ? "true" : "false");
+           calib_.Collecting(c) ? "true" : "false",
+           // A lens that has never been charged has a deadline of 0, and 0
+           // minus an epoch timestamp is -1.8e12 — arithmetically "free to
+           // detect", but it renders as a number nobody can read as that.
+           // Report the same 0 the never-charged and the just-expired case
+           // both mean: nothing owed.
+           detect_budget_until_ms_[c] == 0
+               ? 0L
+               : detect_budget_until_ms_[c] - now_ms);
 
     // roi is what detect() actually scanned last frame (tracker or manual);
     // manual_roi is the operator's box that SEARCH falls back to. An empty
@@ -722,6 +830,27 @@ void SampleComponent::SampleRates(long now_ms, double cpu_s) {
   }
   core_n_ = n;
 
+  // Hand the allocator's spare pages back to the kernel, occasionally.
+  //
+  // free() does not shrink the resident set; the allocator keeps the pages in
+  // case they are wanted again, which is the right default for a process nobody
+  // is watching. This one IS watched, on a device with no swap, and the pages
+  // it holds are ones it demonstrably stops needing — a detect allocates and
+  // releases the same working set every frame.
+  //
+  // Rate-limited to kTrimIntervalMs because the call walks the heap's free
+  // lists. At ~30 s against a 250 ms detect it is far below noise, and doing it
+  // per window (1 s) would put it in the same order as real work for no gain:
+  // the pages it would return are ones the next frame asks for again.
+  //
+  // Deliberately NOT a fix for a leak — malloc_trim cannot return memory that
+  // is still allocated. If heap_in_use keeps climbing in /status, this changes
+  // nothing and the cause is in the code, not the allocator.
+  if (now_ms - last_trim_ms_ >= kTrimIntervalMs) {
+    malloc_trim(0);
+    last_trim_ms_ = now_ms;
+  }
+
   stats_window_s_ = (double)stats_dt_ms / 1000.0;
   stats_sample_ms_ = now_ms;
 }
@@ -814,6 +943,26 @@ void SampleComponent::AppendCalibJson(void* jsonbuf, long now_ms) {
   j.addf("\"session_policy\":{\"target\":%d,\"rms_limit\":%.3f,\"gates\":%s},",
          calib_.TargetViews(), calib_.RmsLimit(), calib_.Gates() ? "true" : "false");
 
+  // Whatever the last CALIB_K_* / K_LOAD command had to say.
+  //
+  // IntrinsicsCalib has kept this string since the port and NOTHING EVER READ
+  // IT (found 2026-08-05). Every message written through NoteMessage() — the
+  // board config rejection, "이 렌즈의 K/dist를 지웠습니다", the revert
+  // confirmation, the K_LOAD validation failure, a refused session — went into
+  // a buffer with no reader, so roughly ten commands answered a press with
+  // nothing at all. /cmd replies with this object and nothing else, so a
+  // command that was refused and one that worked looked identical: the form
+  // simply snapped back on the next poll.
+  //
+  // Not per session, because the reason it exists is the commands that have no
+  // session — a board setting, a load, a refusal to open one in the first
+  // place. Per-lens capture quality already has its own `reason` below.
+  //
+  // No JSON escaping for the same reason anchor_cmd.reason needs none: every
+  // string that reaches here is a literal in this source or a number this code
+  // printf'd, so neither a quote nor a backslash can appear.
+  j.addf("\"message\":\"%s\",", calib_.FailReason());
+
   j.addf("\"sessions\":[");
   for (int c = 0; c < kMaxChannels; ++c) {
     const CalibViewQuality& q = calib_.LastQuality(c);
@@ -842,7 +991,18 @@ void SampleComponent::AppendCalibJson(void* jsonbuf, long now_ms) {
     for (size_t i = 0; i < np; ++i)
       j.addf("%s[%.1f,%.1f,%d]", (i == 0) ? "" : ",", pc[i].x, pc[i].y,
              (i < pid.size()) ? pid[i] : -1);
-    j.addf("]}");
+    j.addf("],");
+
+    // Does the board in front of THIS lens actually have the configured shape?
+    //
+    // Two numbers, not a verdict, because the page has to be able to show the
+    // operator why: sx by sy against sy by sx, both fitted to the marker
+    // centres. There are two physical boards in this project with transposed
+    // layouts, and every count on this page is identical for the pair — 17
+    // markers, 24 corners — so without this the only way to tell which one is
+    // in view is to have been there when it was put down.
+    j.addf("\"board_fit\":{\"rms\":%.2f,\"rms_transposed\":%.2f}}",
+           calib_.BoardFitRms(c), calib_.BoardFitRmsTransposed(c));
   }
   j.addf("],");
 
@@ -851,11 +1011,24 @@ void SampleComponent::AppendCalibJson(void* jsonbuf, long now_ms) {
     double fx, fy, cx, cy, d[5];
     if (calib_.Get(c, &fx, &fy, &cx, &cy, d)) {
       j.addf("%s{\"ch\":%d,\"have\":true,\"fx\":%.4f,\"fy\":%.4f,\"cx\":%.4f,\"cy\":%.4f,"
-             "\"dist\":[%.8f,%.8f,%.8f,%.8f,%.8f]}",
+             "\"dist\":[%.8f,%.8f,%.8f,%.8f,%.8f]",
              (c == 0) ? "" : ",", c, fx, fy, cx, cy, d[0], d[1], d[2], d[3], d[4]);
     } else {
-      j.addf("%s{\"ch\":%d,\"have\":false}", (c == 0) ? "" : ",", c);
+      j.addf("%s{\"ch\":%d,\"have\":false", (c == 0) ? "" : ",", c);
     }
+    // The value this one replaced, if there is one. Carried in full rather than
+    // as a bare "you can revert": the only way to decide whether to step back
+    // is to see what you would be stepping back TO, and a revert taken blind is
+    // how a good calibration gets swapped out for the bad one twice.
+    double pfx, pfy, pcx, pcy, pd[5];
+    if (calib_.GetPrevious(c, &pfx, &pfy, &pcx, &pcy, pd)) {
+      j.addf(",\"prev\":{\"fx\":%.4f,\"fy\":%.4f,\"cx\":%.4f,\"cy\":%.4f,"
+             "\"dist\":[%.8f,%.8f,%.8f,%.8f,%.8f]}",
+             pfx, pfy, pcx, pcy, pd[0], pd[1], pd[2], pd[3], pd[4]);
+    } else {
+      j.addf(",\"prev\":null");
+    }
+    j.addf("}");
   }
   j.addf("],");
 
@@ -870,13 +1043,17 @@ void SampleComponent::AppendCalibJson(void* jsonbuf, long now_ms) {
   for (int c = 0; c < kMaxChannels; ++c) {
     double h[9];
     if (homography_.Get(c, h)) {
+      // k_stale: this lens's K/dist was replaced after this matrix was fitted.
+      // Reported next to the matrix rather than in a corner of its own, because
+      // it is a property OF the matrix — see HomographyMapper::CalibStale().
       j.addf("%s{\"ch\":%d,\"have\":true,\"undistorted\":%s,\"mode_undistorted\":%s,"
-             "\"mappable\":%s,\"camera_z_mm\":%.1f,"
+             "\"mappable\":%s,\"k_stale\":%s,\"camera_z_mm\":%.1f,"
              "\"H\":[%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e,%.9e],",
              (c == 0) ? "" : ",", c,
              homography_.FittedUndistorted(c) ? "true" : "false",
              homography_.CoordModeUndistorted(c) ? "true" : "false",
              homography_.Mappable(c) ? "true" : "false",
+             homography_.CalibStale(c) ? "true" : "false",
              homography_.CameraHeightMm(c),
              h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]);
     } else {
@@ -1043,10 +1220,17 @@ void SampleComponent::ProcessRawVideo(Event* event) {
 
   auto ret = eventToArgumentBuffer(event);
 
+  // Counted here, ahead of everything — this is the last point at which an
+  // event is known to have arrived at all. See the members for why.
+  ++raw_events_;
+
   IPVideoFrameRaw* raw_frame = new ("GetImage") IPLVideoFrameRaw();
   raw_frame->DeserializeBaseObject(raw_frame, ret);
   std::shared_ptr<RawImage> img(raw_frame->GetRawImage());
-  if (!img) return;
+  if (!img) {
+    ++raw_no_image_;
+    return;
+  }
 
   const long t_frame_ms = epoch_ms();
 
@@ -1075,6 +1259,14 @@ void SampleComponent::ProcessRawVideo(Event* event) {
     // this app could ever have used, and mixing the two would hide a format
     // problem inside a healthy-looking rate.
     ++delivered_[ch];
+    // When, for the governor's channel count. The counter above cannot answer
+    // "is this lens still feeding us" without a previous reading to subtract,
+    // and the only place that differencing happens is SampleRates() — which
+    // runs when /status is polled, so in_fps_ freezes at its last value the
+    // moment nobody has the page open. A governor that divided the budget by a
+    // number that only moves while a browser is watching would change the
+    // app's timing depending on whether anyone was looking at it.
+    last_delivery_ms_[ch] = t_frame_ms;
 
     // A lens with a calibration session open is doing a different job, and the
     // two switches below do not apply to it:
@@ -1219,6 +1411,20 @@ void SampleComponent::ProcessRawVideo(Event* event) {
     const bool two_stage = dynroi_[ch].enabled() && !hg_collecting;
     aruco_[ch]->setSearchScale((two_stage && !dynroi_[ch].tracking()) ? search_scale_[ch] : 1);
 
+    // Split the frame's heap growth between the marker search and everything
+    // this app does with the result.
+    //
+    // /status showed heap_in_use climbing ~1 KB per delivered frame with
+    // detection on and dead flat with it off (measured .13, 2026-08-05), which
+    // proves the growth is real — freed memory would show as heap_free — and
+    // puts it somewhere past the detect_enabled_ early-out. That is still a
+    // hundred lines of code and an OpenCV call. Two numbers split it in one
+    // run, and reading them costs a mallinfo2 every kHeapProbeEvery-th frame
+    // rather than on every one.
+    unsigned long heap_h0 = 0;
+    const bool heap_probe = (++heap_probe_seq_ % kHeapProbeEvery) == 0;
+    if (heap_probe) heap_bytes(&heap_h0, NULL);
+
     // A throw inside detect() would otherwise unwind through the SDK's event
     // dispatch and take the process down.
     std::vector<ArucoProcessor::Detection> dets;
@@ -1234,11 +1440,20 @@ void SampleComponent::ProcessRawVideo(Event* event) {
       break;
     }
 
+    unsigned long heap_h1 = 0;
+    if (heap_probe) {
+      heap_bytes(&heap_h1, NULL);
+      // Signed, because a probe that lands while the allocator happens to be
+      // releasing would otherwise wrap into a huge positive number and swamp
+      // the running total on a single sample.
+      heap_detect_bytes_ += (long long)heap_h1 - (long long)heap_h0;
+    }
+
     // Charge this search against THIS channel's share of the budget.
     //
-    // The total duty is split evenly over the channels that are switched on,
-    // so each gets DUTY/n. A search costing c may therefore repeat every
-    // c * n * 100 / DUTY, and what is owed as idle time is that minus c:
+    // The total duty is split evenly over the channels that are actually
+    // searching, so each gets DUTY/n. A search costing c may therefore repeat
+    // every c * n * 100 / DUTY, and what is owed as idle time is that minus c:
     //
     //     wait = c * (100 * n / DUTY - 1)
     //
@@ -1246,13 +1461,45 @@ void SampleComponent::ProcessRawVideo(Event* event) {
     // fps on that lens), while a 7 ms tracking scan waits only ~40 ms (~21
     // fps). A cheap channel is never held back to the pace of an expensive
     // one — it simply does not use up its share.
+    //
+    // n is a count of who is really consuming the thread, not a count of
+    // switches, because it sits in the denominator: every channel wrongly
+    // included there takes idle time away from the ones doing the work. Both
+    // corrections below are arithmetic, not policy.
     {
       const double cost_ms = aruco_[ch]->lastDetectMs();
       if (cost_ms > 0.0) {
         int active = 0;
-        for (int c = 0; c < kMaxChannels; ++c)
-          if (detect_enabled_[c]) ++active;
+        for (int c = 0; c < kMaxChannels; ++c) {
+          // Whatever makes channel c run a marker search counts, and the
+          // switch is not the only thing that does: both session types
+          // deliberately override it (see the early-out above), and a
+          // homography session runs the most expensive mode there is —
+          // full-frame, single-stage, unshrunk. Counting only the switch made
+          // a collection session on a DETECT 0 lens invisible to the
+          // governor, so the other lenses divided the budget as if that
+          // thread time were free.
+          if (!detect_enabled_[c] && !homography_.FitCollecting(c) &&
+              !calib_.Collecting(c))
+            continue;
+          // ...and only while frames are still arriving on it. A lens that is
+          // switched on but whose stream has stopped costs nothing, so
+          // leaving it in the denominator holds the surviving lenses to a
+          // quarter of the thread with three quarters of it idle — the
+          // failure looks like a performance problem on the healthy lenses
+          // rather than a dead stream on the broken one.
+          //
+          // Never-delivered (0) counts as active on purpose: at start-up the
+          // four lenses come up a few frames apart, and guessing "idle" for a
+          // channel that is about to arrive is the one error here that
+          // over-commits the thread instead of under-using it.
+          if (last_delivery_ms_[c] != 0 &&
+              t_frame_ms - last_delivery_ms_[c] > kActiveIdleMs)
+            continue;
+          ++active;
+        }
         if (active < 1) active = 1;
+        governor_active_ = active;
         const double wait = cost_ms * (100.0 * active / detect_duty_pct_ - 1.0);
         detect_budget_until_ms_[ch] = epoch_ms() + (long)(wait > 0.0 ? wait : 0.0);
       }
@@ -1325,6 +1572,13 @@ void SampleComponent::ProcessRawVideo(Event* event) {
     static const std::vector<ArucoProcessor::Detection> kNoDetections;
     SendPosePackets(ch, approximate ? kNoDetections : dets, t_frame_ms,
                     (int)image->width, (int)image->height, pts_ms, queue_ms);
+
+    if (heap_probe) {
+      unsigned long heap_h2 = 0;
+      heap_bytes(&heap_h2, NULL);
+      heap_rest_bytes_ += (long long)heap_h2 - (long long)heap_h1;
+      ++heap_probe_n_;
+    }
     break;  // one frame per event
   }
 
@@ -1576,6 +1830,15 @@ bool SampleComponent::SetDetectEnabled(int ch, bool on) {
   if (detect_enabled_[ch] == on) return true;
 
   detect_enabled_[ch] = on;
+  // Switching a channel changes n for EVERY channel, so every outstanding wait
+  // was computed against a denominator that no longer holds — the same reason
+  // DUTY clears them, and it was missing here. Switching one lens off left the
+  // other three sitting out up to 1.4 s of idle owed to a channel that had just
+  // stopped asking for any, which reads as "DETECT 0 made the others slower".
+  // Switching one on is the direction that matters more: their waits were set
+  // for a smaller n, so without this the thread is briefly over-committed by
+  // exactly the share the new channel is taking.
+  for (int c = 0; c < kMaxChannels; ++c) detect_budget_until_ms_[c] = 0;
   if (!on) {
     dynroi_[ch].configure(dynroi_[ch].enabled(), dynroi_[ch].margin(), dynroi_[ch].maxMiss());
     if (aruco_[ch]) aruco_[ch]->setRoi(manual_roi_[ch]);
@@ -1737,6 +2000,7 @@ bool SampleComponent::DispatchCommand(const char* cmd) {
  *   CALIB_K_UNDO
  *   CALIB_K_COMPUTE
  *   CALIB_K_SAVE <ch>
+ *   CALIB_K_REVERT <ch>         — swap back to the value before the last save
  *   K_LOAD <ch> fx fy cx cy d0 d1 d2 d3 d4
  *
  * Everything answers through /status; there is no separate reply, on purpose —
@@ -1777,6 +2041,22 @@ bool SampleComponent::HandleCalibK(const char* cmd) {
   if (strncmp(cmd, "CALIB_K_START", 13) == 0) {
     int ch = -1;
     if (sscanf(cmd + 13, "%d", &ch) != 1) return true;
+    // The mirror of the refusal in StartFit(), and it has to live here rather
+    // than in IntrinsicsCalib: that object does not know the mapper exists, and
+    // pointing it at one to answer a single question would tie the two together
+    // in the direction the port deliberately kept clear. This handler already
+    // holds both.
+    //
+    // Opening a board session over a running collection does not slow it down,
+    // it stops it dead and leaves it that way: the collection's counters and
+    // its 200-frame ceiling are both driven by frames it stops receiving, so it
+    // neither progresses nor times out. See StartFit() for the same reasoning
+    // from the other side.
+    if (homography_.FitCollecting(ch)) {
+      calib_.NoteMessage("이 렌즈는 호모그래피 수집 중입니다 "
+                         "— 호모그래피 탭에서 끝난 뒤에 시작하세요");
+      return true;
+    }
     if (!calib_.Start(ch, &reason)) calib_.NoteMessage(reason);
     return true;
   }
@@ -1826,6 +2106,18 @@ bool SampleComponent::HandleCalibK(const char* cmd) {
     if (sscanf(cmd + 13, "%d", &ch) != 1) return true;
     calib_.NoteMessage(calib_.Clear(ch) ? "이 렌즈의 K/dist를 지웠습니다"
                                         : "채널 번호 범위 초과");
+    return true;
+  }
+  // CALIB_K_REVERT <ch> — put back the value this lens had before the last
+  // save, and make the current one the previous. Reversible by running it
+  // again; see IntrinsicsCalib::Revert().
+  if (strncmp(cmd, "CALIB_K_REVERT", 14) == 0) {
+    int ch = -1;
+    if (sscanf(cmd + 14, "%d", &ch) != 1) return true;
+    // Revert() sets its own reason on every failure path, so only success needs
+    // saying here — otherwise the button that worked and the button that found
+    // nothing to revert to look identical.
+    if (calib_.Revert(ch)) calib_.NoteMessage("이전 K/dist로 되돌렸습니다 (다시 누르면 원래대로)");
     return true;
   }
   if (strncmp(cmd, "CALIB_K_SAVE", 12) == 0) {

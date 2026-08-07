@@ -126,6 +126,7 @@ IntrinsicsCalib::IntrinsicsCalib()
   reason_buf_[0] = '\0';
   for (int c = 0; c < kChannels; ++c) {
     available_[c] = false;
+    k_generation_[c] = 0;
     Session& S = sess_[c];
     S.state = CS_IDLE;
     S.last_capture = CS_IDLE;
@@ -135,6 +136,8 @@ IntrinsicsCalib::IntrinsicsCalib()
     S.last_capture_ms = 0;
     S.probe_total = 0;
     S.probe_ms = 0;
+    S.board_fit_rms = -1.0;    // -1 = 아직 잴 만큼 마커를 못 봄
+    S.board_fit_rms_t = -1.0;
     memset(&S.last_quality, 0, sizeof(S.last_quality));
     S.last_quality.mean_move_px = -1.0;
     S.reason_buf[0] = '\0';
@@ -260,7 +263,10 @@ void IntrinsicsCalib::Init() {
     }
   }
 
-  for (int c = 0; c < kChannels; ++c) available_[c] = LoadOne(c);
+  // LoadOne() sets available_ itself now, through InstallK() — the load is a
+  // K change like any other, and routing it anywhere else would leave the one
+  // path that runs at start-up outside the counter.
+  for (int c = 0; c < kChannels; ++c) LoadOne(c);
 
   printf("[ArucoPosePNM] calib: persist=%s dir=%s cwd=%s  loaded K:",
          persist_ok_ ? "ok" : "READ-ONLY", persist_dir_, cwd_);
@@ -278,24 +284,33 @@ namespace {
 const int kFileVersion = 2;  // v1 was cctv_app's single-lens file (had a profile line)
 }
 
-bool IntrinsicsCalib::SaveOne(int ch) {
-  char leaf[64], path[512];
-  snprintf(leaf, sizeof(leaf), "camera_intrinsics_ch%d.txt", ch);
+void IntrinsicsCalib::MainLeaf(int ch, char* out, size_t n) {
+  snprintf(out, n, "camera_intrinsics_ch%d.txt", ch);
+}
+
+void IntrinsicsCalib::PrevLeaf(int ch, char* out, size_t n) {
+  snprintf(out, n, "camera_intrinsics_ch%d.prev.txt", ch);
+}
+
+bool IntrinsicsCalib::WriteValues(const char* leaf, int ch, const cv::Mat& K,
+                                  const cv::Mat& dist) const {
+  if (K.empty() || dist.empty()) return false;
+  char path[512];
   PathFor(leaf, path, sizeof(path));
   FILE* f = fopen(path, "w");
   if (!f) return false;
   fprintf(f, "%d %d\n", kFileVersion, ch);
-  fprintf(f, "%.10e %.10e %.10e %.10e\n", K_[ch].at<double>(0, 0), K_[ch].at<double>(1, 1),
-          K_[ch].at<double>(0, 2), K_[ch].at<double>(1, 2));
-  for (int i = 0; i < 5; ++i) fprintf(f, "%.10e ", dist_[ch].at<double>(0, i));
+  fprintf(f, "%.10e %.10e %.10e %.10e\n", K.at<double>(0, 0), K.at<double>(1, 1),
+          K.at<double>(0, 2), K.at<double>(1, 2));
+  for (int i = 0; i < 5; ++i) fprintf(f, "%.10e ", dist.at<double>(0, i));
   fprintf(f, "\n");
   fclose(f);
   return true;
 }
 
-bool IntrinsicsCalib::LoadOne(int ch) {
-  char leaf[64], path[512];
-  snprintf(leaf, sizeof(leaf), "camera_intrinsics_ch%d.txt", ch);
+bool IntrinsicsCalib::ReadValues(const char* leaf, int ch, cv::Mat* K,
+                                 cv::Mat* dist) const {
+  char path[512];
   PathFor(leaf, path, sizeof(path));
   FILE* f = fopen(path, "r");
   if (!f) return false;
@@ -318,8 +333,137 @@ bool IntrinsicsCalib::LoadOne(int ch) {
     fflush(stdout);
     return false;
   }
-  K_[ch] = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
-  dist_[ch] = (cv::Mat_<double>(1, 5) << d[0], d[1], d[2], d[3], d[4]);
+  if (K) *K = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
+  if (dist) *dist = (cv::Mat_<double>(1, 5) << d[0], d[1], d[2], d[3], d[4]);
+  return true;
+}
+
+/**
+ * Write this lens's K/dist, keeping the value it replaces.
+ *
+ * The rotation happens here rather than in Compute() because the FILE is the
+ * durable thing: Compute() only touches RAM, so rotating there would push a
+ * "previous" onto disk for a value that may never be saved at all — and two
+ * computes in a row would then lose the last SAVED value, which is exactly the
+ * one worth keeping.
+ *
+ * A failed rotation does not stop the save. Losing the ability to step back is
+ * bad; refusing to store the calibration the operator just spent ten minutes
+ * taking is worse.
+ */
+bool IntrinsicsCalib::SaveOne(int ch) {
+  char main_leaf[64], prev_leaf[64];
+  MainLeaf(ch, main_leaf, sizeof(main_leaf));
+  PrevLeaf(ch, prev_leaf, sizeof(prev_leaf));
+
+  cv::Mat old_K, old_dist;
+  if (ReadValues(main_leaf, ch, &old_K, &old_dist)) {
+    if (!WriteValues(prev_leaf, ch, old_K, old_dist)) {
+      printf("[ArucoPosePNM] calib ch%d: 이전 값 보관 실패 — 저장은 계속합니다\n", ch);
+      fflush(stdout);
+    }
+  }
+  return WriteValues(main_leaf, ch, K_[ch], dist_[ch]);
+}
+
+bool IntrinsicsCalib::HasPrevious(int ch) const {
+  if (!ValidCh(ch)) return false;
+  char leaf[64];
+  PrevLeaf(ch, leaf, sizeof(leaf));
+  return ReadValues(leaf, ch, NULL, NULL);
+}
+
+bool IntrinsicsCalib::GetPrevious(int ch, double* fx, double* fy, double* cx, double* cy,
+                                  double dist[5]) const {
+  if (!ValidCh(ch)) return false;
+  char leaf[64];
+  PrevLeaf(ch, leaf, sizeof(leaf));
+  cv::Mat K, D;
+  if (!ReadValues(leaf, ch, &K, &D)) return false;
+  if (fx) *fx = K.at<double>(0, 0);
+  if (fy) *fy = K.at<double>(1, 1);
+  if (cx) *cx = K.at<double>(0, 2);
+  if (cy) *cy = K.at<double>(1, 2);
+  if (dist)
+    for (int i = 0; i < 5; ++i) dist[i] = D.at<double>(0, i);
+  return true;
+}
+
+/**
+ * Swap the current and previous values, on disk and in RAM.
+ *
+ * Both files are read in full before either is written, so a write that fails
+ * halfway cannot leave the lens holding a value that exists nowhere else.
+ *
+ * A swap rather than a pop: reverting by mistake is undone by reverting again,
+ * and there is never a moment when one of the two has been thrown away.
+ *
+ * If the current file is missing (computed but never saved) RAM stands in for
+ * it. The operator's model is "go back to the previous one"; silently dropping
+ * the unsaved value would make the second Revert — the one meant to undo this
+ * — return nothing.
+ */
+bool IntrinsicsCalib::Revert(int ch) {
+  if (!ValidCh(ch)) return false;
+  char main_leaf[64], prev_leaf[64];
+  MainLeaf(ch, main_leaf, sizeof(main_leaf));
+  PrevLeaf(ch, prev_leaf, sizeof(prev_leaf));
+
+  cv::Mat prev_K, prev_dist;
+  if (!ReadValues(prev_leaf, ch, &prev_K, &prev_dist)) {
+    SetReason("이 렌즈에는 되돌릴 이전 값이 없습니다");
+    return false;
+  }
+
+  cv::Mat cur_K, cur_dist;
+  bool have_cur = ReadValues(main_leaf, ch, &cur_K, &cur_dist);
+  if (!have_cur && available_[ch]) {
+    cur_K = K_[ch].clone();
+    cur_dist = dist_[ch].clone();
+    have_cur = true;
+  }
+
+  if (!WriteValues(main_leaf, ch, prev_K, prev_dist)) {
+    SetReason("되돌리기 실패 — 저장 위치에 쓸 수 없습니다");
+    return false;
+  }
+  if (have_cur) {
+    WriteValues(prev_leaf, ch, cur_K, cur_dist);
+  } else {
+    char path[512];
+    PathFor(prev_leaf, path, sizeof(path));
+    remove(path);  // nothing left to step back to
+  }
+
+  InstallK(ch, prev_K, prev_dist);
+  return true;
+}
+
+void IntrinsicsCalib::InstallK(int ch, const cv::Mat& K, const cv::Mat& dist) {
+  if (!ValidCh(ch)) return;
+  K_[ch] = K;
+  dist_[ch] = dist;
+  available_[ch] = true;
+  ++k_generation_[ch];
+}
+
+void IntrinsicsCalib::DropK(int ch) {
+  if (!ValidCh(ch)) return;
+  K_[ch].release();
+  dist_[ch].release();
+  available_[ch] = false;
+  // Bumped on the way out too. A lens whose K was cleared is exactly as
+  // different from the one an H was fitted against as a lens that was
+  // recalibrated, and the mapping path has to hear about both.
+  ++k_generation_[ch];
+}
+
+bool IntrinsicsCalib::LoadOne(int ch) {
+  char leaf[64];
+  MainLeaf(ch, leaf, sizeof(leaf));
+  cv::Mat K, dist;
+  if (!ReadValues(leaf, ch, &K, &dist)) return false;
+  InstallK(ch, K, dist);
   return true;
 }
 
@@ -337,13 +481,15 @@ bool IntrinsicsCalib::Save(int ch) {
 
 bool IntrinsicsCalib::Clear(int ch) {
   if (ch < 0 || ch >= kChannels) return false;
-  available_[ch] = false;
-  K_[ch].release();
-  dist_[ch].release();
+  DropK(ch);
   char leaf[64], path[512];
-  snprintf(leaf, sizeof(leaf), "camera_intrinsics_ch%d.txt", ch);
+  MainLeaf(ch, leaf, sizeof(leaf));
   PathFor(leaf, path, sizeof(path));
   remove(path);  // absent already is success as far as the caller cares
+  // The previous value is deliberately LEFT in place. Clearing a lens is what
+  // an operator does when its calibration is wrong, and the value before that
+  // one is the most likely thing they want next — deleting it here would make
+  // "clear" quietly destroy two calibrations while naming one.
   return true;
 }
 
@@ -365,13 +511,21 @@ bool IntrinsicsCalib::SaveBoard() {
 // --- board -----------------------------------------------------------------
 
 bool IntrinsicsCalib::SetBoard(const CharucoBoardConfig& cfg, const char** reason) {
-  // ANY open session blocks this, not just one. The board is shared, so a
-  // change mid-session would mix two geometries into whichever fits are still
-  // collecting — and with four sessions the odds of one being open are higher,
-  // not lower.
-  if (AnyCollecting()) {
-    if (reason) *reason = "열려 있는 세션이 있습니다 — 보드 설정은 세션 중에 바꿀 수 없습니다";
-    return false;
+  // An open session blocks this — but only once it has BANKED something.
+  //
+  // The rule exists so a change cannot mix two geometries into one fit, and a
+  // session holding zero views has no geometry to mix. Refusing those too made
+  // the wrong-orientation warning unusable: the board probe only runs while a
+  // session is open, so the moment the operator can SEE that the layout is
+  // wrong is exactly the moment they were forbidden from fixing it. They had to
+  // stop the session, change the board, and start again — three steps to undo a
+  // setting that had not yet touched anything.
+  for (int c = 0; c < kChannels; ++c) {
+    if (sess_[c].state == CS_COLLECTING && !sess_[c].views_corners.empty()) {
+      if (reason)
+        *reason = "이미 촬영한 뷰가 있는 세션이 있습니다 — 보드 설정을 바꾸려면 먼저 그 세션을 멈추세요";
+      return false;
+    }
   }
   if (!valid_board(cfg, reason)) return false;
   // RAM only. Persisting is a separate operator action so that applying a
@@ -382,8 +536,74 @@ bool IntrinsicsCalib::SetBoard(const CharucoBoardConfig& cfg, const char** reaso
   return true;
 }
 
+/**
+ * How well do these marker centres match an sx-by-sy ChArUco board?
+ *
+ * OpenCV lays a ChArUco board out by walking the chessboard row by row and
+ * dropping marker 0, 1, 2 ... into every square of one colour. So marker i has
+ * a known square, and the square's centre is a known board coordinate. Fit
+ * board coordinates to the observed pixels with a homography — which absorbs
+ * however the board happens to be tilted — and the leftover is the answer.
+ *
+ * Both parities are tried because which colour carries the markers is the
+ * generator's business, and guessing it wrong would make a correct layout look
+ * like a wrong one.
+ */
+double IntrinsicsCalib::MarkerLayoutRms(const std::vector<cv::Point2f>& centers,
+                                        const std::vector<int>& ids, int squares_x,
+                                        int squares_y) {
+  if (centers.size() != ids.size() || ids.size() < 5) return -1.0;
+  if (squares_x < 2 || squares_y < 2) return -1.0;
+
+  double best = -1.0;
+  for (int parity = 0; parity < 2; ++parity) {
+    // Board coordinate of each marker index, in squares.
+    std::vector<cv::Point2f> slot;
+    for (int r = 0; r < squares_y; ++r)
+      for (int c = 0; c < squares_x; ++c)
+        if (((r + c) & 1) == parity)
+          slot.push_back(cv::Point2f((float)c + 0.5f, (float)r + 0.5f));
+
+    std::vector<cv::Point2f> src, dst;
+    for (size_t i = 0; i < ids.size(); ++i) {
+      if (ids[i] < 0 || ids[i] >= (int)slot.size()) continue;  // not this board
+      src.push_back(slot[ids[i]]);
+      dst.push_back(centers[i]);
+    }
+    if (src.size() < 5) continue;
+
+    cv::Mat H;
+    try {
+      H = cv::findHomography(src, dst, 0);  // plain least squares, no RANSAC:
+                                            // an outlier here IS the signal
+    } catch (const cv::Exception&) {
+      continue;
+    }
+    if (H.empty()) continue;
+
+    double sum = 0.0;
+    for (size_t i = 0; i < src.size(); ++i) {
+      const double w = H.at<double>(2, 0) * src[i].x + H.at<double>(2, 1) * src[i].y +
+                       H.at<double>(2, 2);
+      if (std::fabs(w) < 1e-12) { sum = -1.0; break; }
+      const double px = (H.at<double>(0, 0) * src[i].x + H.at<double>(0, 1) * src[i].y +
+                         H.at<double>(0, 2)) / w;
+      const double py = (H.at<double>(1, 0) * src[i].x + H.at<double>(1, 1) * src[i].y +
+                         H.at<double>(1, 2)) / w;
+      const double dx = px - dst[i].x, dy = py - dst[i].y;
+      sum += dx * dx + dy * dy;
+    }
+    if (sum < 0.0) continue;
+    const double rms = std::sqrt(sum / (double)src.size());
+    if (best < 0.0 || rms < best) best = rms;
+  }
+  return best;
+}
+
 bool IntrinsicsCalib::DetectBoard(const cv::Mat& gray, std::vector<cv::Point2f>& corners,
-                                  std::vector<int>& ids) {
+                                  std::vector<int>& ids,
+                                  std::vector<cv::Point2f>* marker_centers,
+                                  std::vector<int>* out_marker_ids) {
   corners.clear();
   ids.clear();
   try {
@@ -425,6 +645,20 @@ bool IntrinsicsCalib::DetectBoard(const cv::Mat& gray, std::vector<cv::Point2f>&
       cv::aruco::interpolateCornersCharuco(marker_corners, marker_ids, gray, board,
                                            corners, ids);
 #endif
+    // The raw marker detections, handed back for the layout check. Taken here
+    // rather than re-detecting: running detectMarkers a second time would cost
+    // as much as the whole probe and could disagree with the corners above.
+    if (marker_centers && out_marker_ids) {
+      marker_centers->clear();
+      out_marker_ids->clear();
+      for (size_t i = 0; i < marker_corners.size() && i < marker_ids.size(); ++i) {
+        if (marker_corners[i].size() < 4) continue;
+        cv::Point2f c(0.f, 0.f);
+        for (int k = 0; k < 4; ++k) c += marker_corners[i][k];
+        marker_centers->push_back(c * 0.25f);
+        out_marker_ids->push_back(marker_ids[i]);
+      }
+    }
   } catch (const cv::Exception&) {
     return false;
   }
@@ -436,8 +670,14 @@ void IntrinsicsCalib::ProbeIfDue(int ch, const cv::Mat& gray, long now_ms) {
   Session& S = sess_[ch];
   if (S.state != CS_COLLECTING) return;
   if (S.probe_ms != 0 && now_ms - S.probe_ms < CALIB_PROBE_MS) return;
-  DetectBoard(gray, S.probe_corners, S.probe_ids);
+  std::vector<cv::Point2f> mcen;
+  std::vector<int> mids;
+  DetectBoard(gray, S.probe_corners, S.probe_ids, &mcen, &mids);
   S.probe_total = (board_.squares_x - 1) * (board_.squares_y - 1);
+  // Judge the layout on the same frame the viewfinder is showing, so the two
+  // can never disagree about what was in front of the lens.
+  S.board_fit_rms   = MarkerLayoutRms(mcen, mids, board_.squares_x, board_.squares_y);
+  S.board_fit_rms_t = MarkerLayoutRms(mcen, mids, board_.squares_y, board_.squares_x);
   S.probe_ms = now_ms;
 }
 
@@ -506,6 +746,8 @@ bool IntrinsicsCalib::Start(int ch, const char** reason) {
   S.probe_corners.clear();
   S.probe_ids.clear();
   S.probe_ms = 0;
+  S.board_fit_rms = -1.0;
+  S.board_fit_rms_t = -1.0;
   S.pruned_views = 0;
   S.last_capture_ms = 0;
   S.image_size = cv::Size();
@@ -530,6 +772,8 @@ void IntrinsicsCalib::Stop(int ch) {
   S.probe_corners.clear();
   S.probe_ids.clear();
   S.probe_ms = 0;
+  S.board_fit_rms = -1.0;
+  S.board_fit_rms_t = -1.0;
 }
 
 bool IntrinsicsCalib::RequestCapture(const char** reason) {
@@ -877,9 +1121,7 @@ CalibState IntrinsicsCalib::Compute(int ch) {
   S.view_centers.swap(kept_centers);
   S.view_coverage.swap(kept_coverage);
 
-  K_[ch] = best_K;
-  dist_[ch] = best_dist.reshape(1, 1).colRange(0, 5).clone();
-  available_[ch] = true;
+  InstallK(ch, best_K, best_dist.reshape(1, 1).colRange(0, 5).clone());
   S.rms = best_rms;
   SetSessionReason(ch, "");
   // Not saved automatically. The value is live in RAM and usable at once;
@@ -925,8 +1167,9 @@ bool IntrinsicsCalib::LoadValues(int ch, double fx, double fy, double cx, double
   for (int i = 0; i < 5; ++i)
     if (!std::isfinite(dist[i])) return false;
 
-  K_[ch] = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
-  dist_[ch] = (cv::Mat_<double>(1, 5) << dist[0], dist[1], dist[2], dist[3], dist[4]);
-  available_[ch] = true;
+  const cv::Mat K = (cv::Mat_<double>(3, 3) << fx, 0, cx, 0, fy, cy, 0, 0, 1);
+  const cv::Mat D =
+      (cv::Mat_<double>(1, 5) << dist[0], dist[1], dist[2], dist[3], dist[4]);
+  InstallK(ch, K, D);
   return true;
 }

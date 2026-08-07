@@ -108,6 +108,36 @@ class HomographyMapper {
   // The space Get(ch) is expressed in. Meaningless when !Available(ch).
   bool FittedUndistorted(int ch) const;
 
+  /**
+   * True when this lens's K/dist has been replaced since its H was fitted.
+   *
+   * An undistorted-space H is not a property of the floor alone: the pixels it
+   * was fitted from had a particular K and dist taken out of them first, so
+   * replacing those numbers leaves a matrix that maps a coordinate system
+   * nothing produces any more. The residuals sitting next to it are worse than
+   * useless — they were measured against the old lens and still read as proof.
+   *
+   * NOT self-correcting, and deliberately not fatal:
+   *
+   *   - the matrix is not discarded. A recalibration is often a REVERT to a
+   *     value very close to the old one, and destroying an afternoon's fit as
+   *     a side effect of a diagnostic press is not something an operator can
+   *     undo. Clearing is left to them, as it is everywhere else here.
+   *   - mapping keeps working. Refusing would stop the robot feed on the
+   *     server with no explanation on that end, which trades a wrong number
+   *     for a silence — and unlike the marker-plane refusal, this matrix is
+   *     UNVERIFIED rather than known wrong.
+   *
+   * So it is loud instead: reported per lens in /status and shown on the
+   * operations table, where it means "refit this lens before believing it".
+   * Cleared by the next Set() — a fit or an injection re-baselines against
+   * whatever K is current at that moment.
+   *
+   * Always false for a raw-fitted H, which never involved K in the first
+   * place.
+   */
+  bool CalibStale(int ch) const;
+
   // --- coordinate space ----------------------------------------------------
 
   /**
@@ -365,7 +395,12 @@ class HomographyMapper {
     // static formatting buffer would have each lens display whichever message
     // was written most recently. Contains only text this code wrote, so it
     // needs no JSON escaping.
-    char last_result[128];
+    // 256, raised from 128 on 2026-08-05. The two longest rejection reasons
+    // measure 142 B and 193 B in UTF-8 — Korean is three bytes a character, so
+    // a sentence that reads short is not. Both were being cut. CopyUtf8() keeps
+    // the cut legal whatever the size, but a buffer that fits the message means
+    // there is no cut to keep legal.
+    char last_result[256];
   };
 
   /** One point's disagreement with the fitted plane, in millimetres. */
@@ -464,7 +499,26 @@ class HomographyMapper {
   // Recompute Hm_[ch] from the current H, marker height and camera height.
   // Called from every path that changes any of the three, so the cache cannot
   // outlive its inputs.
-  void RefreshMarkerPlane(int ch);
+  //
+  // const, over mutable state, because SyncCalib() has to be able to run it
+  // from inside the const readers — see there.
+  void RefreshMarkerPlane(int ch) const;
+  /**
+   * Rebuild anything derived from K if K has changed under us, and record that
+   * the stored H no longer matches the lens it was fitted against.
+   *
+   * Called at the top of every reader of the derived cache rather than from
+   * the K commands themselves. A notification the command path has to send is
+   * a notification a later command path can forget to send, and the symptom of
+   * forgetting is silent: coordinates keep coming, correct in shape and wrong
+   * in value. A version compared where the cache is USED cannot be forgotten,
+   * because there is no way to read the cache without passing through it.
+   *
+   * Costs one unsigned comparison per call in the settled case, which is what
+   * makes it affordable in the frame path. The rebuild itself runs once per
+   * actual change.
+   */
+  void SyncCalib(int ch) const;
   void PathFor(const char* leaf, char* out, size_t out_size) const;
   // Turn the collected averages into H and its residuals, and close the
   // session. Called from FeedFrame() when the target is reached.
@@ -491,19 +545,29 @@ class HomographyMapper {
   // height or the camera height changes — the pose path maps two points per
   // marker per frame through this, and deriving it there would put a 3x3
   // inverse and a decomposition in the frame loop.
-  cv::Mat Hm_[kChannels];
-  bool    hm_valid_[kChannels];
+  //
+  // mutable, along with everything else RefreshMarkerPlane() writes: the
+  // rebuild is a cache-coherence step, not a change of state — the same inputs
+  // produce the same matrix whether it runs now or ran a moment ago. Making it
+  // mutable is what lets SyncCalib() sit inside the const readers, which is
+  // where it has to be to be unforgettable.
+  mutable cv::Mat Hm_[kChannels];
+  mutable bool    hm_valid_[kChannels];
   // Why Hm_ is not valid, per lens. A literal; "" when it is.
-  const char* hm_reason_[kChannels];
+  mutable const char* hm_reason_[kChannels];
+  // The K generation the three cached values below were derived against, and
+  // whether the stored H outlived it. See SyncCalib() and CalibStale().
+  mutable unsigned k_gen_[kChannels];
+  mutable bool     k_stale_[kChannels];
   // The camera centre the floor H implies, cached alongside Hm_ and produced by
   // the same decomposition. /status reads this for four lenses on every poll,
   // and re-deriving it there would be eight 3x3 inversions a second on the
   // thread the frame path shares — for numbers whose inputs only change when an
   // operator does something. Sharing one decomposition also stops the height
   // the page reports from drifting from the height the correction is scaled by.
-  bool        pose_ok_[kChannels];
-  cv::Vec3d   pose_c_[kChannels];       // world mm; [2] is the camera height
-  const char* pose_reason_[kChannels];  // literal; "" when pose_ok_
+  mutable bool        pose_ok_[kChannels];
+  mutable cv::Vec3d   pose_c_[kChannels];       // world mm; [2] is the camera height
+  mutable const char* pose_reason_[kChannels];  // literal; "" when pose_ok_
 
   // Fixed arrays, not vectors: ~2.3 KB total, and it keeps the whole mapper
   // allocation-free, which matters because PixelToWorld() runs in the frame

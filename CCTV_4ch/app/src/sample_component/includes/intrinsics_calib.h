@@ -39,6 +39,14 @@
  * RPi's job or a separate tool; profiles and presets were single-lens
  * conveniences that four lenses turn into four times the bookkeeping for no
  * gain — with one K per lens there is nothing to switch between.
+ *
+ * Revisited 2026-08-05: the profiles argument above was right about switching
+ * and wrong about what the operator needs. Nobody wants to CHOOSE between
+ * calibrations, but they very much need to UNDO one — a session can succeed,
+ * report a good RMS, and still produce a K that is worse than the one it
+ * replaced (a board held still fits its own near-identical views beautifully).
+ * So there is exactly one step of history per lens, and no names, no list, no
+ * deletes: see HasPrevious()/Revert().
  */
 
 /**
@@ -188,6 +196,15 @@ class IntrinsicsCalib {
   // shows up as an id out of sequence rather than as a dot that looks fine.
   const std::vector<int>& ProbeIds(int ch) const;
   long ProbeAgeMs(int ch, long now_ms) const;
+  // Marker-layout fit for this lens's last probe: as configured, and with
+  // squares_x/squares_y swapped. -1 = too few markers to judge. See
+  // Session::board_fit_rms for why this exists and why corners cannot answer it.
+  double BoardFitRms(int ch) const {
+    return ValidCh(ch) ? sess_[ch].board_fit_rms : -1.0;
+  }
+  double BoardFitRmsTransposed(int ch) const {
+    return ValidCh(ch) ? sess_[ch].board_fit_rms_t : -1.0;
+  }
   // Run a board probe if one is due (throttled by CALIB_PROBE_MS). Per lens,
   // because each open session has its own viewfinder to keep current — a shared
   // probe would show the operator whichever lens happened to be last.
@@ -216,10 +233,61 @@ class IntrinsicsCalib {
     static const cv::Mat kNone;
     return (ch >= 0 && ch < kChannels) ? dist_[ch] : kNone;
   }
+  /**
+   * How many times this lens's K/dist has been replaced or dropped.
+   *
+   * Handing out a reference to K_ (above) makes this object the single copy of
+   * the numbers, but it does NOT make anything DERIVED from them notice when
+   * they change — and HomographyMapper derives two things and caches both:
+   * H_marker, and the camera pose the floor H implies. Both were being rebuilt
+   * only when H or one of the heights changed, so a recalibration left them
+   * describing the old lens while the mapping path went on using them every
+   * frame. Nothing said so; the coordinates stayed well-formed.
+   *
+   * A counter rather than a callback because the two objects are already
+   * one-directional (the mapper holds the calib, never the reverse), and
+   * because a reader that compares a number it kept cannot forget to register
+   * — the check is in the path that uses the cache. Same device as
+   * board_generation_, which invalidates the cached ChArUco detector.
+   *
+   * Wraps at 2^32 changes, which is not reachable by an operator pressing a
+   * button, and equality is the only test made of it.
+   */
+  unsigned KGeneration(int ch) const {
+    return (ch >= 0 && ch < kChannels) ? k_generation_[ch] : 0u;
+  }
   // Externally-computed values, applied with no capture session. Refuses
   // obviously broken numbers so a typo cannot silently poison a lens.
   bool LoadValues(int ch, double fx, double fy, double cx, double cy, const double dist[5]);
   bool Save(int ch);            // persist one lens's K/dist now
+
+  // --- the previous saved value, kept automatically -----------------------
+  //
+  // Save() rotates: whatever was on disk for this lens becomes the "previous"
+  // file before the new value takes its place. One step back, not a library of
+  // named profiles.
+  //
+  // The failure this exists for is not "I want to choose between calibrations"
+  // — it is "the one I just took is worse and the good one is gone". Compute()
+  // overwrites RAM the instant it succeeds, and success is not the same as
+  // correct: a board held still for every view fits its own five nearly
+  // identical images beautifully (RMS 0.36 px, measured on .13 2026-08-05) and
+  // is still unusable. By the time that is visible, the previous value has
+  // already been replaced.
+  //
+  // Named profiles were considered and rejected. Four lenses times a list of
+  // names is a filing system, and the snapshots in tools/calib_backup.sh
+  // already hold complete four-lens sets off-camera — a second, per-lens
+  // history on the camera would be a second place claiming to know what the
+  // right calibration is.
+  bool HasPrevious(int ch) const;
+  bool GetPrevious(int ch, double* fx, double* fy, double* cx, double* cy,
+                   double dist[5]) const;
+  // Put the previous value back, and make the current one the previous. A
+  // SWAP, not a pop: reverting by mistake is then undone by reverting again,
+  // and there is never a moment where one of the two values has been thrown
+  // away. Applies to RAM and disk together, so it survives a restart.
+  bool Revert(int ch);
   // Forget one lens's K/dist, in RAM and on disk.
   //
   // Needed because a WRONG calibration is worse than none: with no K the page
@@ -256,7 +324,21 @@ class IntrinsicsCalib {
   // Everything below runs on the scheduler thread only — same thread as
   // ProcessRawVideo and the HTTP handlers, so none of it locks.
   bool DetectBoard(const cv::Mat& gray, std::vector<cv::Point2f>& corners,
-                   std::vector<int>& ids);
+                   std::vector<int>& ids,
+                   std::vector<cv::Point2f>* marker_centers = NULL,
+                   std::vector<int>* marker_ids = NULL);
+  // RMS reprojection error of the detected marker centres against the layout
+  // OpenCV would produce for a squares_x by squares_y ChArUco board, fitted by
+  // homography so board tilt does not count against it. Both chessboard
+  // parities are tried and the better one wins — which one carries the markers
+  // is a property of the board generator, not something worth asserting here.
+  //
+  // -1 when fewer than 5 markers are visible: four points determine a
+  // homography exactly, so the residual would be 0 for any layout and the
+  // comparison would be meaningless rather than merely noisy.
+  static double MarkerLayoutRms(const std::vector<cv::Point2f>& centers,
+                                const std::vector<int>& ids, int squares_x,
+                                int squares_y);
   CalibState CaptureView(int ch, const cv::Mat& gray);
   double MeanCommonCornerMove(int ch, const std::vector<cv::Point2f>& corners,
                               const std::vector<int>& ids) const;
@@ -270,6 +352,13 @@ class IntrinsicsCalib {
   void SetSessionReason(int ch, const char* reason);
   bool SaveOne(int ch);
   bool LoadOne(int ch);
+  // File I/O for one K/dist pair, by leaf name, so the current file and the
+  // previous one go through exactly the same reader and writer. Two copies of
+  // this format is how the two would come to disagree.
+  bool WriteValues(const char* leaf, int ch, const cv::Mat& K, const cv::Mat& dist) const;
+  bool ReadValues(const char* leaf, int ch, cv::Mat* K, cv::Mat* dist) const;
+  static void MainLeaf(int ch, char* out, size_t n);
+  static void PrevLeaf(int ch, char* out, size_t n);
   bool ValidCh(int ch) const { return ch >= 0 && ch < kChannels; }
 
   CharucoBoardConfig board_;
@@ -319,6 +408,25 @@ class IntrinsicsCalib {
     std::vector<int>         probe_ids;
     int  probe_total;
     long probe_ms;
+
+    // How well the MARKERS fit the configured layout, and how well they fit its
+    // transpose. Negative = not measurable (too few markers seen).
+    //
+    // This exists because 5x7 and 7x5 are indistinguishable by every count on
+    // the page — same 17 markers, same 24 interior corners — and, as of
+    // 2026-08-05, also by the corner-grid check the page already draws. A wrong
+    // orientation was diagnosed as right and set, twice, in one afternoon; two
+    // physical boards of different layouts were in play and nothing on screen
+    // could say which one the lens was looking at.
+    //
+    // Marker CENTRES settle it because they never pass through
+    // interpolateCornersCharuco: they are where the detector found black
+    // squares, so a wrong board description cannot move them. Measured on .13
+    // with the 5x7 board in view: 2.07 px as configured against 350.20 px
+    // transposed, on two lenses independently. The two answers are never close
+    // enough to argue about.
+    double board_fit_rms;      // configured layout
+    double board_fit_rms_t;    // sx and sy swapped
   };
   Session sess_[kChannels];
 
@@ -331,6 +439,18 @@ class IntrinsicsCalib {
   cv::Mat K_[kChannels];
   cv::Mat dist_[kChannels];
   bool    available_[kChannels];
+  // Bumped by InstallK()/DropK() and nowhere else. See KGeneration().
+  unsigned k_generation_[kChannels];
+  // The ONLY two writers of K_/dist_/available_.
+  //
+  // There were five (Compute, Revert, LoadValues, LoadOne, Clear), which is
+  // four too many for a counter that has to be bumped on every one of them:
+  // the sixth write added later would compile, run, and quietly leave every
+  // derived value stale. Funnelling them means the next K path cannot fail to
+  // announce itself, because there is no way to set the value except through
+  // the announcement.
+  void InstallK(int ch, const cv::Mat& K, const cv::Mat& dist);
+  void DropK(int ch);
   bool    persist_ok_;
   char    persist_dir_[256];
   static const int kMaxCandidates = 24;

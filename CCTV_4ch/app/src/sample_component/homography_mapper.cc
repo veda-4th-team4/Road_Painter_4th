@@ -7,6 +7,8 @@
 
 #include <opencv2/calib3d.hpp>
 
+#include "app_config.h"  // CopyUtf8 — last_result goes straight into /status
+
 namespace {
 
 // Bump when the on-disk layout changes. A file from an older version is
@@ -78,6 +80,8 @@ HomographyMapper::HomographyMapper()
     pose_ok_[c] = false;
     pose_reason_[c] = "이 렌즈에 H가 없습니다";
     pose_c_[c] = cv::Vec3d(0.0, 0.0, 0.0);
+    k_gen_[c] = 0;
+    k_stale_[c] = false;
     memset(&fit_[c], 0, sizeof(fit_[c]));
     memset(&result_[c], 0, sizeof(result_[c]));
   }
@@ -88,6 +92,15 @@ void HomographyMapper::Init(const IntrinsicsCalib& calib) {
   calib_ = &calib;
   snprintf(persist_dir_, sizeof(persist_dir_), "%s", calib.PersistDir());
   persist_ok_ = calib.Persistable();
+
+  // Baseline every lens against the K that is loaded RIGHT NOW, before any H
+  // comes off disk. A persisted H was fitted against the persisted K, and both
+  // files came back together — a start-up is the one moment the two are known
+  // to agree, so it must not be reported as a mismatch.
+  for (int c = 0; c < kChannels; ++c) {
+    k_gen_[c] = calib.KGeneration(c);
+    k_stale_[c] = false;
+  }
 
   // Shared marker height first: LoadOne() -> Set() -> RefreshMarkerPlane()
   // derives H_marker, and deriving it against a height of 0 and then never
@@ -288,11 +301,14 @@ bool HomographyMapper::SetCameraHeightMm(int ch, double mm) {
 }
 
 bool HomographyMapper::MarkerPlaneReady(int ch) const {
-  return ch >= 0 && ch < kChannels && hm_valid_[ch];
+  if (ch < 0 || ch >= kChannels) return false;
+  SyncCalib(ch);  // PixelToWorldMarker() and GetMarkerPlane() enter through here
+  return hm_valid_[ch];
 }
 
 const char* HomographyMapper::MarkerPlaneReason(int ch) const {
   if (ch < 0 || ch >= kChannels) return "채널 번호가 0..3 범위를 벗어났습니다";
+  SyncCalib(ch);
   return hm_reason_[ch];
 }
 
@@ -399,6 +415,9 @@ bool HomographyMapper::CameraPose(int ch, double* height_mm, double* nadir_x_mm,
     if (reason) *reason = "채널 번호가 0..3 범위를 벗어났습니다";
     return false;
   }
+  // The pose is the diagnostic an installer uses to judge a FRESH K, so it is
+  // the last number in the app that may be allowed to describe the old one.
+  SyncCalib(ch);
   if (!pose_ok_[ch]) {
     if (reason) *reason = pose_reason_[ch];
     return false;
@@ -417,7 +436,7 @@ bool HomographyMapper::CameraPose(int ch, double* height_mm, double* nadir_x_mm,
  * frame path free of the 3x3 inverse, and there is no path that reads Hm_
  * without one of those three having been set first.
  */
-void HomographyMapper::RefreshMarkerPlane(int ch) {
+void HomographyMapper::RefreshMarkerPlane(int ch) const {
   if (ch < 0 || ch >= kChannels) return;
   hm_valid_[ch] = false;
   hm_reason_[ch] = "";
@@ -624,7 +643,7 @@ bool HomographyMapper::SetAnchors(int ch, const Anchor* list, int n) {
   // coordinate — plausible input, silently wrong H.
   if (fit_[ch].active) {
     memset(&fit_[ch], 0, sizeof(fit_[ch]));
-    snprintf(fit_[ch].last_result, sizeof(fit_[ch].last_result),
+    CopyUtf8(fit_[ch].last_result, sizeof(fit_[ch].last_result),
              "마커 목록이 바뀌어 수집 세션을 중단했습니다");
   }
   memset(&result_[ch], 0, sizeof(result_[ch]));
@@ -662,7 +681,23 @@ bool HomographyMapper::StartFit(int ch) {
              "등록된 마커가 %d개뿐입니다 — 최소 4개(권장 10~20개)가 필요합니다",
              anchor_n_[ch]);
     fail_reason_ = why;
-    snprintf(fit_[ch].last_result, sizeof(fit_[ch].last_result), "%s", why);
+    CopyUtf8(fit_[ch].last_result, sizeof(fit_[ch].last_result), why);
+    return false;
+  }
+  // A K/dist session on this same lens takes the frame and breaks before the
+  // ArUco pass (see ProcessRawVideo), so FeedFrame() is never reached.
+  //
+  // And FeedFrame() is what drives BOTH counters — `good` and `total` — so a
+  // collection opened underneath a board session does not fail slowly, it
+  // stops: 0 of 20, 0 of 200, `collecting:true`, forever. The 200-frame
+  // ceiling cannot save it either, because that ceiling is counted in frames
+  // this session never receives. There is no cancel command by design, so the
+  // only way out would be to notice the board session and stop it — which is
+  // exactly what the operator cannot see, the two living on different tabs.
+  if (calib_ != NULL && calib_->Collecting(ch)) {
+    fail_reason_ = "이 렌즈는 K/dist 캘리브레이션 세션 중입니다 "
+                   "— 캘리브레이션 탭에서 먼저 끝내거나 취소(CALIB_K_STOP)하세요";
+    CopyUtf8(fit_[ch].last_result, sizeof(fit_[ch].last_result), fail_reason_);
     return false;
   }
   // Checked now, not at the fit. Undistortion failing after 200 frames of
@@ -670,7 +705,7 @@ bool HomographyMapper::StartFit(int ch) {
   if (coord_undistorted_[ch] && (calib_ == NULL || !calib_->Available(ch))) {
     fail_reason_ = "이 렌즈는 undistort 좌표로 피팅하도록 설정돼 있는데 K/dist가 없습니다 "
                    "— 내부 파라미터를 먼저 캘리브레이션하거나 HG_COORD_MODE 로 raw 로 바꾸세요";
-    snprintf(fit_[ch].last_result, sizeof(fit_[ch].last_result), "%s", fail_reason_);
+    CopyUtf8(fit_[ch].last_result, sizeof(fit_[ch].last_result), fail_reason_);
     return false;
   }
 
@@ -751,12 +786,12 @@ void HomographyMapper::FeedFrame(int ch, const int* ids, const float* cx, const 
   if (f.good >= kFitTargetFrames) {
     const bool ok = FinishFit(ch);
     f.active = false;
-    snprintf(f.last_result, sizeof(f.last_result), "%s", ok ? "완료" : fail_reason_);
+    CopyUtf8(f.last_result, sizeof(f.last_result), ok ? "완료" : fail_reason_);
     return;
   }
   if (f.total >= kFitMaxFrames) {
     f.active = false;
-    snprintf(f.last_result, sizeof(f.last_result),
+    CopyUtf8(f.last_result, sizeof(f.last_result),
              "시간 초과 — 모든 마커가 함께 보인 프레임이 부족했습니다 (missing_ids 확인)");
   }
 }
@@ -932,8 +967,52 @@ bool HomographyMapper::Set(int ch, const double h[9], bool fitted_undistorted) {
   // mode while a matrix exists, and it is safe precisely because both are set
   // together — it is the SPLIT between them that SetCoordMode() refuses.
   coord_undistorted_[ch] = fitted_undistorted;
+
+  // This matrix belongs to the K that is current at this instant, whether it
+  // arrived from a fit, an injection or the disk. Re-baselining here is what
+  // makes CalibStale() mean "changed SINCE the fit" rather than "changed at
+  // some point".
+  k_gen_[ch] = (calib_ != NULL) ? calib_->KGeneration(ch) : 0u;
+  k_stale_[ch] = false;
+
+  // Every derived value was derived from the matrix that just got replaced.
+  //
+  // This was missing, and it is the same failure as the K one a level down:
+  // Set() is the ONE door a new matrix comes through — FinishFit(), HG_SET and
+  // LoadOne() all end here — so leaving the rebuild to the callers meant
+  // leaving it to three of them. Two got it by accident (LoadOne() calls
+  // SetCameraHeightMm() afterwards, which refreshes) and the one that mattered
+  // did not: after a successful CALIB_START the pose path went on consulting
+  // an H_marker built from the PREVIOUS matrix, or, on a lens fitting for the
+  // first time, kept refusing to map at all because the cache still said "이
+  // 렌즈에 H가 없습니다" — an H that is present and mappable, producing no
+  // world coordinates, with nothing anywhere to say why.
+  RefreshMarkerPlane(ch);
   fail_reason_ = "";
   return true;
+}
+
+void HomographyMapper::SyncCalib(int ch) const {
+  if (ch < 0 || ch >= kChannels || calib_ == NULL) return;
+  const unsigned gen = calib_->KGeneration(ch);
+  if (gen == k_gen_[ch]) return;  // the settled case, and the only cost of this
+  k_gen_[ch] = gen;
+
+  // A matrix fitted in RAW pixels never saw K, so a new K leaves it exactly as
+  // valid as it was — only its marker plane, which decomposes through K, has
+  // to be rebuilt (and that path refuses a raw-fitted H anyway). It is the
+  // undistorted-space fit that is orphaned, because the pixels it was fitted
+  // from were produced by the K that just went away.
+  if (available_[ch] && fitted_undistorted_[ch]) k_stale_[ch] = true;
+
+  // Both cached derivations — H_marker and the camera pose — read K.
+  RefreshMarkerPlane(ch);
+}
+
+bool HomographyMapper::CalibStale(int ch) const {
+  if (ch < 0 || ch >= kChannels) return false;
+  SyncCalib(ch);
+  return k_stale_[ch];
 }
 
 bool HomographyMapper::Mappable(int ch) const {
@@ -967,6 +1046,11 @@ bool HomographyMapper::Clear(int ch) {
   available_[ch] = false;
   fitted_undistorted_[ch] = false;
   camera_z_mm_[ch] = 0.0;
+  // Nothing left to be stale. The flag describes a matrix, and there is no
+  // longer one — leaving it set would put a warning on a lens whose next fit
+  // has not happened yet.
+  k_stale_[ch] = false;
+  k_gen_[ch] = (calib_ != NULL) ? calib_->KGeneration(ch) : 0u;
   H_[ch].release();
   memset(&result_[ch], 0, sizeof(result_[ch]));  // measured the matrix just dropped
   RefreshMarkerPlane(ch);                        // derived FROM the matrix just dropped

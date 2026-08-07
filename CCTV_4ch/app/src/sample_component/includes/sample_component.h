@@ -279,7 +279,47 @@ class SampleComponent : public Component, public ISampleComponent {
   // cumulative counters only mean something when subtracted. The instant it was
   // taken is stats_sample_ms_, shared with every other rate on the page.
   unsigned long delivered_prev_[kMaxChannels];
+  // When each lens last delivered, for the detection governor's channel count.
+  // Separate from last_frame_ms_ (which is dashboard-only and compiled out with
+  // the status page) because the governor has to work either way, and it is set
+  // for EVERY delivered frame — including ones a switched-off channel drops
+  // immediately — since the question is whether the stream is alive, not
+  // whether we did anything with it. 0 = nothing yet.
+  long          last_delivery_ms_[kMaxChannels];
+  // What the governor last divided the duty by, reported as-is rather than
+  // recomputed for /status. n decides every lens's share, so when a lens drops
+  // out of the count the only visible effect is the OTHERS speeding up — which
+  // reads as a performance change with no cause on screen. Recomputing it in
+  // BuildStatusJson would answer "what would n be if asked now", and the
+  // question is what the governor actually used. 0 = no frame charged yet.
+  int           governor_active_;
+  // How long a silent lens stays in the governor's denominator. Generous on
+  // purpose: it only has to outlast a real delivery gap, and a lens limping
+  // along at 1 fps is still consuming the thread, so timing it out would speed
+  // the others up into work that is genuinely still there.
+  static const long kActiveIdleMs = 2000;
   long          last_queue_ms_[kMaxChannels];
+
+  // Raw-video EVENTS, counted before the frame is taken apart.
+  //
+  // delivered_ above cannot answer the question this does, because it is
+  // indexed by a channel number that only exists after DeserializeBaseObject()
+  // and GetRawImage() have both succeeded — an event that arrives and yields no
+  // image is dropped without being counted anywhere, and reads exactly like an
+  // event that never arrived.
+  //
+  // That ambiguity is the whole reason these exist. GroupSPMgrVideoRaw3
+  // (DEF_FULL_RAW) has now been tried in three manifest shapes and produced
+  // 0 fps every time (RAW_VIDEO_LIMITS §2.4, §2.4.1, and 2026-08-05 with
+  // SPMgrVideoRaw_0 added to ReceiverNames). "The firmware does not publish
+  // that group" and "it publishes frames this app fails to unpack" call for
+  // completely different next moves — one closes the raw path, the other is a
+  // bug in this app — and until now nothing here could tell them apart.
+  //
+  // Cheap enough to keep afterwards: two increments per event, and they stay
+  // meaningful for any future source change.
+  unsigned long raw_events_;     // eVideoRawData callbacks entered
+  unsigned long raw_no_image_;   // ...of which produced no RawImage at all
 
   // NOTE: the eVideoConnect / SensorInfo probe that used to live here is gone
   // (2026-08-04). It was an experiment to make the camera state its own raw
@@ -364,6 +404,19 @@ class SampleComponent : public Component, public ISampleComponent {
   // up too: nothing runs in ProcessRawVideo when no frame arrives, so a rate
   // maintained there would freeze at its last healthy value forever.
   static const long kStatsWindowMs = 1000;
+  // How often the allocator is asked to return its spare pages. See the call
+  // site for why this is minutes-scale rather than per window.
+  static const long kTrimIntervalMs = 30000;
+  long          last_trim_ms_;
+
+  // Where the per-frame heap growth is coming from: inside the marker search,
+  // or in what this app does afterwards. Sampled every kHeapProbeEvery frames
+  // so the mallinfo2 calls stay off the per-frame cost. See the probe sites.
+  static const unsigned long kHeapProbeEvery = 10;
+  unsigned long heap_probe_seq_;   // frames offered since start, for the modulo
+  unsigned long heap_probe_n_;     // probes actually completed
+  long long     heap_detect_bytes_;
+  long long     heap_rest_bytes_;
   long          stats_sample_ms_;     // 0 = no baseline yet; rates read -1
   double        stats_window_s_;      // interval the cached figures cover
   double        cpu_pct_;             // cached; -1 = not measurable yet

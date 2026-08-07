@@ -1,6 +1,50 @@
 #ifndef APP_CONFIG_H
 #define APP_CONFIG_H
 
+#include <stddef.h>
+#include <string.h>
+
+/**
+ * Copy `src` into `dst` without ever splitting a UTF-8 character.
+ *
+ * Lives in this header, which is otherwise only knobs, because it is needed by
+ * three translation units and adding a header of its own for eight lines costs
+ * more than it saves — a new source file is also the one change this project's
+ * build reliably fails on the first attempt (vboxsf + CMake, see build_install).
+ *
+ * snprintf("%s") truncates on a BYTE boundary. Every operator-facing message
+ * here is Korean, so a byte boundary has a two-in-three chance of landing
+ * inside a character, and these buffers are copied verbatim into /status. Half
+ * a character there is not cosmetic: the response stops being valid UTF-8,
+ * JSON.parse throws, and the dashboard loses EVERY field rather than one — the
+ * camera looks dead from a page that cannot say why.
+ *
+ * Measured 2026-08-05: two messages already overflowed their 128-byte buffer
+ * (142 B and 193 B). Both happened to cut on ASCII, which is luck, not design;
+ * editing one word inside either moves the cut.
+ *
+ * UTF-8 continuation bytes are 10xxxxxx. If the first byte we are NOT copying
+ * is one, the character it belongs to began earlier and would be left half
+ * written, so walk back to its lead byte and drop the whole thing.
+ */
+static inline void CopyUtf8(char* dst, size_t dst_size, const char* src) {
+  if (dst == NULL || dst_size == 0) return;
+  if (src == NULL) {
+    dst[0] = '\0';
+    return;
+  }
+  size_t n = 0;
+  while (src[n] != '\0' && n + 1 < dst_size) ++n;
+  // Only when the string actually got cut. A string that ended on its own is
+  // complete by definition, and walking back from its terminator would eat a
+  // character that fitted.
+  if (src[n] != '\0') {
+    while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) --n;
+  }
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
 /**
  * Minimal config for the marker-detection-only port (ArucoPosePNM).
  *
@@ -51,6 +95,13 @@
 // Shown by /status so "which build is actually on the camera right now" has an
 // answer. Bump by hand on anything worth telling apart; the build timestamp
 // next to it comes from __DATE__/__TIME__ and moves on its own.
+//
+// That timestamp is in UTC, because the compiler runs inside the SDK docker
+// image and the image is UTC while the host is KST. So a build made at 09:01
+// local reports 00:01 — nine hours EARLIER, which reads exactly like a stale
+// install that failed to take. Compare it against `date -u`, not `date`.
+// (2026-08-06: this cost a round of stop/install/start debugging chasing an
+// install that had in fact worked the first time.)
 #ifndef APP_VERSION
 #define APP_VERSION "0.3.0"
 #endif
