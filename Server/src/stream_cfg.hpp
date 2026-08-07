@@ -26,13 +26,41 @@ struct StreamCfg {
     std::string base;
     // 채널 수. 0이면 LOGIN_OK에 싣지 않고 QT가 자기 기본값(4)을 쓴다.
     int channels = 0;
+    // 중계를 쓸지. false면 base가 적혀 있어도 그 주소를 싣지 않고, 대신
+    // {"enabled":false}를 명시적으로 내려보낸다 (아래 toJson 주석 참고).
+    //
+    // 왜 "파일을 지운다"가 아니라 플래그인가: 중계를 껐다 켜는 건 되돌릴 수 있어야
+    // 하는데, 파일을 지우면 다시 켤 때 주소를 어디서 가져올지 아무도 모른다.
+    // base는 남겨두고 이 플래그만 뒤집으면 왕복이 한 줄로 끝난다.
+    // (relay/README.md의 "되돌리려면 프로세스만 죽이면 된다" 원칙과 같은 결.)
+    // ⚠️ 이 플래그는 **서버가 주소를 알려줄지**만 정한다. 중계 프로세스(MediaMTX)를
+    //    띄우고 내리는 것은 별개다 - relay/start.sh 를 손으로 실행해야 한다.
+    bool enabled = true;
+    // 설정 파일을 실제로 읽었는가. "파일이 없다(= 서버가 모른다)"와 "파일이 있고
+    // 중계를 끄기로 했다"를 구분하기 위한 것 - 전자는 LOGIN_OK에 stream을 아예
+    // 안 싣고, 후자는 {"enabled":false}를 싣는다. QT는 이 둘을 다르게 처리한다
+    // (전자: 자기 설정 유지 / 후자: 저장된 중계 주소 해제).
+    bool present = false;
 
-    bool valid() const { return !base.empty(); }
+    // 중계 주소를 내려보낼 수 있는 상태인가.
+    bool valid() const { return enabled && !base.empty(); }
+    // LOGIN_OK.stream 을 실어야 하는가. 끄기로 한 것도 "알려줄 내용"이므로 싣는다.
+    // 파일이 없거나(모름), 켰는데 base가 비어 있으면(주소를 모름) 안 싣는다.
+    bool shouldSend() const { return valid() || (present && !enabled); }
 
     // LOGIN_OK.stream 에 실을 형태. channels는 0이면 생략한다 - "모른다"와
     // "0채널이다"를 구분해야 QT가 기본값으로 넘어갈 수 있다.
+    //
+    // 🔴 enabled=false면 base를 **빼고** 보낸다 (QT-REQ 2026-08-07 회신, 제안 A).
+    //    QT는 "stream 없음 = 서버가 모름 → 내 설정 유지"와 "enabled=false =
+    //    중계 끔 → 저장된 relayBase 해제"를 구분한다. 예전처럼 필드를 생략하면
+    //    QT의 QSettings에 남은 옛 중계 주소가 계속 이겨서, 중계를 내려도
+    //    클라이언트가 죽은 8554로 계속 접속을 시도한다(PC마다 손으로 [비우기]를
+    //    눌러야 했다). base를 같이 안 보내는 이유는 "끄라"는 지시에 주소가 붙으면
+    //    QT가 어느 쪽을 따라야 할지 애매해지기 때문이다.
     json toJson() const {
-        json j{{"base", base}};
+        if (!enabled) return json{{"enabled", false}};
+        json j{{"enabled", true}, {"base", base}};
         if (channels > 0) j["channels"] = channels;
         return j;
     }
@@ -49,9 +77,13 @@ inline StreamCfg loadStreamCfg(const std::string& file) {
     if (!f) return c;  // 중계를 안 쓰는 현장 - 파일이 없는 게 정상이다
     json j = json::parse(f, nullptr, false);
     if (!j.is_object()) {
+        // present는 세우지 않는다 - 깨진 파일은 "설정을 못 읽었다"이지 "중계를
+        // 끄기로 했다"가 아니다. enabled=false를 잘못 내려보내면 QT가 멀쩡한
+        // 중계 주소를 지워버린다.
         logf("[WARN] 중계 스트림 설정 파싱 실패, 무시: %s", file.c_str());
         return c;
     }
+    c.present = true;
     if (j.contains("base") && j["base"].is_string())
         c.base = j["base"].get<std::string>();
     // 끝의 '/'는 떼어낸다. QT가 "{base}/ch1"로 조립하므로 남아 있으면 "//ch1"이
@@ -60,5 +92,12 @@ inline StreamCfg loadStreamCfg(const std::string& file) {
     if (j.contains("channels") && j["channels"].is_number_integer())
         c.channels = j["channels"].get<int>();
     if (c.channels < 0) c.channels = 0;  // 음수는 "미지정"과 같이 취급
+    // 키가 없으면 true - 이 플래그가 생기기 전에 만들어진 stream.json 은 "쓰려고
+    // 만든 파일"이므로 그대로 켜진 채로 읽혀야 한다.
+    if (j.contains("enabled") && j["enabled"].is_boolean())
+        c.enabled = j["enabled"].get<bool>();
+    if (!c.enabled && !c.base.empty())
+        logf("[INFO] 중계 주소가 있으나 enabled=false - QT에 끄라고 알림 (직결 모드): %s",
+             c.base.c_str());
     return c;
 }

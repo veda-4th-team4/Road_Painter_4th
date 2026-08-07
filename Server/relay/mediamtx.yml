@@ -104,31 +104,24 @@ paths:
     sourceOnDemandCloseAfter: 10s
 
   # --- 서브스트림 (2x2 미리보기용) ------------------------------------------
-  # 채널당 저해상도 스트림. 2x2 로 4개를 늘어놓으면 한 칸이 1920x1080 화면에서
-  # 960x540 정도라, 2592x1520 메인스트림을 받아봐야 줄여서 그리게 된다 — 눈에
-  # 안 보이는 화질을 위해 클라이언트 CPU 를 태우는 셈이다. 미리보기는 이쪽을
-  # 쓰고, 선택해서 크게 볼 때만 위의 ch1~ch4 로 붙는다.
+  # 2026-08-04 확인: 이 카메라(PNM-C16083RVQ, 현재 프로파일)에는 별도 저해상도
+  # 프로파일이 없다 (Client/src/backend.h:503 참고). cameras.env 에도 그래서
+  # CH1S~CH4S_SOURCE 를 안 채워놨다 — 예전처럼 source: publisher 로 남겨두면
+  # sourceOnDemand: true 와 조합이 잘못됐다며 MediaMTX 가 기동 자체를 거부한다
+  # ('sourceOnDemand' is useless when source is 'publisher', 2026-08-07 확인,
+  # 이 때문에 ch1~ch4 포함 relay 전체가 안 떴었다).
+  # 그래서 카메라를 또 안 당기고, 이미 열려 있는 메인 스트림으로 리다이렉트만
+  # 한다. Client 는 지금도 미리보기에 /chNs 를 그대로 요청한다
+  # (Client/src/backend.cpp:1896-1898, 아직 안 고쳐짐).
   ch1s:
-    source: publisher
-    rtspTransport: tcp
-    sourceOnDemand: true
-    sourceOnDemandStartTimeout: 10s
-    sourceOnDemandCloseAfter: 10s
+    source: redirect
+    sourceRedirect: /ch1
   ch2s:
-    source: publisher
-    rtspTransport: tcp
-    sourceOnDemand: true
-    sourceOnDemandStartTimeout: 10s
-    sourceOnDemandCloseAfter: 10s
+    source: redirect
+    sourceRedirect: /ch2
   ch3s:
-    source: publisher
-    rtspTransport: tcp
-    sourceOnDemand: true
-    sourceOnDemandStartTimeout: 10s
-    sourceOnDemandCloseAfter: 10s
+    source: redirect
+    sourceRedirect: /ch3
   ch4s:
-    source: publisher
-    rtspTransport: tcp
-    sourceOnDemand: true
-    sourceOnDemandStartTimeout: 10s
-    sourceOnDemandCloseAfter: 10s
+    source: redirect
+    sourceRedirect: /ch4
