@@ -128,17 +128,18 @@ void ServerClient::sendBlueprint(const QList<QPointF> &meterPoints,
         pts.append(pair);
     }
     QJsonObject p; p["points"] = pts;
-    // paint 는 points 와 길이가 같을 때만 싣는다 — 어긋난 배열을 보내면 서버가
-    // 도면 전체를 버리므로(bad_points) 애매한 값은 아예 빼는 편이 안전하다.
+    // paint 는 points 와 길이가 같을 때만 싣는다. 서버는 길이가 다르면 경고 후
+    // 전 구간 도색으로 fallback하므로, 모호한 배열을 보내지 않고 생략한다.
+    // 정상 Qt 경로 생성에서는 항상 points와 같은 길이로 만든다.
     if (paint.size() == meterPoints.size() && !paint.isEmpty()) {
         QJsonArray flags;
         for (bool b : paint) flags.append(b);
         p["paint"] = flags;
     }
-    // 동작 시퀀스 — 서버는 이걸 로봇에 그대로 중계하고, CCTV 보정만 담당한다.
+    // 도면 기준 논리 동작 — 서버 v2가 로봇 op으로 변환한다.
     //
     // ⚠️ 프로토콜에 **없는 필드는 절대 싣지 않는다** (v0.3 §program op 규약):
-    //    · pen_offset_m — 2026-07-28 폐지. 펜 오프셋 보정은 로봇 전담.
+    //    · pen_offset_m — 폐지. 펜 오프셋 보정은 서버 v2와 로봇 실행부 전담.
     //    · pivot        — 폐지. program 은 도면 그대로의 논리 동작만.
     //    · speed_mps / speed_dps — "속도는 프로토콜에 없다"(로봇 펌웨어 고정값).
     //      Op::speed 는 화면 미리보기·예상시간 계산용 로컬 값으로만 남는다.
@@ -148,7 +149,7 @@ void ServerClient::sendBlueprint(const QList<QPointF> &meterPoints,
             QJsonObject j;
             j["op"] = o.opName();
             j["v"] = o.vertex;                 // 필수 — 없으면 서버가 program 전체를 거부
-            // heading_deg 는 공통 필드다: "이 동작 후 로봇이 **바라보는** 절대 방위"
+            // heading_deg: MOVE=진행 방향, TURN=회전 후 방향, ARC=진입 접선(CCW+).
             j["heading_deg"] = std::round(o.heading * 10.0) / 10.0;
             switch (o.kind) {
             case motionprogram::Op::Move:

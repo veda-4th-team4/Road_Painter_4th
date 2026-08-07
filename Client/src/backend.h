@@ -119,7 +119,7 @@ class Backend : public QObject
     // 로봇 도장 폭 (mm) — 고정 사양이지만 기체가 바뀌면 조정
     Q_PROPERTY(double strokeWidthMm READ strokeWidthMm WRITE setStrokeWidthMm NOTIFY strokeWidthChanged)
     // ⚠️ penOffsetMm / penOffsetFromServer 는 지웠다 — BLUEPRINT.pen_offset_m 이
-    //    2026-07-28 프로토콜에서 폐지되고 펜 오프셋 보정이 로봇 전담이 됐다.
+    //    프로토콜에서 폐지되고 펜 오프셋 보정이 서버 v2/로봇 전담이 됐다.
     //    전송에서 빠진 뒤로는 설정창에서 값만 받아두고 아무 데도 쓰이지 않았다.
     // 로봇 속도 — 도색 중에는 도료가 고르게 깔려야 해서 이동보다 느리다
     Q_PROPERTY(double travelSpeedMps READ travelSpeedMps WRITE setTravelSpeedMps NOTIFY speedChanged)
@@ -298,8 +298,8 @@ public:
     Q_INVOKABLE int  pathPointCount() const;
     Q_INVOKABLE void commitDrawing();     // BLUEPRINT 전송 → 로봇 접근 단계
     Q_INVOKABLE void startPainting();     // CMD START_DRAW → 도색 시작
-    // 진행 중 작업 취소 (CMD ABORT_DRAW). ESTOP 과 달리 서버·로봇이 경로를 버리므로
-    // ESTOP 해제를 해도 도색이 재개되지 않는다. 도면은 서버에 남는다.
+    // 현재 서버 v2에는 경로 폐기 명령이 없다. 실행 중에는 ESTOP만 요청하고
+    // 실제로 취소되지 않은 작업을 UI에서 폐기한 것처럼 표시하지 않는다.
     Q_INVOKABLE void cancelJob();
     Q_INVOKABLE void editMission();       // 전송한 경로를 다시 편집 상태로
     Q_INVOKABLE void finishDrawing();
@@ -510,6 +510,8 @@ private:
     int m_channelCount = 4;
     int m_highlightedCh = 0;   // 클릭한 채널 (0 = 없음)
     int m_workingCh = 0;       // 작업 중인 채널 (0 = 그리드 화면)
+    quint64 m_channelRequestSerial = 0;
+    bool m_channelAckPending = false;
     // LOGIN_OK.calibs / CHANNEL_OK 로 받은 채널별 번들. 키는 채널 번호 문자열.
     // "어느 채널이 캘리 됐는지"를 그리드에 표시하고, 채널 전환 시 그 번들을 적용한다.
     QJsonObject m_calibs;

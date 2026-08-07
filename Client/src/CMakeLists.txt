@@ -98,3 +98,12 @@ target_link_libraries(RoadPainterQml PRIVATE
     Qt6::Gui
     ${OpenCV_LIBS}
 )
+
+option(ROADPAINTER_BUILD_TESTS "Build deterministic path-generation regression tests" OFF)
+if (ROADPAINTER_BUILD_TESTS)
+    enable_testing()
+    add_executable(motionprogram_tests tests/motionprogram_tests.cpp)
+    target_include_directories(motionprogram_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(motionprogram_tests PRIVATE Qt6::Core Qt6::Gui)
+    add_test(NAME motionprogram_tests COMMAND motionprogram_tests)
+endif()
