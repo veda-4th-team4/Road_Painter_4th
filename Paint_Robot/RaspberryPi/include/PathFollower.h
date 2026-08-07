@@ -95,6 +95,11 @@ public:
      */
     bool IsMovingStraight() const { return is_moving_straight; }
 
+    /**
+     * @brief Checks if an arc motion is currently in progress.
+     */
+    bool IsArc() const { return is_arc; }
+
 private:
     std::vector<Segment_t> path;
     size_t current_waypoint_idx;

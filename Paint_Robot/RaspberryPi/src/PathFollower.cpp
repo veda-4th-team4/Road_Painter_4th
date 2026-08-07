@@ -27,7 +27,8 @@ void PathFollower::SetPath(const std::vector<Segment_t> &new_path) {
   drift_offset_deg = 0.0f;
   is_turning = false;
   is_moving_straight = false;
-  std::cout << "[PathFollower] Path loaded with " << path.size() << " segments."
+  is_arc = false;
+  std::cout << GetTimestampStr() << "[PathFollower] Path loaded with " << path.size() << " segments."
             << std::endl;
 }
 

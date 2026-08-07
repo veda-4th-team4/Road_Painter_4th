@@ -135,8 +135,8 @@ int main(int argc, char **argv) {
        }
 
         if (has_pending_path) {
-           // Apply new PATH only when robot is at a standstill (not in middle of active straight move or turn)
-           if (path_follower.IsPathFinished() || (!path_follower.IsMovingStraight() && !path_follower.IsTurning())) {
+           // Apply new PATH only when robot is at a standstill (not in middle of active straight move, turn, or arc)
+           if (path_follower.IsPathFinished() || (!path_follower.IsMovingStraight() && !path_follower.IsTurning() && !path_follower.IsArc())) {
                path_follower.SetPath(pending_path);
                waiting_for_go = false;
                ready_seg_sent = 0xFFFFFFFF;
@@ -324,7 +324,7 @@ int main(int argc, char **argv) {
                               path_follower.AdvanceSegment();
                           }
                       } else if (current_seg.op == "arc") {
-                          if (!path_follower.IsMovingStraight()) {
+                          if (!path_follower.IsArc()) {
                               path_follower.StartArc(current_seg.radius_m, current_seg.angle_deg, current_seg.direction, l_steps, r_steps);
                           }
 
