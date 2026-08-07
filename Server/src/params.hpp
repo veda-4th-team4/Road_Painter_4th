@@ -28,8 +28,8 @@ using json = nlohmann::json;
     /* ---- 기하 (로봇 하드웨어 실측값) ---- */                                \
     X(double, pen_offset_m, 0.155,                                             \
       "펜(노즐)이 마커 중심 뒤로 떨어진 거리 a. 로봇 PathFollower.h와 같아야 함")\
-    X(double, wheel_base_m, 0.167,                                             \
-      "좌우 바퀴 축간거리 W. arc 안쪽바퀴 역회전 경고 판정에만 사용")          \
+    X(double, wheel_base_m, 0.166,                                             \
+      "좌우 바퀴 축간거리 W(로봇팀 실측). arc 안쪽바퀴 역회전 경고 판정에만 사용")\
     X(double, min_paint_radius_m, 0.155,                                       \
       "도색 가능한 최소 펜 반지름. 이론 하한 = a. 미만이면 도면 거부")         \
     /* ---- ALIGN (turn 직후 각도 정렬) ---- */                                \
