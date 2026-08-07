@@ -179,6 +179,7 @@ void PathFollower::StartArc(float radius_m, float angle_deg,
                             int32_t start_r_steps) {
   is_arc = true;
   bool is_left = (direction == "left");
+  arc_is_left = is_left;
 
   float r_robot = radius_m;
   float r_left =
@@ -197,7 +198,7 @@ void PathFollower::StartArc(float radius_m, float angle_deg,
   arc_start_r_steps = start_r_steps;
 
   float base_sps = 771.65f; // 0.05 m/s base speed
-  const float kMinArcRadius = 1e-3f;
+  const float kMinArcRadius = 2e-3f; // 2mm threshold to prevent UB division overflow
   if (std::fabs(r_robot) < kMinArcRadius) {
       arc_sps_l = is_left ? static_cast<int16_t>(-base_sps) : static_cast<int16_t>(+base_sps);
       arc_sps_r = is_left ? static_cast<int16_t>(+base_sps) : static_cast<int16_t>(-base_sps);
@@ -206,7 +207,7 @@ void PathFollower::StartArc(float radius_m, float angle_deg,
       arc_sps_r = static_cast<int16_t>(base_sps * (r_right / r_robot));
   }
 
-  std::cout << "[PathFollower ARC] StartArc: R_paint=" << radius_m
+  std::cout << GetTimestampStr() << "[PathFollower ARC] StartArc: R_paint=" << radius_m
             << "m -> R_robot=" << r_robot << "m | angle=" << angle_deg
             << " deg (" << direction << ") | SPS_L=" << arc_sps_l
             << ", SPS_R=" << arc_sps_r << std::endl;
@@ -220,12 +221,15 @@ bool PathFollower::UpdateArc(int32_t cur_l_steps, int32_t cur_r_steps,
   int32_t dl = std::abs(cur_l_steps - arc_start_l_steps);
   int32_t dr = std::abs(cur_r_steps - arc_start_r_steps);
 
-  if (static_cast<uint32_t>(dl) >= arc_target_l_steps ||
-      static_cast<uint32_t>(dr) >= arc_target_r_steps) {
+  // Outer wheel completion evaluation: Prevents premature termination when r_in ~ 0
+  bool outer_completed = arc_is_left ? (static_cast<uint32_t>(dr) >= arc_target_r_steps)
+                                     : (static_cast<uint32_t>(dl) >= arc_target_l_steps);
+
+  if (outer_completed) {
     out_speed.left_sps = 0;
     out_speed.right_sps = 0;
     is_arc = false;
-    std::cout << "[PathFollower ARC] Arc motion completed!" << std::endl;
+    std::cout << GetTimestampStr() << "[PathFollower ARC] Arc motion completed!" << std::endl;
     return true;
   }
 

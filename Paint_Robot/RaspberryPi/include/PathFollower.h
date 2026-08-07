@@ -114,6 +114,7 @@ private:
 
     // Arc tracking state
     bool is_arc;
+    bool arc_is_left;
     uint32_t arc_target_l_steps;
     uint32_t arc_target_r_steps;
     int32_t arc_start_l_steps;
