@@ -3,7 +3,7 @@
 
   "_1_기하": "로봇 하드웨어 실측값. pen_offset_m은 로봇 PathFollower.h NOZZLE_OFFSET_M과 반드시 같아야 한다 - 자동 동기화되지 않는다",
   "pen_offset_m": 0.155,
-  "wheel_base_m": 0.167,
+  "wheel_base_m": 0.166,
   "min_paint_radius_m": 0.155,
 
   "_2_ALIGN": "turn 직후 각도 정렬. 임계값 4.0은 v1 현장 튜닝값(로봇 1틱 오버슛 1.42도 + 마커 코너 노이즈 0.7도). 로봇이 감속 접근으로 오버슛을 줄이면 내릴 것",
