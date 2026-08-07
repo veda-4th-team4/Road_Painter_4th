@@ -360,10 +360,13 @@ bool Router::needsAlign(int k, double& targetCcw) const {
     if (k == 0 && activePhase_ == "draw") {
         // 경로 맨 앞은 보통 오프셋 move(+a)다. 그 전진이 첫 도색 방향과
         // 어긋나면 펜이 시작점 정중앙에 안 떨어지므로 여기서 미리 맞춘다.
-        // 앞쪽에 path turn이 먼저 오면 정렬해봐야 그 turn이 다시 돌리므로 건너뛴다.
+        // 앞쪽에 turn이 먼저 오면 정렬해봐야 그 turn이 다시 돌리므로 건너뛴다.
+        // 🔴 role은 보지 않는다. 호 진입 위상 보정 turn(φ)은 role=offset인데,
+        //   그걸 건너뛰고 뒤 op의 방위로 정렬하면 그 turn이 φ를 한 번 더 더해
+        //   정확히 φ만큼 과회전한 채로 호에 들어간다.
         for (const OpMeta& m : activeMeta_) {
             if (m.op == "nozzle") continue;
-            if (m.isPath && m.op == "turn") return false;
+            if (m.op == "turn") return false;
             if (hasHeading(m.headingDeg)) {
                 targetCcw = m.headingDeg;
                 return true;
@@ -736,11 +739,7 @@ void Router::startApproach() {
     //   직선 방향으로 계산하면 첫 동작이 ARC일 때 크게 어긋난다 - 호의 진입
     //   접선은 시작점과 끝점을 잇는 현(弦)의 방향이 아니기 때문이다
     //   (반원이면 정확히 90도 차이가 난다. 실측으로 확인됨).
-    double first = 1e9;
-    for (const auto& q : planProgram_) {
-        first = q.value("heading_deg", 1e9);
-        if (hasHeading(first)) break;
-    }
+    double first = firstEntryHeading(planProgram_);
     if (!hasHeading(first))  // program이 없거나 heading이 없으면 직선으로 폴백
         first = std::atan2(planPts_[1][1] - planPts_[0][1],
                            planPts_[1][0] - planPts_[0][0]) * 180.0 / M_PI;

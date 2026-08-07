@@ -176,6 +176,9 @@
 //       - paint=true인 ARC의 radius_m이 params().min_paint_radius_m보다 작으면
 //         서버가 도면을 거부한다 (DRAW_FAIL reason="arc_too_tight"). 노즐이
 //         그릴 수 있는 최소 원의 반지름이 곧 펜 오프셋 0.155m이기 때문.
+//       - 🔴 도색 ARC는 차체가 접선을 향하면 안 된다. 서버가 진입 앞뒤에
+//         turn(±φ) 오프셋 op을 끼워 넣는다 (φ = atan(0.155 / R_robot),
+//         docs/PROTOCOL_v2_ROBOT.md §5.7). Qt는 도면 그대로의 값만 주면 된다.
 //     공통 v     : 필수. 이 op가 "출발하는" 도면 꼭짓점 index.
 //       v2에서는 MORE(주행 거리 보정)의 목표 좌표를 여기서 얻는다: 방금 끝낸
 //       주행 op의 "도착" 꼭짓점 = 그다음 op의 v. 추측항법으로 누적하지 않고

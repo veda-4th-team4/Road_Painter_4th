@@ -112,7 +112,10 @@ int main(int argc, char** argv) {
                                {"angle_deg", 180.0},
                                {"direction", "right"},
                                {"paint", true},
-                               {"heading_deg", 0.0}});
+                               // heading_deg = "이 op을 마쳤을 때" 방위 =
+                               // 출구 접선. 진입 접선 0도에서 우회전 180도를
+                               // 쓸었으니 180도다 (서버가 진입 접선을 역산한다).
+                               {"heading_deg", 180.0}});
         }
     }
 
