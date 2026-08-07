@@ -74,14 +74,7 @@ int main(int argc, char **argv) {
               manual_nozzle = 0;
               auto_nozzle = 0;
               robot_comm.SendControlNozzle(0);
-              path_follower.SetPath({});
-              has_pending_path = false;
-              pending_path.clear();
-              waiting_for_go = false;
-              ready_seg_sent = 0xFFFFFFFF;
-              path_done_sent = false;
-              net_manager.ClearLatches();
-          } else if (cmd == "ABORT_DRAW" || cmd == "CANCEL_DRAW" || cmd == "STOP") {
+          } else if (cmd == "ABORT_DRAW" || cmd == "CANCEL_DRAW") {
               std::cout << GetTimestampStr() << "[MAIN] [ABORT] Aborting active path execution and stopping robot." << std::endl;
               manual_override = false;
               manual_speed = {0, 0};
@@ -94,8 +87,11 @@ int main(int argc, char **argv) {
               pending_path.clear();
               waiting_for_go = false;
               ready_seg_sent = 0xFFFFFFFF;
-              path_done_sent = false;
+              path_done_sent = true; // A-3: Prevent false PATH_DONE reporting
               net_manager.ClearLatches();
+          } else if (cmd == "STOP") { // A-4: STOP only clears manual speed
+              manual_speed = {0, 0};
+              robot_comm.SendSetSpeed(0, 0);
           } else if (cmd == "RESUME") {
               robot_comm.SendClearEStop();
               manual_override = false;

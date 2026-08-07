@@ -197,8 +197,14 @@ void PathFollower::StartArc(float radius_m, float angle_deg,
   arc_start_r_steps = start_r_steps;
 
   float base_sps = 771.65f; // 0.05 m/s base speed
-  arc_sps_l = static_cast<int16_t>(base_sps * (r_left / r_robot));
-  arc_sps_r = static_cast<int16_t>(base_sps * (r_right / r_robot));
+  const float kMinArcRadius = 1e-3f;
+  if (std::fabs(r_robot) < kMinArcRadius) {
+      arc_sps_l = is_left ? static_cast<int16_t>(-base_sps) : static_cast<int16_t>(+base_sps);
+      arc_sps_r = is_left ? static_cast<int16_t>(+base_sps) : static_cast<int16_t>(-base_sps);
+  } else {
+      arc_sps_l = static_cast<int16_t>(base_sps * (r_left / r_robot));
+      arc_sps_r = static_cast<int16_t>(base_sps * (r_right / r_robot));
+  }
 
   std::cout << "[PathFollower ARC] StartArc: R_paint=" << radius_m
             << "m -> R_robot=" << r_robot << "m | angle=" << angle_deg
