@@ -65,11 +65,19 @@ struct TravelGeom {
     double rRobot = 0.0;            // 로봇에 실어 보낼 반지름 (arc 전용)
 };
 
-// 🔴 Qt의 heading_deg는 "이 op을 **마쳤을 때** 바라보는 절대 방위"다
-//   (Client/src/motionprogram.h Op::heading). MOVE/TURN은 진입과 출구가 같아
-//   구분이 필요 없지만, 호는 스윕만큼 다르다 - 진입 접선은 여기서 역산한다.
-//   예전에는 서버가 이 값을 진입 접선으로 읽어, 부분호에서 ALIGN 목표와 MORE
-//   투영축이 통째로 스윕만큼 돌아가 있었다 (온전한 원은 360도라 우연히 맞았다).
+// 🔴 ARC의 heading_deg는 "호에 **진입할 때**의 접선"이다 (2026-08-07 Qt팀과 확정).
+//   MOVE/TURN은 진입과 출구가 같아 구분이 필요 없지만, 호는 스윕만큼 다르므로
+//   출구 접선을 여기서 더해 만든다.
+//
+//   경위: 저장소에 올라와 있는 Qt 코드(7/30, motionprogram.h `a.heading = t1`)는
+//   출구 접선을 보내고 있어서, 그 코드에 맞추려고 한때 서버를 출구 기준으로
+//   바꿨다(91ec2e2). 그 뒤 Qt팀이 "진입 접선으로 이미 수정·검증했다"고 회신해
+//   되돌린 것이다. 접근 단계가 정렬시켜야 할 방위가 곧 진입 접선이므로 계약상
+//   이쪽이 자연스럽다.
+//
+//   ⚠️ Qt의 해당 수정이 저장소에 push되기 전까지는 저장소 코드(출구)와 이
+//   구현(진입)이 어긋난다. 부분호에서 스윕만큼 틀어지므로, 호 도색 통합 시험은
+//   Qt push 확인 후에 잡을 것.
 inline TravelGeom travelGeom(const json& q, bool isPaint, double aM) {
     TravelGeom g;
     const double head = q.value("heading_deg", kNoHeading);
@@ -90,8 +98,8 @@ inline TravelGeom travelGeom(const json& q, bool isPaint, double aM) {
         g.rRobot = rPaint;
     }
     if (!hasHeading(head)) return g;
-    const double tanExit = head;
-    const double tanEntry = normDeg(head - (left ? sweep : -sweep));
+    const double tanEntry = head;
+    const double tanExit = normDeg(head + (left ? sweep : -sweep));
     g.bodyEntry = normDeg(tanEntry + g.phase);
     g.bodyExit = normDeg(tanExit + g.phase);
     return g;
@@ -357,17 +365,13 @@ inline PlannedPath buildDrawOps(const json& program,
 // 접근 경로의 마지막 회전이 이 방향으로 세워두고, 도색 경로의 맨 앞 오프셋
 // 보정(필요하면 turn(φ) 포함)이 거기서부터 이어받는다.
 //
-// 🔴 그냥 첫 heading_deg를 쓰면 안 된다. Qt의 heading_deg는 "마쳤을 때"라
-//   호에서는 출구 접선이다 - 반원이면 정확히 180도 반대 방향으로 접근하게 된다.
-//   위상 φ는 여기서 더하지 않는다. 그건 도색 경로의 turn(φ)가 담당한다.
+// heading_deg가 ARC에서도 진입 접선이므로(travelGeom 위 주석) 첫 주행 op의 값을
+// 그대로 쓰면 된다. 위상 φ는 여기서 더하지 않는다 - 그건 도색 경로 맨 앞의
+// turn(φ)가 담당한다. 접근 단계는 접선까지만 세워두고 넘긴다.
 inline double firstEntryHeading(const json& program) {
     for (const auto& q : program) {
         const double h = q.value("heading_deg", kNoHeading);
-        if (!hasHeading(h)) continue;
-        if (q.value("op", "") != "ARC") return h;
-        const double sweep = std::fabs(q.value("angle_deg", 0.0));
-        const bool left = (q.value("direction", "left") != "right");
-        return normDeg(h - (left ? sweep : -sweep));
+        if (hasHeading(h)) return h;
     }
     return kNoHeading;
 }
