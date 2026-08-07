@@ -1,12 +1,11 @@
 # 로봇팀 전달 사항 (2026-08-07) — ARC 완주 불가 + ESTOP 오보고
 
-**대조 기준**: 로봇 `feature/server-driven-v2` @ `bce553f` (2026-08-06 17:38) 실제 코드
-**서버 기준**: 같은 브랜치 @ `3d57ec6`
+**대조 기준**: 로봇 `feature/server-driven-v2` @ `d3b6ec1` (2026-08-07) 실제 코드
 **정본 규격**: `PROTOCOL_v2_ROBOT.md`
 
-> **결론 한 줄**: `ABORT_DRAW` 구현은 정확합니다. 다만 같은 커밋에서 `ESTOP`도 경로를
-> 지우게 되면서 **ESTOP → RESUME 하면 Qt에 "도색 완료"가 뜨고**, `arc`는 상태 가드가
-> 어긋나 **영원히 끝나지 않습니다.** 아래 A-1~A-3이 P0입니다.
+> **결론 한 줄**: `d3b6ec1`로 **A-1(`arc` 상태 가드)이 해결된 것을 확인했습니다.**
+> 저희가 요청드리려던 것보다 더 꼼꼼합니다 — 감사합니다. 남은 것은 `ESTOP`이 경로를
+> 지워서 **ESTOP → RESUME 하면 Qt에 "도색 완료"가 뜨는** 문제(A-2, A-3)입니다.
 
 ---
 
@@ -23,11 +22,11 @@
 
 | # | 항목 | 우선도 | 위치 | 한 줄 |
 |---|---|---|---|---|
-| A-1 | `arc` 상태 가드 어긋남 | **P0** | `main.cpp:327` | 호가 영원히 안 끝난다 |
+| A-1 | `arc` 상태 가드 어긋남 | ✅ **해결** | — | `d3b6ec1`에서 처리됨 |
 | A-2 | `ESTOP`이 경로를 지움 | **P0** | `main.cpp:70~83` | RESUME하면 "도색 완료"가 오보고된다 |
 | A-3 | 취소 후 `path_done_sent` | **P0** | `main.cpp:97` | 한 글자. 같은 오보고 |
 | A-4 | `STOP`이 `ABORT_DRAW`에 합쳐짐 | P1 | `main.cpp:84` | 조이스틱 떼면 경로가 날아간다 |
-| A-5 | `R_robot = 0`에서 0으로 나눗셈 | P1 | `PathFollower.cpp:199` | 최소 반지름 원에서 속도가 미정의 |
+| A-5 | `R_robot = 0`에서 0으로 나눗셈 | P1 | `PathFollower.cpp:200` | 최소 반지름 원에서 속도가 미정의 |
 
 ---
 
@@ -41,85 +40,49 @@
 | **부호 규약** | `turn` op / `ALIGN` / `DRIFT` / `MORE` 네 경로 모두 서버 CCW ↔ 로봇 "양수=오른쪽" 변환이 맞습니다. 이중 반전 없습니다 |
 | **`radius_draw_m` 무시** | 규격대로입니다. 로봇은 `radius_m`만 보면 됩니다 |
 | **축간거리 0.166** | `calibration_test.cpp` 실측값 확인했습니다 (§3 참고) |
+| **`arc` 상태 가드 (`d3b6ec1`)** | 아래 A-1 참고. 요청드리려던 것보다 처리 범위가 넓습니다 |
 
 ---
 
-## A-1. 🔴 `arc` op이 영원히 끝나지 않습니다 (P0)
+## A-1. ✅ `arc` op이 영원히 끝나지 않던 문제 — **해결 확인**
 
-### 증상
+`d3b6ec1 fix(rpi-robot): add IsArc() status check and reset logic for arc segment execution`
 
-`arc` op에서 `PATH_DONE`이 오지 않고 로봇이 계속 같은 속도로 돕니다.
+원인은 `main.cpp`의 `arc` 분기가 `IsMovingStraight()`를 보는데 `StartArc()`는 `is_arc`를
+세우는 것이었습니다. 가드가 항상 참이라 20ms마다 `StartArc()`가 재호출되고
+`arc_start_l_steps`가 매번 현재값으로 리셋돼 누적 거리가 쌓이지 않았습니다.
 
-### 원인 — 가드가 다른 상태변수를 봅니다
+### 적용된 수정 — 확인했습니다
 
-`main.cpp:326-328`
+| 위치 | 내용 |
+|---|---|
+| `PathFollower.h` | `IsArc()` 접근자 추가 |
+| `main.cpp:327` | `!IsMovingStraight()` → `!IsArc()` |
+| `PathFollower.cpp` `SetPath()` | `is_arc = false` 리셋 추가 |
+| `main.cpp:139` | 새 PATH 수락 가드에 `&& !IsArc()` 추가 |
 
-```cpp
-} else if (current_seg.op == "arc") {
-    if (!path_follower.IsMovingStraight()) {          // ← is_moving_straight 를 본다
-        path_follower.StartArc(...);
-    }
-```
+**뒤의 두 개는 저희가 요청드리지 않은 것인데, 넣으신 게 맞습니다.**
 
-그런데 `StartArc()`가 세우는 것은 `is_arc`입니다 (`PathFollower.cpp:179`):
+- `SetPath()`의 `is_arc = false` — 호 도중에 `ABORT_DRAW`가 오면 `is_arc`가 `true`로
+  남아, 다음 경로의 첫 `arc`에서 `StartArc()`가 아예 호출되지 않고 **이전 호의 속도·목표
+  스텝을 그대로 이어 돕니다.** 리셋이 없으면 이 경로가 살아 있었습니다.
+- 새 PATH 수락 가드 — 호 주행 중에 새 경로가 들어오면 중간에 갈아타 버립니다.
+  `move`/`turn`만 막고 `arc`는 안 막고 있었습니다.
 
-```cpp
-void PathFollower::StartArc(...) {
-  is_arc = true;                 // ← is_moving_straight 는 건드리지 않는다
-```
+### 남은 확인 하나
 
-`is_moving_straight`는 계속 `false`이므로 `!IsMovingStraight()`가 **항상 참**입니다.
-그래서 20ms 루프마다 `StartArc()`가 다시 호출되고, 그때마다
-
-```cpp
-arc_start_l_steps = start_l_steps;    // 현재 스텝값으로 리셋
-arc_start_r_steps = start_r_steps;
-```
-
-시작점이 현재 위치로 갱신됩니다. `UpdateArc()`의 누적 거리
+`UpdateArc()`가 완주 시 `is_arc = false`로 내리는 것은 확인했습니다. 다만 **호 완주 판정이
+좌우 중 하나라도 목표 스텝에 도달하면 종료**되는 구조입니다:
 
 ```cpp
-int32_t dl = std::abs(cur_l_steps - arc_start_l_steps);   // 항상 0 근처
+if (static_cast<uint32_t>(dl) >= arc_target_l_steps ||
+    static_cast<uint32_t>(dr) >= arc_target_r_steps) {
 ```
 
-가 절대 쌓이지 않아 종료 조건에 도달하지 못합니다.
-
-### 근본 원인 — `IsArc()` 접근자가 없습니다
-
-`include/PathFollower.h`에 `is_arc`(111행)는 있는데 접근자가 없습니다:
-
-```cpp
-bool IsTurning() const { return is_turning; }              // 64행
-bool IsMovingStraight() const { return is_moving_straight; }  // 96행
-// IsArc() 없음  ← 그래서 main.cpp 가 IsMovingStraight() 를 대신 쓴 것으로 보입니다
-```
-
-### 수정 (2곳)
-
-`include/PathFollower.h` — `IsMovingStraight()` 옆에 한 줄:
-
-```cpp
-bool IsArc() const { return is_arc; }
-```
-
-`main.cpp:327`:
-
-```cpp
--  if (!path_follower.IsMovingStraight()) {
-+  if (!path_follower.IsArc()) {
-       path_follower.StartArc(...);
-   }
-```
-
-### 참고 — `move`/`turn`은 왜 멀쩡한가
-
-같은 패턴인데 상태변수가 맞게 짝지어져 있습니다:
-
-| op | 가드 | `Start...()`가 세우는 것 | 일치 |
-|---|---|---|---|
-| `move` (303행) | `IsMovingStraight()` | `is_moving_straight = true` | ✅ |
-| `turn` (313행) | `IsTurning()` | `is_turning = true` | ✅ |
-| `arc` (327행) | `IsMovingStraight()` | `is_arc = true` | ❌ |
+안쪽/바깥쪽 바퀴의 목표 스텝이 크게 다르므로(200mm 호 기준 약 1:4.8), 스텝 카운트에
+오차가 있으면 **먼저 도달한 쪽 기준으로 일찍 멈춥니다.** 실주행에서 호가 목표 각도보다
+덜 돌면 이 부분을 `&&`로 바꾸거나 바깥쪽 바퀴 기준으로 잡는 것을 검토해 주세요.
+지금 지적이 아니라 시험 때 참고하실 사항입니다.
 
 ---
 
@@ -245,7 +208,7 @@ if (cmd == "ESTOP") {
 
 ## A-5. 🟠 `R_robot = 0` 에서 0으로 나눗셈 (P1)
 
-`PathFollower.cpp:199-200`
+`PathFollower.cpp:200-201` (`d3b6ec1` 기준)
 
 ```cpp
 float base_sps = 771.65f;
@@ -352,11 +315,22 @@ if (std::fabs(r_robot) < kMinArcRadius) {
 
 | 순서 | 항목 | 이유 |
 |---|---|---|
-| 1 | **A-1** | 곡선 도형을 쓰는 순간 재현. 헤더 1줄 + `main.cpp` 1줄 |
-| 2 | **A-2** | ESTOP → RESUME 이 "완료"로 오보고됩니다. 안전 + 오동작. 6줄 제거 |
-| 3 | **A-3** | 한 글자 |
+| ~~0~~ | ~~A-1~~ | ✅ `d3b6ec1`에서 해결 |
+| 1 | **A-2** | ESTOP → RESUME 이 "완료"로 오보고됩니다. 안전 + 오동작. 6줄 제거 |
+| 2 | **A-3** | 한 글자 |
+| 3 | §3 답변 | 답만 주시면 서버가 최소 반지름 하한을 확정합니다. Qt팀도 이 값을 기다리는 중입니다 |
 | 4 | A-4 | ADMIN 조이스틱 경유만 영향 |
 | 5 | A-5 | 서버가 하한을 올리면 당장은 도달하지 않지만, 방어 코드로 필요 |
-| 6 | §3 답변 | 답만 주시면 서버가 처리 |
 
-**A-1 + A-2 + A-3 은 합쳐서 한 커밋 분량입니다** (추가 2줄, 제거 6줄, 수정 1글자).
+**A-2 + A-3 은 합쳐서 한 커밋 분량입니다** (6줄 제거 + 1글자 수정).
+
+---
+
+## 다음 시험 계획
+
+A-2·A-3이 들어가면 **직선 경로 통합 시험**은 바로 가능합니다.
+
+**호 도색 시험은 조금 더 기다려 주세요.** 서버의 호 진입 위상 보정(§4)이 방금
+들어갔고, Qt 쪽 `heading_deg` 규약 수정이 아직 push되지 않아 부분 원호가 틀어집니다.
+양쪽이 맞물리는 대로 다시 알려드리겠습니다. 온전한 원(360°)은 영향이 없어서
+**A-1 검증용으로는 지금 돌려보셔도 됩니다.**
