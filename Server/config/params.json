@@ -4,7 +4,9 @@
   "_1_기하": "로봇 하드웨어 실측값. pen_offset_m은 로봇 PathFollower.h NOZZLE_OFFSET_M과 반드시 같아야 한다 - 자동 동기화되지 않는다. wheel_base_m은 로봇팀 실측 확정값 0.166 (calibration_test.cpp WHEELBASE_M)",
   "pen_offset_m": 0.155,
   "wheel_base_m": 0.166,
-  "min_paint_radius_m": 0.155,
+
+  "_1b_최소반지름": "0.200은 기하가 아니라 모터 한계다. 호에서 바깥 바퀴 SPS = 771.65 * (R_robot + W/2) / R_robot 이 1/R_robot로 발산한다. 로봇팀 회신(2026-08-07): NEMA 17 기준 2000 SPS 초과 시 탈조 위험. 0.200 -> 1278 SPS(권장), 0.180 -> 약 1450 SPS(마진 하한선). 로봇 호 주행속도(0.05 m/s)가 바뀌면 이 값도 재계산해야 한다",
+  "min_paint_radius_m": 0.200,
 
   "_2_ALIGN": "turn 직후 각도 정렬. 임계값 2.0은 v1 현장 튜닝값(로봇 1틱 오버슛 1.42도 + 마커 코너 노이즈 0.7도). 로봇이 감속 접근으로 오버슛을 줄이면 내릴 것",
   "align_threshold_deg": 2.0,
