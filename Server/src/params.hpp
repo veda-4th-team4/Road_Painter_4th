@@ -30,8 +30,9 @@ using json = nlohmann::json;
       "펜(노즐)이 마커 중심 뒤로 떨어진 거리 a. 로봇 PathFollower.h와 같아야 함")\
     X(double, wheel_base_m, 0.166,                                             \
       "좌우 바퀴 축간거리 W(로봇팀 실측). arc 안쪽바퀴 역회전 경고 판정에만 사용")\
-    X(double, min_paint_radius_m, 0.155,                                       \
-      "도색 가능한 최소 펜 반지름. 이론 하한 = a. 미만이면 도면 거부")         \
+    X(double, min_paint_radius_m, 0.200,                                       \
+      "도색 가능한 최소 펜 반지름. 미만이면 도면 거부(arc_too_tight). "        \
+      "이론 하한은 a(0.155)지만 실제 하한은 모터가 정한다 - 아래 주석 참조")   \
     /* ---- ALIGN (turn 직후 각도 정렬) ---- */                                \
     X(double, align_threshold_deg, 4.0,                                        \
       "이 각도 이내면 정렬 완료로 보고 GO")                                    \
@@ -137,8 +138,18 @@ inline void sanitize(Params& p) {
     floorAt("pos_recover_frames", p.pos_recover_frames, 1);
     floorAt("pose_reject_max", p.pose_reject_max, 1);
     floorAt("pos_stat_period_ms", p.pos_stat_period_ms, 1000L);
-    // 펜이 중심 뒤 a에 달려 있는 이상 노즐이 그릴 수 있는 최소 반지름은 a다
-    // (docs/PROTOCOL_v2_ROBOT.md §5.5). 그보다 작은 하한은 의미가 없다.
+    // min_paint_radius_m 기본값 0.200은 기하가 아니라 모터가 정한 값이다.
+    // 호에서는 바깥 바퀴가 base_sps × (R_robot + W/2) / R_robot 으로 돌고,
+    // 이 값이 1/R_robot 로 발산한다. 로봇팀 회신(2026-08-07): NEMA 17 기준
+    // 2000 SPS를 넘으면 토크가 떨어져 탈조 위험. R_paint=0.200 -> 1278 SPS(권장),
+    // 0.180 -> 약 1450 SPS(마진 하한). 그래서 0.200을 기본으로 둔다.
+    //
+    // 🔴 이 값은 로봇의 호 주행 속도(base_sps=771.65, 0.05 m/s)에 묶여 있다.
+    //   로봇이 호를 더 빠르게 돌게 되면 같은 반지름에서 SPS가 비례해 올라가므로
+    //   이 하한도 같이 올려야 한다. 속도를 바꿀 때 반드시 재계산할 것.
+    //
+    // 아래 검사는 그와 별개인 기하학적 하한이다. 펜이 중심 뒤 a에 달려 있는 이상
+    // 노즐이 그릴 수 있는 반지름은 a 미만이 될 수 없다 (PROTOCOL_v2_ROBOT.md §5.5).
     if (p.min_paint_radius_m < p.pen_offset_m) {
         logf("[WARN] params 'min_paint_radius_m'=%g < 'pen_offset_m'=%g - "
              "물리 하한인 %g로 올림 (§5.5)",

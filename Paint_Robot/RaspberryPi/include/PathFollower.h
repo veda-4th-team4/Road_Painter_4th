@@ -95,6 +95,11 @@ public:
      */
     bool IsMovingStraight() const { return is_moving_straight; }
 
+    /**
+     * @brief Checks if an arc motion is currently in progress.
+     */
+    bool IsArc() const { return is_arc; }
+
 private:
     std::vector<Segment_t> path;
     size_t current_waypoint_idx;
@@ -109,6 +114,7 @@ private:
 
     // Arc tracking state
     bool is_arc;
+    bool arc_is_left;
     uint32_t arc_target_l_steps;
     uint32_t arc_target_r_steps;
     int32_t arc_start_l_steps;
