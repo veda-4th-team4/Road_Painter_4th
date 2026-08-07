@@ -108,17 +108,26 @@ void Router::fromQt(const json& msg) {
     } else if (type == "SET_CAM_IP") {
         // Qt 설정란에서 카메라 IP 교체. REGISTER 때와 동일하게 형식 검증은 하지
         // 않고 저장만 한다 (Qt가 이 값으로 RTSP URL을 조립).
+        //
+        // 캘리브레이션(H_MATRIX)과 같은 규약이다: 카메라는 현장에 한 대뿐이라
+        // 주소는 현장 속성이므로 **로그인 여부와 무관하게 전역 슬롯에 먼저** 남기고,
+        // 로그인 중이면 그 계정에도 같이 쓴다. 예전에는 로그인이 없으면 아예 거절해서,
+        // 설치 기사가 계정을 만들기 전에는 카메라를 등록할 수 없었다.
         std::string ip = payload.value("cam_ip", "");
+        users_.setGlobalCamIp(ip);
         if (currentUser_.empty()) {
-            srv_.sendTo("QT", makeMsg("SET_CAM_IP_FAIL", {{"reason", "로그인 필요"}}));
-            logf("[WARN] SET_CAM_IP 수신 - 로그인 사용자 없음");
+            srv_.sendTo("QT", makeMsg("SET_CAM_IP_OK",
+                                      {{"cam_ip", users_.getGlobalCamIp()}}));
+            logf("[INFO] SET_CAM_IP - 로그인 사용자 없음, 전역 슬롯에 저장: '%s'",
+                 ip.c_str());
         } else if (!users_.setCamIp(currentUser_, ip)) {
             srv_.sendTo("QT", makeMsg("SET_CAM_IP_FAIL", {{"reason", "저장 실패"}}));
-            logf("[WARN] SET_CAM_IP 저장 실패 - 사용자 '%s'", currentUser_.c_str());
+            logf("[WARN] SET_CAM_IP 계정 저장 실패 - 사용자 '%s' (전역에는 저장됨)",
+                 currentUser_.c_str());
         } else {
             srv_.sendTo("QT", makeMsg("SET_CAM_IP_OK",
                                       {{"cam_ip", users_.getCamIp(currentUser_)}}));
-            logf("[INFO] SET_CAM_IP - 사용자 '%s' 카메라 IP 변경: '%s'",
+            logf("[INFO] SET_CAM_IP - 사용자 '%s' + 전역 슬롯에 카메라 IP 저장: '%s'",
                  currentUser_.c_str(), ip.c_str());
         }
     } else if (type == "CMD") {
@@ -713,11 +722,15 @@ void Router::handleLogin(const json& payload, const std::string& replyRole) {
     const Calib& act = activeCalib();
     // calib(활성 채널 번들)은 v0.3과 의미가 같아 옛 클라이언트도 그대로 동작한다.
     // calibs(채널별 맵)는 4채널 UI가 "어느 채널이 준비됐는지" 표시하는 데 쓴다.
+    // 카메라 IP는 "계정 값 → 없으면 전역 값" (user_store.hpp getCamIp 주석 참고).
+    // 카메라가 현장에 한 대뿐이라, 계정에 아무것도 없는 새 사용자도 전역 슬롯에
+    // 등록된 주소를 그대로 받는다 - 사용자마다 다시 넣을 필요가 없다.
+    const json camIp = users_.getCamIp(id);
     json out{{"id", id},
              {"calib", act.valid ? act.raw : json()},
              {"calibs", storedMap},
              {"active_ch", activeChannel_},
-             {"cam_ip", users_.getCamIp(id)}};
+             {"cam_ip", camIp}};
     // 중계 RTSP 주소. 설정 파일이 있을 때만 싣는다 - 필드를 null로라도 보내면
     // QT가 "서버가 값을 줬는데 비어있다"와 "안 줬다"를 구분하지 못한다.
     // ⚠️ cam_ip는 그대로 둔다. 저건 카메라 IP(PNO 직결용)라 의미가 다르고,
@@ -725,11 +738,13 @@ void Router::handleLogin(const json& payload, const std::string& replyRole) {
     const StreamCfg stream = loadStreamCfg(kStreamCfgFile);
     if (stream.valid()) out["stream"] = stream.toJson();
     srv_.sendTo(replyRole, makeMsg("LOGIN_OK", out));
+    const std::string camIpStr = camIp.is_string() ? camIp.get<std::string>()
+                                                   : std::string("없음 - QT 설정값 사용");
     logf("[INFO] LOGIN %s 성공 (%s 요청, 캘리브레이션 %zu채널 보유, 활성 채널 %d %s, "
-         "중계 주소 %s)",
+         "카메라 IP %s, 중계 주소 %s)",
          id.c_str(), replyRole.c_str(), calibs_.size(), activeChannel_,
-         act.valid ? "전달" : "없음 - 캘리브레이션 필요",
-         stream.valid() ? stream.base.c_str() : "없음 - QT 설정값 사용");
+         act.valid ? "전달" : "없음 - 캘리브레이션 필요", camIpStr.c_str(),
+         stream.valid() ? stream.base.c_str() : "없음 - 직결 모드");
 }
 
 // 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용). 세 형태를 받는다:

@@ -44,26 +44,44 @@ public:
     // 캘리가 없으면 이 값을 내려준다.
     bool setGlobalCalib(int ch, const json& calib);
     json getGlobalCalib(int ch);
-    // 등록 시 저장한 카메라 IP (없으면 null 반환)
+
+    // ── 카메라 IP ──────────────────────────────────────────────────────
+    // 캘리브레이션과 같은 이유로 전역 슬롯을 둔다. 현장에 카메라는 한 대뿐이고
+    // (이 파일 맨 위 "한 현장 = 카메라 1대 가정"), 그 주소는 **현장의 속성**이지
+    // 사용자 속성이 아니다. 계정마다 따로 들고 있으면 새 계정으로 로그인할 때마다
+    // 카메라 IP를 다시 넣어야 하고, 카메라를 옮기면 전 계정을 순회하며 고쳐야 한다.
+    //
+    // 계정 값은 지우지 않고 남겨둔다 - 이미 users.json에 cam_ip가 박힌 현장이
+    // 있어서, 전역만 보게 바꾸면 그 값들이 조용히 무시된다. 캘리브레이션과 똑같이
+    // **계정 값 → 없으면 전역 값** 순으로 읽는다.
     json getCamIp(const std::string& id);
     // 카메라 IP 변경 + 파일 반영 (Qt 설정란에서 교체. 빈 문자열이면 null로 지움)
     bool setCamIp(const std::string& id, const std::string& camIp);
+    // 계정과 무관한 전역 카메라 IP. 로그인 사용자가 없어도 저장되고, 계정에
+    // cam_ip가 없는 사용자는 로그인 때 이 값을 받는다 (setGlobalCalib과 같은 규약).
+    bool setGlobalCamIp(const std::string& camIp);
+    json getGlobalCamIp();
 
 private:
     void load();
     void save();  // mtx_ 잡은 상태에서 호출
     void loadGlobalCalib();
     void saveGlobalCalib();  // mtx_ 잡은 상태에서 호출
+    void loadGlobalCam();
+    void saveGlobalCam();  // mtx_ 잡은 상태에서 호출
     // 계정에 저장된 캘리브레이션을 채널별 맵으로 (구버전 형식 흡수).
     // mtx_ 잡은 상태에서 호출
     json accountCalibMap(const std::string& id);
 
     std::string file_;
     std::string calibFile_;  // 전역 캘리 파일 (users.json 옆의 calib_latest.json)
+    std::string camFile_;    // 전역 카메라 파일 (users.json 옆의 camera.json)
     std::mutex mtx_;
     // { "<id>": {"salt":hex, "hash":hex, "calib":{"1":{...},"2":{...}}|null} }
     json users_;
     // 계정과 분리된 최신 번들의 채널별 맵 (없으면 빈 오브젝트).
     // 파일에 예전 형식(번들 하나)이 있으면 load 시점에 채널 1의 맵으로 승격된다.
     json globalCalib_;
+    // 계정과 분리된 카메라 IP (등록 안 됐으면 null).
+    json globalCamIp_;
 };

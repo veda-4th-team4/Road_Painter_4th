@@ -35,10 +35,15 @@ UserStore::UserStore(const std::string& file) : file_(file) {
     if (pos != std::string::npos) mkdir(file_.substr(0, pos).c_str(), 0755);
     // 전역 캘리는 users.json과 같은 폴더에 둔다. 계정 파일과 분리하는 이유는
     // users.json이 비번 해시 때문에 .gitignore 대상이고 백업·교체 주기가 다르기 때문.
-    calibFile_ = (pos == std::string::npos ? std::string()
-                                           : file_.substr(0, pos + 1)) + "calib_latest.json";
+    const std::string dir = (pos == std::string::npos ? std::string()
+                                                      : file_.substr(0, pos + 1));
+    calibFile_ = dir + "calib_latest.json";
+    // 전역 카메라 IP도 같은 이유로 users.json 바깥에 둔다 - 현장 설비 정보라
+    // 계정 파일(비번 해시 포함, .gitignore 대상)과 수명이 다르다.
+    camFile_ = dir + "camera.json";
     load();
     loadGlobalCalib();
+    loadGlobalCam();
 }
 
 void UserStore::load() {
@@ -172,10 +177,54 @@ bool UserStore::setCalib(const std::string& id, int ch, const json& calib) {
     return true;
 }
 
+void UserStore::loadGlobalCam() {
+    globalCamIp_ = json();
+    std::ifstream f(camFile_);
+    if (!f) return;  // 아직 카메라를 등록 안 했으면 파일 없음 - 정상
+    json j = json::parse(f, nullptr, false);
+    if (!j.is_object()) {
+        logf("[WARN] 전역 카메라 설정 파싱 실패, 무시: %s", camFile_.c_str());
+        return;
+    }
+    // 오브젝트로 감싸 둔다 - 나중에 계정/포트/프로파일 경로가 더 붙어도 파일
+    // 형식을 안 바꾸고 키만 늘리면 되게.
+    const json ip = j.value("cam_ip", json());
+    if (ip.is_string() && !ip.get<std::string>().empty()) {
+        globalCamIp_ = ip;
+        logf("[INFO] 전역 카메라 IP 로드: %s", ip.get<std::string>().c_str());
+    }
+}
+
+void UserStore::saveGlobalCam() {
+    std::ofstream f(camFile_);
+    if (!f) {
+        logf("[ERROR] 전역 카메라 설정 저장 실패: %s", camFile_.c_str());
+        return;
+    }
+    f << json{{"cam_ip", globalCamIp_}}.dump(2) << "\n";
+}
+
+bool UserStore::setGlobalCamIp(const std::string& camIp) {
+    std::lock_guard<std::mutex> lk(mtx_);
+    globalCamIp_ = camIp.empty() ? json() : json(camIp);
+    saveGlobalCam();
+    return true;
+}
+
+json UserStore::getGlobalCamIp() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return globalCamIp_;
+}
+
 json UserStore::getCamIp(const std::string& id) {
     std::lock_guard<std::mutex> lk(mtx_);
-    if (!users_.contains(id)) return nullptr;
-    return users_[id].value("cam_ip", json());
+    // 계정 값 → 없으면 전역 값. getCalib과 같은 우선순위다 - 계정에 IP를 고정해둔
+    // 현장을 전역이 덮지 않는다.
+    if (users_.contains(id)) {
+        const json c = users_[id].value("cam_ip", json());
+        if (!c.is_null()) return c;
+    }
+    return globalCamIp_;
 }
 
 bool UserStore::setCamIp(const std::string& id, const std::string& camIp) {

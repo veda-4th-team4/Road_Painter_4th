@@ -26,8 +26,17 @@ struct StreamCfg {
     std::string base;
     // 채널 수. 0이면 LOGIN_OK에 싣지 않고 QT가 자기 기본값(4)을 쓴다.
     int channels = 0;
+    // 중계를 쓸지. false면 base가 적혀 있어도 LOGIN_OK에 싣지 않는다.
+    //
+    // 왜 "파일을 지운다"가 아니라 플래그인가: 중계를 껐다 켜는 건 되돌릴 수 있어야
+    // 하는데, 파일을 지우면 다시 켤 때 주소를 어디서 가져올지 아무도 모른다.
+    // base는 남겨두고 이 플래그만 뒤집으면 왕복이 한 줄로 끝난다.
+    // (relay/README.md의 "되돌리려면 프로세스만 죽이면 된다" 원칙과 같은 결.)
+    // ⚠️ 이 플래그는 **서버가 주소를 알려줄지**만 정한다. 중계 프로세스(MediaMTX)를
+    //    띄우고 내리는 것은 별개다 - relay/start.sh 를 손으로 실행해야 한다.
+    bool enabled = true;
 
-    bool valid() const { return !base.empty(); }
+    bool valid() const { return enabled && !base.empty(); }
 
     // LOGIN_OK.stream 에 실을 형태. channels는 0이면 생략한다 - "모른다"와
     // "0채널이다"를 구분해야 QT가 기본값으로 넘어갈 수 있다.
@@ -60,5 +69,12 @@ inline StreamCfg loadStreamCfg(const std::string& file) {
     if (j.contains("channels") && j["channels"].is_number_integer())
         c.channels = j["channels"].get<int>();
     if (c.channels < 0) c.channels = 0;  // 음수는 "미지정"과 같이 취급
+    // 키가 없으면 true - 이 플래그가 생기기 전에 만들어진 stream.json 은 "쓰려고
+    // 만든 파일"이므로 그대로 켜진 채로 읽혀야 한다.
+    if (j.contains("enabled") && j["enabled"].is_boolean())
+        c.enabled = j["enabled"].get<bool>();
+    if (!c.enabled && !c.base.empty())
+        logf("[INFO] 중계 주소가 있으나 enabled=false - QT에 알리지 않음 (직결 모드): %s",
+             c.base.c_str());
     return c;
 }
