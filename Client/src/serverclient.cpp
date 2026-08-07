@@ -248,13 +248,15 @@ void ServerClient::dispatch(const QJsonObject &msg)
         // channelMode 가 꺼진 단일 채널 경로라 아무도 안 본다.
         emit calibChannelsReceived(payload.value("calibs").toObject(),
                                    payload.value("active_ch").toInt(1));
-        // 중계 스트림 주소도 같은 이유로 loginResult 보다 먼저 흘린다 — Backend 가
-        // 로그인 처리 안에서 채널 화면을 띄우므로 그때 주소가 이미 있어야 한다.
-        // ⚠️ 서버가 안 보내면 빈 문자열이 나가고 Backend 가 아무것도 안 한다
-        //    (QSettings 값 유지). v0.3 서버에서도 기존 동작이 그대로다.
-        const QJsonObject stream = payload.value("stream").toObject();
-        emit streamInfoReceived(stream.value("base").toString(),
-                                stream.value("channels").toInt(0));
+        // 필드가 없으면 "서버가 모름"이므로 기존 설정을 유지한다. 명시적
+        // enabled=false만 "중계 OFF, 직결 전환"으로 Backend에 전달한다.
+        const QJsonValue streamValue = payload.value("stream");
+        if (streamValue.isObject()) {
+            const QJsonObject stream = streamValue.toObject();
+            emit streamInfoReceived(stream.value("enabled").toBool(true),
+                                    stream.value("base").toString(),
+                                    stream.value("channels").toInt(0));
+        }
         emit loginResult(true, payload.value("id").toString(),
                          calibVal.toObject(), hasCalib,
                          payload.value("cam_ip").toString(), QString());

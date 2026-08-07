@@ -121,6 +121,12 @@ Backend::Backend(QObject *parent)
     });
     connect(m_client, &ServerClient::disconnectedFromServer, this, [this]() {
         m_serverConnected = false;
+        if (m_abortPending) {
+            m_abortPending = false;
+            setNotice(QStringLiteral("서버 연결이 끊겨 작업 취소 여부를 확인하지 못했습니다."),
+                      QStringLiteral("error"), QStringLiteral("abort"));
+            emit jobChanged();
+        }
         if (!m_testMode)
             m_serverLabel = "끊김";
         emit linkStatusChanged();
@@ -198,13 +204,17 @@ Backend::Backend(QObject *parent)
     // 받는다. 그 주소를 사람이 설정에 손으로 넣는 대신 서버가 로그인 때 알려주는 것이
     // 운영상 맞다 — 중계 주소가 바뀌어도 클라이언트를 안 건드린다.
     //
-    // ⚠️ 서버가 안 보내면 **아무것도 하지 않는다.** 지금 서버(v0.3)는 이 필드가 없으므로
-    //    빈 문자열이 오고, 그러면 QSettings 의 relayBase 가 그대로 쓰인다. 중계 주소를
-    //    비워두면 PNO 단일 채널 직결로 돌아가는 것도 그대로다.
+    // 서버가 stream 필드를 안 보내면 signal 자체가 오지 않아 기존 설정을 유지한다.
+    // enabled=false를 명시하면 저장된 중계를 지우고 4채널 카메라 직결로 전환한다.
     // ⚠️ cam_ip 의 의미는 건드리지 않는다. 그걸 바꾸면 PNO 경로가 깨진다.
     connect(m_client, &ServerClient::streamInfoReceived, this,
-            [this](const QString &base, int channels) {
-        if (base.trimmed().isEmpty()) return;          // 서버가 안 준다 → 설정값 유지
+            [this](bool enabled, const QString &base, int channels) {
+        if (!enabled) {
+            setRelayBase(QString());
+            appendLog(QStringLiteral("LOGIN_OK stream.enabled=false — 중계 해제, 카메라 직결 사용"));
+            return;
+        }
+        if (base.trimmed().isEmpty()) return;
         if (channels > 0 && channels != m_channelCount) {
             m_channelCount = channels;
             saveSettings();
@@ -249,24 +259,9 @@ Backend::Backend(QObject *parent)
         setNotice(QStringLiteral("도색이 완료되었습니다."), QStringLiteral("info"));
         finishJob(QStringLiteral("DRAW_DONE — 도색 완료"));
     });
-    // 작업 취소 확인. cancelJob() 이 이미 UI 를 정리했으므로 보통은 로그만 남는다.
-    // 관리자 창(ADMIN)이 취소한 경우엔 여기가 유일한 통지라 상태를 여기서 접는다.
+    // 작업 취소 확인. 요청 주체와 무관하게 서버 ACK 뒤에만 로컬 상태를 접는다.
     connect(m_client, &ServerClient::drawAborted, this, [this](bool wasActive) {
-        appendLog(QStringLiteral("DRAW_ABORTED — 서버 경로 폐기 (진행 중이던 작업 %1)")
-                      .arg(wasActive ? QStringLiteral("있음") : QStringLiteral("없음")));
-        if (!m_jobActive) return;   // cancelJob() 이 이미 정리한 정상 경로
-        stopTestProgressSim();
-        m_jobActive = false;
-        m_paintingSeen = false;
-        m_jobElapsedValid = false;
-        m_jobProgress = 0.0;
-        if (m_topView) m_topView->setMissionProgress(0.0);
-        if (m_originalView) m_originalView->setMissionProgress(0.0);
-        updateJobRecord(m_currentJobId, QStringLiteral("중단"), m_jobProgress);
-        setNotice(QStringLiteral("다른 곳(관리자 창)에서 작업이 취소되었습니다."),
-                  QStringLiteral("warn"));
-        emit jobChanged();
-        updatePhase();
+        completeAbort(wasActive, m_abortPending);
     });
     connect(m_client, &ServerClient::drawFailed, this,
             [this](const QString &stage, const QString &reason, const QString &msg) {
@@ -294,6 +289,7 @@ Backend::Backend(QObject *parent)
         // 나머지(bad_points / no_blueprint / robot_offline / not_ready)는 실행이 서지 않은
         // 것이므로 "그리는 중"을 풀고 다시 손볼 수 있게 되돌린다.
         m_jobActive = false;
+        m_abortPending = false;
         m_paintingSeen = false;
         m_jobElapsedValid = false;
         if (stage == QLatin1String("plan") || reason == QLatin1String("no_blueprint"))
@@ -1116,28 +1112,58 @@ void Backend::startPainting()
         startTestProgressSim();
 }
 
-// server-driven-v2에는 ABORT_DRAW 계약이 없다. ESTOP은 즉시 요청하되,
-// 서버와 로봇에 남은 경로를 폐기할 수 없으므로 로컬 작업 상태도 유지한다.
+// 작업 취소는 ESTOP과 다르다. ABORT_DRAW는 서버와 로봇의 실행 경로를 폐기하고,
+// DRAW_ABORTED ACK가 와야 성공이다. ACK 전에는 로컬 상태를 유지한다.
 void Backend::cancelJob()
 {
-    if (!m_jobActive) return;
+    if (!m_jobActive || m_abortPending) return;
 
-    m_robotStatus = QStringLiteral("비상 정지");
-    m_robotState = QStringLiteral("ESTOPPED");
-    m_estopActive = true;
-    emit robotStatusChanged();
+    m_abortPending = true;
+    emit jobChanged();
     if (m_testMode) {
-        stopTestProgressSim();
-        appendLog(QStringLiteral("[테스트] ESTOP — 경로 실행 일시정지"));
+        appendLog(QStringLiteral("[테스트] CMD ABORT_DRAW — 즉시 ACK 시뮬레이션"));
+        completeAbort(true, true);
     } else if (m_client) {
-        m_client->sendCmd(QStringLiteral("ESTOP"));
-        appendLog(QStringLiteral("CMD ESTOP — server-driven-v2는 실행 경로 폐기 미지원"));
+        m_client->sendAbortDraw();
+        appendLog(QStringLiteral("CMD ABORT_DRAW — 서버·로봇 실행 경로 폐기 요청"));
+        setNotice(QStringLiteral("작업 취소 응답을 기다리는 중입니다."),
+                  QStringLiteral("warn"), QStringLiteral("abort"));
+        QTimer::singleShot(3000, this, [this]() {
+            if (!m_abortPending) return;
+            m_abortPending = false;
+            appendLog(QStringLiteral("ABORT_DRAW 응답 시간 초과 — 작업 상태 유지"));
+            setNotice(QStringLiteral("작업 취소 응답을 받지 못했습니다. 서버 연결을 확인한 뒤 다시 시도하세요."),
+                      QStringLiteral("error"), QStringLiteral("abort"));
+            emit jobChanged();
+            updatePhase();
+        });
+    }
+}
+
+void Backend::completeAbort(bool wasActive, bool requestedHere)
+{
+    m_abortPending = false;
+    appendLog(QStringLiteral("DRAW_ABORTED — 서버·로봇 실행 경로 폐기 (진행 중이던 작업 %1)")
+                  .arg(wasActive ? QStringLiteral("있음") : QStringLiteral("없음")));
+    clearNotice(QStringLiteral("abort"));
+    if (!m_jobActive) {
+        emit jobChanged();
+        return;
     }
 
-    setNotice(QStringLiteral("로봇을 비상 정지했습니다. 현재 서버는 실행 중 경로 폐기를 "
-                             "지원하지 않아 작업은 취소되지 않았습니다. ESTOP을 해제하면 "
-                             "남은 경로가 재개될 수 있습니다."),
-              QStringLiteral("warn"), QStringLiteral("estop"));
+    stopTestProgressSim();
+    m_jobActive = false;
+    m_paintingSeen = false;
+    m_jobElapsedValid = false;
+    m_jobProgress = 0.0;
+    if (m_topView) m_topView->setMissionProgress(0.0);
+    if (m_originalView) m_originalView->setMissionProgress(0.0);
+    updateJobRecord(m_currentJobId, QStringLiteral("중단"), 0.0);
+    setNotice(requestedHere
+                  ? QStringLiteral("작업이 취소됐습니다. 같은 도면을 다시 시작하거나 경로를 수정할 수 있습니다.")
+                  : QStringLiteral("다른 곳에서 작업이 취소됐습니다."),
+              requestedHere ? QStringLiteral("info") : QStringLiteral("warn"),
+              QStringLiteral("abort-result"));
     emit jobChanged();
     updatePhase();
 }
@@ -1239,6 +1265,7 @@ void Backend::storeMission(const QList<QList<QPointF>> &paths, const QList<bool>
 void Backend::beginPainting()
 {
     m_jobActive = true;
+    m_abortPending = false;
     m_paintingSeen = false;
     m_jobProgress = 0.0;
     m_waypointIndex = 0;
@@ -1254,6 +1281,7 @@ void Backend::finishJob(const QString &reason)
 {
     stopTestProgressSim();
     m_jobActive = false;
+    m_abortPending = false;
     m_paintingSeen = false;
     m_blueprintSent = false;   // 완료된 도면은 다시 그리려면 재전송이 필요하다
     setJobProgress(1.0);
@@ -1912,7 +1940,7 @@ void Backend::updatePhase()
 // 주소는 두 갈래다:
 //   · 중계 있음 → {relayBase}/chN · /chNs   (Server/relay/README.md 와 짝. 여기만
 //                                            바꾸면 안 되고 mediamtx.yml 도 같이)
-//   · 중계 없음 → 카메라 직결 템플릿 ({ch0} 치환, 센서 번호는 0부터)
+    //   · 중계 없음 → 카메라 직결 템플릿 ({ip}/{ch0} 치환, 센서 번호는 0부터)
 // **중계가 있으면 중계가 이긴다.** 서버가 나중에 LOGIN_OK.stream 으로 중계 주소를
 // 주면 직결 템플릿은 저절로 안 쓰이게 된다 — 그때 코드를 고칠 필요가 없다.
 QString Backend::channelUrl(int ch, bool sub) const
@@ -1921,10 +1949,14 @@ QString Backend::channelUrl(int ch, bool sub) const
         return QStringLiteral("%1/ch%2%3").arg(m_relayBase).arg(ch)
                                           .arg(sub ? QStringLiteral("s") : QString());
 
+    if (m_channelUrlTemplate.contains(QStringLiteral("{ip}")) && m_camIp.isEmpty())
+        return QString();
+
     // 직결. ⚠️ 이 카메라에는 저해상도 서브 프로파일이 없어서 sub 여부와 무관하게
     //    같은 주소가 나간다 (현재 4채널 전부 H.264 1920x1080 15fps 2560kbps GOV 8).
     //    서브가 생기면 여기서 sub 일 때 다른 템플릿을 쓰도록 갈라주면 된다.
     QString url = m_channelUrlTemplate;
+    url.replace(QStringLiteral("{ip}"),  m_camIp);
     url.replace(QStringLiteral("{ch0}"), QString::number(ch - 1));
     url.replace(QStringLiteral("{ch}"),  QString::number(ch));
     return url;
@@ -1994,6 +2026,15 @@ void Backend::setRelayBase(const QString &base)
         appendLog(QStringLiteral("중계 주소 해제 — 단일 채널(직결) 동작으로 되돌립니다"));
         emit channelChanged();
         if (wasChannelMode) {
+            // `{ip}` 템플릿은 있지만 LOGIN_OK.cam_ip가 아직 안 온 로그인 중간 상태.
+            // 여기서 단일채널 /FullHD/를 열지 말고 IP 도착을 기다린다.
+            if (!m_channelUrlTemplate.isEmpty()
+                && m_channelUrlTemplate.contains(QStringLiteral("{ip}"))
+                && m_camIp.isEmpty()) {
+                setNotice(QStringLiteral("서버의 카메라 IP를 기다리는 중입니다."),
+                          QStringLiteral("warn"), QStringLiteral("camera-ip"));
+                return;
+            }
             // 중계 URL 이 걸려 있으면 그대로 되돌아가지 못한다. 직결 주소로 되돌린다.
             setRtsp(m_directRtspUrl);
             if (!m_workerStarted) startWorker();
@@ -2125,8 +2166,8 @@ void Backend::showChannelGrid()
 {
     if (!channelMode()) return;
     if (m_jobActive) {
-        setNotice(QStringLiteral("작업이 진행 중이라 채널을 바꿀 수 없습니다. 현재 서버는 "
-                                 "실행 중 경로 폐기를 지원하지 않으므로 작업 완료를 기다리세요."),
+        setNotice(QStringLiteral("작업이 진행 중이라 채널을 바꿀 수 없습니다. 먼저 작업을 "
+                                 "완료하거나 취소하세요."),
                   QStringLiteral("warn"));
         return;
     }
@@ -2186,6 +2227,11 @@ void Backend::pausePreviews(bool on)
 void Backend::startPreviews()
 {
     if (!channelMode()) return;
+    if (m_relayBase.isEmpty() && m_camIp.isEmpty()) {
+        setNotice(QStringLiteral("4채널 카메라 IP가 설정되지 않아 영상을 열지 않았습니다."),
+                  QStringLiteral("warn"), QStringLiteral("camera-ip"));
+        return;
+    }
     // 이미 돌고 있으면 **다시 열지 않는다.** 작업 화면에서 돌아온 경우가 이쪽인데,
     // 여기서 stop→start 를 하면 채널당 1.1초 x 4채널 직렬 = 4.6초를 그대로 낸다.
     // ⚠️ 단, 채널 수가 달라졌으면 재개하면 안 된다 — m_channelCount 는 서버의
@@ -2427,8 +2473,24 @@ void Backend::setCamIp(const QString &ip)
 {
     const QString clean = ip.trimmed();
     if (clean.isEmpty()) return;
+    const bool changed = (clean != m_camIp);
     m_camIp = clean;
     emit sessionChanged();
+
+    // 4채널 직결은 LOGIN_OK.cam_ip를 {ip}에 넣는다. 단일채널 FullHD URL을 열면
+    // PNM에 없는 프로파일을 두드려 계정 잠금 위험이 있으므로 이 경로로 내려가지 않는다.
+    if (!m_channelUrlTemplate.isEmpty()) {
+        appendLog(QStringLiteral("카메라 IP %1 → 4채널 직결 URL 갱신").arg(clean));
+        clearNotice(QStringLiteral("camera-ip"));
+        if (changed && m_relayBase.isEmpty()) {
+            stopPreviews();
+            if (m_workingCh > 0) setRtsp(mainUrl(m_workingCh));
+            else if (!m_userId.isEmpty()) startPreviews();
+        }
+        emit channelChanged();
+        return;
+    }
+
     QString url = m_rtspTemplate;
     url.replace(QStringLiteral("{ip}"), clean);
     appendLog(QStringLiteral("카메라 IP %1 → RTSP 조립").arg(clean));
@@ -2795,6 +2857,15 @@ void Backend::loadSettings()
     //    (relayBase 도 비어 있을 때). 재빌드 없는 되돌리기 수단이다.
     if (s.contains("camera/channelUrlTemplate"))
         m_channelUrlTemplate = s.value("camera/channelUrlTemplate").toString().trimmed();
+    // 2026-08-07 이전 기본값은 현장 IP가 템플릿에 박혀 있었다. 사용자가 별도로
+    // 만든 템플릿은 건드리지 않고, 정확히 옛 기본값인 경우만 {ip} 방식으로 이관한다.
+    const QString legacyChannelTemplate = QStringLiteral(
+        "rtsp://admin:5hanwha!@192.168.0.13:554/{ch0}/H.264/media.smp");
+    if (m_channelUrlTemplate == legacyChannelTemplate) {
+        m_channelUrlTemplate = QStringLiteral(
+            "rtsp://admin:5hanwha!@{ip}:554/{ch0}/H.264/media.smp");
+        s.setValue("camera/channelUrlTemplate", m_channelUrlTemplate);
+    }
     m_channelCount = qBound(1, s.value("camera/channelCount", 4).toInt(), 8);
 }
 
