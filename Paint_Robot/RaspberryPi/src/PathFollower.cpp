@@ -27,7 +27,8 @@ void PathFollower::SetPath(const std::vector<Segment_t> &new_path) {
   drift_offset_deg = 0.0f;
   is_turning = false;
   is_moving_straight = false;
-  std::cout << "[PathFollower] Path loaded with " << path.size() << " segments."
+  is_arc = false;
+  std::cout << GetTimestampStr() << "[PathFollower] Path loaded with " << path.size() << " segments."
             << std::endl;
 }
 
@@ -58,10 +59,11 @@ void PathFollower::SetDriftOffset(float offset_deg) {
 }
 
 uint32_t PathFollower::CalculateTurnSteps(float angle_deg) const {
-  // 90 deg = 2032.24 pulses (with K_slip = 1.01)
-  // 0.1 deg resolution: 2.258044 pulses per 0.1 deg (22.58044 pulses/deg)
-  float abs_angle = std::fabs(angle_deg);
-  float steps = abs_angle * 22.58044f;
+  // Turn angle with 1.030f (+3%) hardware calibration factor
+  float turn_circ = M_PI * wheelbase_m;
+  float arc_len = turn_circ * (std::fabs(angle_deg) * 1.030f / 360.0f);
+  float wheel_circ = M_PI * wheel_diameter_m;
+  float steps = (arc_len / wheel_circ) * steps_per_rev * gear_ratio;
   return static_cast<uint32_t>(std::round(steps));
 }
 
@@ -113,9 +115,8 @@ bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps,
 }
 
 uint32_t PathFollower::CalculateMoveSteps(float dist_m) const {
-  // 3200 steps/rev, 66mm wheel diameter -> C = pi * 0.066 = 0.20734515 m
-  // 3200 / 0.20734515 = 15433.09 steps/meter (~15.433 steps/mm)
-  float abs_dist = std::fabs(dist_m);
+  // Straight move distance with 1.010f (+1%) hardware calibration factor
+  float abs_dist = std::fabs(dist_m) * 1.010f;
   float steps = abs_dist * 15433.09f;
   return static_cast<uint32_t>(std::round(steps));
 }
@@ -178,6 +179,7 @@ void PathFollower::StartArc(float radius_m, float angle_deg,
                             int32_t start_r_steps) {
   is_arc = true;
   bool is_left = (direction == "left");
+  arc_is_left = is_left;
 
   float r_robot = radius_m;
   float r_left =
@@ -196,10 +198,16 @@ void PathFollower::StartArc(float radius_m, float angle_deg,
   arc_start_r_steps = start_r_steps;
 
   float base_sps = 771.65f; // 0.05 m/s base speed
-  arc_sps_l = static_cast<int16_t>(base_sps * (r_left / r_robot));
-  arc_sps_r = static_cast<int16_t>(base_sps * (r_right / r_robot));
+  const float kMinArcRadius = 2e-3f; // 2mm threshold to prevent UB division overflow
+  if (std::fabs(r_robot) < kMinArcRadius) {
+      arc_sps_l = is_left ? static_cast<int16_t>(-base_sps) : static_cast<int16_t>(+base_sps);
+      arc_sps_r = is_left ? static_cast<int16_t>(+base_sps) : static_cast<int16_t>(-base_sps);
+  } else {
+      arc_sps_l = static_cast<int16_t>(base_sps * (r_left / r_robot));
+      arc_sps_r = static_cast<int16_t>(base_sps * (r_right / r_robot));
+  }
 
-  std::cout << "[PathFollower ARC] StartArc: R_paint=" << radius_m
+  std::cout << GetTimestampStr() << "[PathFollower ARC] StartArc: R_paint=" << radius_m
             << "m -> R_robot=" << r_robot << "m | angle=" << angle_deg
             << " deg (" << direction << ") | SPS_L=" << arc_sps_l
             << ", SPS_R=" << arc_sps_r << std::endl;
@@ -213,12 +221,15 @@ bool PathFollower::UpdateArc(int32_t cur_l_steps, int32_t cur_r_steps,
   int32_t dl = std::abs(cur_l_steps - arc_start_l_steps);
   int32_t dr = std::abs(cur_r_steps - arc_start_r_steps);
 
-  if (static_cast<uint32_t>(dl) >= arc_target_l_steps ||
-      static_cast<uint32_t>(dr) >= arc_target_r_steps) {
+  // Outer wheel completion evaluation: Prevents premature termination when r_in ~ 0
+  bool outer_completed = arc_is_left ? (static_cast<uint32_t>(dr) >= arc_target_r_steps)
+                                     : (static_cast<uint32_t>(dl) >= arc_target_l_steps);
+
+  if (outer_completed) {
     out_speed.left_sps = 0;
     out_speed.right_sps = 0;
     is_arc = false;
-    std::cout << "[PathFollower ARC] Arc motion completed!" << std::endl;
+    std::cout << GetTimestampStr() << "[PathFollower ARC] Arc motion completed!" << std::endl;
     return true;
   }
 
