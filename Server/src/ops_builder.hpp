@@ -2,10 +2,11 @@
 // ===== Qt 도면/동작 시퀀스 -> 로봇 op 시퀀스 (프로토콜 v2) =====
 // 규격: docs/PROTOCOL_v2_ROBOT.md (이 파일은 그 문서의 §4·§5 구현체다)
 //
-// 이 파일이 책임지는 것 세 가지:
+// 이 파일이 책임지는 것 네 가지:
 //   1. 부호 반전  - 서버 내부는 CCW 양수, 로봇 대면은 "양수 = 오른쪽" (§1.3)
 //   2. 펜 오프셋 보정 op 삽입 - Qt NOZZLE은 버리고 서버가 다시 만든다 (§5.3)
 //   3. arc 반지름 치환 - R_robot = sqrt(R_paint² - d²) (§5.4)
+//   4. arc 진입 위상 보정 - 차체를 접선에서 φ만큼 틀어 세운다 (§11-2, 아래 arcPhaseDeg)
 //
 // 로봇에 나가는 op에는 서버 판정용 정보(목표 좌표 등)를 싣지 않는다. 대신
 // 같은 길이의 OpMeta 배열을 나란히 만들어 서버가 들고 있는다 - 로봇이 읽지도
@@ -29,6 +30,72 @@ inline double toRobotDeg(double ccwDeg) { return -ccwDeg; }
 
 inline double round1(double v) { return std::round(v * 10) / 10; }
 inline double round3(double v) { return std::round(v * 1000) / 1000; }
+
+// ===== 도색 호의 진입 위상 φ (§11-2) =====
+//
+// 🔴 노즐을 내린 채 호를 그리려면 차체가 접선을 향하면 안 된다.
+//
+// 펜 P를 도면 원 위에 놓는 것만으로는 부족하다. 회전 중심(ICR)은 반드시 좌우
+// 바퀴 축선 위에 있고 그 축선은 마커 중심 C를 지나 진행방향에 수직인데, 도면
+// 원의 중심 O에 ICR을 놓으려면 C가 O에서 R_robot만큼, P에서 a만큼 떨어진
+// 자리여야 한다. R_robot² + a² = R_paint² 이므로 이 삼각형은 항상 성립하고,
+// 그때 차체 방위는 접선에서 정확히 φ = atan(a / R_robot)만큼 호 안쪽으로
+// 틀어진 방향이다.
+//
+// 이걸 빼먹으면 반지름은 맞는데 **원이 통째로 다른 자리에 그려진다** -
+// 드라이런 실측에서 R=0.5m 반원의 펜 도착점이 0.31m 어긋났다 (φ = 18.06도).
+//
+// 검산: R_paint = a (= 최소 도색 반지름, 제자리 회전)이면 R_robot = 0이라
+//   φ = 90도. 차체가 접선과 직각 = 마커 중심이 원 중심에 가만히 있고 펜만
+//   반지름 a로 도는 자명한 사실과 맞는다. atan2를 쓰므로 R_robot = 0에서도
+//   나눗셈이 터지지 않는다.
+//
+// 반환값은 CCW 부호를 포함한다 (좌회전 호면 +, 우회전 호면 -).
+inline double arcPhaseDeg(double rRobotM, double aM, bool left) {
+    const double phi = std::atan2(aM, rRobotM) * 180.0 / M_PI;
+    return left ? phi : -phi;
+}
+
+// 주행 op 하나의 기하. Qt op을 읽어 "차체가 어느 방위로 들어가고 나오는가"를
+// 확정한다. 직선은 접선 = 차체 방위지만, 도색 호는 위 φ만큼 어긋나 있다.
+struct TravelGeom {
+    double bodyEntry = kNoHeading;  // 이 op을 시작할 때 차체가 바라보는 방위
+    double bodyExit = kNoHeading;   // 마쳤을 때 바라보는 방위
+    double phase = 0.0;             // 접선 대비 차체 위상 (도색 호만 0이 아니다)
+    double rRobot = 0.0;            // 로봇에 실어 보낼 반지름 (arc 전용)
+};
+
+// 🔴 Qt의 heading_deg는 "이 op을 **마쳤을 때** 바라보는 절대 방위"다
+//   (Client/src/motionprogram.h Op::heading). MOVE/TURN은 진입과 출구가 같아
+//   구분이 필요 없지만, 호는 스윕만큼 다르다 - 진입 접선은 여기서 역산한다.
+//   예전에는 서버가 이 값을 진입 접선으로 읽어, 부분호에서 ALIGN 목표와 MORE
+//   투영축이 통째로 스윕만큼 돌아가 있었다 (온전한 원은 360도라 우연히 맞았다).
+inline TravelGeom travelGeom(const json& q, bool isPaint, double aM) {
+    TravelGeom g;
+    const double head = q.value("heading_deg", kNoHeading);
+    if (q.value("op", "") != "ARC") {  // 직진: 방향이 안 바뀐다
+        g.bodyEntry = g.bodyExit = head;
+        return g;
+    }
+    const double rPaint = q.value("radius_m", 0.0);
+    const double sweep = std::fabs(q.value("angle_deg", 0.0));
+    const bool left = (q.value("direction", "left") != "right");
+    // 도색하지 않는 호는 펜이 올라가 있어 마커 중심이 곧 도면 자취다 - 반지름도
+    // 위상도 보정하지 않는다 (§5.2 불변식의 나머지 절반).
+    if (isPaint) {
+        const double inner = rPaint * rPaint - aM * aM;
+        g.rRobot = inner > 0 ? std::sqrt(inner) : 0.0;
+        g.phase = arcPhaseDeg(g.rRobot, aM, left);
+    } else {
+        g.rRobot = rPaint;
+    }
+    if (!hasHeading(head)) return g;
+    const double tanExit = head;
+    const double tanEntry = normDeg(head - (left ? sweep : -sweep));
+    g.bodyEntry = normDeg(tanEntry + g.phase);
+    g.bodyExit = normDeg(tanExit + g.phase);
+    return g;
+}
 
 // op 하나에 대해 "서버만 아는 것". activeOps_와 index가 1:1로 대응한다.
 struct OpMeta {
@@ -171,9 +238,33 @@ inline PlannedPath buildDrawOps(const json& program,
     const double a = params().pen_offset_m;
     OpSeq seq;
     bool penDown = false;
-    // 노즐을 올릴 때 뒤로 물러날 방향 = 직전 도색 op의 방위 (그 방향 그대로
-    // 후진한다). 로봇은 회전하지 않았으므로 여전히 그쪽을 바라보고 있다.
-    double lastPaintHeading = kNoHeading;
+    // 노즐을 올릴 때 뒤로 물러날 방향 = 직전 도색 op의 **차체** 종료 방위.
+    // 로봇은 회전하지 않았으므로 여전히 그쪽을 바라보고 있다. 호에서는 접선이
+    // 아니라 접선 + φ다 - 접선으로 후진하면 중심이 꼭짓점에 안 돌아온다.
+    double penBodyHeading = kNoHeading;
+    // 지금 유지 중인 차체 위상. 도색을 끝낼 때 이만큼 되돌려 접선으로 세운다.
+    double penPhase = 0.0;
+
+    // 도색 진입: (필요하면 위상만큼 틀고) a 전진 후 노즐 down.
+    // 노즐을 올리는 op은 넣지 않는다 - penDown == false라 이미 올라가 있다.
+    auto openPaint = [&](const TravelGeom& g) {
+        if (g.phase != 0.0 && hasHeading(g.bodyEntry))
+            seq.turnOp(g.phase, false, g.bodyEntry);  // 접선 -> 차체 방위
+        seq.moveOp(+a, false, g.bodyEntry);
+        seq.nozzleOp(true);
+        penDown = true;
+        penPhase = g.phase;
+    };
+    // 도색 이탈: 노즐 up -> a 후진 -> 위상 원복. 원복까지 해야 뒤따르는 직선
+    // op이 접선 기준으로 이어진다 (안 하면 이후 경로 전체가 φ만큼 기운다).
+    auto closePaint = [&]() {
+        seq.nozzleOp(false);
+        seq.moveOp(-a, false, penBodyHeading);
+        if (penPhase != 0.0 && hasHeading(penBodyHeading))
+            seq.turnOp(-penPhase, false, normDeg(penBodyHeading - penPhase));
+        penDown = false;
+        penPhase = 0.0;
+    };
 
     for (size_t i = 0; i < program.size(); ++i) {
         const json& q = program[i];
@@ -183,6 +274,7 @@ inline PlannedPath buildDrawOps(const json& program,
         const bool isTravel = (o == "MOVE" || o == "ARC");
         const bool isPaint = isTravel && q.value("paint", false);
         const double head = q.value("heading_deg", kNoHeading);  // CCW 절대 방위
+        const TravelGeom g = travelGeom(q, isPaint, a);
 
         // 도착 꼭짓점 = 그다음 Qt op의 v. 없으면 폴리라인 마지막 점 (§6.5).
         // 추측항법으로 누적하지 않고 Qt가 준 좌표만 쓴다 - 오차가 쌓이지 않는다.
@@ -203,15 +295,19 @@ inline PlannedPath buildDrawOps(const json& program,
             }
         }
 
-        if (isPaint && !penDown) {  // 도색 진입: a 전진 후 노즐 down
-            // 노즐을 올리는 op은 넣지 않는다 - penDown==false라 이미 올라가 있다.
-            seq.moveOp(+a, false, head);
-            seq.nozzleOp(true);
-            penDown = true;
-        } else if (!isPaint && penDown) {  // 도색 이탈: 노즐 up 후 a 후진
-            seq.nozzleOp(false);
-            seq.moveOp(-a, false, lastPaintHeading);
-            penDown = false;
+        // 🔴 위상이 바뀌는 것도 "도색 상태가 바뀌는 것"과 똑같이 취급한다.
+        //   펜을 내린 채로 제자리 회전하면 펜이 반지름 a의 호를 그어 버린다 -
+        //   직선에서 호로 넘어갈 때 φ만큼 트는 것도 예외가 아니다. 그래서
+        //   접합부에서는 노즐을 반드시 한 번 올렸다 내린다.
+        if (isPaint) {
+            if (!penDown) {
+                openPaint(g);
+            } else if (g.phase != penPhase) {
+                closePaint();
+                openPaint(g);
+            }
+        } else if (penDown) {  // 도색 이탈 (turn / 비도색 이동 직전)
+            closePaint();
         }
 
         if (o == "MOVE") {
@@ -229,40 +325,51 @@ inline PlannedPath buildDrawOps(const json& program,
             //   R_paint = d = 0.155m - 노즐만 반지름 d의 원을 그리는 자명한 사실과 맞다.
             // 도색하지 않는 arc는 펜이 올라가 있어 중심이 곧 도면 자취이므로
             // 보정하지 않는다 (§5.2 불변식의 나머지 절반).
-            double rRobot = rPaint;
-            if (isPaint) {
-                // 정상 흐름에서는 validateProgram이 이미 걸렀다. 여기서 한 번 더
-                // 보는 것은 sqrt 안이 음수가 되어 NaN이 로봇까지 흘러가는 경로를
-                // 원천 차단하기 위한 것 (§4.4 마이그레이션 체크리스트 #3).
-                if (rPaint < params().min_paint_radius_m) {
-                    PlannedPath bad;
-                    bad.ok = false;
-                    bad.failReason = "arc_too_tight";
-                    char b[128];
-                    snprintf(b, sizeof b,
-                             "곡선 반지름 %.3fm - 최소 도색 반지름 %.3fm 미만",
-                             rPaint, params().min_paint_radius_m);
-                    bad.failMsg = b;
-                    return bad;
-                }
-                double inner = rPaint * rPaint - a * a;
-                rRobot = inner > 0 ? std::sqrt(inner) : 0.0;
+            // 정상 흐름에서는 validateProgram이 이미 걸렀다. 여기서 한 번 더
+            // 보는 것은 sqrt 안이 음수가 되어 NaN이 로봇까지 흘러가는 경로를
+            // 원천 차단하기 위한 것 (§4.4 마이그레이션 체크리스트 #3).
+            // 반지름 보정 자체는 travelGeom이 이미 했다 (g.rRobot).
+            if (isPaint && rPaint < params().min_paint_radius_m) {
+                PlannedPath bad;
+                bad.ok = false;
+                bad.failReason = "arc_too_tight";
+                char b[128];
+                snprintf(b, sizeof b,
+                         "곡선 반지름 %.3fm - 최소 도색 반지름 %.3fm 미만",
+                         rPaint, params().min_paint_radius_m);
+                bad.failMsg = b;
+                return bad;
             }
-            // left = CCW(+), right = CW(-)
-            double exitHead = hasHeading(head)
-                                  ? normDeg(head + (dir == "left" ? angMag : -angMag))
-                                  : kNoHeading;
-            seq.arcOp(rRobot, angMag, dir, rPaint, head, exitHead, hasTgt, tgt,
-                      isPaint);
+            // 🔴 arcOp에 넘기는 진입/출구 방위는 접선이 아니라 **차체 방위**다
+            //   (도색 호면 접선 + φ). ALIGN 목표와 MORE 투영축이 전부 이 값을
+            //   쓰는데, 로봇이 실제로 바라보는 방향은 차체 방위이기 때문이다.
+            seq.arcOp(g.rRobot, angMag, dir, rPaint, g.bodyEntry, g.bodyExit,
+                      hasTgt, tgt, isPaint);
         }
-        if (isPaint && hasHeading(head)) lastPaintHeading = head;
+        if (isPaint && hasHeading(g.bodyExit)) penBodyHeading = g.bodyExit;
     }
 
-    if (penDown) {  // 경로 끝 - 노즐은 반드시 올려두고 중심을 꼭짓점에 되돌린다
-        seq.nozzleOp(false);
-        seq.moveOp(-a, false, lastPaintHeading);
-    }
+    if (penDown) closePaint();  // 경로 끝 - 노즐 up + 중심 원복 + 위상 원복
     return seq.take();
+}
+
+// 도색을 시작할 때 로봇이 서 있어야 할 방위 = 첫 주행 op의 **진입 접선**.
+// 접근 경로의 마지막 회전이 이 방향으로 세워두고, 도색 경로의 맨 앞 오프셋
+// 보정(필요하면 turn(φ) 포함)이 거기서부터 이어받는다.
+//
+// 🔴 그냥 첫 heading_deg를 쓰면 안 된다. Qt의 heading_deg는 "마쳤을 때"라
+//   호에서는 출구 접선이다 - 반원이면 정확히 180도 반대 방향으로 접근하게 된다.
+//   위상 φ는 여기서 더하지 않는다. 그건 도색 경로의 turn(φ)가 담당한다.
+inline double firstEntryHeading(const json& program) {
+    for (const auto& q : program) {
+        const double h = q.value("heading_deg", kNoHeading);
+        if (!hasHeading(h)) continue;
+        if (q.value("op", "") != "ARC") return h;
+        const double sweep = std::fabs(q.value("angle_deg", 0.0));
+        const bool left = (q.value("direction", "left") != "right");
+        return normDeg(h - (left ? sweep : -sweep));
+    }
+    return kNoHeading;
 }
 
 // ===== 접근(approach) 경로 생성 =====
