@@ -736,15 +736,25 @@ void Router::handleLogin(const json& payload, const std::string& replyRole) {
     // ⚠️ cam_ip는 그대로 둔다. 저건 카메라 IP(PNO 직결용)라 의미가 다르고,
     //    합치면 PNO로 되돌아갈 수 없게 된다 (stream_cfg.hpp 주석 참고).
     const StreamCfg stream = loadStreamCfg(kStreamCfgFile);
-    if (stream.valid()) out["stream"] = stream.toJson();
+    // 켰으면 주소를, 껐으면 {"enabled":false}를 싣는다. 설정 파일 자체가 없으면
+    // 아예 안 싣는다 - QT는 "필드 없음 = 서버가 모름"으로 보고 자기 설정을
+    // 유지하고, "enabled=false"는 저장된 중계 주소를 지우라는 지시로 읽는다
+    // (stream_cfg.hpp toJson 주석 참고).
+    if (stream.shouldSend()) out["stream"] = stream.toJson();
     srv_.sendTo(replyRole, makeMsg("LOGIN_OK", out));
     const std::string camIpStr = camIp.is_string() ? camIp.get<std::string>()
                                                    : std::string("없음 - QT 설정값 사용");
+    // 중계는 세 가지 상태를 구분해서 남긴다 - QT의 동작이 셋 다 다르기 때문에,
+    // 화면이 이상할 때 로그만 보고 어느 경우인지 바로 알 수 있어야 한다.
+    const std::string streamStr =
+        stream.valid()   ? stream.base
+        : stream.present ? std::string("끔 - QT에 해제 지시(직결)")
+                         : std::string("설정 없음 - QT 설정값 유지");
     logf("[INFO] LOGIN %s 성공 (%s 요청, 캘리브레이션 %zu채널 보유, 활성 채널 %d %s, "
-         "카메라 IP %s, 중계 주소 %s)",
+         "카메라 IP %s, 중계 %s)",
          id.c_str(), replyRole.c_str(), calibs_.size(), activeChannel_,
          act.valid ? "전달" : "없음 - 캘리브레이션 필요", camIpStr.c_str(),
-         stream.valid() ? stream.base.c_str() : "없음 - 직결 모드");
+         streamStr.c_str());
 }
 
 // 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용). 세 형태를 받는다:
