@@ -1,0 +1,55 @@
+/*
+ * Device tree overlay for the WS2812B strip driver.
+ *
+ * Repurposes the (normally disabled) PWM0 block: binds it to this driver
+ * instead of pwm-bcm2835, routes GPIO12 to PWM0_0, and wires up the DMA
+ * request line so the serialiser can be fed without CPU involvement.
+ *
+ * PWM0_0 also reaches GPIO18 (ALT5), but the robot carries a max98357a I2S
+ * amplifier that claims GPIO18 as PCM_CLK, so the strip sits on GPIO12.
+ * Override with pin=/func= if the wiring changes (ALT5 = 2, ALT0 = 4).
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	/* GPIO12 (header pin 32) -> ALT0 = PWM0_0 */
+	fragment@0 {
+		target = <&gpio>;
+		__overlay__ {
+			led_strip_pins: led_strip_pins {
+				brcm,pins = <12>;
+				brcm,function = <4>;	/* 4 = ALT0 */
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&pwm>;
+		frag1: __overlay__ {
+			compatible = "roadpainter,led-strip";
+			pinctrl-names = "default";
+			pinctrl-0 = <&led_strip_pins>;
+
+			/* 2.4MHz = three sub-bits per 1.25us WS2812 bit */
+			assigned-clock-rates = <2400000>;
+
+			/* cell is the DREQ line; 5 = PWM */
+			dmas = <&dma 5>;
+			dma-names = "pwm";
+
+			led-count = <7>;
+
+			status = "okay";
+		};
+	};
+
+	__overrides__ {
+		pin       = <&led_strip_pins>,"brcm,pins:0";
+		func      = <&led_strip_pins>,"brcm,function:0";
+		led-count = <&frag1>,"led-count:0";
+	};
+};
