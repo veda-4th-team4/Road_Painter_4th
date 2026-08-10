@@ -20,6 +20,7 @@ Rectangle {
         anchors.fill: parent
         anchors.margins: 16
         spacing: 12
+        visible: !Backend.homographyPending
 
         // ── 헤더 ────────────────────────────────────────────────────────
         Item {
@@ -121,6 +122,15 @@ Rectangle {
                         anchors.margins: cell.border.width
                         Component.onCompleted: Backend.registerTile(tile, cell.ch)
                     }
+                    Connections {
+                        target: Backend
+                        function onHomographyChanged() {
+                            // 대기 화면의 단일 타일이 같은 채널 등록을 잠시 가져간다.
+                            // 대기 종료 뒤 2x2 타일을 다시 등록해야 프레임이 돌아온다.
+                            if (!Backend.homographyPending)
+                                Backend.registerTile(tile, cell.ch)
+                        }
+                    }
 
                     // 채널 라벨 + 스트림 상태 점
                     Rectangle {
@@ -190,6 +200,151 @@ Rectangle {
                         }
                         onPressed: function(mouse) { mouse.accepted = false }
                     }
+                }
+            }
+        }
+    }
+
+    Item {
+        id: homographyView
+        anchors.fill: parent
+        anchors.margins: 16
+        visible: Backend.homographyPending
+
+        Rectangle {
+            id: selectedVideo
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            width: parent.width * 0.68
+            radius: Theme.radius
+            color: "#14161A"
+            border.width: 2
+            border.color: Theme.accent
+            clip: true
+
+            ChannelTile {
+                id: homographyTile
+                anchors.fill: parent
+                anchors.margins: 2
+                onVisibleChanged: {
+                    if (visible && Backend.homographyChannel > 0)
+                        Backend.registerTile(homographyTile, Backend.homographyChannel)
+                }
+            }
+            Connections {
+                target: Backend
+                function onHomographyChanged() {
+                    if (Backend.homographyPending && Backend.homographyChannel > 0)
+                        Backend.registerTile(homographyTile, Backend.homographyChannel)
+                }
+            }
+
+            Rectangle {
+                anchors.left: parent.left
+                anchors.top: parent.top
+                anchors.margins: 12
+                width: liveLabel.implicitWidth + 18
+                height: 28
+                radius: 4
+                color: "#E6FFFFFF"
+                Text {
+                    id: liveLabel
+                    anchors.centerIn: parent
+                    text: "CH" + Backend.homographyChannel + " 실시간 영상"
+                    color: Theme.text
+                    font.pixelSize: 12
+                    font.bold: true
+                    font.family: Theme.fontFamily
+                }
+            }
+        }
+
+        Rectangle {
+            anchors.left: selectedVideo.right
+            anchors.leftMargin: 14
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            radius: Theme.radius
+            color: Theme.surface
+            border.width: 1
+            border.color: Theme.stroke
+
+            Column {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.margins: 24
+                spacing: 18
+
+                BusyIndicator {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    running: Backend.homographyPending
+                    width: 48
+                    height: 48
+                }
+                Text {
+                    width: parent.width
+                    text: "CH" + Backend.homographyChannel + " 호모그래피 계산 중"
+                    horizontalAlignment: Text.AlignHCenter
+                    color: Theme.text
+                    font.pixelSize: 20
+                    font.bold: true
+                    font.family: Theme.fontFamily
+                    wrapMode: Text.WordWrap
+                }
+                Text {
+                    width: parent.width
+                    text: Backend.homographyStatus
+                    horizontalAlignment: Text.AlignHCenter
+                    color: Theme.sub
+                    font.pixelSize: 12
+                    font.family: Theme.fontFamily
+                    wrapMode: Text.WordWrap
+                }
+                ProgressBar {
+                    width: parent.width
+                    visible: Backend.homographyProgress >= 0
+                    from: 0
+                    to: 1
+                    value: Math.max(0, Backend.homographyProgress)
+                }
+                Rectangle {
+                    width: parent.width
+                    height: safetyText.implicitHeight + 24
+                    radius: 6
+                    color: Theme.warnSoft
+                    border.width: 1
+                    border.color: Theme.warn
+                    Text {
+                        id: safetyText
+                        anchors.fill: parent
+                        anchors.margins: 12
+                        text: "로봇이 자동으로 이동할 수 있습니다.\n작업 영역에 들어가지 마세요."
+                        horizontalAlignment: Text.AlignHCenter
+                        color: Theme.text
+                        font.pixelSize: 12
+                        font.bold: true
+                        font.family: Theme.fontFamily
+                        wrapMode: Text.WordWrap
+                    }
+                }
+                Text {
+                    width: parent.width
+                    text: "완료되면 새 보정값을 적용하고 이 채널의 작업 화면으로 자동 전환합니다."
+                    horizontalAlignment: Text.AlignHCenter
+                    color: Theme.muted
+                    font.pixelSize: 11
+                    font.family: Theme.fontFamily
+                    wrapMode: Text.WordWrap
+                }
+                AppButton {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: Backend.homographyCancelPending ? "중단 확인 대기 중" : "호모그래피 중단"
+                    enabled: !Backend.homographyCancelPending
+                    danger: true
+                    onClicked: Backend.cancelHomography()
                 }
             }
         }

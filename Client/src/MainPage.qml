@@ -137,7 +137,87 @@ Item {
         if (!Backend.drawing && !Backend.hasPath) Backend.startDrawSession(false)
     }
 
+    component HelpIcon: Item {
+        id: helpIcon
+        property string helpTitle: "도움말"
+        property string helpText: ""
+        property bool opensPopover: true
+        signal activated()
+        width: 20
+        height: 20
+        Accessible.role: Accessible.Button
+        Accessible.name: helpTitle
+
+        Rectangle {
+            anchors.fill: parent
+            radius: width / 2
+            color: helpMouse.containsMouse || helpPopup.opened ? Theme.accentSoft : "transparent"
+            border.width: 1
+            border.color: helpMouse.containsMouse || helpPopup.opened ? Theme.accent : Theme.stroke
+            Text {
+                anchors.centerIn: parent
+                text: "?"
+                color: helpMouse.containsMouse || helpPopup.opened ? Theme.accentDim : Theme.muted
+                font.pixelSize: 12
+                font.bold: true
+                font.family: Theme.fontFamily
+            }
+            MouseArea {
+                id: helpMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                ToolTip.visible: containsMouse && !helpPopup.opened
+                ToolTip.text: helpIcon.helpTitle
+                onClicked: {
+                    helpIcon.activated()
+                    if (helpIcon.opensPopover) helpPopup.open()
+                }
+            }
+        }
+
+        Popup {
+            id: helpPopup
+            parent: Overlay.overlay
+            width: Math.min(310, page.width - 24)
+            padding: 14
+            closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+            x: Math.max(12, Math.min(parent.width - width - 12,
+                       helpIcon.mapToItem(parent, 0, 0).x + helpIcon.width - width))
+            y: Math.max(12, Math.min(parent.height - height - 12,
+                       helpIcon.mapToItem(parent, 0, 0).y + helpIcon.height + 6))
+            background: Rectangle {
+                radius: 6
+                color: Theme.surface
+                border.width: 1
+                border.color: Theme.accent
+            }
+            contentItem: Column {
+                width: helpPopup.width - 28
+                spacing: 7
+                Text {
+                    width: parent.width
+                    text: helpIcon.helpTitle
+                    color: Theme.text
+                    font.pixelSize: 13
+                    font.bold: true
+                    font.family: Theme.fontFamily
+                }
+                Text {
+                    width: parent.width
+                    text: helpIcon.helpText
+                    color: Theme.sub
+                    font.pixelSize: 11
+                    font.family: Theme.fontFamily
+                    lineHeight: 1.25
+                    wrapMode: Text.WordWrap
+                }
+            }
+        }
+    }
+
     component Pill: Rectangle {
+        id: pill
         property string label: ""
         property bool ok: false
         property bool bad: false
@@ -154,11 +234,11 @@ Item {
             Rectangle {
                 width: 7; height: 7; radius: 4
                 anchors.verticalCenter: parent.verticalCenter
-                color: parent.parent.bad ? Theme.danger
-                     : (parent.parent.ok ? Theme.success : Theme.muted)
+                color: pill.bad ? Theme.danger
+                     : (pill.ok ? Theme.success : Theme.muted)
             }
             Text {
-                text: label
+                text: pill.label
                 color: Theme.text
                 font.pixelSize: 11
                 font.family: Theme.fontFamily
@@ -346,6 +426,7 @@ Item {
             }
             AppButton {
                 text: "작업 이력"
+                enabled: !Backend.homographyPending
                 ToolTip.visible: hovered
                 ToolTip.text: "지금까지 그린 도면 — 계획→결과 확인, 다시 그리기, 수정, 이름변경, 삭제"
                 onClicked: historyDialog.open()
@@ -368,9 +449,25 @@ Item {
                     }
                 }
             }
+            HelpIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                helpTitle: "Road Painter 사용 순서"
+                helpText: ""
+                opensPopover: false
+                onActivated: tutorialPopup.open()
+            }
             AppButton {
                 text: "설정"
+                enabled: !Backend.homographyPending
                 onClicked: settingsPopup.open()
+            }
+            AppButton {
+                visible: page.channelGridMode
+                enabled: !Backend.homographyPending
+                text: "로그아웃"
+                ToolTip.visible: hovered
+                ToolTip.text: "현재 계정에서 로그아웃합니다"
+                onClicked: logoutPopup.open()
             }
             AppButton {
                 danger: Backend.robotState !== "ESTOPPED"
@@ -422,16 +519,14 @@ Item {
             spacing: 6
             AppButton {
                 visible: Backend.calibMissing
-                text: "관리자 창 주소 복사"
+                text: "캘리브 설정 열기"
                 onClicked: {
-                    adminUrlHolder.text = Backend.adminConsoleUrl
-                    adminUrlHolder.selectAll()
-                    adminUrlHolder.copy()
+                    settingsPopup.tabIndex = 1
+                    settingsPopup.open()
                 }
             }
             AppButton { text: "닫기"; onClicked: Backend.dismissNotice() }
         }
-        TextEdit { id: adminUrlHolder; visible: false; width: 1; height: 1 }
     }
 
     // ── 4채널 미리보기 (PNM) ─────────────────────────────────────────
@@ -616,10 +711,15 @@ Item {
                     cursorShape: Qt.PointingHandCursor
                     hoverEnabled: true
                     ToolTip.visible: containsMouse
-                    ToolTip.text: "마커 외곽선과 ID 표시를 켜고 끕니다\n" +
+                    ToolTip.text: "OpenCV 마커 검출과 화면 표시를 함께 켜고 끕니다\n" +
                                   (Backend.arucoSummary.length ? Backend.arucoSummary : "검출된 마커 없음")
                     onClicked: Backend.arucoOverlay = !Backend.arucoOverlay
                 }
+            },
+            HelpIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                helpTitle: "CCTV 영상"
+                helpText: "선택한 채널의 RTSP 영상을 확인합니다. ArUco를 끄면 마커 검출과 외곽선 표시가 모두 중지됩니다. 연결 실패 시 설정의 카메라 IP와 스트림 주소를 확인하세요."
             }
         ]
 
@@ -820,6 +920,11 @@ Item {
                 ToolTip.text: "TopView 위 로봇 아이콘을 숨깁니다.\n"
                     + "작도할 때 로봇이 도면을 가리면 끄세요.\n"
                     + "표시만 꺼지고 위치 수신·진행률 계산은 그대로 돕니다."
+            },
+            HelpIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                helpTitle: "Top View와 경로 작성"
+                helpText: "프리셋을 캔버스로 끌거나 [경로 추가]로 점을 찍습니다. 기본 크기 조절은 비율을 유지하고, Shift를 누른 동안만 자유 변형합니다. 도색 반지름 200 mm 미만의 곡선은 빨간색으로 표시되며 전송할 수 없습니다."
             }
             // 곡선은 도면 기하가 원호 허용오차를 만족할 때 ARC로 보낸다.
             // 서버 v2가 실행 반지름과 펜 오프셋을 로봇 op으로 변환한다.
@@ -1009,25 +1114,31 @@ Item {
                             topPadding: 4
                         }
 
-                        AppButton {
+                        Row {
                             width: parent.width
-                            accent: Backend.drawing
-                            text: Backend.drawing ? "작도 끝내기" : "경로 추가"
-                            enabled: !Backend.jobActive
-                            onClicked: {
-                                if (Backend.drawing) Backend.finishDrawing()
-                                else Backend.startDrawSession(false)
+                            spacing: 6
+                            AppButton {
+                                width: parent.width - 26
+                                accent: Backend.drawing
+                                text: Backend.drawing ? "작도 끝내기" : "경로 추가"
+                                enabled: !Backend.jobActive
+                                onClicked: {
+                                    if (Backend.drawing) Backend.finishDrawing()
+                                    else Backend.startDrawSession(false)
+                                }
+                            }
+                            HelpIcon {
+                                anchors.verticalCenter: parent.verticalCenter
+                                helpTitle: "경로 작성"
+                                helpText: "프리셋은 캔버스로 끌어놓습니다. 직접 그릴 때는 점을 차례로 찍고 첫 점을 다시 누르면 닫힙니다. 더블클릭, 우클릭 또는 Esc로 열린 경로를 끝냅니다. 빈 곳을 드래그하면 여러 점을 선택합니다."
                             }
                         }
                         Text {
                             width: parent.width
                             wrapMode: Text.WordWrap
                             lineHeight: 1.15
-                            text: Backend.drawing
-                                ? "클릭 = 점 추가\n첫 점 클릭 = 닫기\n더블·우클릭/Esc = 끝"
-                                : (Backend.hasPath
-                                   ? "휠 = 확대 · 휠클릭 = 이동\n빈 곳 드래그 = 범위 선택\nCtrl+클릭 = 점 추가 선택\n치수 클릭 = 길이 입력"
-                                   : "프리셋을 끌어놓거나\n경로 추가로 점 찍기\n휠 = 확대 · 휠클릭 = 이동")
+                            visible: Backend.drawing
+                            text: "점을 추가하는 중 · 첫 점 클릭으로 닫기"
                             color: Theme.muted
                             font.pixelSize: 10
                             font.family: Theme.fontFamily
@@ -1303,6 +1414,11 @@ Item {
         floatHeight: 300
 
         headerExtra: [
+            HelpIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                helpTitle: "수동 조작"
+                helpText: "방향 버튼을 누르는 동안만 주행하고 떼면 정지합니다. 노즐은 올림/내림 상태를 전환합니다. 자동 경로 실행 중에는 수동 주행이 잠기며, Space는 언제든 비상 정지입니다."
+            },
             Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 visible: !Backend.manualEnabled
@@ -1435,6 +1551,11 @@ Item {
         floatHeight: 420
 
         headerExtra: [
+            HelpIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                helpTitle: "시스템 로그"
+                helpText: "서버 연결, 경로 전송, 작업 응답과 오류를 시간순으로 표시합니다. 문제를 확인할 때 지우기 전에 마지막 오류 문구를 먼저 확인하세요."
+            },
             AppButton {
                 anchors.verticalCenter: parent.verticalCenter
                 height: 22
@@ -1483,6 +1604,14 @@ Item {
         title: "제어판"
         floatWidth: 360
         floatHeight: 820
+
+        headerExtra: [
+            HelpIcon {
+                anchors.verticalCenter: parent.verticalCenter
+                helpTitle: "작업 제어"
+                helpText: "경로 작성 후 [도면 전송]으로 서버에 저장하고, 확인 뒤 [그림그리기 시작]을 누릅니다. 작업 취소는 현재 경로를 폐기하고, ESTOP은 로봇을 즉시 정지시킵니다."
+            }
+        ]
 
         Flickable {
             id: rightFlick
@@ -1570,13 +1699,23 @@ Item {
                         anchors.top: parent.top
                         anchors.margins: 14
                         spacing: 10
-                        Text {
-                            text: "작업 정보"
-                            color: Theme.sub
-                            font.pixelSize: 12
-                            font.bold: true
-                            font.family: Theme.fontFamily
-                        }
+                            Row {
+                                width: parent.width
+                                spacing: 6
+                                Text {
+                                    text: "작업 정보"
+                                    color: Theme.sub
+                                    font.pixelSize: 12
+                                    font.bold: true
+                                    font.family: Theme.fontFamily
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                HelpIcon {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    helpTitle: "작업 단계"
+                                    helpText: "작도 → 도면 전송 → 작업 시작 순서입니다. 도면 전송만으로 로봇은 움직이지 않습니다. 작업 시작 후 서버가 시작점 접근과 도색을 이어서 수행합니다."
+                                }
+                            }
                         // 단계 표시 — 지금 어디쯤인지 한눈에
                         Row {
                             width: parent.width
@@ -1775,13 +1914,22 @@ Item {
                         Row {
                             width: parent.width
                             spacing: 6
-                            Text {
-                                text: "로봇 동작 시퀀스"
-                                color: Theme.sub
-                                font.pixelSize: 12
-                                font.bold: true
-                                font.family: Theme.fontFamily
+                            Row {
+                                spacing: 5
                                 anchors.verticalCenter: parent.verticalCenter
+                                Text {
+                                    text: "로봇 동작 시퀀스"
+                                    color: Theme.sub
+                                    font.pixelSize: 12
+                                    font.bold: true
+                                    font.family: Theme.fontFamily
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                HelpIcon {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    helpTitle: "동작 시퀀스"
+                                    helpText: "Qt가 서버에 보낼 경로를 MOVE, TURN, ARC, 노즐 동작으로 미리 보여줍니다. 원과 유효한 원호는 여러 직선이 아니라 ARC 한 동작이어야 합니다. 펜 오프셋과 실제 바퀴 제어는 서버와 로봇이 담당합니다."
+                                }
                             }
                             Rectangle {
                                 width: seqTag.implicitWidth + 12
@@ -1807,17 +1955,6 @@ Item {
                                 anchors.verticalCenter: parent.verticalCenter
                                 onClicked: planCard.expanded = !planCard.expanded
                             }
-                        }
-
-                        Text {
-                            width: parent.width
-                            text: "양수 = 좌회전, 음수 = 우회전 · Qt가 서버에 보내는 도면 기준 논리 동작\n"
-                                  + "흐린 칸 = 칠하지 않는 이동, 초록 = 노즐, 보라 = 곡선(ARC) · "
-                                  + "펜 오프셋·노즐 타이밍·실행 반지름은 서버/로봇이 변환"
-                            color: Theme.muted
-                            font.pixelSize: 10
-                            font.family: Theme.fontFamily
-                            wrapMode: Text.WordWrap
                         }
 
                         // 접힌 상태에서는 시퀀스를 한 줄 띠로 요약해서 보여준다
@@ -2030,6 +2167,186 @@ Item {
 
     // ── 팝업들 ──────────────────────────────────────────────────────
     JobHistoryDialog { id: historyDialog }
+
+    Popup {
+        id: tutorialPopup
+        property int step: 0
+        readonly property var steps: [
+            {
+                title: "작업 채널 선택",
+                body: "4채널 화면에서 로봇을 볼 채널의 [작업하기]를 누릅니다. 영상이 없으면 설정에서 카메라 IP 또는 RTSP 주소를 먼저 확인하세요.",
+                action: "확인할 것: CCTV 연결 상태와 올바른 채널",
+                visual: "예시 화면 · 작업 채널 선택",
+                image: "qrc:/assets/tutorial_step_1_channel.jpg"
+            },
+            {
+                title: "Top View 확인",
+                body: "Top View의 보정 상태와 축척을 확인합니다. 도면 좌표는 이 바닥 평면 기준으로 서버에 전송되므로, 카메라가 움직였다면 먼저 다시 캘리브레이션해야 합니다.",
+                action: "확인할 것: 바닥 기준점과 축척",
+                visual: "Top View · 보정된 바닥 평면",
+                image: "qrc:/assets/tutorial_step_2_calibration.jpg"
+            },
+            {
+                title: "경로 작성",
+                body: "프리셋을 끌어놓거나 [경로 추가]로 점을 찍습니다. 크기 조절은 기본적으로 비율을 유지하며 Shift를 누른 동안만 자유 변형합니다. 도색 반지름은 200 mm보다 작게 줄어들지 않습니다.",
+                action: "곡선이 빨간색이면 크기를 키우세요",
+                visual: "도색 경로 · R ≥ 200 mm",
+                image: "qrc:/assets/tutorial_step_3_path.jpg"
+            },
+            {
+                title: "경로 검토",
+                body: "오른쪽 동작 시퀀스에서 직선은 MOVE, 곡선은 ARC로 생성됐는지 확인합니다. 원 하나는 ARC 한 동작이어야 하며, 점 개수가 많다고 MOVE가 늘어나면 전송 전에 경로를 수정합니다.",
+                action: "확인할 것: 거리, ARC 반지름, 동작 수",
+                visual: "경로 미리보기 · MOVE 1 · ARC 1",
+                image: "qrc:/assets/tutorial_step_4_review.jpg"
+            },
+            {
+                title: "전송하고 시작",
+                body: "[도면 전송]은 경로만 서버에 저장합니다. 서버 확인이 끝난 뒤 [그림그리기 시작]을 눌러야 로봇이 움직입니다. 정상 중단은 [작업 취소], 즉시 정지는 [ESTOP]을 사용합니다.",
+                action: "시작 전 로봇 주변과 노즐 상태를 확인하세요",
+                visual: "도면 전송 → 서버 확인 → 작업 시작",
+                image: "qrc:/assets/tutorial_step_5_execute.jpg"
+            }
+        ]
+        readonly property var currentStep: steps[step]
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(620, page.width - 32)
+        padding: 20
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        onAboutToShow: step = 0
+        background: Rectangle {
+            radius: 6
+            color: Theme.surface
+            border.width: 1
+            border.color: Theme.stroke
+        }
+        contentItem: Column {
+            width: tutorialPopup.width - 40
+            spacing: 18
+            Row {
+                width: parent.width
+                spacing: 10
+                Rectangle {
+                    width: 30; height: 30; radius: 15
+                    color: Theme.accent
+                    Text {
+                        anchors.centerIn: parent
+                        text: tutorialPopup.step + 1
+                        color: "#FFFFFF"
+                        font.pixelSize: 13
+                        font.bold: true
+                        font.family: Theme.fontFamily
+                    }
+                }
+                Column {
+                    width: parent.width - 40
+                    spacing: 2
+                    Text {
+                        width: parent.width
+                        text: "Road Painter 사용 순서"
+                        color: Theme.muted
+                        font.pixelSize: 10
+                        font.family: Theme.fontFamily
+                    }
+                    Text {
+                        width: parent.width
+                        text: tutorialPopup.currentStep.title
+                        color: Theme.text
+                        font.pixelSize: 17
+                        font.bold: true
+                        font.family: Theme.fontFamily
+                    }
+                }
+            }
+            Text {
+                width: parent.width
+                text: tutorialPopup.currentStep.visual
+                color: Theme.sub
+                font.pixelSize: 11
+                font.bold: true
+                font.family: Theme.fontFamily
+            }
+            Rectangle {
+                width: parent.width
+                height: Math.min(250, width * 0.46)
+                radius: 5
+                clip: true
+                color: Theme.panel
+                border.width: 1
+                border.color: Theme.stroke
+                Image {
+                    anchors.fill: parent
+                    source: tutorialPopup.currentStep.image
+                    fillMode: Image.PreserveAspectFit
+                    smooth: true
+                    mipmap: true
+                }
+            }
+            Text {
+                width: parent.width
+                text: tutorialPopup.currentStep.body
+                color: Theme.sub
+                font.pixelSize: 13
+                font.family: Theme.fontFamily
+                lineHeight: 1.35
+                wrapMode: Text.WordWrap
+            }
+            Rectangle {
+                width: parent.width
+                height: actionText.implicitHeight + 20
+                radius: 5
+                color: Theme.accentSoft
+                border.width: 1
+                border.color: Theme.accent
+                Text {
+                    id: actionText
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.margins: 10
+                    text: tutorialPopup.currentStep.action
+                    color: Theme.accentDim
+                    font.pixelSize: 12
+                    font.bold: true
+                    font.family: Theme.fontFamily
+                    wrapMode: Text.WordWrap
+                }
+            }
+            Row {
+                anchors.horizontalCenter: parent.horizontalCenter
+                spacing: 6
+                Repeater {
+                    model: tutorialPopup.steps.length
+                    Rectangle {
+                        required property int index
+                        width: tutorialPopup.step === index ? 18 : 6
+                        height: 6
+                        radius: 3
+                        color: tutorialPopup.step === index ? Theme.accent : Theme.stroke
+                        Behavior on width { NumberAnimation { duration: 120 } }
+                    }
+                }
+            }
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                AppButton {
+                    visible: tutorialPopup.step > 0
+                    text: "이전"
+                    onClicked: tutorialPopup.step--
+                }
+                AppButton {
+                    accent: true
+                    text: tutorialPopup.step + 1 === tutorialPopup.steps.length ? "완료" : "다음"
+                    onClicked: {
+                        if (tutorialPopup.step + 1 === tutorialPopup.steps.length) tutorialPopup.close()
+                        else tutorialPopup.step++
+                    }
+                }
+            }
+        }
+    }
 
     Popup {
         id: sendConfirmPopup
@@ -2261,6 +2578,16 @@ Item {
 
     Popup {
         id: settingsPopup
+        property int tabIndex: 0
+        property int calibrationChannel: Backend.workingChannel > 0
+            ? Backend.workingChannel
+            : (Backend.highlightedChannel > 0 ? Backend.highlightedChannel : 1)
+        property bool manualCalibrationExpanded: false
+        onAboutToShow: {
+            calibrationChannel = Backend.workingChannel > 0
+                ? Backend.workingChannel
+                : (Backend.highlightedChannel > 0 ? Backend.highlightedChannel : 1)
+        }
         modal: true
         anchors.centerIn: Overlay.overlay
         width: 560
@@ -2275,12 +2602,21 @@ Item {
             spacing: 10
             width: 528
 
-            Text {
-                text: "설정"
-                color: Theme.text
-                font.pixelSize: 16
-                font.bold: true
-                font.family: Theme.fontFamily
+            Row {
+                spacing: 7
+                Text {
+                    text: "설정"
+                    color: Theme.text
+                    font.pixelSize: 16
+                    font.bold: true
+                    font.family: Theme.fontFamily
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+                HelpIcon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    helpTitle: "설정"
+                    helpText: "영상은 화면 표시와 카메라 연결, 캘리브는 Top View 좌표 보정, 서버는 로그인 서버 주소를 설정합니다. 연결 정보를 바꾸면 적용 후 미리보기가 다시 열릴 수 있습니다."
+                }
             }
 
             Row {
@@ -2318,6 +2654,7 @@ Item {
                 visible: settingsPopup.tabIndex === 0
 
                 component FilterRow: Column {
+                    id: filterRow
                     width: 488
                     property alias value: sl.value
                     property string label: ""
@@ -2334,7 +2671,7 @@ Item {
                         width: parent.width
                         spacing: 8
                         Text {
-                            text: parent.parent.label
+                            text: filterRow.label
                             color: Theme.sub
                             font.pixelSize: 12
                             font.family: Theme.fontFamily
@@ -2344,8 +2681,8 @@ Item {
                         Slider {
                             id: sl
                             width: parent.width - 56 - 72 - 16
-                            from: parent.parent.from
-                            to: parent.parent.to
+                            from: filterRow.from
+                            to: filterRow.to
                             stepSize: 1
                             value: 0
                             anchors.verticalCenter: parent.verticalCenter
@@ -2365,8 +2702,8 @@ Item {
                             font.pixelSize: 12
                             inputMethodHints: Qt.ImhFormattedNumbersOnly
                             anchors.verticalCenter: parent.verticalCenter
-                            onEditingFinished: parent.parent.setFromText(text)
-                            onAccepted: parent.parent.setFromText(text)
+                            onEditingFinished: filterRow.setFromText(text)
+                            onAccepted: filterRow.setFromText(text)
                             background: Rectangle {
                                 radius: 4
                                 color: Theme.panel
@@ -2385,7 +2722,7 @@ Item {
                     width: parent.width
                     spacing: 8
                     AppButton {
-                        text: Backend.arucoOverlay ? "ArUco 마커 표시: 켬" : "ArUco 마커 표시: 끔"
+                        text: Backend.arucoOverlay ? "ArUco 검출: 켬" : "ArUco 검출: 끔"
                         accent: Backend.arucoOverlay
                         onClicked: Backend.arucoOverlay = !Backend.arucoOverlay
                     }
@@ -2620,10 +2957,8 @@ Item {
                 Text {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    // 이 칸이 곧 되돌리기 스위치라는 것을 여기 적어둔다. 현장에서
-                    // PNM 이 말썽이면 재빌드 없이 이 한 칸을 비우면 끝이다.
-                    text: "서버의 RTSP 중계 주소를 넣으면 4채널 화면으로 동작합니다. "
-                        + "비우면 위의 단일 카메라 직결 동작으로 즉시 되돌아갑니다 (재시작 불필요)."
+                    text: "MediaMTX 중계를 쓸 때만 서버 베이스 주소를 입력합니다. "
+                        + "카메라에 직접 연결할 때는 비워두고 위의 카메라 IP만 적용하세요."
                     color: Theme.muted
                     font.pixelSize: 11
                     font.family: Theme.fontFamily
@@ -2638,7 +2973,7 @@ Item {
                         color: Theme.text
                         leftPadding: 8
                         selectByMouse: true
-                        placeholderText: "rtsp://192.168.0.2:8554   (비우면 단일 채널)"
+                        placeholderText: "rtsp://192.168.0.2:8554   (카메라 직결이면 비움)"
                         placeholderTextColor: Theme.muted
                         font.family: Theme.fontFamily
                         font.pixelSize: 12
@@ -2663,7 +2998,7 @@ Item {
                     AppButton {
                         height: 30
                         text: "비우기"
-                        visible: Backend.channelMode
+                        visible: Backend.relayBase.length > 0
                         onClicked: { relayField.text = ""; Backend.setRelayBase("") }
                     }
                 }
@@ -2686,6 +3021,119 @@ Item {
                 width: parent.width
                 spacing: 8
                 visible: settingsPopup.tabIndex === 1
+
+                Rectangle {
+                    width: parent.width
+                    height: robotCalibCol.implicitHeight + 28
+                    radius: Theme.radius
+                    color: Theme.panel
+                    border.width: 1
+                    border.color: Theme.stroke
+                    Column {
+                        id: robotCalibCol
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 14
+                        spacing: 10
+                        Row {
+                            width: parent.width
+                            height: 20
+                            Text {
+                                text: "로봇 주행 호모그래피"
+                                color: Theme.text
+                                font.pixelSize: 14
+                                font.bold: true
+                                font.family: Theme.fontFamily
+                            }
+                            Text {
+                                anchors.right: parent.right
+                                text: Backend.calibratedChannels.indexOf(settingsPopup.calibrationChannel) >= 0
+                                    ? "기존 보정 있음" : "보정 필요"
+                                color: Backend.calibratedChannels.indexOf(settingsPopup.calibrationChannel) >= 0
+                                    ? Theme.success : Theme.warn
+                                font.pixelSize: 11
+                                font.bold: true
+                                font.family: Theme.fontFamily
+                            }
+                        }
+                        Text {
+                            width: parent.width
+                            text: "채널을 선택해 시작만 요청합니다. 로봇 이동과 영상 계산은 서버·로봇·CCTV가 수행합니다."
+                            color: Theme.sub
+                            font.pixelSize: 11
+                            font.family: Theme.fontFamily
+                            wrapMode: Text.WordWrap
+                        }
+                        Row {
+                            spacing: 6
+                            Repeater {
+                                model: Backend.channelCount
+                                delegate: AppButton {
+                                    required property int index
+                                    width: 58
+                                    text: "CH" + (index + 1)
+                                    accent: settingsPopup.calibrationChannel === index + 1
+                                    onClicked: settingsPopup.calibrationChannel = index + 1
+                                }
+                            }
+                        }
+                        Rectangle {
+                            width: parent.width
+                            height: safetyStartText.implicitHeight + 18
+                            radius: 5
+                            color: Theme.warnSoft
+                            border.width: 1
+                            border.color: Theme.warn
+                            Text {
+                                id: safetyStartText
+                                anchors.fill: parent
+                                anchors.margins: 9
+                                text: "시작하면 로봇이 자동으로 움직일 수 있습니다. 작업 영역이 비어 있는지 확인하세요."
+                                color: Theme.text
+                                font.pixelSize: 11
+                                font.family: Theme.fontFamily
+                                wrapMode: Text.WordWrap
+                            }
+                        }
+                        Row {
+                            spacing: 8
+                            AppButton {
+                                accent: true
+                                text: "CH" + settingsPopup.calibrationChannel + " 호모그래피 시작"
+                                enabled: !Backend.testMode && Backend.serverConnected
+                                    && Backend.robotOnline && Backend.cctvOnline
+                                    && !Backend.jobActive && !Backend.drawing
+                                    && !Backend.homographyPending
+                                onClicked: {
+                                    if (Backend.startHomography(settingsPopup.calibrationChannel))
+                                        settingsPopup.close()
+                                }
+                            }
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: Backend.testMode ? "서버 로그인 필요"
+                                    : (!Backend.serverConnected ? "서버 연결 필요"
+                                    : (!Backend.robotOnline || !Backend.cctvOnline
+                                       ? "로봇·CCTV 연결 필요" : ""))
+                                color: Theme.warn
+                                font.pixelSize: 10
+                                font.family: Theme.fontFamily
+                            }
+                        }
+                    }
+                }
+
+                AppButton {
+                    text: settingsPopup.manualCalibrationExpanded
+                        ? "고급 수동 보정 접기" : "고급 수동 보정 펼치기"
+                    onClicked: settingsPopup.manualCalibrationExpanded = !settingsPopup.manualCalibrationExpanded
+                }
+
+                Column {
+                    width: parent.width
+                    spacing: 8
+                    visible: settingsPopup.manualCalibrationExpanded
 
                 Text {
                     width: parent.width
@@ -2714,8 +3162,8 @@ Item {
                         anchors.margins: 8
                         anchors.verticalCenter: parent.verticalCenter
                         wrapMode: Text.WordWrap
-                        text: "서버에 저장된 캘리브레이션이 없습니다 (LOGIN_OK.calib = null).\n"
-                            + "카메라 설치·캘리브레이션은 관리자 창에서 진행하세요: " + Backend.adminConsoleUrl
+                        text: "현재 사용할 수 있는 캘리브레이션이 없습니다.\n"
+                            + "위에서 채널을 선택한 뒤 호모그래피 계산을 시작하세요."
                         color: Theme.text
                         font.pixelSize: 11
                         font.family: Theme.fontFamily
@@ -2926,6 +3374,7 @@ Item {
                         onClicked: settingsPopup.clearAnchors()
                     }
                 }
+                }
             }
 
             // ── 서버 탭 ──
@@ -2995,8 +3444,8 @@ Item {
                 Text {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    text: "캘리브레이션 시작은 관리자 창에서 진행합니다 (프로토콜 v0.3). "
-                        + "QT는 결과(LOGIN_OK.calib / H_MATRIX)만 받습니다."
+                    text: "QT는 선택 채널에 CALIB_START만 요청합니다. 로봇 이동과 계산은 "
+                        + "서버·로봇·CCTV가 수행하고, QT는 H_MATRIX 결과를 적용합니다."
                     color: Theme.muted
                     font.pixelSize: 11
                     font.family: Theme.fontFamily
@@ -3010,8 +3459,6 @@ Item {
                 AppButton { accent: true; text: "닫기"; onClicked: settingsPopup.close() }
             }
         }
-
-        property int tabIndex: 0
 
         function applyFilters() {
             Backend.setVideoFilters(fBright.value, fContrast.value, fSharpen.value, fSat.value)

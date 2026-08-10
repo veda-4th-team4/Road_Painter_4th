@@ -259,10 +259,10 @@ inline Glyph glyphFor(QChar ch, double *advance)
             Glyph o;
             if (!def || !*def) return o;
             if (std::strchr(def, 'A')) {
-                const double u = std::min(sx, sy);
-                ox += (sx - u) * 0.5;
-                oy += (sy - u) * 0.5;
-                sx = sy = u;
+                const double uniformScale = std::min(sx, sy);
+                ox += (sx - uniformScale) * 0.5;
+                oy += (sy - uniformScale) * 0.5;
+                sx = sy = uniformScale;
             }
             for (const Stroke &st : parse(QString::fromUtf8(def))) {
                 Stroke n;

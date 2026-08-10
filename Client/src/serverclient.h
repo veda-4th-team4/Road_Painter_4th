@@ -30,7 +30,8 @@
 //       "접근 완료"는 QT 에 통지되지 않으므로 2단계 버튼을 만들지 말 것.
 //     · 끝은 DRAW_DONE 하나로만 온다.
 //     · POS(CCTV 원본 픽셀)는 더 이상 QT 로 오지 않는다 → 수신 분기 없음.
-//   ⚠️ QT 는 CALIB_START 를 보내지 않는다 (캘리브레이션 시작은 관리자 창 담당).
+//   QT 는 선택 채널의 로봇 주행 호모그래피를 CALIB_START 로 요청하고,
+//   서버/CCTV가 계산한 H_MATRIX 결과만 적용한다. 이동·계산 로직은 QT에 없다.
 class ServerClient : public QObject
 {
     Q_OBJECT
@@ -69,6 +70,10 @@ public:
     // CCTV 에 중계해 그 채널의 마커를 잡게 한다 → 응답 CHANNEL_OK{ch,calib}.
     // ⚠️ 영상만 바꾸고 이걸 안 보내면 로봇 위치가 옛 채널 기준이라 조용히 어긋난다.
     void sendSelectChannel(int ch);
+    // 선택 채널의 로봇 주행 호모그래피 시작/취소. requestId는 늦게 도착한
+    // 이전 결과를 현재 요청으로 오인하지 않기 위한 상관관계 키다.
+    void sendCalibStart(int ch, const QString &requestId);
+    void sendCalibCancel(int ch, const QString &requestId);
     // ⚠️ sendSpeeds 는 없앴다 — 프로토콜에 속도 CMD 가 없고(2026-07-28 확정),
     //    로봇에도 SET_SPEED 분기가 없어 보내봐야 버려진다.
     // 로그인 후 카메라 IP 변경 (빈 문자열이면 등록 해제)
@@ -91,7 +96,13 @@ signals:
     void peersReceived(bool robot, bool cctv);
     // 캘리브레이션 갱신 → top-view 재생성. ch 는 이 번들이 어느 채널의 것인지
     // (단일 채널 카메라·v0.3 서버는 ch 를 안 실으므로 1로 온다).
-    void hMatrixReceived(int ch, const QJsonObject &calib);
+    void hMatrixReceived(int ch, const QJsonObject &calib, const QString &requestId);
+    void calibStarted(int ch, const QString &requestId, const QString &message);
+    void calibProgress(int ch, const QString &requestId, double progress,
+                       const QString &stage, const QString &message);
+    void calibFailed(int ch, const QString &requestId, const QString &reason,
+                     const QString &message);
+    void calibCancelled(int ch, const QString &requestId, const QString &message);
     // LOGIN_OK 의 채널별 번들 맵 + 서버가 기억하는 활성 채널 (프로토콜 v0.4).
     // loginResult 와 따로 두는 이유: 단일 채널 경로는 calib 하나만 보면 되고,
     // 그 시그니처를 건드리면 4채널과 무관한 코드까지 다 바뀐다.
