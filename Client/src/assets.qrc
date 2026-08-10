@@ -6,5 +6,6 @@
         <file>assets/tutorial_step_3_path.jpg</file>
         <file>assets/tutorial_step_4_review.jpg</file>
         <file>assets/tutorial_step_5_execute.jpg</file>
+        <file alias="certs/server.crt">certs/server.crt</file>
     </qresource>
 </RCC>
