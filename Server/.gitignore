@@ -44,3 +44,8 @@ cctv_pose
 
 #채널별 캘리브레이션 회귀 테스트 (프로토콜 v0.4)
 calib_channel_test
+
+#로봇 주행 호모그래피 세션 회귀 테스트 (2026-08-10 계약 §6)
+calib_session_test
+
+start.log

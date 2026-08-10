@@ -11,12 +11,15 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <csignal>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -55,6 +58,11 @@ public:
     // 접속 + HELLO{role} 까지. 실패하면 이유를 로그로 남기고 false.
     bool connect(const std::string& ip, int port, const std::string& caFile,
                  const std::string& role) {
+        // 끊긴 소켓에 SSL_write(특히 close()의 SSL_shutdown)를 하면 SIGPIPE로
+        // 프로세스가 통째로 죽는다 - 상대가 먼저 나가는 것은 테스트에서 흔한
+        // 정상 상황인데, 그때마다 도구가 죽으면 결과를 못 본다. 오류는 반환값
+        // 으로 받는다.
+        ::signal(SIGPIPE, SIG_IGN);
         ctx_ = SSL_CTX_new(TLS_client_method());
         SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
         if (SSL_CTX_load_verify_locations(ctx_, caFile.c_str(), nullptr) != 1) {
@@ -79,6 +87,16 @@ public:
             ERR_print_errors_fp(stderr);
             return false;
         }
+        // 🔴 핸드셰이크가 끝난 뒤에야 논블로킹으로 바꾼다. 대부분의 도구가
+        //   "수신 스레드 + 메인 스레드 송신" 구조라 SSL_read와 SSL_write가 같은
+        //   SSL 객체에 동시에 들어가는데, OpenSSL의 SSL 객체는 그렇게 쓰라고
+        //   만들어진 물건이 아니다. 아래 io_ 하나로 둘을 직렬화하되, 블로킹
+        //   SSL_read가 락을 쥔 채 잠들면 송신이 영영 막히므로 poll()로 읽을
+        //   것이 생겼을 때만 락을 잡는다.
+        //   (이 레이스는 실제로 관측됐다: 접속 직후 보낸 LOGIN이 서버에 아예
+        //    도착하지 않고 세션이 끊기는 현상이 몇 번에 한 번씩 재현됐다.)
+        int fl = fcntl(fd_, F_GETFL, 0);
+        fcntl(fd_, F_SETFL, fl | O_NONBLOCK);
         tlogf(tag_, "접속 성공 %s:%d (role=%s)", ip.c_str(), port, role.c_str());
         return send("HELLO", {{"role", role}});
     }
@@ -86,9 +104,23 @@ public:
     bool send(const std::string& type, const json& payload) {
         json msg{{"type", type}, {"seq", ++seq_}, {"payload", payload}};
         std::string data = msg.dump() + "\n";
-        std::lock_guard<std::mutex> lk(wmtx_);
-        if (!ssl_) return false;
-        return SSL_write(ssl_, data.data(), (int)data.size()) > 0;
+        size_t off = 0;
+        while (off < data.size()) {
+            int n;
+            {
+                std::lock_guard<std::mutex> lk(io_);
+                if (!ssl_) return false;
+                n = SSL_write(ssl_, data.data() + off, (int)(data.size() - off));
+                if (n <= 0) {
+                    int e = SSL_get_error(ssl_, n);
+                    if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE)
+                        return false;
+                }
+            }
+            if (n > 0) off += (size_t)n;
+            else waitIo(POLLOUT, 200);  // 커널 송신 버퍼가 빌 때까지
+        }
+        return true;
     }
 
     // 한 줄 수신 (블로킹). 연결이 끊기면 false.
@@ -106,15 +138,29 @@ public:
                 }
                 return true;
             }
-            char tmp[4096];
-            int n = SSL_read(ssl_, tmp, sizeof(tmp));
-            if (n <= 0) return false;
-            buf_.append(tmp, (size_t)n);
+            // SSL_read가 이미 복호화해 들고 있는 바이트는 poll()에 안 잡힌다
+            // (커널 소켓은 비어 있는데 SSL 내부 버퍼에는 남아 있는 상태).
+            // 그래서 SSL_pending을 먼저 보고, 없을 때만 fd를 기다린다.
+            {
+                std::lock_guard<std::mutex> lk(io_);
+                if (!ssl_) return false;
+                char tmp[4096];
+                int n = SSL_read(ssl_, tmp, sizeof(tmp));
+                if (n > 0) {
+                    buf_.append(tmp, (size_t)n);
+                    continue;
+                }
+                int e = SSL_get_error(ssl_, n);
+                if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE)
+                    return false;  // 정상 종료 또는 오류
+            }
+            if (!waitIo(POLLIN, 200) && closed_) return false;
         }
     }
 
     // 수신 스레드의 SSL_read를 깨워 정상 종료시킨다
     void shutdownRead() {
+        closed_ = true;
         if (fd_ >= 0) ::shutdown(fd_, SHUT_RDWR);
     }
 
@@ -125,11 +171,21 @@ public:
     }
 
 private:
+    // fd가 준비될 때까지 기다린다. 🔴 반드시 io_ 락을 놓은 상태로 부를 것 -
+    // 여기서 잠든 채 락을 쥐고 있으면 반대 방향이 통째로 막힌다.
+    bool waitIo(short ev, int timeoutMs) {
+        if (fd_ < 0) return false;
+        pollfd p{fd_, ev, 0};
+        return ::poll(&p, 1, timeoutMs) > 0;
+    }
+
     const char* tag_;
     SSL_CTX* ctx_ = nullptr;
     SSL* ssl_ = nullptr;
     int fd_ = -1;
     std::string buf_;
-    std::mutex wmtx_;
+    // SSL 객체 하나에 대한 읽기/쓰기를 직렬화한다 (송신 전용이 아니다).
+    std::mutex io_;
+    std::atomic<bool> closed_{false};
     std::atomic<long> seq_{0};
 };

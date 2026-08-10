@@ -131,8 +131,11 @@
 //     + START_DRAW ("그림그리기 시작" 버튼): 서버가 1단계(접근) 경로부터
 //       생성·전송하고, 이후 접근 완료 -> 도색 -> 완료까지 자동 진행한다.
 //       로봇 중계는 안 함.
-//     ※ CALIB_START는 QT가 안 보냄(2026-07-23) - 캘리 시작은 관리자 창(ADMIN)
-//       담당. 서버는 하위호환으로 QT의 CALIB_START도 여전히 CCTV까지 중계함.
+//     ※ 2026-07-23 "CALIB_START는 QT가 안 보냄, 캘리는 관리자 창(ADMIN) 담당"은
+//       2026-08-10 Qt팀 계약서로 **뒤집혔다** - 이제 QT도 개시자다. 개시자가
+//       둘이 되었으므로 두 경로 모두 같은 세션 상태(calibActive_)를 공유한다:
+//       한쪽이 도는 동안 다른 쪽 요청은 busy로 거절된다. 아래 [로봇 주행
+//       호모그래피 세션] 절이 정본이다.
 //   BLUEPRINT payload: {"points":[[x,y],...],          // 필수
 //                       "paint":[bool,...],            // 선택 (2026-07-28)
 //                       "program":[{op...},...]}       // 선택 (2026-07-28)
@@ -231,6 +234,52 @@
 //     - stage=draw: START_DRAW 이후 처리 중
 //       (reason: no_blueprint/busy/no_pose/robot_offline/not_ready)
 //
+// ============================================================================
+// [로봇 주행 호모그래피 세션] (2026-08-10 신설, router_calib.cpp)
+//   규격 원본: QT_HOMOGRAPHY_SERVER_CONTRACT_2026-08-10.md (Qt팀 제안),
+//   서버 회신: docs/QT_HOMOGRAPHY_REPLY_20260810_SERVER.md
+//
+//   Qt는 "CH n 캘리 시작"만 보내고, 로봇 이동·샘플링·계산에는 관여하지 않는다.
+//   서버는 요청을 검증해 수락 여부를 즉시 회신하고, 끝날 때까지 반드시
+//   **종결 응답 하나**(H_MATRIX | CALIB_FAIL | CALIB_CANCELLED)를 돌려준다.
+//   🔴 종결 응답을 빠뜨리면 Qt는 5분 타임아웃까지 대기 화면에 갇힌다.
+//
+//   [QT -> 서버]
+//     CMD payload: {"cmd":"CALIB_START","ch":2,"request_id":"qt-...","method":"robot_motion"}
+//       - ch/request_id 필수. 서버가 이 요청 하나를 처리하면서 활성 채널까지
+//         바꾸므로, Qt는 앞에 SELECT_CHANNEL을 따로 보낼 필요가 없다
+//         (onMessage 전체가 mtx_로 직렬화되어 채널 전환과 세션 개시가 원자적).
+//       - 같은 request_id 재수신은 새 작업을 만들지 않고 CALIB_STARTED를 재전송한다(멱등).
+//     CMD payload: {"cmd":"CALIB_CANCEL","ch":2,"request_id":"qt-..."}
+//       - 서버는 ROBOT/CCTV 양쪽에 중계하고 **둘 다** CALIB_STOPPED로 답해야
+//         CALIB_CANCELLED를 보낸다. 못 받으면 CALIB_FAIL{cancel_failed}.
+//
+//   [서버 -> QT]
+//     CALIB_STARTED   payload: {"ch","request_id","msg"}      수락 즉시
+//     CALIB_PROGRESS  payload: {"ch","request_id","progress","stage","msg"}
+//       - 서버가 만들지 않는다. CCTV가 보내면 ch/request_id를 채워 중계할 뿐이다.
+//         진행률을 못 주면 아예 안 보내면 된다 (Qt는 무한 진행 표시로 폴백).
+//     H_MATRIX        payload: {"ch","request_id", ...번들}    성공 = 대기 해제
+//       - 세션 중이면 서버가 request_id를 직접 찍어 넣는다 (CCTV 회신에 의존 안 함).
+//     CALIB_FAIL      payload: {"ch","request_id","reason","msg"}
+//       - reason: invalid_channel | busy | robot_offline | cctv_offline |
+//                 motion_failed | insufficient_samples | solve_failed |
+//                 cancel_failed | timeout | internal_error
+//         (timeout은 서버가 추가한 코드 - 계약서 권장 목록에 없다. 회신 §4 참고)
+//       - 서버가 자력으로 만들 수 있는 것은 사전 검증 실패와 timeout/오프라인뿐이다.
+//         motion_failed/insufficient_samples/solve_failed는 ROBOT/CCTV가 CALIB_FAIL을
+//         보내줘야 나온다 - 안 보내면 params().calib_timeout_ms 뒤 timeout이 된다.
+//     CALIB_CANCELLED payload: {"ch","request_id","msg"}
+//
+//   [ROBOT/CCTV -> 서버]  🔴 아직 어느 쪽도 구현하지 않았다 (회신 §3)
+//     CALIB_STOPPED payload: {}
+//       - CALIB_CANCEL을 받아 안전 정지 + 작업 폐기를 마쳤다는 ACK.
+//         이것이 없으면 취소는 항상 cancel_failed로 끝난다 - 서버가 로봇이
+//         실제로 섰는지 확인할 방법이 없기 때문이다(추정으로 OK를 주지 않는다).
+//     CALIB_FAIL payload: {"reason","msg"}  -> 그대로 QT에 종결 전달
+//     CALIB_PROGRESS payload: {"progress","stage","msg"}  -> QT에 중계
+// ============================================================================
+//
 // [CCTV -> 서버]
 //   H_MATRIX payload: {"calib":{"version":1, "K":[[...]x3], "D":[k1,k2,p1,p2,k3],
 //                      "H_floor":[[...]x3], "H_marker":[[...]x3], "marker_height_m":0.25}}
@@ -258,9 +307,19 @@
 //       HOLD{hold:true}를 보내 즉시 세운다 (복구되면 HOLD{hold:false}).
 #include <nlohmann/json.hpp>
 #include <atomic>
+#include <chrono>
 #include <string>
 
 using json = nlohmann::json;
+
+// 프로토콜 타이밍의 기준 시계. 판정 대기 창·POS 두절·캘리 타임아웃이 전부 이걸
+// 쓴다. 🔴 반드시 단조 시계여야 한다 - 벽시계를 쓰면 NTP 보정 한 번에 대기 창이
+// 음수가 되거나 타임아웃이 즉시 터진다.
+inline long nowMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch())
+        .count();
+}
 
 // type/payload 받아서 seq 자동 증가한 메시지 생성
 inline json makeMsg(const std::string& type, const json& payload) {

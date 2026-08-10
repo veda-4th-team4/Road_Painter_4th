@@ -1,12 +1,5 @@
 #include "router.hpp"
 #include "log.hpp"
-#include <chrono>
-
-static long nowMs() {
-    using namespace std::chrono;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch())
-        .count();
-}
 
 void Router::onMessage(const std::string& role, const json& msg) {
     // 세션 스레드마다 진입하므로 라우터 상태 접근을 직렬화 (router.hpp mtx_ 참고)
@@ -18,9 +11,33 @@ void Router::onMessage(const std::string& role, const json& msg) {
     // 이번 메시지로 조건이 충족됐을 수 있으니(POS로 새 pose가 들어왔거나, 그냥
     // 시간이 지났거나) 아래 셋을 한 곳에서 회수한다. POS가 완전히 끊겨도
     // 로봇 STATUS(500ms 주기)가 heartbeat가 되어 이 셋을 계속 돌려준다.
+    sweep();
+}
+
+// 시간이 지나 조건이 충족됐을 수 있는 것들을 한곳에서 회수한다.
+// onMessage 꼬리와 tick() 둘 다에서 불린다 - 메시지가 왔을 때는 즉시 반응하고,
+// 아무것도 안 오면 tick이 뒤늦게라도 챙긴다.
+// ⚠️ 호출부가 이미 mtx_를 쥐고 있어야 한다.
+void Router::sweep() {
     checkPosLoss();
     resolveBoundary();
     logPosStats();
+    // 캘리 세션도 같은 방식으로 회수한다. 종결 응답이 안 오는 세션을 서버가
+    // 먼저 접지 않으면 calibActive_가 켜진 채 남아 이후 요청이 전부 busy가 된다.
+    checkCalibTimeout();
+}
+
+// 주기 호출 (main의 tick 스레드).
+//
+// 🔴 예전에는 위 회수 작업이 onMessage 꼬리에서만 돌았다. "로봇 STATUS가
+//   500ms마다 오니 그게 heartbeat"라는 전제였는데, 그 전제가 깨지는 경우가
+//   정확히 이 타이머가 필요한 경우다: 로봇이 TCP는 붙잡은 채 응답만 멈추면
+//   (펌웨어 헹, 시리얼 두절) 아무 메시지도 안 오고, 그래서 타임아웃 판정 자체가
+//   돌지 않아 캘리 세션이 영원히 busy로 남았다. onPeerChange도 소켓이 살아
+//   있으니 안 불린다. 감시자가 감시 대상의 생존에 의존하면 안 된다.
+void Router::tick() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    sweep();
 }
 
 // TlsServer가 세션 등록/정리 시 통지 (재접속 교체는 false 없이 넘어감 - tls_server.cpp 참고)
@@ -40,6 +57,13 @@ void Router::onPeerChange(const std::string& role, bool connected) {
         sendDrawFail("draw", "robot_offline", "경로 실행 중 로봇 연결 끊김");
         clearPath();
     }
+    // 캘리 세션도 마찬가지다. 여기서 접지 않으면 결과를 만들어줄 상대가 사라진
+    // 채로 타임아웃(기본 3분)까지 Qt가 대기 화면에 갇힌다 - 원인을 이미 아는데
+    // 3분을 기다리게 할 이유가 없다.
+    if (!connected && calibActive_)
+        failCalib(role == "ROBOT" ? "robot_offline" : "cctv_offline",
+                  std::string(role == "ROBOT" ? "로봇" : "카메라") +
+                      " 연결이 끊겨 캘리브레이션을 계속할 수 없습니다.");
 }
 
 // 현재 ROBOT/CCTV 접속 여부를 조회해 QT로 전송. QT 미접속이면 다른 중계와
@@ -67,12 +91,20 @@ void Router::fromAdmin(const json& msg) {
             selectChannel(payload, msg);
             return;
         }
-        bool toCctv = (cmd == "CALIB_START");
+        // 캘리는 관리자 창도 개시할 수 있다(2026-07-23 결정, 아직 유효). 다만
+        // 세션 상태는 QT 경로와 공유한다 - 로봇이 한 대뿐이라 두 세션이 동시에
+        // 돌면 서로의 주행을 자기 관측으로 착각한다.
+        if (cmd == "CALIB_START") {
+            startCalib(payload, msg, "ADMIN");
+            return;
+        }
+        if (cmd == "CALIB_CANCEL") {
+            cancelCalib(payload, msg);
+            return;
+        }
         // 요약 INFO를 sendTo보다 먼저 (미접속 [WARN]이 뒤따르도록 - fromQt 참고)
-        logf("[INFO] (ADMIN) CMD %s -> ROBOT%s", cmd.c_str(),
-             toCctv ? " + CCTV" : "");
+        logf("[INFO] (ADMIN) CMD %s -> ROBOT", cmd.c_str());
         srv_.sendTo("ROBOT", msg);
-        if (toCctv) srv_.sendTo("CCTV", msg);
     } else if (type == "PATH") {
         // 관리자 테스트 경로는 손대지 않고 그대로 넘긴다 (v2 ops 형식으로 직접
         // 작성해야 한다 - 서버는 내용을 검사하지도, op_index를 부여하지도 않는다).
@@ -160,6 +192,18 @@ void Router::fromQt(const json& msg) {
             selectChannel(payload, msg);
             return;
         }
+        // CALIB_START/CALIB_CANCEL: 로봇 주행 호모그래피 세션 (2026-08-10 계약).
+        // 예전에는 CALIB_START가 아래 일반 CMD 경로로 흘러 검증도 회신도 없이
+        // 그대로 중계됐다 - 도색 중에도 통과했고, 실패하면 Qt는 아무 소식도
+        // 못 받았다. 이제 router_calib.cpp가 세션으로 관리한다.
+        if (cmd == "CALIB_START") {
+            startCalib(payload, msg, "QT");
+            return;
+        }
+        if (cmd == "CALIB_CANCEL") {
+            cancelCalib(payload, msg);
+            return;
+        }
         bool manualCmd = (cmd == "FORWARD" || cmd == "BACKWARD" ||
                           cmd == "TURN_LEFT" || cmd == "TURN_RIGHT" || cmd == "STOP");
         // [A안] 경로 실행(도색) 중에는 수동 조작을 차단한다 - 자동이 우선.
@@ -174,14 +218,12 @@ void Router::fromQt(const json& msg) {
             logf("[WARN] CMD %s 무시 - 경로 실행 중이라 수동 조작 차단", cmd.c_str());
             return;
         }
-        bool toCctv = (cmd == "CALIB_START");
         // 요약 INFO를 sendTo보다 먼저 찍는다 - sendTo가 미접속 시 [WARN]을 그
         // 자리에서 남기므로, 요약이 뒤에 오면 "경고 먼저, 정체는 나중"이라
         // 로그를 읽기 헷갈린다 (어느 명령의 경고인지 위로 스크롤해야 앎).
-        logf("[INFO] CMD %s -> ROBOT%s%s", cmd.c_str(), toCctv ? " + CCTV" : "",
+        logf("[INFO] CMD %s -> ROBOT%s", cmd.c_str(),
              manualCmd ? " [수동모드]" : "");
         srv_.sendTo("ROBOT", msg);
-        if (toCctv) srv_.sendTo("CCTV", msg);
         // 여기 오는 수동 CMD는 경로가 없는(planActive_==false) 상태뿐이다.
         // 수동 조작에 진입하면 자동 판정을 멈춰 충돌을 막는다.
         // (자동 복귀는 새 BLUEPRINT 수신 시)
@@ -307,6 +349,12 @@ void Router::fromRobot(const json& msg) {
         } else {
             logf("[WARN] PATH_DONE 수신 - 진행 중인 경로 없음 (무시)");
         }
+    } else if (type == "CALIB_STOPPED") {
+        onCalibStopped("ROBOT");
+    } else if (type == "CALIB_FAIL") {
+        // 캘리 주행이 실패했다는 로봇의 통지 (motion_failed 등). 이게 없으면
+        // Qt는 타임아웃까지 기다린다.
+        relayCalibFail(payload);
     } else {
         logf("[WARN] ROBOT으로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -685,6 +733,13 @@ void Router::fromCctv(const json& msg) {
         }
     } else if (type == "H_MATRIX") {
         handleHMatrix(msg);
+    } else if (type == "CALIB_PROGRESS") {
+        relayCalibProgress(msg);
+    } else if (type == "CALIB_FAIL") {
+        // insufficient_samples / solve_failed 등 - 서버가 만들 수 없는 사유다.
+        relayCalibFail(payload);
+    } else if (type == "CALIB_STOPPED") {
+        onCalibStopped("CCTV");
     } else {
         logf("[WARN] CCTV로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -799,7 +854,24 @@ void Router::handleHMatrix(const json& msg) {
     // 없으면 사라지는데, Qt는 "지금 보고 있는 채널의 번들인가"를 판단해야 한다 -
     // 다른 채널 캘리로 top-view를 갈아엎으면 화면과 좌표가 통째로 어긋난다.
     outMsg["payload"]["ch"] = ch;
+    // ----- 캘리 세션의 종결 응답 (2026-08-10 계약 §3.4) -----
+    // 🔴 request_id는 서버가 직접 찍는다. CCTV가 되돌려주기를 기대하면 안 된다:
+    //   평면 번들 스키마에서는 바로 위 `outMsg["payload"] = bundle`이 payload를
+    //   통째로 갈아치우므로 CCTV가 실어 보낸 필드가 여기서 사라진다.
+    // 채널이 어긋나면 세션을 닫지 않는다 - 계약 §6 "다른 요청의 늦은 결과가 현재
+    // 대기를 풀면 안 된다"와 같은 이유다. 번들 자체는 정상이므로 저장은 한다.
+    const bool closesSession = calibActive_ && ch == calibCh_;
+    if (closesSession && !calibReqId_.empty())
+        outMsg["payload"]["request_id"] = calibReqId_;
+    else if (calibActive_)
+        logf("[WARN] H_MATRIX 채널 %d - 캘리 세션은 채널 %d 진행 중이라 "
+             "종결로 보지 않음 (저장만)", ch, calibCh_);
     srv_.sendTo("QT", outMsg);
+    if (closesSession) {
+        logf("[INFO] 캘리 세션 성공 종료 [채널 %d] request_id=%s", ch,
+             calibReqId_.empty() ? "(없음)" : calibReqId_.c_str());
+        clearCalib();  // 종결 응답(H_MATRIX)을 이미 보낸 뒤라 안전하다
+    }
     // 어느 스키마로 읽혔는지 남긴다 - 평면 번들을 보냈는데 "레거시"로 찍히면
     // K/D가 빠졌다는 뜻이라, 로그만 보고 바로 알 수 있어야 한다.
     const char* schema = nested ? "중첩 calib" : (legacyH ? "레거시 H" : "평면 번들");

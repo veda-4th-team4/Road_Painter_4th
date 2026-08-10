@@ -6,7 +6,7 @@ CXXFLAGS += -std=c++17 -O2 -Wall -Iinclude -Isrc -pthread
 LDLIBS   += -lssl -lcrypto -pthread
 
 SRCS = src/main.cpp src/tls_server.cpp src/router.cpp src/router_channel.cpp \
-       src/user_store.cpp
+       src/router_calib.cpp src/user_store.cpp
 
 server: $(SRCS) src/*.hpp
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $@ $(LDLIBS)
@@ -56,6 +56,13 @@ cctv_pose: tools/cctv_pose.cpp tools/tls_client.hpp
 calib_channel_test: tools/calib_channel_test.cpp src/user_store.cpp src/*.hpp
 	$(CXX) $(CXXFLAGS) tools/calib_channel_test.cpp src/user_store.cpp -o tools/$@ $(LDLIBS)
 
+# 로봇 주행 호모그래피 세션 회귀 테스트 (2026-08-10 계약 §6 시험표).
+# QT/ROBOT/CCTV 세 role로 동시에 붙어 "시작한 세션은 반드시 종결 응답 하나로
+# 닫힌다"를 못 박는다 - 응답 누락은 크래시가 아니라 조작자가 5분 갇히는 것으로만
+# 드러나서, 테스트 없이는 현장에서야 알게 된다. 서버를 먼저 띄워두고 실행할 것.
+calib_session_test: tools/calib_session_test.cpp tools/tls_client.hpp
+	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
+
 clean:
-	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose tools/calib_channel_test
+	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose tools/calib_channel_test tools/calib_session_test
 .PHONY: clean sim

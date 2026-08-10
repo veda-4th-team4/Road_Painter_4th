@@ -20,6 +20,17 @@ const Calib& Router::activeCalib() const {
     return (it == calibs_.end()) ? kNone : it->second;
 }
 
+// 활성 채널 전환에 딸린 서버 상태 정리. 전송은 하지 않는다 - SELECT_CHANNEL과
+// CALIB_START가 둘 다 채널을 바꾸는데, 전자는 CHANNEL_OK를, 후자는 CALIB_STARTED를
+// 회신하기 때문이다. 상태 정리만 여기 모아두면 채널 상태가 늘어도 한 곳만 고친다.
+void Router::applyChannel(int ch) {
+    activeChannel_ = ch;
+    // 예전 채널 기준으로 잡아둔 pose는 새 채널에서 의미가 없다 (좌표계가 다르다).
+    // 그대로 두면 새 채널의 첫 POS가 오기 전까지 서버가 엉뚱한 위치를 믿는다.
+    poseValid_ = false;
+    lastIgnoredPosCh_ = 0;
+}
+
 // SELECT_CHANNEL: 작업 채널 전환. 로봇과는 무관하므로 CCTV로만 중계한다.
 void Router::selectChannel(const json& payload, const json& msg) {
     // ⚠️ 여기서는 channelOf()를 쓰지 않는다. 그 함수는 잘못된 값을 조용히 1로
@@ -32,11 +43,16 @@ void Router::selectChannel(const json& payload, const json& msg) {
         return;
     }
     const int ch = payload["ch"].get<int>();
-    activeChannel_ = ch;
-    // 예전 채널 기준으로 잡아둔 pose는 새 채널에서 의미가 없다 (좌표계가 다르다).
-    // 그대로 두면 새 채널의 첫 POS가 오기 전까지 서버가 엉뚱한 위치를 믿는다.
-    poseValid_ = false;
-    lastIgnoredPosCh_ = 0;
+    // 캘리 세션 중에 채널을 갈아치우면 그 세션은 다른 채널의 좌표계로 계산을
+    // 마치게 된다 - 결과가 엉뚱한 채널에 저장되고, 로봇은 이미 옛 채널 기준으로
+    // 돌아다니는 중이다. 채널 전환은 세션이 끝난 뒤에만 허용한다.
+    if (calibActive_) {
+        srv_.sendTo("QT", makeMsg("CHANNEL_FAIL", {{"reason", "calib_busy"}}));
+        logf("[WARN] SELECT_CHANNEL(%d) 거절 - 채널 %d 캘리브레이션 진행 중",
+             ch, calibCh_);
+        return;
+    }
+    applyChannel(ch);
     // 카메라도 그 채널을 봐야 POS가 이 채널 기준으로 온다.
     srv_.sendTo("CCTV", msg);
     const Calib& c = activeCalib();
