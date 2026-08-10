@@ -5,7 +5,10 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 ## 하는 일
 
 - **TLS 릴레이**: 클라이언트가 role(QT / ROBOT / CCTV / ADMIN)로 등록하면, 메시지를 규칙에 따라 상대에게 중계
-- **로그인 / 캘리브레이션 저장**: 사용자(id/비번)별로 캘리브레이션 번들(K, D, H행렬)을 저장했다가 재로그인 시 Qt에 돌려줌
+- **로그인 / 캘리브레이션 저장**: 사용자(id/비번)별로 캘리브레이션 번들(K, D, H행렬)을 저장했다가 재로그인 시 Qt에 돌려줌. **캘리브레이션은 채널별로 따로 저장된다** (v0.4 — 채널마다 렌즈 방향이 달라 K/D/H가 전부 다르다)
+- **채널 전환 (v0.4)**: 4채널 카메라(PNM-C16083RVQ)에서 `SELECT_CHANNEL`로 작업 채널을 바꾸면 그 채널의 캘리브레이션이 적용되고, **활성 채널이 아닌 `POS`는 무시한다**(채널마다 좌표계가 달라 pose가 튀는 것을 막는다). ⚠️ `ch`는 전부 선택 필드라 **단일 채널 현장(PNO)은 한 줄도 안 고쳐도 그대로 동작**한다
+- **작업 완전 중지 (`ABORT_DRAW`, v0.4)**: `ESTOP`이 일시정지라면 이건 취소다 — 서버가 들고 있는 경로 상태를 비우고 로봇에 중계해 **받아둔 경로까지 버리게** 한다. 🔴 **로봇 쪽 구현이 아직 없다** ([R-11](docs/ROBOT_ACTION_ITEMS_20260805.md))
+- **중계 스트림 주소 배포** (2026-08-04): `config/stream.json`이 있으면 `LOGIN_OK.stream`으로 중계(MediaMTX) RTSP 베이스 주소를 Qt에 내려준다 — 사용자가 설정 화면에 손으로 입력하지 않아도 된다. **파일이 없으면 필드를 안 보내고 Qt는 종전대로 자기 설정값을 쓴다**(= 중계를 안 쓰는 PNO 직결 현장은 그대로). ⚠️ `cam_ip`(카메라 IP, PNO 직결용)와는 **별개 필드**다 — 합치면 PNO로 되돌아갈 수 없다
 > 🔴 **프로토콜 v2 (server-driven)로 갈아엎었다.** 서버↔로봇 구간의 정본은
 > **[docs/PROTOCOL_v2_ROBOT.md](docs/PROTOCOL_v2_ROBOT.md)** 이다. Qt↔서버, CCTV↔서버 구간은 v1 그대로 바뀌지 않았다.
 > 아래 목록의 서버↔로봇 항목은 전부 v2 기준이다.
@@ -30,7 +33,8 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 | 문서 | 내용 |
 |---|---|
 | **[docs/PROTOCOL_v2_ROBOT.md](docs/PROTOCOL_v2_ROBOT.md)** | 🔴 **서버↔로봇 v2 규격 (정본)**. 로봇팀이 봐야 할 문서 |
-| **[docs/ROBOT_ACTION_ITEMS_20260805.md](docs/ROBOT_ACTION_ITEMS_20260805.md)** | 🔴 로봇 코드 v2 적용 수정 지시서 (R-1~R-10 + 참조 구현·검증 방법) |
+| **[docs/ROBOT_ACTION_ITEMS_20260805.md](docs/ROBOT_ACTION_ITEMS_20260805.md)** | 🔴 로봇 코드 v2 적용 수정 지시서 (R-1~R-10 + **R-11 `ABORT_DRAW`** + 참조 구현·검증 방법) |
+| **[docs/CCTV_ACTION_ITEMS_20260806.md](docs/CCTV_ACTION_ITEMS_20260806.md)** | 🔴 CCTV 앱 v0.4 다채널 지원 요청서 (C-0~C-4). **C-0 선행 확인 필요** |
 | **[server_PROTOCOL.md](server_PROTOCOL.md)** | 통신 규격 전체 (Qt/CCTV 팀용). ⚠️ 서버↔로봇 절은 v1 시절 내용이라 위 문서가 우선한다 |
 | [docs/TESTING.md](docs/TESTING.md) | 서버/Qt 테스트 가이드 |
 | [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) | 로봇 주행 통합 테스트 계획 (단계 A~D, 합격 기준, 드라이런 결과) |
@@ -48,17 +52,20 @@ Server/
 ├── gen_cert.sh         TLS 자체서명 인증서 생성 (최초 1회)
 ├── certs/              server.crt(공개) / server.key(비밀, git 제외)
 ├── config/             params.json (튜닝 상수 - 편집 대상) + users.json (자동 생성, git 제외)
+│   └── stream.json.example  중계 RTSP 베이스 주소 템플릿 (stream.json으로 복사, git 제외)
 ├── docs/               부속 문서 (v2 프로토콜 규격, 테스트 가이드, 주행 테스트 계획)
 ├── src/
 │   ├── main.cpp            시작점 + 파라미터 로드 + 테스트용 콘솔 + graceful shutdown
 │   ├── tls_server.hpp/cpp  TLS 네트워크 층 (접속, role 등록, 세션 스레드, ADMIN tap)
 │   ├── router.hpp/cpp      메시지 라우팅 (중계 규칙 + 경로 전송 + READY/피드백 판정)
+│   ├── router_channel.cpp  채널 전환(SELECT_CHANNEL) + 작업 취소(ABORT_DRAW)
 │   ├── ops_builder.hpp     Qt program → 로봇 op 변환 (부호반전·펜보정 삽입·arc 반지름)
 │   ├── params.hpp          🔴 튜닝 상수 정의 + config/params.json 로딩 (하드코딩 금지 지점)
 │   ├── path_planner.hpp    마커 4점 → pose 추정 (좌표 계산만 남음)
-│   ├── calib.hpp           캘리브레이션 번들 파싱 + undistort/호모그래피 수학
-│   ├── user_store.hpp/cpp  사용자 저장소 (비번 해시 + 캘리브레이션 영속화)
-│   ├── protocol.hpp        메시지 스펙 주석 + 생성 헬퍼
+│   ├── calib.hpp           캘리브레이션 번들 파싱 + undistort/호모그래피 수학 (채널별)
+│   ├── stream_cfg.hpp      중계 RTSP 주소 설정 로딩 (LOGIN_OK.stream)
+│   ├── user_store.hpp/cpp  사용자 저장소 (비번 해시 + 채널별 캘리브레이션 영속화)
+│   ├── protocol.hpp        메시지 스펙 주석 + 생성 헬퍼 + 채널 헬퍼(channelOf 등)
 │   └── log.hpp             타임스탬프 로그
 ├── tools/
 │   ├── tls_client.hpp      테스트 도구 공용 TLS 클라이언트 뼈대

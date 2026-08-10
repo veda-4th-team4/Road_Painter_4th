@@ -46,8 +46,12 @@ authInternalUsers:
 # 프로토콜 — RTSP 와 관리 API 만 켠다
 ###############################################################################
 rtsp: true
-# ⚠️ TCP 고정. UDP 를 남겨두면 협상이 UDP 로 먼저 붙었다가 실패하고 30초쯤
-#    까먹는다 (Qt 쪽 video_worker.cpp 에 같은 이유의 주석이 있다).
+# ⚠️ 이건 **중계가 클라이언트에게 열어주는** 쪽만 정한다 (중계 → Qt).
+#    카메라에서 당겨오는 쪽(카메라 → 중계)은 경로마다 `rtspTransport` 로 따로
+#    정해야 한다. 아래 paths 를 볼 것 — 둘 다 TCP 로 맞춰야 의미가 있다.
+#
+#    UDP 를 남겨두면 협상이 UDP 로 먼저 붙었다가 실패하고 30초쯤 까먹는다
+#    (Qt 쪽 video_worker.cpp 에 같은 이유의 주석이 있다).
 rtspTransports: [tcp]
 rtspAddress: :8554
 
@@ -76,21 +80,48 @@ playback: false
 paths:
   ch1:
     source: publisher
+    rtspTransport: tcp
     sourceOnDemand: true
     sourceOnDemandStartTimeout: 10s
     sourceOnDemandCloseAfter: 10s
   ch2:
     source: publisher
+    rtspTransport: tcp
     sourceOnDemand: true
     sourceOnDemandStartTimeout: 10s
     sourceOnDemandCloseAfter: 10s
   ch3:
     source: publisher
+    rtspTransport: tcp
     sourceOnDemand: true
     sourceOnDemandStartTimeout: 10s
     sourceOnDemandCloseAfter: 10s
   ch4:
     source: publisher
+    rtspTransport: tcp
     sourceOnDemand: true
     sourceOnDemandStartTimeout: 10s
     sourceOnDemandCloseAfter: 10s
+
+  # --- 서브스트림 (2x2 미리보기용) ------------------------------------------
+  # 2026-08-04 확인: 이 카메라(PNM-C16083RVQ, 현재 프로파일)에는 별도 저해상도
+  # 프로파일이 없다 (Client/src/backend.h:503 참고). cameras.env 에도 그래서
+  # CH1S~CH4S_SOURCE 를 안 채워놨다 — 예전처럼 source: publisher 로 남겨두면
+  # sourceOnDemand: true 와 조합이 잘못됐다며 MediaMTX 가 기동 자체를 거부한다
+  # ('sourceOnDemand' is useless when source is 'publisher', 2026-08-07 확인,
+  # 이 때문에 ch1~ch4 포함 relay 전체가 안 떴었다).
+  # 그래서 카메라를 또 안 당기고, 이미 열려 있는 메인 스트림으로 리다이렉트만
+  # 한다. Client 는 지금도 미리보기에 /chNs 를 그대로 요청한다
+  # (Client/src/backend.cpp:1896-1898, 아직 안 고쳐짐).
+  ch1s:
+    source: redirect
+    sourceRedirect: /ch1
+  ch2s:
+    source: redirect
+    sourceRedirect: /ch2
+  ch3s:
+    source: redirect
+    sourceRedirect: /ch3
+  ch4s:
+    source: redirect
+    sourceRedirect: /ch4

@@ -4,15 +4,25 @@
 #include <QJsonArray>
 #include <QJsonValue>
 #include <QHostAddress>
+#include <QSslCertificate>
+#include <QSslConfiguration>
 #include <QDebug>
+#include <QStringList>
 #include <cmath>
 
 ServerClient::ServerClient(QObject *parent)
     : QObject(parent)
 {
     m_socket = new QSslSocket(this);
-    // 1차 연동: 자가서명 인증서 검증 생략 (권장 방식은 server.crt 를 신뢰 CA 로 추가)
-    m_socket->setPeerVerifyMode(QSslSocket::VerifyNone);
+
+    const QList<QSslCertificate> trustedCertificates = QSslCertificate::fromPath(
+        QStringLiteral(":/certs/server.crt"), QSsl::Pem);
+    QSslConfiguration tls = m_socket->sslConfiguration();
+    tls.setCaCertificates(trustedCertificates);
+    tls.setPeerVerifyMode(QSslSocket::VerifyPeer);
+    m_socket->setSslConfiguration(tls);
+    m_tlsCertificateReady = trustedCertificates.size() == 1
+                         && !trustedCertificates.constFirst().isNull();
 
     connect(m_socket, &QSslSocket::encrypted, this, &ServerClient::onEncrypted);
     connect(m_socket, &QSslSocket::readyRead, this, &ServerClient::onReadyRead);
@@ -33,11 +43,17 @@ ServerClient::~ServerClient()
 void ServerClient::connectToServer()
 {
     if (isConnected()) return;
+    if (!m_tlsCertificateReady) {
+        emit socketError(QStringLiteral("내장 서버 인증서를 읽을 수 없습니다. 프로그램을 다시 배포해 주세요."));
+        return;
+    }
+    if (!QSslSocket::supportsSsl()) {
+        emit socketError(QStringLiteral("TLS 백엔드를 사용할 수 없습니다. 프로그램 배포 파일을 확인해 주세요."));
+        return;
+    }
     m_seq = 0;
     m_helloSent = false;
     m_buffer.clear();
-    // 자가서명 인증서라도 우선 접속을 진행하도록 에러를 무시한다.
-    m_socket->ignoreSslErrors();
     m_socket->connectToHostEncrypted(m_host, m_port);
 }
 
@@ -65,9 +81,12 @@ bool ServerClient::isEncrypted() const
 
 void ServerClient::onErrors(const QList<QSslError> &errors)
 {
-    Q_UNUSED(errors);
-    // VerifyNone 이므로 계속 진행. (검증 강화 시 여기서 화이트리스트 처리)
-    m_socket->ignoreSslErrors();
+    QStringList messages;
+    messages.reserve(errors.size());
+    for (const QSslError &error : errors)
+        messages.append(error.errorString());
+    emit socketError(QStringLiteral("서버 인증서 검증 실패: %1")
+                         .arg(messages.join(QStringLiteral(", "))));
 }
 
 // 접속 직후(암호화 완료) HELLO {role:"QT"} 를 1회 전송한다.
@@ -128,17 +147,18 @@ void ServerClient::sendBlueprint(const QList<QPointF> &meterPoints,
         pts.append(pair);
     }
     QJsonObject p; p["points"] = pts;
-    // paint 는 points 와 길이가 같을 때만 싣는다 — 어긋난 배열을 보내면 서버가
-    // 도면 전체를 버리므로(bad_points) 애매한 값은 아예 빼는 편이 안전하다.
+    // paint 는 points 와 길이가 같을 때만 싣는다. 서버는 길이가 다르면 경고 후
+    // 전 구간 도색으로 fallback하므로, 모호한 배열을 보내지 않고 생략한다.
+    // 정상 Qt 경로 생성에서는 항상 points와 같은 길이로 만든다.
     if (paint.size() == meterPoints.size() && !paint.isEmpty()) {
         QJsonArray flags;
         for (bool b : paint) flags.append(b);
         p["paint"] = flags;
     }
-    // 동작 시퀀스 — 서버는 이걸 로봇에 그대로 중계하고, CCTV 보정만 담당한다.
+    // 도면 기준 논리 동작 — 서버 v2가 로봇 op으로 변환한다.
     //
     // ⚠️ 프로토콜에 **없는 필드는 절대 싣지 않는다** (v0.3 §program op 규약):
-    //    · pen_offset_m — 2026-07-28 폐지. 펜 오프셋 보정은 로봇 전담.
+    //    · pen_offset_m — 폐지. 펜 오프셋 보정은 서버 v2와 로봇 실행부 전담.
     //    · pivot        — 폐지. program 은 도면 그대로의 논리 동작만.
     //    · speed_mps / speed_dps — "속도는 프로토콜에 없다"(로봇 펌웨어 고정값).
     //      Op::speed 는 화면 미리보기·예상시간 계산용 로컬 값으로만 남는다.
@@ -148,7 +168,7 @@ void ServerClient::sendBlueprint(const QList<QPointF> &meterPoints,
             QJsonObject j;
             j["op"] = o.opName();
             j["v"] = o.vertex;                 // 필수 — 없으면 서버가 program 전체를 거부
-            // heading_deg 는 공통 필드다: "이 동작 후 로봇이 **바라보는** 절대 방위"
+            // heading_deg: MOVE=진행 방향, TURN=회전 후 방향, ARC=진입 접선(CCW+).
             j["heading_deg"] = std::round(o.heading * 10.0) / 10.0;
             switch (o.kind) {
             case motionprogram::Op::Move:
@@ -182,6 +202,44 @@ void ServerClient::sendCmd(const QString &cmd)
     sendJson("CMD", p);
 }
 
+// ESTOP 만 보내던 예전 "작업 중단"은 사실 일시정지였다 — 서버의 경로 상태도
+// 로봇의 세그먼트 커서도 남아서, RESUME 한 번이면 도색이 멈춘 지점부터 재개됐다.
+// 이 명령을 받으면 서버와 로봇이 받아둔 경로를 버린다 (프로토콜 v0.4).
+void ServerClient::sendAbortDraw()
+{
+    sendCmd(QStringLiteral("ABORT_DRAW"));
+}
+
+// CMD 에 ch 를 같이 싣는다 (프로토콜 v0.4). sendCmd 를 재사용하지 않는 이유는
+// payload 에 필드가 하나 더 붙기 때문이고, 그 하나 때문에 sendCmd 시그니처에
+// 채널 인자를 달면 채널과 무관한 호출 20곳이 다 지저분해진다.
+void ServerClient::sendSelectChannel(int ch)
+{
+    QJsonObject p;
+    p["cmd"] = QStringLiteral("SELECT_CHANNEL");
+    p["ch"] = ch;
+    sendJson("CMD", p);
+}
+
+void ServerClient::sendCalibStart(int ch, const QString &requestId)
+{
+    QJsonObject p;
+    p["cmd"] = QStringLiteral("CALIB_START");
+    p["ch"] = ch;
+    p["request_id"] = requestId;
+    p["method"] = QStringLiteral("robot_motion");
+    sendJson("CMD", p);
+}
+
+void ServerClient::sendCalibCancel(int ch, const QString &requestId)
+{
+    QJsonObject p;
+    p["cmd"] = QStringLiteral("CALIB_CANCEL");
+    p["ch"] = ch;
+    p["request_id"] = requestId;
+    sendJson("CMD", p);
+}
+
 
 // 로그인 상태에서만 동작한다. 서버는 IP 형식을 검사하지 않으므로 검증은 Qt 몫.
 void ServerClient::sendSetCamIp(const QString &camIp)
@@ -194,7 +252,7 @@ void ServerClient::sendSetCamIp(const QString &camIp)
 void ServerClient::onReadyRead()
 {
     m_buffer.append(m_socket->readAll());
-    int nl;
+    qsizetype nl;
     while ((nl = m_buffer.indexOf('\n')) != -1) {
         QByteArray line = m_buffer.left(nl);
         m_buffer.remove(0, nl + 1);
@@ -221,6 +279,22 @@ void ServerClient::dispatch(const QJsonObject &msg)
         // calib 가 null 이면 캘리브레이션 미완료 → 관리자 창 안내 대상
         const QJsonValue calibVal = payload.value("calib");
         const bool hasCalib = calibVal.isObject() && !calibVal.toObject().isEmpty();
+        // 채널별 맵을 loginResult **보다 먼저** 흘린다 — Backend 가 로그인 처리
+        // 안에서 채널 화면을 띄우는데, 그때 이 맵이 이미 있어야 "어느 채널이
+        // 캘리 됐는지"를 그리드에 바로 표시할 수 있다.
+        // v0.3 서버는 calibs 를 안 보내므로 빈 오브젝트가 나가고, 그러면
+        // channelMode 가 꺼진 단일 채널 경로라 아무도 안 본다.
+        emit calibChannelsReceived(payload.value("calibs").toObject(),
+                                   payload.value("active_ch").toInt(1));
+        // 필드가 없으면 "서버가 모름"이므로 기존 설정을 유지한다. 명시적
+        // enabled=false만 "중계 OFF, 직결 전환"으로 Backend에 전달한다.
+        const QJsonValue streamValue = payload.value("stream");
+        if (streamValue.isObject()) {
+            const QJsonObject stream = streamValue.toObject();
+            emit streamInfoReceived(stream.value("enabled").toBool(true),
+                                    stream.value("base").toString(),
+                                    stream.value("channels").toInt(0));
+        }
         emit loginResult(true, payload.value("id").toString(),
                          calibVal.toObject(), hasCalib,
                          payload.value("cam_ip").toString(), QString());
@@ -244,10 +318,43 @@ void ServerClient::dispatch(const QJsonObject &msg)
     } else if (type == "H_MATRIX") {
         // v0.3: calib 번들. 레거시 {"H":[[..]x3]} 도 당분간 허용.
         QJsonObject calib = payload.value("calib").toObject();
-        if (calib.isEmpty() && payload.contains("H")) {
-            calib = QJsonObject{ { "H", payload.value("H") } };
+        // 평면 스키마는 payload 자체가 번들이다. K/D/H_marker 등의 보정
+        // 메타데이터까지 보존하고 전송 envelope 필드만 제거한다.
+        if (calib.isEmpty() && (payload.contains("H") || payload.contains("H_floor"))) {
+            calib = payload;
+            calib.remove("ch");
+            calib.remove("request_id");
         }
-        emit hMatrixReceived(calib);
+        // ch 없으면 1 (단일 채널 카메라·v0.3 서버 하위호환)
+        emit hMatrixReceived(payload.value("ch").toInt(1), calib,
+                             payload.value("request_id").toString());
+    } else if (type == "CALIB_STARTED") {
+        emit calibStarted(payload.value("ch").toInt(),
+                          payload.value("request_id").toString(),
+                          payload.value("msg").toString());
+    } else if (type == "CALIB_PROGRESS") {
+        double progress = payload.value("progress").toDouble(-1.0);
+        if (progress > 1.0) progress /= 100.0;
+        emit calibProgress(payload.value("ch").toInt(),
+                           payload.value("request_id").toString(), progress,
+                           payload.value("stage").toString(),
+                           payload.value("msg").toString());
+    } else if (type == "CALIB_FAIL") {
+        emit calibFailed(payload.value("ch").toInt(),
+                         payload.value("request_id").toString(),
+                         payload.value("reason").toString(),
+                         payload.value("msg").toString());
+    } else if (type == "CALIB_CANCELLED") {
+        emit calibCancelled(payload.value("ch").toInt(),
+                            payload.value("request_id").toString(),
+                            payload.value("msg").toString());
+    } else if (type == "CHANNEL_OK") {
+        const QJsonObject calib = payload.value("calib").toObject();
+        emit channelResult(true, payload.value("ch").toInt(), calib,
+                           !calib.isEmpty(), QString());
+    } else if (type == "CHANNEL_FAIL") {
+        emit channelResult(false, 0, QJsonObject(), false,
+                           payload.value("reason").toString());
     } else if (type == "BLUEPRINT_OK") {
         emit blueprintAck(payload.value("points").toInt(),
                           payload.value("paint").toBool(),
@@ -258,6 +365,8 @@ void ServerClient::dispatch(const QJsonObject &msg)
         emit camIpResult(false, QString(), payload.value("reason").toString());
     } else if (type == "DRAW_DONE") {
         emit drawDone();
+    } else if (type == "DRAW_ABORTED") {
+        emit drawAborted(payload.value("was_active").toBool());
     } else if (type == "DRAW_FAIL") {
         emit drawFailed(payload.value("stage").toString(),
                         payload.value("reason").toString(),

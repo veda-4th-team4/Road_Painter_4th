@@ -21,6 +21,7 @@ sudo apt-get install -y g++ make cmake libssl-dev wiringpi
 RaspberryPi/
 ├── CMakeLists.txt         # CMake 빌드 설정 파일
 ├── README.md              # 본 설명 문서
+├── LED_STRIP_KR.md        # 타워램프(WS2812B) 설치 및 연동 가이드
 │
 ├── include/
 │   ├── RobotTypes.h       # 공통 구조체, enum, Protocol v2 payload 및 ms 타임스탬프 헬퍼
@@ -28,7 +29,14 @@ RaspberryPi/
 │   ├── NetworkManager.h   # RPi ↔ 비전 서버 TCP/TLS 연결 및 Protocol v2 JSON 파서 클래스
 │   ├── PathFollower.h     # 스텝 오도메트리 정밀 주행/회전 및 DRIFT 연속 차동 조향 클래스
 │   ├── ImuManager.h       # MPU6050 I2C 자이로 센서 필터링 및 적분 클래스
+│   ├── LedStripManager.h  # 타워램프 상태표시 API (SetState 한 줄로 제어)
 │   └── nlohmann/          # JSON Parser 라이브러리 디렉토리 (nlohmann/json.hpp)
+│
+├── driver/                # 커널 디바이스 드라이버 (모듈 + DT 오버레이)
+│   ├── mpu6050_driver.c   # MPU6050 I2C 드라이버
+│   ├── led_strip_driver.c # WS2812B 드라이버 (PWM 시리얼라이저 + DMA)
+│   ├── led_strip_regs.h   # BCM2711 PWM 레지스터 맵 / WS2812B 인코딩 상수
+│   └── *_overlay.dts      # 디바이스 트리 오버레이 (LED는 GPIO12 = 물리 32번)
 │
 └── src/
     ├── main.cpp           # 메인 시퀀스 오케스트레이터 (Protocol v2 핸드셰이크 & 제어 루프)
@@ -36,11 +44,26 @@ RaspberryPi/
     ├── NetworkManager.cpp # TLS 소켓 세션 관리, op_index 매칭 및 HOLD 처리 구현
     ├── PathFollower.cpp   # 기구학 스텝 환산 및 후진/직진/턴 조향 알고리즘 구현
     ├── ImuManager.cpp     # MPU6050 I2C DLPF 필터링 및 Yaw 처리 구현
+    ├── LedStripManager.cpp# 타워램프 렌더 스레드 및 상태별 애니메이션 구현
     ├── calibration_test.cpp# 🎯 하드웨어 캘리브레이션 (거리/각도 실측 보정) 대화형 CLI 툴
     ├── motor_test.cpp     # STM32 UART 모터/노즐 하드웨어 단독 검증 툴
     ├── arc_test.cpp       # 호(Arc) 주행 기구학 검증 툴
+    ├── led_test.cpp       # 타워램프 점등 검증 전용 독립 테스트 툴
     └── imu_test.cpp       # MPU6050 I2C 실시간 센서 검증 툴
 ```
+
+> 타워램프는 커널 모듈과 디바이스 트리 오버레이 설치가 선행되어야 합니다.
+> 배선·설치·연동 방법은 **[LED_STRIP_KR.md](LED_STRIP_KR.md)** 를 참고하세요.
+
+---
+
+## 📐 하드웨어 기구학 규격 & 보정 계수
+
+* **바퀴 지름 (Wheel Diameter)**: $66\text{ mm}$ ($0.066\text{ m}$)
+* **차축 거리 (Wheelbase)**: $166\text{ mm}$ ($0.166\text{ m}$)
+* **1회전당 스텝 수**: $3,200\text{ steps/rev}$ (16 마이크로스텝)
+* **거리 보정 계수 (`DISTANCE_CALIB_FACTOR`)**: `1.010f` (+1% 실측 보정) $\rightarrow$ 약 $15,587\text{ steps/m}$ ($10\text{cm} = \mathbf{1,559\text{ 스텝}}$)
+* **회전 보정 계수 (`TURN_ANGLE_CALIB_FACTOR`)**: `1.030f` (+3% 실측 보정) $\rightarrow$ 약 $2,073\text{ steps/90}^\circ$ ($1^\circ = \mathbf{23.03\text{ 스텝}}$)
 
 ---
 

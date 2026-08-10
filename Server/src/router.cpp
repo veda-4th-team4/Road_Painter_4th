@@ -1,12 +1,5 @@
 #include "router.hpp"
 #include "log.hpp"
-#include <chrono>
-
-static long nowMs() {
-    using namespace std::chrono;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch())
-        .count();
-}
 
 void Router::onMessage(const std::string& role, const json& msg) {
     // 세션 스레드마다 진입하므로 라우터 상태 접근을 직렬화 (router.hpp mtx_ 참고)
@@ -18,9 +11,33 @@ void Router::onMessage(const std::string& role, const json& msg) {
     // 이번 메시지로 조건이 충족됐을 수 있으니(POS로 새 pose가 들어왔거나, 그냥
     // 시간이 지났거나) 아래 셋을 한 곳에서 회수한다. POS가 완전히 끊겨도
     // 로봇 STATUS(500ms 주기)가 heartbeat가 되어 이 셋을 계속 돌려준다.
+    sweep();
+}
+
+// 시간이 지나 조건이 충족됐을 수 있는 것들을 한곳에서 회수한다.
+// onMessage 꼬리와 tick() 둘 다에서 불린다 - 메시지가 왔을 때는 즉시 반응하고,
+// 아무것도 안 오면 tick이 뒤늦게라도 챙긴다.
+// ⚠️ 호출부가 이미 mtx_를 쥐고 있어야 한다.
+void Router::sweep() {
     checkPosLoss();
     resolveBoundary();
     logPosStats();
+    // 캘리 세션도 같은 방식으로 회수한다. 종결 응답이 안 오는 세션을 서버가
+    // 먼저 접지 않으면 calibActive_가 켜진 채 남아 이후 요청이 전부 busy가 된다.
+    checkCalibTimeout();
+}
+
+// 주기 호출 (main의 tick 스레드).
+//
+// 🔴 예전에는 위 회수 작업이 onMessage 꼬리에서만 돌았다. "로봇 STATUS가
+//   500ms마다 오니 그게 heartbeat"라는 전제였는데, 그 전제가 깨지는 경우가
+//   정확히 이 타이머가 필요한 경우다: 로봇이 TCP는 붙잡은 채 응답만 멈추면
+//   (펌웨어 헹, 시리얼 두절) 아무 메시지도 안 오고, 그래서 타임아웃 판정 자체가
+//   돌지 않아 캘리 세션이 영원히 busy로 남았다. onPeerChange도 소켓이 살아
+//   있으니 안 불린다. 감시자가 감시 대상의 생존에 의존하면 안 된다.
+void Router::tick() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    sweep();
 }
 
 // TlsServer가 세션 등록/정리 시 통지 (재접속 교체는 false 없이 넘어감 - tls_server.cpp 참고)
@@ -40,6 +57,13 @@ void Router::onPeerChange(const std::string& role, bool connected) {
         sendDrawFail("draw", "robot_offline", "경로 실행 중 로봇 연결 끊김");
         clearPath();
     }
+    // 캘리 세션도 마찬가지다. 여기서 접지 않으면 결과를 만들어줄 상대가 사라진
+    // 채로 타임아웃(기본 3분)까지 Qt가 대기 화면에 갇힌다 - 원인을 이미 아는데
+    // 3분을 기다리게 할 이유가 없다.
+    if (!connected && calibActive_)
+        failCalib(role == "ROBOT" ? "robot_offline" : "cctv_offline",
+                  std::string(role == "ROBOT" ? "로봇" : "카메라") +
+                      " 연결이 끊겨 캘리브레이션을 계속할 수 없습니다.");
 }
 
 // 현재 ROBOT/CCTV 접속 여부를 조회해 QT로 전송. QT 미접속이면 다른 중계와
@@ -60,12 +84,27 @@ void Router::fromAdmin(const json& msg) {
     json payload = msg.value("payload", json::object());
     if (type == "CMD") {
         std::string cmd = payload.value("cmd", "");
-        bool toCctv = (cmd == "CALIB_START");
+        // SELECT_CHANNEL은 카메라 전용이다. 관리자 창이 채널을 골라 캘리브레이션할 때
+        // 쓰므로, 로봇에 보내면 로봇이 모르는 명령을 받는 셈이라 CCTV로만 보낸다.
+        if (cmd == "SELECT_CHANNEL") {
+            logf("[INFO] (ADMIN) CMD SELECT_CHANNEL -> CCTV");
+            selectChannel(payload, msg);
+            return;
+        }
+        // 캘리는 관리자 창도 개시할 수 있다(2026-07-23 결정, 아직 유효). 다만
+        // 세션 상태는 QT 경로와 공유한다 - 로봇이 한 대뿐이라 두 세션이 동시에
+        // 돌면 서로의 주행을 자기 관측으로 착각한다.
+        if (cmd == "CALIB_START") {
+            startCalib(payload, msg, "ADMIN");
+            return;
+        }
+        if (cmd == "CALIB_CANCEL") {
+            cancelCalib(payload, msg);
+            return;
+        }
         // 요약 INFO를 sendTo보다 먼저 (미접속 [WARN]이 뒤따르도록 - fromQt 참고)
-        logf("[INFO] (ADMIN) CMD %s -> ROBOT%s", cmd.c_str(),
-             toCctv ? " + CCTV" : "");
+        logf("[INFO] (ADMIN) CMD %s -> ROBOT", cmd.c_str());
         srv_.sendTo("ROBOT", msg);
-        if (toCctv) srv_.sendTo("CCTV", msg);
     } else if (type == "PATH") {
         // 관리자 테스트 경로는 손대지 않고 그대로 넘긴다 (v2 ops 형식으로 직접
         // 작성해야 한다 - 서버는 내용을 검사하지도, op_index를 부여하지도 않는다).
@@ -101,17 +140,26 @@ void Router::fromQt(const json& msg) {
     } else if (type == "SET_CAM_IP") {
         // Qt 설정란에서 카메라 IP 교체. REGISTER 때와 동일하게 형식 검증은 하지
         // 않고 저장만 한다 (Qt가 이 값으로 RTSP URL을 조립).
+        //
+        // 캘리브레이션(H_MATRIX)과 같은 규약이다: 카메라는 현장에 한 대뿐이라
+        // 주소는 현장 속성이므로 **로그인 여부와 무관하게 전역 슬롯에 먼저** 남기고,
+        // 로그인 중이면 그 계정에도 같이 쓴다. 예전에는 로그인이 없으면 아예 거절해서,
+        // 설치 기사가 계정을 만들기 전에는 카메라를 등록할 수 없었다.
         std::string ip = payload.value("cam_ip", "");
+        users_.setGlobalCamIp(ip);
         if (currentUser_.empty()) {
-            srv_.sendTo("QT", makeMsg("SET_CAM_IP_FAIL", {{"reason", "로그인 필요"}}));
-            logf("[WARN] SET_CAM_IP 수신 - 로그인 사용자 없음");
+            srv_.sendTo("QT", makeMsg("SET_CAM_IP_OK",
+                                      {{"cam_ip", users_.getGlobalCamIp()}}));
+            logf("[INFO] SET_CAM_IP - 로그인 사용자 없음, 전역 슬롯에 저장: '%s'",
+                 ip.c_str());
         } else if (!users_.setCamIp(currentUser_, ip)) {
             srv_.sendTo("QT", makeMsg("SET_CAM_IP_FAIL", {{"reason", "저장 실패"}}));
-            logf("[WARN] SET_CAM_IP 저장 실패 - 사용자 '%s'", currentUser_.c_str());
+            logf("[WARN] SET_CAM_IP 계정 저장 실패 - 사용자 '%s' (전역에는 저장됨)",
+                 currentUser_.c_str());
         } else {
             srv_.sendTo("QT", makeMsg("SET_CAM_IP_OK",
                                       {{"cam_ip", users_.getCamIp(currentUser_)}}));
-            logf("[INFO] SET_CAM_IP - 사용자 '%s' 카메라 IP 변경: '%s'",
+            logf("[INFO] SET_CAM_IP - 사용자 '%s' + 전역 슬롯에 카메라 IP 저장: '%s'",
                  currentUser_.c_str(), ip.c_str());
         }
     } else if (type == "CMD") {
@@ -121,34 +169,90 @@ void Router::fromQt(const json& msg) {
         // 2단계(도색) 전송 -> 도색 완료(PATH_DONE) -> DRAW_DONE까지 전부 자동이라
         // Qt가 중간에 더 눌러야 하는 버튼은 없다.
         if (cmd == "START_DRAW") {
+            // 🔴 수동 모드 래치를 여기서 푼다 (2026-08-10).
+            //   예전에는 새 BLUEPRINT가 와야만 풀렸다. 그래서 "도면 전송 →
+            //   대기 중 조이스틱으로 로봇 위치 잡기 → START_DRAW"라는 지극히
+            //   자연스러운 순서를 밟으면, 그 작업 **전체**가 ALIGN/MORE/DRIFT
+            //   없이 개루프로 돌았다. 조용히 도색 품질만 나빠져서 로그로도
+            //   드러나지 않는다.
+            //   START_DRAW 시점에는 래치를 유지할 이유가 없다: 접근 경로를
+            //   지금 pose에서 새로 만들기 때문에 "서버가 든 경로가 낡았다"는
+            //   전제 자체가 사라진다.
+            if (manualMode_) {
+                manualMode_ = false;
+                logf("[INFO] START_DRAW - 수동 모드 해제, 자동 판정 복귀");
+            }
             startApproach();
             return;
         }
+        // ABORT_DRAW: Qt "작업 중단" 버튼. ESTOP과 달리 받아둔 경로를 버린다
+        // (v0.4). ESTOP은 일시정지라 RESUME하면 멈춘 지점부터 이어서 그렸고,
+        // 서버도 planActive_가 살아 있어 다음 START_DRAW를 busy로 거절했다.
+        // ⚠️ 로봇에도 그대로 중계해야 한다. 서버 경로만 비우고 로봇 버퍼를 안
+        //    비우면 로봇이 남은 op을 계속 실행한다 - 화면은 멈췄는데 로봇은
+        //    도색을 계속하는 상태가 된다.
+        if (cmd == "ABORT_DRAW") {
+            const bool wasActive = abortDraw();
+            logf("[INFO] CMD ABORT_DRAW -> ROBOT (%s)",
+                 wasActive ? "실행 중이던 경로 폐기" : "실행 중인 경로 없음 - 정지만");
+            srv_.sendTo("ROBOT", msg);
+            srv_.sendTo("QT", makeMsg("DRAW_ABORTED", {{"was_active", wasActive}}));
+            return;
+        }
+        // SELECT_CHANNEL: 4채널 카메라에서 작업 채널 전환. 로봇과는 무관하므로
+        // ROBOT이 아니라 CCTV로 간다.
+        if (cmd == "SELECT_CHANNEL") {
+            selectChannel(payload, msg);
+            return;
+        }
+        // CALIB_START/CALIB_CANCEL: 로봇 주행 호모그래피 세션 (2026-08-10 계약).
+        // 예전에는 CALIB_START가 아래 일반 CMD 경로로 흘러 검증도 회신도 없이
+        // 그대로 중계됐다 - 도색 중에도 통과했고, 실패하면 Qt는 아무 소식도
+        // 못 받았다. 이제 router_calib.cpp가 세션으로 관리한다.
+        if (cmd == "CALIB_START") {
+            startCalib(payload, msg, "QT");
+            return;
+        }
+        if (cmd == "CALIB_CANCEL") {
+            cancelCalib(payload, msg);
+            return;
+        }
+        // 로봇을 움직이는 수동 조작 (조이스틱).
         bool manualCmd = (cmd == "FORWARD" || cmd == "BACKWARD" ||
                           cmd == "TURN_LEFT" || cmd == "TURN_RIGHT" || cmd == "STOP");
+        // 노즐 수동 조작. 차단은 같이 받지만 manualMode_는 켜지 않는다 -
+        // 로봇이 움직이지 않으므로 자동 판정과 충돌할 일이 없고, 켜면 대기 중
+        // 노즐 점검 한 번에 다음 작업 전체가 개루프로 돈다 (아래 래치 주석 참고).
+        bool nozzleCmd = (cmd == "NOZZLE_DOWN" || cmd == "NOZZLE_UP" ||
+                          cmd == "PAINT_ON" || cmd == "PAINT_OFF");
         // [A안] 경로 실행(도색) 중에는 수동 조작을 차단한다 - 자동이 우선.
         // 도색 도중 조이스틱으로 로봇을 흔들어 그림을 망치는 것을 막기 위함.
         // 🔴 v2에서는 차단이 더 중요해졌다: 로봇이 READY로 서버 응답을 기다리는
         //   중에 사람이 로봇을 옮기면, 서버가 들고 있는 경로와 실제 위치가
         //   어긋난 채 GO가 나간다. 수동으로 개입하려면 먼저 경로를 끝내거나
         //   새 도면을 보내야 한다.
+        // 노즐도 같이 막는다(2026-08-10, QT 검토 §4-2): 도색 op의 노즐 상태는
+        // buildDrawOps가 paint+펜오프셋으로 단독 결정하는데, 그 사이에 수동
+        // 명령이 서보를 뒤집으면 다음 nozzle op이 올 때까지 반대 상태로 그린다.
+        // ⚠️ 관리자 창(fromAdmin)은 이 판정을 거치지 않는다 - 점검용이라
+        //    의도적으로 열어둔 경로이므로 수동 노즐 탈출구는 그쪽에 남는다.
         // 단 ESTOP/RESUME/CALIB_START 같은 비수동 명령은 아래로 흘려보내 항상 통과시킨다
         // (비상정지가 막히면 위험).
-        if (manualCmd && planActive_) {
-            logf("[WARN] CMD %s 무시 - 경로 실행 중이라 수동 조작 차단", cmd.c_str());
+        if ((manualCmd || nozzleCmd) && planActive_) {
+            logf("[WARN] CMD %s 무시 - 경로 실행 중이라 %s 차단", cmd.c_str(),
+                 nozzleCmd ? "수동 노즐" : "수동 조작");
             return;
         }
-        bool toCctv = (cmd == "CALIB_START");
         // 요약 INFO를 sendTo보다 먼저 찍는다 - sendTo가 미접속 시 [WARN]을 그
         // 자리에서 남기므로, 요약이 뒤에 오면 "경고 먼저, 정체는 나중"이라
         // 로그를 읽기 헷갈린다 (어느 명령의 경고인지 위로 스크롤해야 앎).
-        logf("[INFO] CMD %s -> ROBOT%s%s", cmd.c_str(), toCctv ? " + CCTV" : "",
+        logf("[INFO] CMD %s -> ROBOT%s", cmd.c_str(),
              manualCmd ? " [수동모드]" : "");
         srv_.sendTo("ROBOT", msg);
-        if (toCctv) srv_.sendTo("CCTV", msg);
         // 여기 오는 수동 CMD는 경로가 없는(planActive_==false) 상태뿐이다.
-        // 수동 조작에 진입하면 자동 판정을 멈춰 충돌을 막는다.
-        // (자동 복귀는 새 BLUEPRINT 수신 시)
+        // 수동 조작에 진입하면 자동 판정을 멈춰 충돌을 막는다 - 사람이 로봇을
+        // 미는 동안 서버가 옛 경로 기준으로 ALIGN/MORE/DRIFT를 쏘면 서로 싸운다.
+        // (해제는 새 BLUEPRINT 또는 START_DRAW - 아래 startApproach 호출부 주석)
         if (manualCmd) manualMode_ = true;
     } else if (type == "BLUEPRINT") {
         // points = Qt가 top-view 픽셀 -> 바닥 미터 변환을 마친 좌표.
@@ -159,7 +263,7 @@ void Router::fromQt(const json& msg) {
         planProgram_ = json::array();
         clearPath();
         drawRequested_ = false;  // 이전 도면에 걸려 있던 시작 요청은 무효
-        manualMode_ = false;  // 새 도면 = 자동 모드 복귀
+        manualMode_ = false;  // 새 도면 = 자동 모드 복귀 (START_DRAW에서도 푼다)
         for (auto& p : payload.value("points", json::array())) {
             // 점 하나라도 형식이 어긋나면 도면 전체를 버린다 - 파싱이 중간에
             // 끊겨 반쪽짜리 planPts_로 경로를 만드는 것을 방지
@@ -271,6 +375,12 @@ void Router::fromRobot(const json& msg) {
         } else {
             logf("[WARN] PATH_DONE 수신 - 진행 중인 경로 없음 (무시)");
         }
+    } else if (type == "CALIB_STOPPED") {
+        onCalibStopped("ROBOT");
+    } else if (type == "CALIB_FAIL") {
+        // 캘리 주행이 실패했다는 로봇의 통지 (motion_failed 등). 이게 없으면
+        // Qt는 타임아웃까지 기다린다.
+        relayCalibFail(payload);
     } else {
         logf("[WARN] ROBOT으로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -513,19 +623,40 @@ void Router::fromCctv(const json& msg) {
         // ALIGN/MORE/DRIFT로만 내려준다.
         // 원본 POS는 QT에 중계하지 않는다: Qt가 쓰는 건 아래 POSE(미터 좌표)뿐이고,
         // 원본 픽셀은 Qt에서 해석할 방법이 없다 (캘리브레이션은 서버만 갖고 있음).
+        //
+        // ----- 채널 필터 (v0.4) -----
+        // 활성 채널이 아닌 곳에서 온 마커는 버린다. 받아들이면 pose가 두 채널
+        // 사이에서 튄다 - 채널마다 H가 달라 좌표계 자체가 다르기 때문이다.
+        // ⚠️ 게이트/카운터보다 먼저 걸러야 한다. 다른 채널의 좌표는 이상치가
+        //    아니라 "다른 단위계의 정상값"이라, 게이트를 태우면 연속 폐기
+        //    한도만 소모하고 결국 재동기로 받아들여진다.
+        const int ch = channelOf(payload);  // ch 없으면 1 (단일 채널 하위호환)
+        if (ch != activeChannel_) {
+            // POS는 15~30Hz라 매번 찍으면 로그가 뒤덮이므로 채널이 바뀔 때만 남긴다.
+            // (조용히 버리면 "왜 로봇이 안 보이지"를 몇 시간씩 찾게 된다)
+            if (ch != lastIgnoredPosCh_) {
+                lastIgnoredPosCh_ = ch;
+                logf("[WARN] POS 채널 %d 무시 - 활성 채널은 %d 다 "
+                     "(CCTV가 다른 채널을 보고 있거나 ch를 잘못 싣는 중)",
+                     ch, activeChannel_);
+            }
+            return;
+        }
+        lastIgnoredPosCh_ = 0;
         lastPos_ = payload;
         ++posRecv_;
         if (posStatMs_ == 0) posStatMs_ = nowMs();  // 첫 POS부터 요약 구간 시작
 
         const Params& P = params();
         Pose p;
-        if (!poseFromPos(payload, calib_, p)) {
+        if (!poseFromPos(payload, activeCalib(), p)) {
             // 캘리브레이션이 없는 경우만 여기서 소리를 낸다. corners 형식 오류는
             // 매 프레임 같은 로그가 쏟아지므로 카운터로만 세고, 주기 요약
             // (logPosStats)의 "파싱실패" 항목으로 드러낸다.
             ++posParseFail_;
-            if (!calib_.valid)
-                logf("[WARN] POS 수신했으나 캘리브레이션 없음 - pose 계산 불가");
+            if (!activeCalib().valid)
+                logf("[WARN] POS 수신했으나 채널 %d 캘리브레이션 없음 - pose 계산 불가",
+                     activeChannel_);
             return;  // pose를 못 구하면 여기서 끝 (QT로 나가는 건 POSE뿐)
         }
         // ----- 이상치 게이트: 물리적으로 불가능한 각도 변화는 검출 오류다 -----
@@ -628,6 +759,13 @@ void Router::fromCctv(const json& msg) {
         }
     } else if (type == "H_MATRIX") {
         handleHMatrix(msg);
+    } else if (type == "CALIB_PROGRESS") {
+        relayCalibProgress(msg);
+    } else if (type == "CALIB_FAIL") {
+        // insufficient_samples / solve_failed 등 - 서버가 만들 수 없는 사유다.
+        relayCalibFail(payload);
+    } else if (type == "CALIB_STOPPED") {
+        onCalibStopped("CCTV");
     } else {
         logf("[WARN] CCTV로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -646,14 +784,58 @@ void Router::handleLogin(const json& payload, const std::string& replyRole) {
         return;
     }
     currentUser_ = id;
-    json stored = users_.getCalib(id);
-    Calib c;
-    if (!stored.is_null() && calibFromJson(stored, c))
-        calib_ = c;  // 저장된 캘리브레이션을 현재 세션에 복원
-    srv_.sendTo(replyRole, makeMsg("LOGIN_OK",
-        {{"id", id}, {"calib", stored}, {"cam_ip", users_.getCamIp(id)}}));
-    logf("[INFO] LOGIN %s 성공 (%s 요청, 캘리브레이션 %s)", id.c_str(),
-         replyRole.c_str(), stored.is_null() ? "없음 - 캘리브레이션 필요" : "전달");
+    // 저장된 채널별 번들을 현재 세션에 통째로 복원한다. 예전에는 번들이 하나뿐이라
+    // 한 줄이면 됐지만, 이제 채널마다 따로 들고 있어야 한다.
+    const json storedMap = users_.getCalibs(id);
+    calibs_.clear();
+    for (auto it = storedMap.begin(); it != storedMap.end(); ++it) {
+        if (it->is_null()) continue;
+        const int ch = std::atoi(it.key().c_str());
+        if (!validChannel(ch)) {
+            logf("[WARN] 저장된 캘리브레이션에 이상한 채널 키 '%s' - 무시",
+                 it.key().c_str());
+            continue;
+        }
+        Calib c;
+        if (calibFromJson(*it, c)) calibs_[ch] = c;
+        else logf("[WARN] 채널 %d 캘리브레이션 파싱 실패 - 무시", ch);
+    }
+    const Calib& act = activeCalib();
+    // calib(활성 채널 번들)은 v0.3과 의미가 같아 옛 클라이언트도 그대로 동작한다.
+    // calibs(채널별 맵)는 4채널 UI가 "어느 채널이 준비됐는지" 표시하는 데 쓴다.
+    // 카메라 IP는 "계정 값 → 없으면 전역 값" (user_store.hpp getCamIp 주석 참고).
+    // 카메라가 현장에 한 대뿐이라, 계정에 아무것도 없는 새 사용자도 전역 슬롯에
+    // 등록된 주소를 그대로 받는다 - 사용자마다 다시 넣을 필요가 없다.
+    const json camIp = users_.getCamIp(id);
+    json out{{"id", id},
+             {"calib", act.valid ? act.raw : json()},
+             {"calibs", storedMap},
+             {"active_ch", activeChannel_},
+             {"cam_ip", camIp}};
+    // 중계 RTSP 주소. 설정 파일이 있을 때만 싣는다 - 필드를 null로라도 보내면
+    // QT가 "서버가 값을 줬는데 비어있다"와 "안 줬다"를 구분하지 못한다.
+    // ⚠️ cam_ip는 그대로 둔다. 저건 카메라 IP(PNO 직결용)라 의미가 다르고,
+    //    합치면 PNO로 되돌아갈 수 없게 된다 (stream_cfg.hpp 주석 참고).
+    const StreamCfg stream = loadStreamCfg(kStreamCfgFile);
+    // 켰으면 주소를, 껐으면 {"enabled":false}를 싣는다. 설정 파일 자체가 없으면
+    // 아예 안 싣는다 - QT는 "필드 없음 = 서버가 모름"으로 보고 자기 설정을
+    // 유지하고, "enabled=false"는 저장된 중계 주소를 지우라는 지시로 읽는다
+    // (stream_cfg.hpp toJson 주석 참고).
+    if (stream.shouldSend()) out["stream"] = stream.toJson();
+    srv_.sendTo(replyRole, makeMsg("LOGIN_OK", out));
+    const std::string camIpStr = camIp.is_string() ? camIp.get<std::string>()
+                                                   : std::string("없음 - QT 설정값 사용");
+    // 중계는 세 가지 상태를 구분해서 남긴다 - QT의 동작이 셋 다 다르기 때문에,
+    // 화면이 이상할 때 로그만 보고 어느 경우인지 바로 알 수 있어야 한다.
+    const std::string streamStr =
+        stream.valid()   ? stream.base
+        : stream.present ? std::string("끔 - QT에 해제 지시(직결)")
+                         : std::string("설정 없음 - QT 설정값 유지");
+    logf("[INFO] LOGIN %s 성공 (%s 요청, 캘리브레이션 %zu채널 보유, 활성 채널 %d %s, "
+         "카메라 IP %s, 중계 %s)",
+         id.c_str(), replyRole.c_str(), calibs_.size(), activeChannel_,
+         act.valid ? "전달" : "없음 - 캘리브레이션 필요", camIpStr.c_str(),
+         streamStr.c_str());
 }
 
 // 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용). 세 형태를 받는다:
@@ -675,38 +857,67 @@ void Router::handleHMatrix(const json& msg) {
                          !payload.contains("K") && !payload.contains("D") &&
                          !payload.contains("H_floor") && !payload.contains("H_marker");
     json bundle = nested ? payload["calib"] : (legacyH ? payload["H"] : payload);
+    // 어느 채널의 번들인가. payload 최상위의 "ch"를 본다 (없으면 1 - 단일 채널
+    // 카메라와 v0.3 클라이언트 하위호환). 평면 스키마는 payload 자체가 번들이라
+    // "ch"가 번들 안에 남는데, calib_id처럼 손대지 않는 메타데이터로 보존한다 -
+    // 저장된 번들만 봐도 어느 채널 것인지 알 수 있어 오히려 낫다.
+    const int ch = channelOf(payload);
     normalizeBundleMmToM(bundle);  // mm -> m (÷1000). 이후 번들은 미터 기준.
     aliasFloorKey(bundle);  // 평면 스키마의 "H"에 "H_floor" 별칭 (QT는 H_floor만 봄)
     Calib c;
     if (!calibFromJson(bundle, c)) {
-        logf("[WARN] H_MATRIX 파싱 실패 - calib/H 형식 확인 필요: %s",
-             payload.dump().c_str());
+        logf("[WARN] H_MATRIX(채널 %d) 파싱 실패 - calib/H 형식 확인 필요: %s",
+             ch, payload.dump().c_str());
         return;
     }
-    calib_ = c;
+    calibs_[ch] = c;
     // 정규화된(미터) 번들로 다시 싸서 QT에 중계 + 영속 저장 - QT는 미터 H_floor로 top-view.
     json outMsg = msg;
     if (nested) outMsg["payload"]["calib"] = bundle;
     else if (legacyH) outMsg["payload"]["H"] = bundle;
     else outMsg["payload"] = bundle;  // 평면 번들은 payload 자체가 번들
+    // 중계본에도 채널을 명시한다. 중첩/레거시 스키마는 ch가 payload 밖이라 원본에
+    // 없으면 사라지는데, Qt는 "지금 보고 있는 채널의 번들인가"를 판단해야 한다 -
+    // 다른 채널 캘리로 top-view를 갈아엎으면 화면과 좌표가 통째로 어긋난다.
+    outMsg["payload"]["ch"] = ch;
+    // ----- 캘리 세션의 종결 응답 (2026-08-10 계약 §3.4) -----
+    // 🔴 request_id는 서버가 직접 찍는다. CCTV가 되돌려주기를 기대하면 안 된다:
+    //   평면 번들 스키마에서는 바로 위 `outMsg["payload"] = bundle`이 payload를
+    //   통째로 갈아치우므로 CCTV가 실어 보낸 필드가 여기서 사라진다.
+    // 채널이 어긋나면 세션을 닫지 않는다 - 계약 §6 "다른 요청의 늦은 결과가 현재
+    // 대기를 풀면 안 된다"와 같은 이유다. 번들 자체는 정상이므로 저장은 한다.
+    const bool closesSession = calibActive_ && ch == calibCh_;
+    if (closesSession && !calibReqId_.empty())
+        outMsg["payload"]["request_id"] = calibReqId_;
+    else if (calibActive_)
+        logf("[WARN] H_MATRIX 채널 %d - 캘리 세션은 채널 %d 진행 중이라 "
+             "종결로 보지 않음 (저장만)", ch, calibCh_);
     srv_.sendTo("QT", outMsg);
+    if (closesSession) {
+        logf("[INFO] 캘리 세션 성공 종료 [채널 %d] request_id=%s", ch,
+             calibReqId_.empty() ? "(없음)" : calibReqId_.c_str());
+        clearCalib();  // 종결 응답(H_MATRIX)을 이미 보낸 뒤라 안전하다
+    }
     // 어느 스키마로 읽혔는지 남긴다 - 평면 번들을 보냈는데 "레거시"로 찍히면
     // K/D가 빠졌다는 뜻이라, 로그만 보고 바로 알 수 있어야 한다.
     const char* schema = nested ? "중첩 calib" : (legacyH ? "레거시 H" : "평면 번들");
     // 로그인 상태와 무관하게 전역 슬롯에 먼저 남긴다 (QT-REQ-SRV-001 R-1).
     // 캘리브레이션은 현장 속성이라, 아무도 로그인하지 않은 채 올려도 서버 재시작 후
     // 살아남아야 한다 - 예전엔 이 경우 메모리에만 남아 그대로 유실됐다.
-    users_.setGlobalCalib(bundle);
+    users_.setGlobalCalib(ch, bundle);
     const char* detail_marker =
         c.hasMarker ? "H_marker 포함" : "H_marker 없음 - 시차 보정 생략됨";
     const char* detail_kd = c.hasKD ? ", K/D 포함" : ", K/D 없음 - 왜곡 보정 생략됨";
-    if (!currentUser_.empty() && users_.setCalib(currentUser_, bundle))
-        logf("[INFO] 캘리브레이션 수신 (%s, mm->m 정규화, %s%s) - 사용자 '%s' + 전역 슬롯에 영속 저장",
-             schema, detail_marker, detail_kd, currentUser_.c_str());
+    // ch를 안 실어 보내면 전부 채널 1에 덮어써진다 - 4채널을 캘리한 줄 알았는데
+    // 마지막 하나만 남는 상황이라, 어느 채널로 저장됐는지 로그에 반드시 남긴다.
+    if (!currentUser_.empty() && users_.setCalib(currentUser_, ch, bundle))
+        logf("[INFO] 캘리브레이션 수신 [채널 %d] (%s, mm->m 정규화, %s%s) - "
+             "사용자 '%s' + 전역 슬롯에 영속 저장",
+             ch, schema, detail_marker, detail_kd, currentUser_.c_str());
     else
-        logf("[INFO] 캘리브레이션 수신 (%s, mm->m 정규화, %s%s) - 로그인 사용자 없음, "
-             "전역 슬롯에 영속 저장 (다음 로그인 때 전달됨)",
-             schema, detail_marker, detail_kd);
+        logf("[INFO] 캘리브레이션 수신 [채널 %d] (%s, mm->m 정규화, %s%s) - "
+             "로그인 사용자 없음, 전역 슬롯에 영속 저장 (다음 로그인 때 전달됨)",
+             ch, schema, detail_marker, detail_kd);
 }
 
 // 1단계: Qt "그림그리기 시작" -> 로봇 현재 위치에서 도면 시작점(planPts_[0])까지

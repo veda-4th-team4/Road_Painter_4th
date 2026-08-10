@@ -49,6 +49,11 @@ int main(int argc, char** argv) {
     std::string id = "test", pw = "1234";
     bool noProgram = false;
     double arcR = 0;  // > 0 이면 사각형 대신 반원 도색
+    // --nudge: BLUEPRINT_OK 직후 START_DRAW 전에 조이스틱 명령을 한 번 끼운다.
+    // 현장에서 가장 흔한 순서("도면 올리고 → 로봇 위치 잡고 → 시작")를 재현한다.
+    // 🔴 이 순서가 자동 판정(ALIGN/MORE/DRIFT)을 죽이던 버그의 회귀 확인용이다:
+    //   서버 로그에 GO 사유 "수동 모드"가 한 번이라도 찍히면 재발한 것이다.
+    bool nudge = false;
 
     int ai = 2;
     if (argc > 2 && argv[2][0] != '-') crt = argv[ai++];
@@ -62,6 +67,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-program") noProgram = true;
         else if (a == "--arc" && ai + 1 < argc) arcR = atof(argv[++ai]);
         else if (a == "--port" && ai + 1 < argc) port = atoi(argv[++ai]);
+        else if (a == "--nudge") nudge = true;
         else { fprintf(stderr, "알 수 없는 옵션: %s\n", a.c_str()); return 1; }
     }
 
@@ -154,6 +160,12 @@ int main(int argc, char** argv) {
                       points.size(), program.size());
             } else if (type == "BLUEPRINT_OK") {
                 // 서버가 받은 개수가 보낸 것과 같은지 여기서 바로 대조된다
+                if (nudge) {
+                    qt.send("CMD", {{"cmd", "FORWARD"}});
+                    qt.send("CMD", {{"cmd", "STOP"}});
+                    tlogf("QT", "[--nudge] 시작 전 조이스틱 조작 1회 - 서버가 "
+                                "수동 모드로 들어간다");
+                }
                 qt.send("CMD", {{"cmd", "START_DRAW"}});
                 tlogf("QT", "CMD START_DRAW 송신 - 접근 단계 시작 대기");
             } else if (type == "DRAW_DONE") {

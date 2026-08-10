@@ -70,6 +70,17 @@ int main(int argc, char** argv) {
         // 네트워크 스레드 시작 (srv.run()은 블로킹)
         std::thread netThread([&] { gpServer->run(); });
 
+        // 시간 기반 판정 스레드. 로봇 STATUS(500ms)를 heartbeat로 삼던 것을
+        // 대체한다 - 상대가 조용해져도 서버의 감시는 계속 돌아야 한다
+        // (Router::tick 주석 참고). 200ms면 판정 지연이 체감되지 않고
+        // mtx_ 경합도 무시할 수준이다.
+        std::thread tickThread([&] {
+            while (!gShutdown) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                router.tick();
+            }
+        });
+
         // ----- 임시 테스트용 콘솔 (별도 스레드) -----
         // std::getline(std::cin, ...)은 시그널로 깨울 수 없는 블로킹 호출이라
         // 메인 스레드에서 직접 돌리면 Ctrl+C/kill을 받고도 Enter를 한 번 더
@@ -106,11 +117,17 @@ int main(int argc, char** argv) {
                 } else if (cmd == "resume") {
                     gpServer->sendTo("ROBOT", makeMsg("CMD", {{"cmd", "RESUME"}}));
                     logf("[INFO] RESUME 전송");
-                } else if (cmd == "calib") {
-                    json m = makeMsg("CMD", {{"cmd", "CALIB_START"}});
-                    gpServer->sendTo("CCTV", m);
-                    gpServer->sendTo("ROBOT", m);
-                    logf("[INFO] CALIB_START 전송");
+                } else if (cmd == "calib" || cmd.rfind("calib ", 0) == 0) {
+                    // 🔴 Router를 거쳐 보낸다. 예전처럼 sendTo로 직접 쏘면 서버가
+                    // 모르는 캘리 세션이 시작돼, 그 결과 H_MATRIX가 아무도
+                    // 기다리지 않는 종결 응답으로 Qt에 떨어진다. ADMIN 개시로
+                    // 취급되므로 검증·busy·타임아웃이 전부 똑같이 걸린다.
+                    // 사용법: "calib" (활성 채널) 또는 "calib 3" (채널 지정)
+                    int ch = 0;
+                    if (cmd.size() > 6) ch = std::atoi(cmd.c_str() + 6);
+                    json p{{"cmd", "CALIB_START"}, {"method", "robot_motion"}};
+                    if (validChannel(ch)) p["ch"] = ch;
+                    router.onMessage("ADMIN", makeMsg("CMD", p));
                 } else if (cmd == "who") {
                     std::string s;
                     for (auto& r : gpServer->connectedRoles()) s += r + " ";
@@ -138,6 +155,7 @@ int main(int argc, char** argv) {
         // 안 돌아옴). 시그널 경로에서 이미 닫았으면 no-op (내부에서 처리).
         gpServer->shutdown();
         netThread.join();  // 스레드 정상 종료 대기
+        tickThread.join();  // router를 참조하므로 router보다 먼저 끝나야 한다
 
         logf("[INFO] 서버 정상 종료");
         // return 대신 즉시 종료. 이유: detach된 콘솔 스레드가 getline(std::cin)에서

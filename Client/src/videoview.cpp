@@ -1,4 +1,5 @@
 #include "videoview.h"
+#include "motionprogram.h"
 
 #include <QPainter>
 #include <QPainterPath>
@@ -16,6 +17,7 @@
 #include <QFont>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace {
@@ -41,6 +43,35 @@ const QColor kPaint(255, 255, 255);
 
 // 점이 이보다 많으면 라벨/번호/배지를 접는다 (글자 도장처럼 촘촘한 경로)
 constexpr int kDenseLimit = 28;
+
+struct DisplayArc {
+    bool ok = false;
+    QPointF center;
+    double radiusPx = 0.0;
+    double sweepDeg = 0.0;
+    bool left = true;
+};
+
+// 화면의 샘플 점이 실제 전송 단계에서 ARC 하나가 되는지 같은 판정기로 확인한다.
+// 이 경우 각 현의 길이와 꼭짓점 회전각은 로봇 명령이 아니므로 편집 라벨로 보이면 안 된다.
+DisplayArc displayArcFor(const QVector<QPointF> &pts, bool closed)
+{
+    DisplayArc out;
+    if (pts.size() < 5) return out;
+    QList<QPointF> run;
+    run.reserve(pts.size() + (closed ? 1 : 0));
+    for (const QPointF &p : pts) run.append(p);
+    if (closed) run.append(pts.first());
+
+    motionprogram::detail::Circle fit;
+    if (!motionprogram::detail::arcFits(run, 0, run.size() - 1,
+                                        fit, out.sweepDeg, out.left))
+        return out;
+    out.ok = true;
+    out.center = fit.c;
+    out.radiusPx = fit.r;
+    return out;
+}
 
 QString mmLabel(double mm)
 {
@@ -114,6 +145,12 @@ void VideoView::setShowLabels(bool v)
 {
     if (m_showLabels == v) return;
     m_showLabels = v;
+    if (!v) {
+        // 다시 그리기 전의 짧은 순간에도 숨긴 배지가 클릭되지 않게 한다.
+        m_edgeLabelRects.clear();
+        m_turnBadgeRects.clear();
+        m_hoverEdge = -1;
+    }
     emit showLabelsChanged();
     update();
 }
@@ -305,15 +342,14 @@ void VideoView::onFrame(const QImage &original)
 {
     const QSize before = m_frame.size();
     if (m_isTopView) {
-        // ⚠️ warpToTopView 는 1920x1080 을 통째로 warpPerspective 하는데, 이 함수는
-        //    **GUI 스레드**에서 불린다 (frameReceived → onFrame). 30fps 로 매 프레임
-        //    펴면 GUI 스레드를 15~20ms 씩 붙잡아, 마우스로 작도하는 것까지 끊긴다.
-        //    TopView 는 작도용 배경이라 12fps 면 충분하다 — 로봇/경로 오버레이는
-        //    자기가 바뀔 때 따로 update() 를 부르므로 반응성에 영향이 없다.
-        constexpr int kTopViewMinIntervalMs = 80;      // ≈ 12fps
-        if (m_tvThrottle.isValid() && m_tvThrottle.elapsed() < kTopViewMinIntervalMs)
-            return;
-        m_tvThrottle.restart();
+        // 🔴 여기 있던 80ms(≈12fps) 스로틀은 지웠다. 근거로 적혀 있던
+        //    "1920x1080 을 통째로 펴서 GUI 스레드를 15~20ms 붙잡는다" 가 **사실이 아니다.**
+        //    warpToTopView 의 출력은 TopView 캔버스 크기(840x560)라 입력 해상도와
+        //    무관하다. 실측(2026-07-31, 1920x1080 입력):
+        //        remap 0.86ms + QImage copy 0.38ms = 프레임당 1.23ms
+        //    30fps 여도 GUI 스레드 부담은 초당 37ms(3.7%)뿐이다.
+        //    반대로 스로틀 때문에 들어온 프레임을 버려서 TopView 만 끊겨 보였다.
+        //    ⚠️ 다시 넣고 싶어지면 먼저 재라. 추정으로 넣은 값이 이 사달을 냈다.
         QImage w = warpToTopView(original);
         m_frame = w.isNull() ? original : w;
     } else {
@@ -401,11 +437,22 @@ void VideoView::paint(QPainter *p)
 
         if (!m_points.isEmpty()) {
             const bool dense = m_points.size() > kDenseLimit;
+            const DisplayArc displayArc = displayArcFor(m_points, m_closed);
 
-            // 실제 도포 폭(50 mm) — 이게 로봇이 칠할 면적이다
-            paintBand(p, m_points, m_closed, sx, sy, ox, oy, QColor(255, 255, 255, 80));
+            const double arcRadiusM = displayArc.ok
+                                    ? displayArc.radiusPx / std::max(1e-9, m_tvPxPerM)
+                                    : 0.0;
+            const bool arcTooTight = displayArc.ok
+                                  && arcRadiusM + 1e-9
+                                     < motionprogram::kServerConfirmedMinPaintRadiusM;
 
-            p->setPen(QPen(kActive, 2.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            // 실제 도포 폭(50 mm) — 불가능한 ARC는 도면에서 바로 빨간색으로 보인다.
+            paintBand(p, m_points, m_closed, sx, sy, ox, oy,
+                      arcTooTight ? QColor(229, 107, 107, 95)
+                                  : QColor(255, 255, 255, 80));
+
+            p->setPen(QPen(arcTooTight ? QColor(229, 107, 107) : kActive,
+                           2.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
             p->setBrush(Qt::NoBrush);
             for (int i = 1; i < m_points.size(); ++i)
                 p->drawLine(toW(m_points[i - 1]), toW(m_points[i]));
@@ -414,14 +461,14 @@ void VideoView::paint(QPainter *p)
 
             // 편집 표시가 꺼져 있으면(빈 곳 클릭) 완성 도형과 똑같이 그린다.
             const bool edit = m_focused || m_drawing;
-            if (edit && m_showLabels && !dense) {
+            if (edit && m_showLabels && !dense && !displayArc.ok) {
                 paintEdgeLengths(p, m_points, m_closed, sx, sy, ox, oy);
             } else {
                 m_edgeLabelRects.clear();
                 m_turnBadgeRects.clear();
             }
             paintPathGuides(p, m_points, m_closed, sx, sy, ox, oy,
-                            edit && m_showLabels && !dense);
+                            edit && m_showLabels && !dense && !displayArc.ok);
 
             // 작도 중 첫 점은 "여기 클릭하면 닫힘" 표시
             if (m_drawing && m_points.size() >= 3 && !m_closed) {
@@ -505,6 +552,43 @@ void VideoView::paint(QPainter *p)
                     p->setPen(QPen(QColor(255, 255, 255, 220), 1.5));
                     p->drawEllipse(toW(cur), 5, 5);
                 }
+            }
+
+            // 원호는 실제 전송 단위와 같은 요약만 보여준다. 원 중심은 점 번호와
+            // 마커가 가장 많이 겹치는 자리이므로 쓰지 않는다. 변형 안내가 선택
+            // 박스 아래·왼쪽에 있으니 ARC 요약은 도형 위·오른쪽에 둔다. 점과
+            // 번호를 다 그린 뒤 덮어 그려 배경 영상이 복잡해도 읽히게 한다.
+            if (edit && m_showLabels && !dense && displayArc.ok) {
+                const double radiusMm = displayArc.radiusPx
+                                      / std::max(1e-9, m_tvPxPerM) * 1000.0;
+                const QString tag = arcTooTight
+                    ? QStringLiteral("도색 불가 · R %1 · 최소 200 mm").arg(mmLabel(radiusMm))
+                    : QStringLiteral("ARC · R %1 · %2°")
+                          .arg(mmLabel(radiusMm)).arg(displayArc.sweepDeg, 0, 'f', 0);
+                p->setFont(QFont("Pretendard", 8));
+                const QFontMetrics fm(p->font());
+                QRectF pathBox;
+                for (const QPointF &point : std::as_const(m_points)) {
+                    const QPointF viewPoint(point.x() * sx + ox, point.y() * sy + oy);
+                    pathBox |= QRectF(viewPoint, QSizeF(0.1, 0.1));
+                }
+                const double boxWidth = fm.horizontalAdvance(tag) + 12.0;
+                const double boxHeight = fm.height() + 6.0;
+                double boxX = pathBox.right() - boxWidth;
+                double boxY = pathBox.top() - boxHeight - 7.0;
+                if (boxY < 2.0) boxY = pathBox.top() + 7.0;
+                QRectF box(boxX, boxY, boxWidth, boxHeight);
+                box.moveLeft(qBound(2.0, box.left(),
+                                    std::max(2.0, width() - box.width() - 2.0)));
+                box.moveTop(qBound(2.0, box.top(),
+                                   std::max(2.0, height() - box.height() - 2.0)));
+                p->setPen(Qt::NoPen);
+                p->setBrush(arcTooTight ? QColor(92, 24, 24, 225)
+                                        : QColor(26, 29, 33, 210));
+                p->drawRoundedRect(box, 3, 3);
+                p->setPen(arcTooTight ? QColor(255, 190, 190)
+                                      : QColor(kSel.red(), kSel.green(), kSel.blue(), 235));
+                p->drawText(box, Qt::AlignCenter, tag);
             }
         }
 
@@ -1316,6 +1400,26 @@ void VideoView::applyToSelection(const std::function<QPointF(const QPointF &)> &
     }
 }
 
+double VideoView::selectedArcRadiusPx(const QList<VVPath> &snapshot) const
+{
+    if (snapshot.isEmpty()) return 0.0;
+    double minimum = std::numeric_limits<double>::infinity();
+    auto consider = [&](const VVPath &path, bool fullySelected) {
+        if (!fullySelected) return;
+        const DisplayArc arc = displayArcFor(path.pts, path.closed);
+        if (arc.ok) minimum = std::min(minimum, arc.radiusPx);
+    };
+
+    if (selectedPointCount() == 0) {
+        consider(snapshot.first(), true);
+    } else {
+        consider(snapshot.first(), m_selection.size() == snapshot.first().pts.size());
+        for (int i = 1; i < snapshot.size() && i - 1 < m_doneSel.size(); ++i)
+            consider(snapshot[i], m_doneSel[i - 1].size() == snapshot[i].pts.size());
+    }
+    return std::isfinite(minimum) ? minimum : 0.0;
+}
+
 // 변환/핸들의 기준이 되는 사각형. 선택이 있으면 선택 점들, 없으면 활성 도형.
 QRectF VideoView::selectionBoundsImg() const
 {
@@ -1449,20 +1553,29 @@ void VideoView::paintSelectionBox(QPainter *p, double sx, double sy, double ox, 
         else        p->drawRect(QRectF(hp[i].x() - hr, hp[i].y() - hr, hr * 2, hr * 2));
     }
 
-    // 선택 상태 안내 — 몇 점을 잡고 있는지
-    p->setFont(QFont("Pretendard", 8, QFont::DemiBold));
-    const QString tag = partial
-                        ? QStringLiteral("선택 %1점 · 안쪽 드래그로 이동 · 핸들로 크기 조절 · Delete 로 삭제")
-                              .arg(selectedPointCount())
-                        : QStringLiteral("도형 전체 · 핸들 드래그로 크기 조절");
-    const QFontMetrics fm(p->font());
-    QRectF tb(r.left(), r.bottom() + 6, fm.horizontalAdvance(tag) + 10, fm.height() + 4);
-    if (tb.bottom() > height() - 2) tb.moveTop(r.top() - tb.height() - 6);
-    p->setPen(Qt::NoPen);
-    p->setBrush(QColor(26, 29, 33, 205));
-    p->drawRoundedRect(tb, 3, 3);
-    p->setPen(kSel);
-    p->drawText(tb, Qt::AlignCenter, tag);
+    // 조작 중에는 도형을 가리지 않고, 손을 뗐을 때만 작은 안내처럼 보인다.
+    if (m_handleIdx < 0) {
+        p->setFont(QFont("Pretendard", 8));
+        const QString tag = m_radiusConstraintHit
+            ? QStringLiteral("최소 도색 R 200 mm · 더 줄일 수 없음")
+            : (partial
+               ? QStringLiteral("선택 %1점 · 모서리=비율 유지 · Shift=자유 변형")
+                     .arg(selectedPointCount())
+               : QStringLiteral("모서리=비율 유지 · Shift=자유 변형(ARC 해제) · 변=한쪽 조절"));
+        const QFontMetrics fm(p->font());
+        QRectF tb(r.left(), r.bottom() + 6, fm.horizontalAdvance(tag) + 10,
+                  fm.height() + 4);
+        if (tb.bottom() > height() - 2) tb.moveTop(r.top() - tb.height() - 6);
+        tb.moveLeft(qBound(2.0, tb.left(),
+                           std::max(2.0, width() - tb.width() - 2.0)));
+        p->setPen(Qt::NoPen);
+        p->setBrush(m_radiusConstraintHit ? QColor(92, 52, 18, 220)
+                                          : QColor(26, 29, 33, 145));
+        p->drawRoundedRect(tb, 3, 3);
+        p->setPen(m_radiusConstraintHit ? QColor(255, 210, 135)
+                                        : QColor(kSel.red(), kSel.green(), kSel.blue(), 185));
+        p->drawText(tb, Qt::AlignCenter, tag);
+    }
 }
 
 int VideoView::handleAtView(const QPointF &v) const
@@ -1478,6 +1591,7 @@ void VideoView::applyHandleDrag(const QPointF &img)
     // 드래그 시작 시점의 좌표를 원본으로 삼아야 누적 오차가 안 생긴다
     if (m_handleStartAll.isEmpty()) return;
 
+    m_radiusConstraintHit = false;
     // 스냅샷을 되돌려놓고 변환을 새로 얹는다 (드래그 중 계속 호출되므로)
     m_points = m_handleStartAll.first().pts;
     m_closed = m_handleStartAll.first().closed;
@@ -1509,18 +1623,31 @@ void VideoView::applyHandleDrag(const QPointF &img)
     const bool useX = corner || m_handleIdx == 5 || m_handleIdx == 7;
     const bool useY = corner || m_handleIdx == 4 || m_handleIdx == 6;
     const QPointF a = m_handleAnchor;
-
+    // 화면에 표시되는 선택 박스는 조작하기 쉽도록 여백이 있다. 마우스 이동량을
+    // 실제 도형 핸들에 적용해야 반대편 도형 경계가 움직이지 않는다.
+    const QPointF handleImg = m_handleOrigin + (img - m_rotStartImg);
     double fx = 1.0, fy = 1.0;
     const double dx0 = m_handleOrigin.x() - a.x();
     const double dy0 = m_handleOrigin.y() - a.y();
-    if (useX && std::abs(dx0) > 1e-6) fx = (img.x() - a.x()) / dx0;
-    if (useY && std::abs(dy0) > 1e-6) fy = (img.y() - a.y()) / dy0;
+    if (useX && std::abs(dx0) > 1e-6) fx = (handleImg.x() - a.x()) / dx0;
+    if (useY && std::abs(dy0) > 1e-6) fy = (handleImg.y() - a.y()) / dy0;
 
-    // Shift = 비율 유지 (모서리 핸들)
-    if (corner && (QGuiApplication::keyboardModifiers() & Qt::ShiftModifier)) {
+    // 모서리는 기본적으로 비율을 유지한다. Shift를 누른 동안만 자유 변형한다.
+    // 원을 평범하게 키웠다가 타원이 되어 ARC 피팅이 깨지는 일을 막기 위한 기본값이다.
+    if (corner && !(QGuiApplication::keyboardModifiers() & Qt::ShiftModifier)) {
         const double f = (std::abs(fx) + std::abs(fy)) / 2.0;
         fx = (fx < 0 ? -f : f);
         fy = (fy < 0 ? -f : f);
+
+        const double radiusPx = selectedArcRadiusPx(m_handleStartAll);
+        if (radiusPx > 0.0 && m_tvPxPerM > 1e-9) {
+            const double requested = std::min(std::abs(fx), std::abs(fy));
+            const double constrained = motionprogram::constrainPaintArcScale(
+                radiusPx / m_tvPxPerM, requested);
+            if (constrained > requested + 1e-9) m_radiusConstraintHit = true;
+            fx = std::copysign(constrained, fx);
+            fy = std::copysign(constrained, fy);
+        }
     }
     // 0 배로 찌그러뜨려 복구 불가가 되는 것만 막는다 (뒤집기는 허용)
     auto guard = [](double f) {
@@ -1578,6 +1705,18 @@ void VideoView::scaleActive(double factor)
     if (factor <= 0.01) return;
     const QRectF b = selectionBoundsImg();
     if (b.isNull()) return;
+    QList<VVPath> snapshot;
+    snapshot.append(VVPath{m_points, m_closed});
+    for (const VVPath &path : std::as_const(m_done)) snapshot.append(path);
+    const double radiusPx = selectedArcRadiusPx(snapshot);
+    if (radiusPx > 0.0 && m_tvPxPerM > 1e-9) {
+        const double constrained = motionprogram::constrainPaintArcScale(
+            radiusPx / m_tvPxPerM, factor);
+        m_radiusConstraintHit = constrained > factor + 1e-9;
+        factor = constrained;
+    } else {
+        m_radiusConstraintHit = false;
+    }
     pushUndo();
     const QPointF c = b.center();
     applyToSelection([&](const QPointF &p) { return c + (p - c) * factor; });
@@ -1796,7 +1935,7 @@ void VideoView::mousePressEvent(QMouseEvent *e)
     const bool additive = e->modifiers() & (Qt::ControlModifier | Qt::ShiftModifier);
     const double thr = (sx > 0) ? 12.0 / sx : 12.0;
 
-    m_scaling = false; m_movingShape = false; m_dragIdx = -1; m_rubber = false;
+    m_movingShape = false; m_dragIdx = -1; m_rubber = false;
     m_handleIdx = -1; m_movingSel = false;
 
     // 0) 선택 박스 핸들 → 크기 조절 / 회전
@@ -1810,7 +1949,6 @@ void VideoView::mousePressEvent(QMouseEvent *e)
             if (!m_boxImg.isEmpty()) {
                 beginPendingUndo();
                 m_handleIdx = h;
-                m_handleStart = m_points;
                 // 드래그 시작 시점의 모든 도형 좌표를 보관 (0=활성, 1..=완성)
                 m_handleStartAll.clear();
                 VVPath act; act.pts = m_points; act.closed = m_closed;
@@ -1818,11 +1956,14 @@ void VideoView::mousePressEvent(QMouseEvent *e)
                 for (const VVPath &d : std::as_const(m_done)) m_handleStartAll.append(d);
                 m_rotStartImg = img;
                 QPointF hp[9];
-                handlePointsFor(m_boxImg, hp);
+                // 표시/히트 테스트용 여백을 제외한 실제 도형 경계를 변환 기준으로 쓴다.
+                const QRectF geometryBox = selectionBoundsImg();
+                handlePointsFor(geometryBox, hp);
                 m_handleOrigin = hp[h];
                 // 반대편 모서리/변이 고정점
                 static const int opposite[8] = { 2, 3, 0, 1, 6, 7, 4, 5 };
-                m_handleAnchor = (h == 8) ? m_boxImg.center() : hp[opposite[h]];
+                m_handleAnchor = (h == 8) ? geometryBox.center() : hp[opposite[h]];
+                update(); // 누르는 동안 반투명 조작 안내를 숨긴다.
                 e->accept();
                 return;
             }
@@ -2044,10 +2185,11 @@ void VideoView::mouseReleaseEvent(QMouseEvent *e)
 
     if (m_handleIdx >= 0) {
         m_handleIdx = -1;
-        m_handleStart.clear();
         m_handleStartAll.clear();
         m_pendingUndoValid = false;
-        mergeClosePoints();
+        // 크기 조절은 점의 위치만 바꾸는 변환이다. 작게 줄였다는 이유로 인접점을
+        // 영구 삭제하면 다시 키워도 원래 곡률을 복원할 수 없고 ARC가 조각난다.
+        // 점 하나를 직접 끌어 겹친 경우의 병합은 아래 별도 경로에서 계속 수행한다.
         update();
         return;
     }
@@ -2112,8 +2254,6 @@ void VideoView::mouseReleaseEvent(QMouseEvent *e)
     m_pendingUndoValid = false;   // 안 움직였으면 되돌리기에 올리지 않는다
     m_dragIdx = -1;
     m_dragStartPts.clear();
-    m_scaling = false;
-    m_scaleStart.clear();
     m_movingShape = false;
     m_moveStartPts.clear();
     m_movingSel = false;
@@ -2180,7 +2320,8 @@ void VideoView::hoverMoveEvent(QHoverEvent *e)
 // ── 꼭짓점 회전각 (프로토콜 TURN: 양수 = 좌회전) ─────────────────────
 int VideoView::turnBadgeAtView(qreal viewX, qreal viewY) const
 {
-    if (!m_isTopView) return -1;
+    if (!m_isTopView || !m_showLabels || !m_focused || m_points.size() > kDenseLimit)
+        return -1;
     const QPointF v(viewX, viewY);
     for (int i = 0; i < m_turnBadgeRects.size(); ++i) {
         const QRectF &r = m_turnBadgeRects[i];
@@ -2235,7 +2376,8 @@ bool VideoView::setTurnAngleAt(int index, double deg)
 // ── 변 길이(mm) 수치 편집 ─────────────────────────────────────────────
 int VideoView::edgeAtView(qreal viewX, qreal viewY) const
 {
-    if (!m_isTopView) return -1;
+    if (!m_isTopView || !m_showLabels || !m_focused || m_points.size() > kDenseLimit)
+        return -1;
     const QPointF v(viewX, viewY);
     for (int i = 0; i < m_edgeLabelRects.size(); ++i) {
         const QRectF &r = m_edgeLabelRects[i];
@@ -2373,7 +2515,7 @@ void VideoView::addPresetAt(const QString &type, qreal viewX, qreal viewY)
 // 중심(cx,cy) 기준 프리셋 생성. 기존 도형은 유지된다.
 void VideoView::buildPreset(const QString &type, double cx, double cy)
 {
-    const double s = std::max(40.0, std::min(m_frame.width(), m_frame.height()) / 6.0);
+    double s = std::max(40.0, std::min(m_frame.width(), m_frame.height()) / 6.0);
     pushUndo();
     stashActive();
     m_focused = true;              // 방금 넣은 것은 바로 편집할 수 있어야 한다
@@ -2401,6 +2543,9 @@ void VideoView::buildPreset(const QString &type, double cx, double cy)
         //    점 개수는 병합 임계값에 맞춰 정한다. 촘촘하게 깔면 예쁘지만, 점 하나를
         //    끌자마자 mergeClosePoints() 가 이웃을 통째로 지워 원이 무너진다.
         m_closed = true;
+        // 새 원을 만든 직후부터 서버가 거부하는 상태가 되면 안 된다. 캔버스의
+        // 실제 축척을 기준으로 최소 도색 반지름에서 시작한다.
+        s = std::max(s, motionprogram::kServerConfirmedMinPaintRadiusM * m_tvPxPerM);
         const double minStep = std::max(mergeThresholdPx() * 1.3, 6.0);
         const int nPt = qBound(16, int(std::floor(2.0 * M_PI * s / minStep)), 36);
         for (int i = 0; i < nPt; ++i) {
@@ -3094,9 +3239,13 @@ QImage VideoView::warpToTopView(const QImage &src)
     if (src.isNull()) return QImage();
     buildTopViewIfNeeded(src.width(), src.height());
     if (!m_tvBuilt || m_tvH.empty()) return QImage();
-    QImage rgb = src.convertToFormat(QImage::Format_RGB888);
-    cv::Mat m(rgb.height(), rgb.width(), CV_8UC3,
-              const_cast<uchar *>(rgb.bits()), size_t(rgb.bytesPerLine()));
+    // ⚠️ 들어오는 프레임은 **BGR888** 이다 (video_worker::matToQImage 주석 참고).
+    //    여기서 RGB888 로 바꾸면 워커에서 없앤 변환이 GUI 스레드로 옮겨올 뿐이다.
+    //    remap 은 채널 순서를 신경쓰지 않으므로 BGR 그대로 펴서 BGR 로 내보낸다.
+    QImage bgr = src.format() == QImage::Format_BGR888
+                     ? src : src.convertToFormat(QImage::Format_BGR888);
+    cv::Mat m(bgr.height(), bgr.width(), CV_8UC3,
+              const_cast<uchar *>(bgr.bits()), size_t(bgr.bytesPerLine()));
     cv::Mat warped;
 
     // 렌즈 보정을 켜면 warpPerspective 대신 remap 을 쓴다.
@@ -3115,7 +3264,7 @@ QImage VideoView::warpToTopView(const QImage &src)
     if (warped.empty())
         cv::warpPerspective(m, warped, m_tvH, cv::Size(m_tvOutW, m_tvOutH));
 
-    QImage out(warped.data, warped.cols, warped.rows, int(warped.step), QImage::Format_RGB888);
+    QImage out(warped.data, warped.cols, warped.rows, int(warped.step), QImage::Format_BGR888);
     return out.copy();
 }
 

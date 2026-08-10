@@ -1,0 +1,21 @@
+# CMake build output
+build/
+
+# Kernel module build artifacts
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+
+# Device tree overlay output
+*.dtbo
+
+# Test binaries
+led_test
+motor_test
+arc_test
+robot_exec

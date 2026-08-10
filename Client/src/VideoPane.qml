@@ -300,6 +300,12 @@ Rectangle {
             if (!turnEditor.activeEdit)
                 turnEditor.visible = false
         }
+        function onShowLabelsChanged() {
+            if (!vv.showLabels) {
+                edgeEditor.close()
+                turnEditor.close()
+            }
+        }
     }
 
     // ── 꼭짓점 회전각(°) 직접 입력 ───────────────────────────────────

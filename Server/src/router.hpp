@@ -38,8 +38,10 @@
 #include "params.hpp"
 #include "path_planner.hpp"
 #include "protocol.hpp"
+#include "stream_cfg.hpp"
 #include "tls_server.hpp"
 #include "user_store.hpp"
+#include <map>
 #include <mutex>
 
 class Router {
@@ -49,8 +51,14 @@ public:
     // ROBOT/CCTV 접속·해제 시(TlsServer가 통지) QT에 PEERS로 알림.
     // QT 자신이 막 접속했을 때도 호출되어 현재 접속 현황 스냅샷을 보낸다.
     void onPeerChange(const std::string& role, bool connected);
+    // 주기 호출(main의 tick 스레드, 기본 200ms). 시간이 지나야 판정되는 것들
+    // (POS 두절 HOLD, 판정 대기 창, 캘리 타임아웃)을 메시지 수신과 무관하게
+    // 돌린다. 🔴 이게 없으면 상대가 조용해진 순간 감시도 같이 멈춘다.
+    void tick();
 
 private:
+    // 시간 경과로 충족됐을 수 있는 판정들을 한곳에서 회수. mtx_를 쥔 채 부를 것.
+    void sweep();
     // 현재 ROBOT/CCTV 접속 여부를 모아 PEERS 메시지로 QT에 전송
     void sendPeers();
     void fromQt(const json& msg);
@@ -62,6 +70,49 @@ private:
     void handleLogin(const json& payload, const std::string& replyRole);
     // 캘리브레이션 번들 수신 처리 (CCTV/ADMIN 공용): 저장 + Qt 중계
     void handleHMatrix(const json& msg);
+
+    // ----- 채널 (v0.4, router_channel.cpp) -----
+    // 지금 보고 있는 채널의 캘리브레이션. 그 채널이 미캘리면 valid=false인 빈 값.
+    // 🔴 pose 계산은 반드시 이걸 거칠 것 - 채널마다 H가 달라 좌표계가 다르다.
+    const Calib& activeCalib() const;
+    // SELECT_CHANNEL: 작업 채널 전환. CCTV로 중계 + QT에 CHANNEL_OK/FAIL 회신.
+    void selectChannel(const json& payload, const json& msg);
+    // 활성 채널 전환에 딸린 서버 상태 정리만 한다 (전송 없음). selectChannel과
+    // startCalib이 공유한다 - 채널을 바꾸면서 pose를 안 버리면 새 채널의 첫 POS가
+    // 오기 전까지 서버가 옛 좌표계의 위치를 믿는다.
+    void applyChannel(int ch);
+    // 진행 중인 도색 작업을 취소한다 (CMD ABORT_DRAW).
+    // ESTOP과 달리 "받아둔 경로를 버린다" - 반환값은 실제로 취소할 게 있었는지.
+    bool abortDraw();
+
+    // ----- 로봇 주행 호모그래피 세션 (2026-08-10, router_calib.cpp) -----
+    // 🔴 불변식: calibActive_가 켜졌다면 반드시 종결 응답 하나로만 꺼진다
+    //   (H_MATRIX / CALIB_FAIL / CALIB_CANCELLED). 조용히 끄면 Qt가 대기 화면에
+    //   갇힌다 - clearCalib()를 단독으로 부르지 말고 항상 전송과 짝지을 것.
+    // origin = "QT" | "ADMIN". 개시자가 둘이라 회신 대상과 검증 강도가 다르다.
+    void startCalib(const json& payload, const json& msg, const char* origin);
+    void cancelCalib(const json& payload, const json& msg);
+    // ROBOT/CCTV의 CALIB_STOPPED 수신. 둘 다 모이면 CALIB_CANCELLED를 보낸다.
+    void onCalibStopped(const std::string& role);
+    // CCTV가 올린 CALIB_PROGRESS/CALIB_FAIL을 ch/request_id를 채워 QT로 넘긴다.
+    void relayCalibProgress(const json& msg);
+    void relayCalibFail(const json& payload);
+    // 세션이 도는 중이면 CALIB_FAIL을 QT에 보내고 상태를 접는다 (개시자가 ADMIN
+    // 이면 QT는 기다리는 게 없으므로 로그만 남긴다).
+    void failCalib(const char* reason, const std::string& m);
+    // 종결 응답 없이 늘어지는 세션을 서버가 먼저 접는다 (Qt 5분 한도보다 짧게).
+    void checkCalibTimeout();
+    void clearCalib();
+
+    bool calibActive_ = false;     // 세션이 도는 중인가 (busy 판정의 단일 근거)
+    bool calibFromQt_ = false;     // QT가 개시했나 (아니면 ADMIN - QT에 회신 안 함)
+    std::string calibReqId_;       // Qt가 준 상관관계 ID (ADMIN 개시면 빈 문자열)
+    int calibCh_ = 0;              // 이 세션이 캘리 중인 채널
+    long calibStartMs_ = 0;        // 수락 시각 (calib_timeout_ms 기준점)
+    bool calibCancelling_ = false;   // CALIB_CANCEL을 중계하고 ACK를 기다리는 중
+    long calibCancelMs_ = 0;         // 중계 시각 (calib_cancel_ack_ms 기준점)
+    bool cancelAckRobot_ = false;    // ROBOT의 CALIB_STOPPED를 받았나
+    bool cancelAckCctv_ = false;     // CCTV의 CALIB_STOPPED를 받았나
 
     // ----- 로봇 핸드셰이크 (§3, §6) -----
     // READY 수신. 판정이 필요 없는 boundary면 즉시 GO, 필요하면 대기 창을 연다.
@@ -98,7 +149,17 @@ private:
     TlsServer& srv_;
     UserStore users_;          // id/pw/H행렬 영속 저장소
     std::string currentUser_;  // 로그인된 사용자 (단일 사용자 가정)
-    Calib calib_;      // 캘리브레이션 (현재 세션. raw는 calib_.raw)
+    // 중계 스트림 설정 파일 경로. 로그인마다 다시 읽으므로 값은 들고 있지 않는다
+    // (stream_cfg.hpp loadStreamCfg 주석 - 서버 재시작 없이 주소를 바꾸기 위함).
+    static constexpr const char* kStreamCfgFile = "config/stream.json";
+    // 채널별 캘리브레이션 (v0.4). 채널마다 H가 다르므로 하나로 합칠 수 없다.
+    // 단일 채널 현장은 키가 1 하나뿐인 맵으로 그대로 동작한다 (channelOf가
+    // ch 없는 payload를 1로 읽어주므로 구버전 CCTV/QT도 수정 없이 붙는다).
+    std::map<int, Calib> calibs_;
+    int activeChannel_ = kMinChannel;  // 지금 작업 중인 채널 (SELECT_CHANNEL로 전환)
+    // 직전에 "활성 채널이 아니라서" 버린 POS의 채널. 같은 채널이 계속 들어올 때
+    // 로그를 한 번만 남기기 위한 것 - POS는 15~30Hz라 매번 찍으면 로그가 덮인다.
+    int lastIgnoredPosCh_ = 0;
     json blueprint_;   // Qt가 보낸 도면 원본
     json lastStatus_;  // 로봇 최신 상태
     json lastPos_;     // CCTV 최신 마커 검출 원본 (픽셀)

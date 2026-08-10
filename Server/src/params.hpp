@@ -60,7 +60,14 @@ using json = nlohmann::json;
     X(long, pos_stat_period_ms, 10000, "POS 수신 요약 로그 주기")              \
     /* ---- 경로 생성 ---- */                                                  \
     X(double, min_turn_deg, 2.0, "이 각도 미만의 회전은 op으로 만들지 않음")   \
-    X(double, min_move_m, 0.01, "이 거리 미만의 이동은 op으로 만들지 않음")
+    X(double, min_move_m, 0.01, "이 거리 미만의 이동은 op으로 만들지 않음")    \
+    /* ---- 로봇 주행 호모그래피 세션 (2026-08-10) ---- */                     \
+    X(long, calib_timeout_ms, 180000,                                          \
+      "CALIB_START 후 이만큼 지나도 종결 응답이 없으면 CALIB_FAIL{timeout}. "  \
+      "🔴 Qt 자체 타임아웃(5분)보다 반드시 짧아야 한다 - 아래 주석 참조")      \
+    X(long, calib_cancel_ack_ms, 5000,                                         \
+      "CALIB_CANCEL 후 ROBOT/CCTV의 CALIB_STOPPED를 기다리는 한도. "           \
+      "넘으면 CALIB_FAIL{cancel_failed} (정지를 추정으로 확인하지 않는다)")
 
 struct Params {
 #define RP_DECL(T, N, D, C) T N = D;
@@ -138,6 +145,18 @@ inline void sanitize(Params& p) {
     floorAt("pos_recover_frames", p.pos_recover_frames, 1);
     floorAt("pose_reject_max", p.pose_reject_max, 1);
     floorAt("pos_stat_period_ms", p.pos_stat_period_ms, 1000L);
+    floorAt("calib_cancel_ack_ms", p.calib_cancel_ack_ms, 1000L);
+    // 0을 넣으면 CALIB_START가 수락되자마자 타임아웃으로 죽는다. 하한을 두는
+    // 편이 "왜 캘리가 즉시 실패하지"를 현장에서 찾는 것보다 싸다.
+    floorAt("calib_timeout_ms", p.calib_timeout_ms, 5000L);
+    // 🔴 Qt는 종결 응답이 5분(300s) 없으면 스스로 대기를 푼다. 서버 타임아웃이
+    // 그보다 길면 Qt는 이미 포기했는데 서버만 busy로 남아, 다음 요청이 전부
+    // busy로 거절된다 (사람 눈에는 "캘리가 영영 안 되는" 상태로 보인다).
+    if (p.calib_timeout_ms >= 300000L) {
+        logf("[WARN] params 'calib_timeout_ms'=%ld 은(는) Qt 대기 한도(300000)"
+             " 이상 - 290000으로 내림", p.calib_timeout_ms);
+        p.calib_timeout_ms = 290000L;
+    }
     // min_paint_radius_m 기본값 0.200은 기하가 아니라 모터가 정한 값이다.
     // 호에서는 바깥 바퀴가 base_sps × (R_robot + W/2) / R_robot 으로 돌고,
     // 이 값이 1/R_robot 로 발산한다. 로봇팀 회신(2026-08-07): NEMA 17 기준

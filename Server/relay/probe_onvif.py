@@ -27,10 +27,16 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urlunparse, quote
 
 import requests
+import urllib3
 
 SOAP_NS = "http://www.w3.org/2003/05/soap-envelope"
 MEDIA10_NS = "http://www.onvif.org/ver10/media/wsdl"
 DEVICE_NS = "http://www.onvif.org/ver10/device/wsdl"
+
+# 카메라는 자체서명 인증서를 쓴다 (브라우저에서도 "주의 요함" 이 뜨는 그것).
+# 검증을 켜두면 SSLCertVerificationError 로 아무것도 못 한다. 폐쇄망의 장비를
+# 직접 지정해서 부르는 용도라 검증을 끈다 — 경고도 같이 끈다.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def ws_security_header(user, password, clock_offset):
@@ -62,6 +68,11 @@ def soap_call(url, body, user, password, clock_offset, timeout=8):
     """SOAP 요청 한 번. WS-Security 로 먼저 시도하고, 거부되면 HTTP digest 로 재시도.
 
     카메라 펌웨어에 따라 둘 중 하나만 받는 경우가 있어서 양쪽을 다 시도한다.
+
+    ⚠️ 리다이렉트를 requests 에 맡기면 안 된다. 카메라가 http 를 https 로 301 로
+       넘기는데, requests 는 301 을 따라갈 때 POST 를 GET 으로 바꾼다 (브라우저와
+       같은 동작) → SOAP 본문이 통째로 사라진다. 그래서 따라가지 않게 막고
+       Location 을 직접 읽어 같은 방식(POST)으로 다시 부른다.
     """
     header = ws_security_header(user, password, clock_offset) if user else ""
     envelope = (
@@ -70,7 +81,22 @@ def soap_call(url, body, user, password, clock_offset, timeout=8):
     )
     headers = {"Content-Type": "application/soap+xml; charset=utf-8"}
 
-    resp = requests.post(url, data=envelope.encode(), headers=headers, timeout=timeout)
+    def post(target, **kw):
+        return requests.post(
+            target, data=envelope.encode(), headers=headers, timeout=timeout,
+            verify=False, allow_redirects=False, **kw
+        )
+
+    resp = post(url)
+    for _ in range(3):                      # http -> https 같은 이동은 보통 1번이다
+        if resp.status_code not in (301, 302, 303, 307, 308):
+            break
+        loc = resp.headers.get("Location")
+        if not loc:
+            break
+        url = loc if "://" in loc else url.rsplit("/", 3)[0] + loc
+        resp = post(url)
+
     if resp.status_code == 200:
         return resp.text
     if resp.status_code in (400, 401) and user:
@@ -84,6 +110,7 @@ def soap_call(url, body, user, password, clock_offset, timeout=8):
             data=plain.encode(),
             headers=headers,
             timeout=timeout,
+            verify=False,
             auth=requests.auth.HTTPDigestAuth(user, password),
         )
         if resp.status_code == 200:
@@ -200,6 +227,62 @@ def with_credentials(uri, user, password):
     return urlunparse((p.scheme, cred + host, p.path, p.params, p.query, p.fragment))
 
 
+def pick_main_per_channel(rows):
+    """채널별로 '메인스트림' 하나씩 고른다.
+
+    멀티디렉셔널 카메라는 URL 경로에 채널 번호가 들어간다:
+        rtsp://<ip>:554/<채널 0-3>/onvif/profile<N>/media.smp
+    그리고 채널마다 프로파일이 여러 개다 (MJPEG / H.264 / 모바일). 그냥 앞에서
+    4개를 집으면 한 채널의 프로파일 3개 + 옆 채널 1개가 잡혀서 완전히 틀린다.
+    그래서 채널로 묶은 뒤, 채널 안에서 화질이 가장 좋은 것을 고른다.
+
+    고르는 기준 (순서대로):
+      1. JPEG 제외 — MJPEG 은 스냅샷용이고 대역을 훨씬 많이 먹는다
+      2. 해상도(픽셀 수)가 큰 것
+      3. fps 가 높은 것
+    """
+    by_channel = {}
+    for p, uri in rows:
+        if not uri:
+            continue
+        m = re.search(r"://[^/]+/(\d+)/", uri)
+        ch = int(m.group(1)) if m else -1
+        by_channel.setdefault(ch, []).append((p, uri))
+
+    def score(item):
+        p, _ = item
+        w, _, h = p["resolution"].partition("x")
+        try:
+            pixels = int(w) * int(h)
+        except ValueError:
+            pixels = 0
+        try:
+            fps = float(p["fps"])
+        except ValueError:
+            fps = 0.0
+        is_video = 0 if p["encoding"].upper().startswith("JPEG") else 1
+        return (is_video, pixels, fps)
+
+    return [(ch, *max(by_channel[ch], key=score)) for ch in sorted(by_channel)]
+
+
+def print_env(rows, user, password):
+    picked = pick_main_per_channel(rows)
+
+    print("# probe_onvif.py 출력 — cameras.env 에 붙여넣으세요.")
+    print("# 채널 번호는 URL 경로의 0-based 인덱스이며, 카메라 웹 UI 의 CH 1~4 에 대응합니다.")
+    for i, (ch, p, _uri) in enumerate(picked, start=1):
+        print(f"#   ch{i}  <- 카메라 채널 {ch} (웹UI CH{ch + 1}) : "
+              f"{p['name']} {p['resolution']} {p['encoding']} {p['fps']}fps")
+    print()
+    for i, (_ch, _p, uri) in enumerate(picked, start=1):
+        print(f"MTX_PATHS_CH{i}_SOURCE={with_credentials(uri, user, password)}")
+
+    if len(picked) != 4:
+        print(f"\n# ⚠️ 채널이 4개가 아니라 {len(picked)}개로 잡혔습니다. "
+              f"mediamtx.yml 의 paths 항목 수와 맞는지 확인하세요.", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description="ONVIF 로 채널별 RTSP 주소를 조회한다")
     ap.add_argument("--host", required=True, help="카메라 IP")
@@ -229,16 +312,7 @@ def main():
         rows.append((p, uri))
 
     if args.env:
-        # 메인스트림으로 보이는 것(해상도가 큰 순)부터 ch1..ch4 로 배치해 제안한다.
-        # ⚠️ 어느 프로파일이 몇 번 채널인지는 카메라 구성에 달렸다. 아래 이름/해상도를
-        #    보고 실제 채널 순서에 맞게 손으로 정렬한 뒤 쓰는 것이 안전하다.
-        print("# probe_onvif.py 출력 — 이름/해상도를 보고 채널 순서를 확인한 뒤 사용하세요.")
-        for i, (p, uri) in enumerate(rows, start=1):
-            print(f"#   ch{i} 후보: {p['name']} {p['resolution']} {p['encoding']} {p['fps']}fps")
-        print()
-        for i, (p, uri) in enumerate(rows[:4], start=1):
-            full = with_credentials(uri, args.user, args.password) if uri else "?"
-            print(f"MTX_PATHS_CH{i}_SOURCE={full}")
+        print_env(rows, args.user, args.password)
     else:
         print(f"\n프로파일 {len(rows)}개\n")
         for p, uri in rows:
