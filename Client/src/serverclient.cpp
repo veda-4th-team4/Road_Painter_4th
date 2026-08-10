@@ -202,6 +202,25 @@ void ServerClient::sendSelectChannel(int ch)
     sendJson("CMD", p);
 }
 
+void ServerClient::sendCalibStart(int ch, const QString &requestId)
+{
+    QJsonObject p;
+    p["cmd"] = QStringLiteral("CALIB_START");
+    p["ch"] = ch;
+    p["request_id"] = requestId;
+    p["method"] = QStringLiteral("robot_motion");
+    sendJson("CMD", p);
+}
+
+void ServerClient::sendCalibCancel(int ch, const QString &requestId)
+{
+    QJsonObject p;
+    p["cmd"] = QStringLiteral("CALIB_CANCEL");
+    p["ch"] = ch;
+    p["request_id"] = requestId;
+    sendJson("CMD", p);
+}
+
 
 // 로그인 상태에서만 동작한다. 서버는 IP 형식을 검사하지 않으므로 검증은 Qt 몫.
 void ServerClient::sendSetCamIp(const QString &camIp)
@@ -214,7 +233,7 @@ void ServerClient::sendSetCamIp(const QString &camIp)
 void ServerClient::onReadyRead()
 {
     m_buffer.append(m_socket->readAll());
-    int nl;
+    qsizetype nl;
     while ((nl = m_buffer.indexOf('\n')) != -1) {
         QByteArray line = m_buffer.left(nl);
         m_buffer.remove(0, nl + 1);
@@ -280,15 +299,36 @@ void ServerClient::dispatch(const QJsonObject &msg)
     } else if (type == "H_MATRIX") {
         // v0.3: calib 번들. 레거시 {"H":[[..]x3]} 도 당분간 허용.
         QJsonObject calib = payload.value("calib").toObject();
-        if (calib.isEmpty() && payload.contains("H")) {
-            calib = QJsonObject{ { "H", payload.value("H") } };
-        }
-        // 평면 스키마는 payload 자체가 번들이라 여기서 calib 가 비어 있다.
-        // 그 경우 payload 를 그대로 번들로 본다 (Backend 가 정규화한다).
-        if (calib.isEmpty() && payload.contains("H_floor"))
+        // 평면 스키마는 payload 자체가 번들이다. K/D/H_marker 등의 보정
+        // 메타데이터까지 보존하고 전송 envelope 필드만 제거한다.
+        if (calib.isEmpty() && (payload.contains("H") || payload.contains("H_floor"))) {
             calib = payload;
+            calib.remove("ch");
+            calib.remove("request_id");
+        }
         // ch 없으면 1 (단일 채널 카메라·v0.3 서버 하위호환)
-        emit hMatrixReceived(payload.value("ch").toInt(1), calib);
+        emit hMatrixReceived(payload.value("ch").toInt(1), calib,
+                             payload.value("request_id").toString());
+    } else if (type == "CALIB_STARTED") {
+        emit calibStarted(payload.value("ch").toInt(),
+                          payload.value("request_id").toString(),
+                          payload.value("msg").toString());
+    } else if (type == "CALIB_PROGRESS") {
+        double progress = payload.value("progress").toDouble(-1.0);
+        if (progress > 1.0) progress /= 100.0;
+        emit calibProgress(payload.value("ch").toInt(),
+                           payload.value("request_id").toString(), progress,
+                           payload.value("stage").toString(),
+                           payload.value("msg").toString());
+    } else if (type == "CALIB_FAIL") {
+        emit calibFailed(payload.value("ch").toInt(),
+                         payload.value("request_id").toString(),
+                         payload.value("reason").toString(),
+                         payload.value("msg").toString());
+    } else if (type == "CALIB_CANCELLED") {
+        emit calibCancelled(payload.value("ch").toInt(),
+                            payload.value("request_id").toString(),
+                            payload.value("msg").toString());
     } else if (type == "CHANNEL_OK") {
         const QJsonObject calib = payload.value("calib").toObject();
         emit channelResult(true, payload.value("ch").toInt(), calib,

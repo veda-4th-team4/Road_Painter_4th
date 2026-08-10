@@ -124,6 +124,29 @@ void testServerRadiusPreflight()
     const QList<motionprogram::Op> confirmedBoundary = buildClosedLikeBackend(0.200, 0.200, 19);
     check(motionprogram::firstTooTightPaintArc(confirmedBoundary) < 0,
           "confirmed 200mm boundary must be accepted");
+
+    motionprogram::Op roundedUp;
+    roundedUp.kind = motionprogram::Op::Arc;
+    roundedUp.paint = true;
+    roundedUp.radius = 0.19996;
+    check(motionprogram::firstTooTightPaintArc({roundedUp}) < 0,
+          "199.96mm must be accepted because the wire value is 200.0mm");
+
+    roundedUp.radius = 0.19994;
+    check(motionprogram::firstTooTightPaintArc({roundedUp}) >= 0,
+          "199.94mm must be rejected because the wire value is 199.9mm");
+}
+
+void testArcResizeConstraint()
+{
+    check(near(motionprogram::constrainPaintArcScale(0.50, 0.10), 0.40),
+          "500mm ARC must stop shrinking at the 200mm boundary");
+    check(near(motionprogram::constrainPaintArcScale(0.20, 0.90), 1.0),
+          "ARC already at the boundary must not shrink further");
+    check(near(motionprogram::constrainPaintArcScale(0.15, 0.80), 1.0),
+          "legacy invalid ARC must not shrink further");
+    check(near(motionprogram::constrainPaintArcScale(0.15, 1.20), 1.20),
+          "legacy invalid ARC must remain freely enlargeable");
 }
 
 void testEllipseIsNotOneCircle()
@@ -199,6 +222,7 @@ int main(int argc, char **argv)
     testCircleOneArc();
     testPartialArcEntryHeading();
     testServerRadiusPreflight();
+    testArcResizeConstraint();
     testEllipseIsNotOneCircle();
     testUniformResizeRoundTripKeepsCircle();
     testSharedServerQuarterArcFixture();

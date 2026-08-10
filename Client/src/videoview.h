@@ -246,6 +246,9 @@ private:
     void beginSelectionMove(const QPointF &img, bool onVertex);
     // 선택된 모든 점(없으면 활성 도형 전체)에 변환을 적용한다
     void applyToSelection(const std::function<QPointF(const QPointF &)> &fn);
+    // 현재 변환 대상 전체가 포함하는 원호 중 가장 작은 반지름(px).
+    // 부분 선택으로 원호를 찌그러뜨리는 경우는 균일 ARC 제약 대상이 아니다.
+    double selectedArcRadiusPx(const QList<VVPath> &snapshot) const;
     QRectF selectionBoundsImg() const;
 
     // ── 되돌리기 (동작 단위 스냅샷) ──────────────────────────────────
@@ -306,12 +309,6 @@ private:
     QPointF m_rubberEnd;
     QVector<QPointF> m_dragStartPts;  // 선택 이동 기준
     QPointF m_dragStartImg;
-
-    // Ctrl+드래그 비율 스케일링
-    bool m_scaling = false;
-    QPointF m_scaleAnchor;
-    QVector<QPointF> m_scaleStart;
-    double m_scaleStartDist = 0.0;
 
     // 도형 전체 이동
     bool m_movingShape = false;
@@ -377,9 +374,9 @@ private:
     QPointF m_handleAnchor;     // 반대편 고정점
     QPointF m_handleOrigin;     // 잡은 핸들의 원래 위치
     QPointF m_rotStartImg;
-    QVector<QPointF> m_handleStart;
     // 드래그 시작 시점의 전체 좌표 (0=활성, 1..=완성 도형) — 누적 오차 방지
     QList<VVPath> m_handleStartAll;
+    bool m_radiusConstraintHit = false;
 
     // 미션 오버레이 (표시 프레임 px)
     QList<VVPath> m_missionPaths;

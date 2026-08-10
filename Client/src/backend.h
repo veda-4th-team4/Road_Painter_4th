@@ -83,8 +83,6 @@ class Backend : public QObject
     //    화면에는 이미 calibStatus 하나로 합쳐서 나가고(backend.cpp 의 calibStatus 조립),
     //    개별 노출은 중복이었다. 멤버 m_calibId/m_coordMode/m_calibSource 는 그 조립과
     //    렌즈보정 판정에 계속 쓰이므로 남아 있다.
-    Q_PROPERTY(double mmPerPx READ mmPerPx NOTIFY calibChanged)
-    Q_PROPERTY(double pxPerMm READ pxPerMm NOTIFY calibChanged)
     Q_PROPERTY(QString scaleText READ scaleText NOTIFY calibChanged)
     Q_PROPERTY(QString rtspUrl READ rtspUrl NOTIFY rtspChanged)
 
@@ -106,6 +104,11 @@ class Backend : public QObject
     // 캘리브레이션이 끝난 채널 번호 목록. QML 바인딩용이다 — channelCalibrated() 는
     // Q_INVOKABLE 이라 캘리가 새로 들어와도 바인딩이 다시 계산되지 않는다.
     Q_PROPERTY(QVariantList calibratedChannels READ calibratedChannels NOTIFY channelChanged)
+    Q_PROPERTY(bool homographyPending READ homographyPending NOTIFY homographyChanged)
+    Q_PROPERTY(int homographyChannel READ homographyChannel NOTIFY homographyChanged)
+    Q_PROPERTY(double homographyProgress READ homographyProgress NOTIFY homographyChanged)
+    Q_PROPERTY(QString homographyStatus READ homographyStatus NOTIFY homographyChanged)
+    Q_PROPERTY(bool homographyCancelPending READ homographyCancelPending NOTIFY homographyChanged)
 
     // 서버 통지(DRAW_FAIL 등) 배너
     Q_PROPERTY(QString notice READ notice NOTIFY noticeChanged)
@@ -178,7 +181,7 @@ public:
     bool jobActive() const { return m_jobActive; }
     bool abortPending() const { return m_abortPending; }
     // 경로 실행(접근+도색) 중에는 서버가 QT 수동조작을 무시한다 → UI도 잠근다
-    bool manualEnabled() const { return !m_jobActive; }
+    bool manualEnabled() const { return !m_jobActive && !m_homographyPending; }
     bool canEditMission() const {
         int n = 0;
         for (const auto &p : m_missionPaths) n += p.size();
@@ -202,9 +205,6 @@ public:
     QString workName() const { return m_workName; }
     QString calibStatus() const { return m_calibStatus; }
     bool calibMissing() const { return m_calibMissing; }
-    // 지금 걸려 있는 번들이 어느 것인지 화면에서 바로 보이게 한다.
-    double mmPerPx() const { return m_mmPerPx; }
-    double pxPerMm() const { return (m_mmPerPx > 1e-9) ? 1.0 / m_mmPerPx : 0.0; }
     QString scaleText() const;
     QString rtspUrl() const { return m_rtspUrl; }
 
@@ -238,7 +238,8 @@ public:
     // 그 채널에 캘리브레이션 번들이 있는가 (LOGIN_OK.calibs / CHANNEL_OK 기준)
     Q_INVOKABLE bool channelCalibrated(int ch) const;
     QVariantList calibratedChannels() const;
-    // 중계 주소 변경 (설정창). 빈 문자열이면 4채널 기능을 끄고 예전 동작으로.
+    // 중계 주소 변경. 빈 문자열이면 카메라 직결 템플릿으로 돌아간다. 중계와
+    // 직결 템플릿이 모두 비어 있을 때만 단일 채널 동작으로 돌아간다.
     Q_INVOKABLE void setRelayBase(const QString &base);
     // 타일 클릭 — 하이라이트만 바뀐다 (스트림은 이미 4개 다 흐르는 중)
     Q_INVOKABLE void highlightChannel(int ch);
@@ -255,6 +256,13 @@ public:
     Q_INVOKABLE void refreshStreams();
     // ChannelGrid.qml 의 타일을 Backend 에 등록한다 (프레임을 밀어 넣기 위해)
     Q_INVOKABLE void registerTile(ChannelTile *tile, int ch);
+    bool homographyPending() const { return m_homographyPending; }
+    int homographyChannel() const { return m_homographyCh; }
+    double homographyProgress() const { return m_homographyProgress; }
+    QString homographyStatus() const { return m_homographyStatus; }
+    bool homographyCancelPending() const { return m_homographyCancelPending; }
+    Q_INVOKABLE bool startHomography(int ch);
+    Q_INVOKABLE void cancelHomography();
 
     QString notice() const { return m_notice; }
     QString noticeLevel() const { return m_noticeLevel; }
@@ -372,6 +380,7 @@ signals:
     void robotVisibleChanged();
     void channelChanged();
     void historyChanged();
+    void homographyChanged();
 
 private:
     void startWorker();
@@ -442,6 +451,9 @@ private:
     void setNotice(const QString &text, const QString &level,
                    const QString &key = QString());
     void clearNotice(const QString &key);
+    bool matchesHomographyReply(int ch, const QString &requestId) const;
+    void failHomography(const QString &message, const QString &reason);
+    void resetHomography();
 
     // 작업 이력 파일 (사용자별 AppData/jobs.json)
     QString historyPath() const;
@@ -459,6 +471,7 @@ private:
     QTimer *m_testProgressTimer = nullptr;
     QTimer *m_jobTick = nullptr;
     QTimer *m_frameWatch = nullptr;
+    QTimer *m_homographyTimer = nullptr;
     bool m_gotRealFrame = false;
 
     QString m_userId;
@@ -511,10 +524,9 @@ private:
     // ⚠️ 이 카메라에는 **저해상도 서브 프로파일이 없다.** 그래서 subUrl 은 직결
     //    모드에서 메인과 같은 주소를 준다 — 미리보기 4장이 전부 같은 해상도를
     //    디코딩한다. 서브가 생기면 여기만 고치면 된다.
-    //    현재 프로파일(2026-08-04): 4채널 전부 H.264 1920x1080 15fps 2560kbps GOV 8.
-    //    16:9 모니터에 맞춘 값이고, 2592x1520(2026-08-04 이전) 대비 픽셀 47% 감소.
+    //    현장 실측(2026-08-07): profile2는 4채널 모두 1920x1080 30fps.
     QString m_channelUrlTemplate =
-        QStringLiteral("rtsp://admin:5hanwha!@{ip}:554/{ch0}/H.264/media.smp");
+        QStringLiteral("rtsp://admin:5hanwha!@{ip}:554/{ch0}/profile2/media.smp");
     int m_channelCount = 4;
     int m_highlightedCh = 0;   // 클릭한 채널 (0 = 없음)
     int m_workingCh = 0;       // 작업 중인 채널 (0 = 그리드 화면)
@@ -525,6 +537,13 @@ private:
     QJsonObject m_calibs;
     QList<preview_worker *> m_previews;
     QHash<int, ChannelTile *> m_tiles;
+    bool m_homographyPending = false;
+    bool m_homographyCancelPending = false;
+    int m_homographyCh = 0;
+    double m_homographyProgress = -1.0;
+    QString m_homographyStatus;
+    QString m_homographyRequestId;
+    quint64 m_homographyRequestSerial = 0;
 
     bool m_serverConnected = false;
     QString m_serverLabel = "대기";

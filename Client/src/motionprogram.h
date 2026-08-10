@@ -41,6 +41,21 @@ constexpr double kDegToRad = kPi / 180.0;
 // 추후 LOGIN_OK가 min_paint_radius_m을 제공하면 이 상수 대신 서버 값을 사용한다.
 constexpr double kServerConfirmedMinPaintRadiusM = 0.200;
 
+// 균일 축소 중 도색 ARC가 서버·로봇 하한 아래로 내려가지 않게 한다.
+// 이미 하한보다 작은 옛 도면은 갑자기 200mm로 튀지 않도록 추가 축소만 막고,
+// 확대는 사용자가 자연스럽게 경계까지 키울 수 있게 그대로 허용한다.
+inline double constrainPaintArcScale(double currentRadiusM, double requestedFactor)
+{
+    if (!std::isfinite(currentRadiusM) || currentRadiusM <= 0.0
+        || !std::isfinite(requestedFactor) || requestedFactor == 0.0)
+        return requestedFactor;
+    const double magnitude = std::abs(requestedFactor);
+    if (currentRadiusM < kServerConfirmedMinPaintRadiusM)
+        return std::copysign(std::max(1.0, magnitude), requestedFactor);
+    const double minimum = kServerConfirmedMinPaintRadiusM / currentRadiusM;
+    return std::copysign(std::max(minimum, magnitude), requestedFactor);
+}
+
 // 로봇 속도. 도색 중에는 도료가 고르게 깔려야 해서 이동할 때보다 느리다.
 // ⚠️ 전송하지 않는다 — 미리보기/예상시간 전용.
 struct Speeds {
@@ -363,7 +378,10 @@ inline int firstTooTightPaintArc(const QList<Op> &ops, double *radiusM = nullptr
 {
     for (int i = 0; i < ops.size(); ++i) {
         const Op &o = ops[i];
-        if (o.kind == Op::Arc && o.paint && o.radius + 1e-9 < minRadiusM) {
+        // serverclient.cpp가 radius_m을 0.1 mm 단위로 반올림해 전송하므로
+        // 화면 사전검사도 서버가 실제로 받는 값으로 판정해야 경계 오경고가 없다.
+        const double wireRadiusM = std::round(o.radius * 10000.0) / 10000.0;
+        if (o.kind == Op::Arc && o.paint && wireRadiusM < minRadiusM) {
             if (radiusM) *radiusM = o.radius;
             return i;
         }
