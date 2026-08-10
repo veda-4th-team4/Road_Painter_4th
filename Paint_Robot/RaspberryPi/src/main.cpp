@@ -51,6 +51,8 @@ int main(int argc, char **argv) {
   bool waiting_for_go = false;
   uint32_t ready_seg_sent = 0xFFFFFFFF; // Track last segment index READY was sent for
   bool path_done_sent = false;          // Track PATH_DONE transmission per path
+  static std::vector<Segment_t> pending_path;
+  static bool has_pending_path = false;
 
   enum class NozzleSubSeq { OFFSET_MOVE, WAIT_DELAY };
 
@@ -147,9 +149,6 @@ int main(int argc, char **argv) {
 
        // 3. Handle incoming PATH (segments sequence)
        // Defense logic: Buffer incoming new PATH and defer loading until current active segment movement completes!
-       static std::vector<Segment_t> pending_path;
-       static bool has_pending_path = false;
-
        std::vector<Segment_t> new_path;
        if (net_manager.GetPath(new_path)) {
            pending_path = new_path;
