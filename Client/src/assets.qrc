@@ -1,5 +1,10 @@
 <RCC>
     <qresource prefix="/">
         <file>assets/hanwha_vision_logo.png</file>
+        <file>assets/tutorial_step_1_channel.jpg</file>
+        <file>assets/tutorial_step_2_calibration.jpg</file>
+        <file>assets/tutorial_step_3_path.jpg</file>
+        <file>assets/tutorial_step_4_review.jpg</file>
+        <file>assets/tutorial_step_5_execute.jpg</file>
     </qresource>
 </RCC>

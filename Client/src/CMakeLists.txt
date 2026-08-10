@@ -58,8 +58,6 @@ qt_add_qml_module(RoadPainterQml
         MainPage.qml
         ChannelGrid.qml
         PresetTile.qml
-        PresetPanel.qml
-        UndoButton.qml
         ScaleRuler.qml
         DockPanel.qml
         PathThumb.qml

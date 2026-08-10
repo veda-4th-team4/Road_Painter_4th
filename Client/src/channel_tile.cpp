@@ -74,7 +74,7 @@ void ChannelTile::paint(QPainter *p)
     p->setFont(f);
     p->drawText(box, Qt::AlignCenter,
                 m_failed
-                    ? QStringLiteral("CH%1 연결 실패\n중계 주소를 확인하세요").arg(m_ch)
+                    ? QStringLiteral("CH%1 연결 실패\n카메라 IP/스트림 주소를 확인하세요").arg(m_ch)
                     // 중계는 on-demand 라 아무도 안 보면 카메라에서 당겨오지 않는다.
                     // 첫 프레임까지 1~3초가 정상이므로 그 사이를 안내한다.
                     : QStringLiteral("CH%1 연결 중…").arg(m_ch));
