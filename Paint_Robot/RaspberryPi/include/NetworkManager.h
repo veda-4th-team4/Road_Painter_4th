@@ -59,6 +59,20 @@ public:
     bool SendPathDone(const std::string& phase);
 
     /**
+     * @brief Transmits CALIB_STOPPED ACK message to vision server upon calibration cancellation/stop.
+     * @return true if successfully sent.
+     */
+    bool SendCalibStopped();
+
+    /**
+     * @brief Transmits CALIB_FAIL error message to vision server upon calibration failure.
+     * @param reason Fail reason string ("motion_failed" etc.)
+     * @param msg Descriptive error message.
+     * @return true if successfully sent.
+     */
+    bool SendCalibFail(const std::string& reason, const std::string& msg);
+
+    /**
      * @brief Thread-safely fetches the latest received ALIGN angle correction matching active op_index.
      */
     bool GetAlignCommand(uint32_t active_op_index, float& out_angle_deg);

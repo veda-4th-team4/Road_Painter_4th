@@ -117,6 +117,31 @@ int main(int argc, char **argv) {
               manual_override = true; // §4.1 Fix: Enable manual override so IDLE manual nozzle persists
               manual_nozzle = 0;
               robot_comm.SendControlNozzle(0);
+          } else if (cmd == "CALIB_START") { // R-1: Homography calibration motion start request
+              std::cout << GetTimestampStr() << "[MAIN] [CALIB] CALIB_START received. Initializing calibration state (nozzle UP)." << std::endl;
+              manual_override = false;
+              manual_speed = {0, 0};
+              manual_nozzle = 0;
+              auto_nozzle = 0;
+              robot_comm.SendControlNozzle(0); // Ensure nozzle is strictly UP during calibration
+          } else if (cmd == "CALIB_CANCEL" || cmd == "CANCEL_CALIB") { // R-2: Homography calibration cancellation ACK request
+              std::cout << GetTimestampStr() << "[MAIN] [CALIB] CALIB_CANCEL received. Stopping robot, raising nozzle, and sending CALIB_STOPPED." << std::endl;
+              manual_override = false;
+              manual_speed = {0, 0};
+              manual_nozzle = 0;
+              auto_nozzle = 0;
+              robot_comm.SendSetSpeed(0, 0);
+              robot_comm.SendControlNozzle(0);
+              path_follower.SetPath({});
+              has_pending_path = false;
+              pending_path.clear();
+              waiting_for_go = false;
+              ready_seg_sent = 0xFFFFFFFF;
+              path_done_sent = true;
+              net_manager.ClearLatches();
+              // Settling delay: Ensure robot is fully still for 100ms before transmitting CALIB_STOPPED ACK
+              std::this_thread::sleep_for(std::chrono::milliseconds(100));
+              net_manager.SendCalibStopped();
           }
       }
 
