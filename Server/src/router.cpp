@@ -169,6 +169,19 @@ void Router::fromQt(const json& msg) {
         // 2단계(도색) 전송 -> 도색 완료(PATH_DONE) -> DRAW_DONE까지 전부 자동이라
         // Qt가 중간에 더 눌러야 하는 버튼은 없다.
         if (cmd == "START_DRAW") {
+            // 🔴 수동 모드 래치를 여기서 푼다 (2026-08-10).
+            //   예전에는 새 BLUEPRINT가 와야만 풀렸다. 그래서 "도면 전송 →
+            //   대기 중 조이스틱으로 로봇 위치 잡기 → START_DRAW"라는 지극히
+            //   자연스러운 순서를 밟으면, 그 작업 **전체**가 ALIGN/MORE/DRIFT
+            //   없이 개루프로 돌았다. 조용히 도색 품질만 나빠져서 로그로도
+            //   드러나지 않는다.
+            //   START_DRAW 시점에는 래치를 유지할 이유가 없다: 접근 경로를
+            //   지금 pose에서 새로 만들기 때문에 "서버가 든 경로가 낡았다"는
+            //   전제 자체가 사라진다.
+            if (manualMode_) {
+                manualMode_ = false;
+                logf("[INFO] START_DRAW - 수동 모드 해제, 자동 판정 복귀");
+            }
             startApproach();
             return;
         }
@@ -204,18 +217,30 @@ void Router::fromQt(const json& msg) {
             cancelCalib(payload, msg);
             return;
         }
+        // 로봇을 움직이는 수동 조작 (조이스틱).
         bool manualCmd = (cmd == "FORWARD" || cmd == "BACKWARD" ||
                           cmd == "TURN_LEFT" || cmd == "TURN_RIGHT" || cmd == "STOP");
+        // 노즐 수동 조작. 차단은 같이 받지만 manualMode_는 켜지 않는다 -
+        // 로봇이 움직이지 않으므로 자동 판정과 충돌할 일이 없고, 켜면 대기 중
+        // 노즐 점검 한 번에 다음 작업 전체가 개루프로 돈다 (아래 래치 주석 참고).
+        bool nozzleCmd = (cmd == "NOZZLE_DOWN" || cmd == "NOZZLE_UP" ||
+                          cmd == "PAINT_ON" || cmd == "PAINT_OFF");
         // [A안] 경로 실행(도색) 중에는 수동 조작을 차단한다 - 자동이 우선.
         // 도색 도중 조이스틱으로 로봇을 흔들어 그림을 망치는 것을 막기 위함.
         // 🔴 v2에서는 차단이 더 중요해졌다: 로봇이 READY로 서버 응답을 기다리는
         //   중에 사람이 로봇을 옮기면, 서버가 들고 있는 경로와 실제 위치가
         //   어긋난 채 GO가 나간다. 수동으로 개입하려면 먼저 경로를 끝내거나
         //   새 도면을 보내야 한다.
+        // 노즐도 같이 막는다(2026-08-10, QT 검토 §4-2): 도색 op의 노즐 상태는
+        // buildDrawOps가 paint+펜오프셋으로 단독 결정하는데, 그 사이에 수동
+        // 명령이 서보를 뒤집으면 다음 nozzle op이 올 때까지 반대 상태로 그린다.
+        // ⚠️ 관리자 창(fromAdmin)은 이 판정을 거치지 않는다 - 점검용이라
+        //    의도적으로 열어둔 경로이므로 수동 노즐 탈출구는 그쪽에 남는다.
         // 단 ESTOP/RESUME/CALIB_START 같은 비수동 명령은 아래로 흘려보내 항상 통과시킨다
         // (비상정지가 막히면 위험).
-        if (manualCmd && planActive_) {
-            logf("[WARN] CMD %s 무시 - 경로 실행 중이라 수동 조작 차단", cmd.c_str());
+        if ((manualCmd || nozzleCmd) && planActive_) {
+            logf("[WARN] CMD %s 무시 - 경로 실행 중이라 %s 차단", cmd.c_str(),
+                 nozzleCmd ? "수동 노즐" : "수동 조작");
             return;
         }
         // 요약 INFO를 sendTo보다 먼저 찍는다 - sendTo가 미접속 시 [WARN]을 그
@@ -225,8 +250,9 @@ void Router::fromQt(const json& msg) {
              manualCmd ? " [수동모드]" : "");
         srv_.sendTo("ROBOT", msg);
         // 여기 오는 수동 CMD는 경로가 없는(planActive_==false) 상태뿐이다.
-        // 수동 조작에 진입하면 자동 판정을 멈춰 충돌을 막는다.
-        // (자동 복귀는 새 BLUEPRINT 수신 시)
+        // 수동 조작에 진입하면 자동 판정을 멈춰 충돌을 막는다 - 사람이 로봇을
+        // 미는 동안 서버가 옛 경로 기준으로 ALIGN/MORE/DRIFT를 쏘면 서로 싸운다.
+        // (해제는 새 BLUEPRINT 또는 START_DRAW - 아래 startApproach 호출부 주석)
         if (manualCmd) manualMode_ = true;
     } else if (type == "BLUEPRINT") {
         // points = Qt가 top-view 픽셀 -> 바닥 미터 변환을 마친 좌표.
@@ -237,7 +263,7 @@ void Router::fromQt(const json& msg) {
         planProgram_ = json::array();
         clearPath();
         drawRequested_ = false;  // 이전 도면에 걸려 있던 시작 요청은 무효
-        manualMode_ = false;  // 새 도면 = 자동 모드 복귀
+        manualMode_ = false;  // 새 도면 = 자동 모드 복귀 (START_DRAW에서도 푼다)
         for (auto& p : payload.value("points", json::array())) {
             // 점 하나라도 형식이 어긋나면 도면 전체를 버린다 - 파싱이 중간에
             // 끊겨 반쪽짜리 planPts_로 경로를 만드는 것을 방지
