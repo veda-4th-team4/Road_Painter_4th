@@ -33,8 +33,8 @@
 
 | 용도 | URL | 스펙 |
 |---|---|---|
-| 메인 (선택 채널용) | `rtsp://192.168.0.2:8554/ch1` … `/ch4` | 2592x1520 H.264 30fps |
-| 서브 (2x2 미리보기용) | `rtsp://192.168.0.2:8554/ch1s` … `/ch4s` | 640x480 H.264 10fps |
+| 메인 (선택 채널용) | `rtsp://192.168.0.8:8554/ch1` … `/ch4` | 2592x1520 H.264 30fps |
+| 서브 (2x2 미리보기용) | `rtsp://192.168.0.8:8554/ch1s` … `/ch4s` | 640x480 H.264 10fps |
 
 - `ch1`↔카메라 웹UI `CH1`, `ch2`↔`CH2`, … 순서 그대로다.
 - 인증 없다. TCP 로 붙어야 한다 (`rtsp_transport=tcp`).
@@ -53,19 +53,19 @@
 
 **영상이 깨지면 Qt 를 의심하기 전에 서버 경로부터 확인할 것.**
 
-파이는 유선(eth0, 192.168.0.2)과 무선(wlan0, 192.168.0.8)이 같은 서브넷에 동시에
-올라와 있고, 그냥 두면 커널이 **무선을 고른다**. 무선으로 나가면 4채널이 깨진다
-(카메라가 송신 버퍼를 포기해서 RTP 유실 → 화면 깨짐).
+카메라 트래픽이 파이의 **무선(wlan0)으로 나가면 4채널이 깨진다** — 카메라가 송신
+버퍼를 포기해서 RTP 유실이 나고 화면이 깨진다. 실측 근거는 `Server/relay/README.md`.
+
+2026-08-10 현재는 서버 주소(`192.168.0.8`)가 유선(eth0)에 있어서 정상이다. 확인:
 
 ```bash
-# 파이에서 확인 — dev eth0 여야 정상
+# 파이에서 — .8 이 eth0 에 있고, 카메라 경로가 dev eth0 이어야 정상
+ip -brief addr show
 ip route get 192.168.0.13
-
-# 무선으로 나가고 있으면
-sudo ip route add 192.168.0.13/32 dev eth0 src 192.168.0.2 metric 50
 ```
 
-**이 경로는 재부팅하면 사라진다.** 파이를 껐다 켠 뒤 영상이 깨지면 십중팔구 이것이다.
+**파이를 껐다 켠 뒤 영상이 깨지면 십중팔구 이것이다.** `/etc/netplan/60-wifi.yaml`
+이 `.8` 을 wlan0 것으로 지정한 채면 재부팅 때 서버 주소가 무선으로 이사한다.
 
 자세한 내용: [`Server/relay/README.md`](../Server/relay/README.md)
 
@@ -152,7 +152,7 @@ QSettings 에 중계 주소만 넣고 나머지는 규칙으로 만든다.
 
 ```cpp
 // QSettings 키
-//   camera/relayBase   예: "rtsp://192.168.0.2:8554"   (비면 4채널 기능 전체 off)
+//   camera/relayBase   예: "rtsp://192.168.0.8:8554"   (비면 4채널 기능 전체 off)
 //   camera/channelCount 기본 4
 
 QString mainUrl(int ch) { return m_relayBase + "/ch" + QString::number(ch); }
@@ -341,8 +341,8 @@ qputenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000");
 PC 에서 VLC 나 ffplay 로 열어본다. 여기서 안 나오면 Qt 문제가 아니다.
 
 ```
-rtsp://192.168.0.2:8554/ch1     메인
-rtsp://192.168.0.2:8554/ch1s    서브
+rtsp://192.168.0.8:8554/ch1     메인
+rtsp://192.168.0.8:8554/ch1s    서브
 ```
 
 VLC: `도구 → 환경설정 → 입력/코덱 → 라이브 캡처 스트리밍 방식: TCP`

@@ -1140,7 +1140,7 @@ v0.3까지 "작업 중단"은 `ESTOP` 하나뿐이었는데 이건 **일시정�
 안 건드린다.
 
 ```json
-{"type":"LOGIN_OK","payload":{ …, "stream": {"enabled":true,"base":"rtsp://192.168.0.2:8554","channels":4}}}
+{"type":"LOGIN_OK","payload":{ …, "stream": {"enabled":true,"base":"rtsp://192.168.0.8:8554","channels":4}}}
 ```
 
 **2026-08-07 확정 (QT팀 회신, 제안 A 채택) — 세 가지 상태를 구분한다.**
@@ -1173,7 +1173,7 @@ v0.3까지 "작업 중단"은 `ESTOP` 하나뿐이었는데 이건 **일시정�
 서버 로그로 어느 상태인지 바로 알 수 있다:
 
 ```
-중계 rtsp://192.168.0.2:8554        ← enabled=true
+중계 rtsp://192.168.0.8:8554        ← enabled=true
 중계 끔 - QT에 해제 지시(직결)        ← enabled=false
 중계 설정 없음 - QT 설정값 유지        ← 파일 없음/깨짐
 ```
