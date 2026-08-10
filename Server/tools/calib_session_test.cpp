@@ -259,6 +259,23 @@ int main(int argc, char** argv) {
               j["payload"].value("reason", "") == "robot_offline",
           "T11b 로봇 없을 때 시작 요청 -> 즉시 robot_offline (허공 전송 안 함)");
 
+    // ---- 뒷정리: 활성 채널을 되돌린다 ----
+    // 🔴 activeChannel_은 접속과 무관하게 서버에 남는 현장 상태다. 이 테스트는
+    //   CH2로 끝나는데, 같은 서버에 이어 붙는 robot_sim은 POS를 항상 CH1로 보내
+    //   서버가 전부 버린다("POS 채널 1 무시"). 그러면 pose가 안 잡혀 START_DRAW가
+    //   no_pose로 죽는데, 주행 테스트 쪽에서 보면 증상이 "판정이 하나도 안 돈다"라
+    //   **피드백 회귀와 구분되지 않는다** (실제로 한 번 오진했다).
+    //   공유 상태를 건드린 테스트는 스스로 원상복구한다.
+    // ⚠️ 큐를 먼저 비운다. 앞선 CALIB_START들이 CHANNEL_OK{ch:2}를 남겨뒀는데,
+    //    wait()는 타입만 보고 가장 오래된 것을 꺼내므로 그 옛것에 걸린다.
+    qtBox.clear();
+    qt.send("CMD", {{"cmd", "SELECT_CHANNEL"}, {"ch", 1}});
+    if (qtBox.wait("CHANNEL_OK", 2000, j) && j["payload"].value("ch", 0) == 1)
+        tlogf("TEST", "활성 채널을 1로 복구");
+    else
+        tlogf("TEST", "⚠️ 활성 채널 복구 실패 - 이 서버로 주행 테스트를 이어서 "
+                      "돌리면 POS가 전부 버려진다");
+
     qt.shutdownRead();
     cctv.shutdownRead();
     tq.join();
