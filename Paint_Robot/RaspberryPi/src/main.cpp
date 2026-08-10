@@ -110,9 +110,11 @@ int main(int argc, char **argv) {
               manual_override = true;
               manual_speed = {300, -300};
           } else if (cmd == "NOZZLE_DOWN" || cmd == "PAINT_ON") {
+              manual_override = true; // §4.1 Fix: Enable manual override so IDLE manual nozzle persists
               manual_nozzle = 1;
               robot_comm.SendControlNozzle(1);
           } else if (cmd == "NOZZLE_UP" || cmd == "PAINT_OFF") {
+              manual_override = true; // §4.1 Fix: Enable manual override so IDLE manual nozzle persists
               manual_nozzle = 0;
               robot_comm.SendControlNozzle(0);
           }
@@ -342,6 +344,7 @@ int main(int argc, char **argv) {
 
       // 6. Periodic UART heartbeat: Transmit controls to STM32 (every 80ms loop iteration)
       robot_comm.SendSetSpeed(target_speed.left_sps, target_speed.right_sps);
+      nozzle_on = manual_override ? manual_nozzle : auto_nozzle; // §4.2 Fix: Recalculate latest nozzle_on to avoid stale pulse
       robot_comm.SendControlNozzle(nozzle_on);
 
       // 7. Periodic STATUS forwarding (every 500ms) from STM32 back to the TLS server
