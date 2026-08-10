@@ -22,7 +22,7 @@
 //     - SET_CAM_IP {cam_ip} → SET_CAM_IP_OK/FAIL
 //     - POSE / STATUS / PEERS / H_MATRIX / DRAW_DONE / DRAW_FAIL 수신
 //   메시지 프레이밍: JSON Lines (JSON 1개 + '\n' = 1메시지)
-//   1차 연동이므로 서버 자가서명 인증서 검증은 생략(VerifyNone)한다.
+//   서버 자가서명 인증서는 실행파일에 내장해 체인과 접속 주소를 모두 검증한다.
 //
 //   ⚠️ 2026-07-27 변경 (이전 v0.3 문서와 다름 — 꼭 확인):
 //     · BLUEPRINT 를 보내도 로봇은 움직이지 않는다. 실행은 START_DRAW 부터.
@@ -143,6 +143,7 @@ private:
     QString     m_host = QStringLiteral("192.168.0.8");
     quint16     m_port = 9000;
     bool        m_helloSent = false;
+    bool        m_tlsCertificateReady = false;
 };
 
 #endif // SERVERCLIENT_H
