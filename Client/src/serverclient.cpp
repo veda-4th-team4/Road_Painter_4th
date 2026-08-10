@@ -4,15 +4,25 @@
 #include <QJsonArray>
 #include <QJsonValue>
 #include <QHostAddress>
+#include <QSslCertificate>
+#include <QSslConfiguration>
 #include <QDebug>
+#include <QStringList>
 #include <cmath>
 
 ServerClient::ServerClient(QObject *parent)
     : QObject(parent)
 {
     m_socket = new QSslSocket(this);
-    // 1차 연동: 자가서명 인증서 검증 생략 (권장 방식은 server.crt 를 신뢰 CA 로 추가)
-    m_socket->setPeerVerifyMode(QSslSocket::VerifyNone);
+
+    const QList<QSslCertificate> trustedCertificates = QSslCertificate::fromPath(
+        QStringLiteral(":/certs/server.crt"), QSsl::Pem);
+    QSslConfiguration tls = m_socket->sslConfiguration();
+    tls.setCaCertificates(trustedCertificates);
+    tls.setPeerVerifyMode(QSslSocket::VerifyPeer);
+    m_socket->setSslConfiguration(tls);
+    m_tlsCertificateReady = trustedCertificates.size() == 1
+                         && !trustedCertificates.constFirst().isNull();
 
     connect(m_socket, &QSslSocket::encrypted, this, &ServerClient::onEncrypted);
     connect(m_socket, &QSslSocket::readyRead, this, &ServerClient::onReadyRead);
@@ -33,11 +43,17 @@ ServerClient::~ServerClient()
 void ServerClient::connectToServer()
 {
     if (isConnected()) return;
+    if (!m_tlsCertificateReady) {
+        emit socketError(QStringLiteral("내장 서버 인증서를 읽을 수 없습니다. 프로그램을 다시 배포해 주세요."));
+        return;
+    }
+    if (!QSslSocket::supportsSsl()) {
+        emit socketError(QStringLiteral("TLS 백엔드를 사용할 수 없습니다. 프로그램 배포 파일을 확인해 주세요."));
+        return;
+    }
     m_seq = 0;
     m_helloSent = false;
     m_buffer.clear();
-    // 자가서명 인증서라도 우선 접속을 진행하도록 에러를 무시한다.
-    m_socket->ignoreSslErrors();
     m_socket->connectToHostEncrypted(m_host, m_port);
 }
 
@@ -65,9 +81,12 @@ bool ServerClient::isEncrypted() const
 
 void ServerClient::onErrors(const QList<QSslError> &errors)
 {
-    Q_UNUSED(errors);
-    // VerifyNone 이므로 계속 진행. (검증 강화 시 여기서 화이트리스트 처리)
-    m_socket->ignoreSslErrors();
+    QStringList messages;
+    messages.reserve(errors.size());
+    for (const QSslError &error : errors)
+        messages.append(error.errorString());
+    emit socketError(QStringLiteral("서버 인증서 검증 실패: %1")
+                         .arg(messages.join(QStringLiteral(", "))));
 }
 
 // 접속 직후(암호화 완료) HELLO {role:"QT"} 를 1회 전송한다.
