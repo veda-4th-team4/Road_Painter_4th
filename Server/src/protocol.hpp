@@ -282,7 +282,13 @@
 //         보내줘야 나온다 - 안 보내면 params().calib_timeout_ms 뒤 timeout이 된다.
 //     CALIB_CANCELLED payload: {"ch","request_id","msg"}
 //
-//   [ROBOT/CCTV -> 서버]  🔴 아직 어느 쪽도 구현하지 않았다 (회신 §3)
+//   [ROBOT/CCTV -> 서버]
+//     구현 현황 (2026-08-10):
+//       ROBOT ✅ feature/server-driven-v2 @52aa849 (아직 main 미병합)
+//             단 CALIB_FAIL은 송신 함수만 있고 호출부가 없다 - 주행 실패는
+//             여전히 서버 타임아웃(3분)으로만 드러난다.
+//       CCTV  🔴 미구현. central_tls_sender.cpp가 CALIB_START를 문자열 검색으로만
+//             처리해 ch/request_id가 카메라 앱 경계에서 소멸한다.
 //     CALIB_STOPPED payload: {}
 //       - CALIB_CANCEL을 받아 안전 정지 + 작업 폐기를 마쳤다는 ACK.
 //         이것이 없으면 취소는 항상 cancel_failed로 끝난다 - 서버가 로봇이

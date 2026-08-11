@@ -7,7 +7,7 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 - **TLS 릴레이**: 클라이언트가 role(QT / ROBOT / CCTV / ADMIN)로 등록하면, 메시지를 규칙에 따라 상대에게 중계
 - **로그인 / 캘리브레이션 저장**: 사용자(id/비번)별로 캘리브레이션 번들(K, D, H행렬)을 저장했다가 재로그인 시 Qt에 돌려줌. **캘리브레이션은 채널별로 따로 저장된다** (v0.4 — 채널마다 렌즈 방향이 달라 K/D/H가 전부 다르다)
 - **채널 전환 (v0.4)**: 4채널 카메라(PNM-C16083RVQ)에서 `SELECT_CHANNEL`로 작업 채널을 바꾸면 그 채널의 캘리브레이션이 적용되고, **활성 채널이 아닌 `POS`는 무시한다**(채널마다 좌표계가 달라 pose가 튀는 것을 막는다). ⚠️ `ch`는 전부 선택 필드라 **단일 채널 현장(PNO)은 한 줄도 안 고쳐도 그대로 동작**한다
-- **작업 완전 중지 (`ABORT_DRAW`, v0.4)**: `ESTOP`이 일시정지라면 이건 취소다 — 서버가 들고 있는 경로 상태를 비우고 로봇에 중계해 **받아둔 경로까지 버리게** 한다. 🔴 **로봇 쪽 구현이 아직 없다** ([R-11](docs/ROBOT_ACTION_ITEMS_20260805.md))
+- **작업 완전 중지 (`ABORT_DRAW`, v0.4)**: `ESTOP`이 일시정지라면 이건 취소다 — 서버가 들고 있는 경로 상태를 비우고 로봇에 중계해 **받아둔 경로까지 버리게** 한다. 로봇 쪽 구현은 `bce553f`에서 완료됐다. ⚠️ 서버의 `DRAW_ABORTED`는 **로봇에 중계한 직후의 접수 ACK**이지 물리적 정지 완료 ACK가 아니다
 - **중계 스트림 주소 배포** (2026-08-04): `config/stream.json`이 있으면 `LOGIN_OK.stream`으로 중계(MediaMTX) RTSP 베이스 주소를 Qt에 내려준다 — 사용자가 설정 화면에 손으로 입력하지 않아도 된다. **파일이 없으면 필드를 안 보내고 Qt는 종전대로 자기 설정값을 쓴다**(= 중계를 안 쓰는 PNO 직결 현장은 그대로). ⚠️ `cam_ip`(카메라 IP, PNO 직결용)와는 **별개 필드**다 — 합치면 PNO로 되돌아갈 수 없다
 > 🔴 **프로토콜 v2 (server-driven)로 갈아엎었다.** 서버↔로봇 구간의 정본은
 > **[docs/PROTOCOL_v2_ROBOT.md](docs/PROTOCOL_v2_ROBOT.md)** 이다. Qt↔서버, CCTV↔서버 구간은 v1 그대로 바뀌지 않았다.
@@ -33,14 +33,26 @@ Qt(관제 UI) · 로봇(도색 로봇) · CCTV · 관리자 창 네 클라이언
 | 문서 | 내용 |
 |---|---|
 | **[docs/PROTOCOL_v2_ROBOT.md](docs/PROTOCOL_v2_ROBOT.md)** | 🔴 **서버↔로봇 v2 규격 (정본)**. 로봇팀이 봐야 할 문서 |
-| **[docs/ROBOT_ACTION_ITEMS_20260805.md](docs/ROBOT_ACTION_ITEMS_20260805.md)** | 🔴 로봇 코드 v2 적용 수정 지시서 (R-1~R-10 + **R-11 `ABORT_DRAW`** + 참조 구현·검증 방법) |
-| **[docs/CCTV_ACTION_ITEMS_20260806.md](docs/CCTV_ACTION_ITEMS_20260806.md)** | 🔴 CCTV 앱 v0.4 다채널 지원 요청서 (C-0~C-4). **C-0 선행 확인 필요** |
 | **[server_PROTOCOL.md](server_PROTOCOL.md)** | 통신 규격 전체 (Qt/CCTV 팀용). ⚠️ 서버↔로봇 절은 v1 시절 내용이라 위 문서가 우선한다 |
+| **[docs/SERVER_ARCHITECTURE.md](docs/SERVER_ARCHITECTURE.md)** | 서버 구조·불변식·함정. 코드를 처음 볼 때 여기부터 |
 | [docs/TESTING.md](docs/TESTING.md) | 서버/Qt 테스트 가이드 |
-| [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) | 로봇 주행 통합 테스트 계획 (단계 A~D, 합격 기준, 드라이런 결과) |
-| [docs/REFACTOR_SUMMARY.md](docs/REFACTOR_SUMMARY.md) | graceful shutdown 개선 기록 |
 | [admin_console/PLAN.md](admin_console/PLAN.md) | 관리자 창 설계/진행 상황 |
 | [relay/README.md](relay/README.md) | RTSP 4채널 패스스루 중계 (카메라 → 서버 → Qt 영상 경로) |
+
+### 진행 중인 팀 간 문서 (2026-08-10)
+
+| 문서 | 내용 |
+|---|---|
+| [docs/ROBOT_ACTION_ITEMS_20260810.md](docs/ROBOT_ACTION_ITEMS_20260810.md) | 로봇 캘리 세션 R-1~R-4 (R-1~R-2·R-4 반영됨, R-3 호출부 미착수) |
+| [docs/QT_HOMOGRAPHY_REPLY_20260810_SERVER.md](docs/QT_HOMOGRAPHY_REPLY_20260810_SERVER.md) | 호모그래피 세션 계약 §7 회신 |
+| [docs/QT_NOZZLE_PATH_REPLY_20260810_SERVER.md](docs/QT_NOZZLE_PATH_REPLY_20260810_SERVER.md) | 경로·노즐 계약 §6 회신 |
+| [docs/QT_TLS_VERIFY_20260810.md](docs/QT_TLS_VERIFY_20260810.md) | Qt TLS 검증 요청 (PR #42로 반영 완료, 기록용) |
+
+### 종결된 문서 — 노션 아카이브
+
+날짜가 박힌 1회성 서신·계획서 9건은 [서버 문서 아카이브](https://app.notion.com/p/3b914dc6aecf812183e3c64d07c1a8ac)로 옮겼습니다 (2026-08-10). 원본은 git 이력에 그대로 있습니다.
+
+`REFACTOR_SUMMARY` · `DRIVE_TEST_PLAN` · `ROBOT_ACTION_ITEMS` 20260803/05/06/07 · `CCTV_ACTION_ITEMS_20260806` · `QT_ACTION_ITEMS_20260807` (+ 회신)
 
 ## 파일 구성
 
@@ -184,7 +196,7 @@ make sim
 `draw_test`가 출력한 도면 꼭짓점과 맞으면 "펜이 꼭짓점을 지난다"가 검증된 것입니다.
 이탈 복귀까지 보려면 `robot_sim`에 조향 오차를 주입하세요:
 `--drift-dps 15 --ignore-drift`. 자세한 항목은
-[docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) 단계 C.
+[DRIVE_TEST_PLAN (노션 아카이브)](https://app.notion.com/p/3b914dc6aecf812183e3c64d07c1a8ac) 단계 C.
 
 ### 로봇 주행만 단독으로 (CCTV·도면 없이)
 
@@ -207,7 +219,7 @@ make drive_test
 한 변 0.3 m 정사각형을 **변마다 노즐을 내렸다 올리며**(획 4개) 그립니다. 첫 시운전은
 `--no-paint`로 동선만 확인하세요. 방향은 로봇 자기 기준(PATH 수신 시점이 0도)이고,
 CCTV가 없어 서버가 정렬 판정을 못 하므로 각도 정확도는 로봇 IMU에 달려 있습니다.
-옵션·합격 기준은 [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) 단계 A-3.
+옵션·합격 기준은 [DRIVE_TEST_PLAN (노션 아카이브)](https://app.notion.com/p/3b914dc6aecf812183e3c64d07c1a8ac) 단계 A-3.
 
 ### 실시간 CCTV 없이 접근 → 도색 돌려보기 (cctv_pose)
 
@@ -300,5 +312,5 @@ openssl s_client -connect 127.0.0.1:9000 -CAfile certs/server.crt -quiet
   쓴다 — **로봇의 실제 오프셋이 바뀌면 이 상수도 손으로 같이 고쳐야 한다** (자동 동기화 없음)
 - **회전 중 `DRIFT` 억제 = 로봇 담당으로 확정** — 로봇이 `TURN` 실행 중엔 스스로
   무시한다. 서버가 "지금 TURN 중"임을 알려주는 신호는 만들지 않는다 (이탈 감시는
-  pose 기반이라 영향 없음). [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) C-3
+  pose 기반이라 영향 없음). [DRIVE_TEST_PLAN (노션 아카이브)](https://app.notion.com/p/3b914dc6aecf812183e3c64d07c1a8ac) C-3
 - **마커 중심 = 로봇 회전중심 가정** — 서버 pose는 마커 4코너 평균이라, ArUco 판이 회전중심 위에 있지 않으면 펜 오프셋과 별개인 또 하나의 오프셋이 생긴다. 기구팀 확인 필요
