@@ -16,6 +16,7 @@ set(SOURCES
     src/NetworkManager.cpp
     src/PathFollower.cpp
     src/ImuManager.cpp
+    src/LedStripManager.cpp
 )
 add_executable(robot_exec ${SOURCES})
 target_link_libraries(robot_exec wiringPi OpenSSL::SSL OpenSSL::Crypto pthread)
@@ -43,5 +44,13 @@ set(CALIB_TEST_SOURCES
 )
 add_executable(calibration_test ${CALIB_TEST_SOURCES})
 target_link_libraries(calibration_test wiringPi pthread)
+
+# 5) Tower Lamp (WS2812B) Status LED Test Tool
+set(LED_TEST_SOURCES
+    src/led_test.cpp
+    src/LedStripManager.cpp
+)
+add_executable(led_test ${LED_TEST_SOURCES})
+target_link_libraries(led_test pthread)
 
 
