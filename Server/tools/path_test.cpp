@@ -154,8 +154,9 @@ static json makeMsg(const std::string& type, const json& payload) {
 // ── 스냅샷 로더 (CCTV 자료 -> 서버 입력. CCTV 포맷 의존은 여기 한 곳에만) ────────
 // 실제 CCTV 출력 포맷이 바뀌면 이 함수만 고치면 나머지는 그대로 동작한다.
 // 출력: calib = 서버 H_MATRIX용 번들(mm 원본 그대로), corners = POS용 4코너(원본 픽셀).
-// ※ mm -> m 환산은 이제 서버가 담당한다(입구에서 normalizeBundleMmToM). 도구는 CCTV가
-//   준 mm 호모그래피를 손대지 않고 그대로 올린다 - 여기서 또 환산하면 이중 스케일이 된다.
+// ※ mm -> m 환산은 서버가 내부 계산용 사본에서만 한다(calib.hpp calibFromJson).
+//   번들 자체는 서버도 mm 그대로 저장·중계하므로, 도구도 CCTV가 준 mm 호모그래피를
+//   손대지 않고 그대로 올린다 - 여기서 환산하면 이중 스케일이 된다.
 static bool loadSnapshot(const std::string& path, json& calib, json& corners) {
     std::ifstream f(path);
     if (!f) {

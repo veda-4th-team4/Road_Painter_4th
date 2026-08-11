@@ -1,7 +1,10 @@
 #pragma once
 // 사용자 저장소: id / 비밀번호(PBKDF2-SHA256 해시) / 캘리브레이션 번들을 JSON 파일로 영속화.
 // 로그인 = 저장된 캘리브레이션 재사용 목적 (동시 다중 사용자 없음, 한 현장 = 카메라 1대 가정)
-// 번들 = {K, D, H_floor, H_marker, marker_height_m, version} (calib.hpp 참고)
+// 번들 = {calib_id, image_size, coord_mode, unit:"mm", K, D, H_floor, H_marker,
+//         marker_height_mm, origin_mm, canvas_mm, axis} (calib.hpp 참고).
+// ⚠️ 저장 단위는 mm다 (2026-08-11 규격). 예전 서버가 미터로 저장해 둔 파일도 그대로
+//    읽히며, 로그인 때 bundleToMm으로 mm 환산해 Qt에 내보낸다 (파일은 안 고친다).
 //
 // 2026-08-03 (프로토콜 v0.4): 카메라가 4채널(PNM-C16083RVQ)이 되면서 번들이
 // 채널마다 달라졌다 - 렌즈 방향이 다르면 K/D/H가 전부 다르다. 그래서 저장 형식이

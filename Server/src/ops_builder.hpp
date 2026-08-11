@@ -115,8 +115,12 @@ struct OpMeta {
     double exitHeadingDeg = kNoHeading;
     bool hasTarget = false;   // MORE 판정이 가능한가 (도착 꼭짓점을 아는가)
     Pt penTarget{0, 0};       // 도착 꼭짓점 = 펜이 있어야 할 자리 (도면 좌표)
-    bool painting = false;    // 이 op을 실행하는 동안 노즐이 내려가 있는가.
-                              // true면 마커 중심은 꼭짓점보다 a 앞에 있어야 한다 (§5.2)
+    // 이 op을 마쳤을 때 마커 중심이 꼭짓점보다 진행방향으로 a 앞에 있어야 하는가.
+    // 즉 §5.2 불변식 중 "노즐 down" 쪽 상태로 끝나는 op인가 (MORE 목표 보정항).
+    //   도색 move/arc  : true  - 노즐을 내린 채 끝나므로 중심이 a 앞
+    //   오프셋 move(+a): true  - 곧 노즐을 내리려고 a 앞으로 나간 참이다
+    //   오프셋 move(-a): false - 노즐을 올리고 물러났으므로 중심이 꼭짓점 위
+    bool centerAheadByA = false;
 };
 
 struct PlannedPath {
@@ -132,14 +136,14 @@ struct PlannedPath {
 class OpSeq {
 public:
     void moveOp(double distM, bool isPath, double headCcw, bool hasTgt = false,
-                Pt tgt = {0, 0}, bool painting = false) {
+                Pt tgt = {0, 0}, bool centerAheadByA = false) {
         OpMeta m;
         m.op = "move";
         m.isPath = isPath;
         m.headingDeg = m.exitHeadingDeg = headCcw;  // 직진은 방향이 안 바뀐다
         m.hasTarget = hasTgt;
         m.penTarget = tgt;
-        m.painting = painting;
+        m.centerAheadByA = centerAheadByA;
         push(json{{"op", "move"}, {"dist_m", round3(distM)}}, m);
     }
     // angCcw = CCW 양수 (서버 내부 규약). 전선에는 부호를 뒤집어 내보낸다.
@@ -160,7 +164,7 @@ public:
     // angleMagDeg = 회전량 크기(항상 양수), dir = "left"/"right".
     void arcOp(double radiusRobotM, double angleMagDeg, const std::string& dir,
                double radiusDrawM, double entryHeadCcw, double exitHeadCcw,
-               bool hasTgt, Pt tgt, bool painting) {
+               bool hasTgt, Pt tgt, bool centerAheadByA) {
         OpMeta m;
         m.op = "arc";
         m.isPath = true;
@@ -168,7 +172,7 @@ public:
         m.exitHeadingDeg = exitHeadCcw;
         m.hasTarget = hasTgt;
         m.penTarget = tgt;
-        m.painting = painting;
+        m.centerAheadByA = centerAheadByA;
         push(json{{"op", "arc"},
                   {"radius_m", round3(radiusRobotM)},
                   {"angle_deg", round1(angleMagDeg)},
@@ -252,22 +256,39 @@ inline PlannedPath buildDrawOps(const json& program,
     double penBodyHeading = kNoHeading;
     // 지금 유지 중인 차체 위상. 도색을 끝낼 때 이만큼 되돌려 접선으로 세운다.
     double penPhase = 0.0;
+    // 직전 도색 op이 끝나야 할 꼭짓점. closePaint의 후진 다리가 이 점을 목표로
+    // 삼는다 (노즐 up 상태이므로 마커 중심이 그대로 꼭짓점 위여야 한다).
+    Pt penEndTgt{0, 0};
+    bool penEndHasTgt = false;
 
     // 도색 진입: (필요하면 위상만큼 틀고) a 전진 후 노즐 down.
     // 노즐을 올리는 op은 넣지 않는다 - penDown == false라 이미 올라가 있다.
-    auto openPaint = [&](const TravelGeom& g) {
+    //
+    // startTgt = 이 도색이 시작될 꼭짓점(= 펜이 내려앉아야 할 자리). 전진 다리에
+    // 실어 보내면 그 다리가 끝난 boundary에서 MORE가 걸린다 - 목표는 "중심이
+    // 꼭짓점보다 a 앞"(centerAheadByA=true)이라 곧 내려올 펜이 꼭짓점에 맞는다.
+    // 🔴 이 보정은 노즐이 아직 올라가 있을 때 실행된다 (nozzle down은 다음 op).
+    //   젖은 도료를 문지를 여지가 없다.
+    auto openPaint = [&](const TravelGeom& g, bool hasStart, Pt startTgt) {
         if (g.phase != 0.0 && hasHeading(g.bodyEntry))
             seq.turnOp(g.phase, false, g.bodyEntry);  // 접선 -> 차체 방위
-        seq.moveOp(+a, false, g.bodyEntry);
+        seq.moveOp(+a, false, g.bodyEntry, hasStart, startTgt,
+                   /*centerAheadByA=*/true);
         seq.nozzleOp(true);
         penDown = true;
         penPhase = g.phase;
     };
     // 도색 이탈: 노즐 up -> a 후진 -> 위상 원복. 원복까지 해야 뒤따르는 직선
     // op이 접선 기준으로 이어진다 (안 하면 이후 경로 전체가 φ만큼 기운다).
+    //
+    // 후진 다리도 직전 도색의 종료 꼭짓점을 목표로 물고 간다. 노즐을 이미 올린
+    // 뒤라 목표는 꼭짓점 그대로다(centerAheadByA=false).
+    // ⚠️ 경로 맨 끝의 closePaint는 뒤에 op이 없어 로봇이 READY 대신 PATH_DONE을
+    //   보낸다 - 그 한 번만 보정이 걸리지 않는다. 도색은 이미 끝난 뒤라 무해하다.
     auto closePaint = [&]() {
         seq.nozzleOp(false);
-        seq.moveOp(-a, false, penBodyHeading);
+        seq.moveOp(-a, false, penBodyHeading, penEndHasTgt, penEndTgt,
+                   /*centerAheadByA=*/false);
         if (penPhase != 0.0 && hasHeading(penBodyHeading))
             seq.turnOp(-penPhase, false, normDeg(penBodyHeading - penPhase));
         penDown = false;
@@ -303,16 +324,26 @@ inline PlannedPath buildDrawOps(const json& program,
             }
         }
 
+        // 출발 꼭짓점 = 이 op 자신의 v (validateProgram이 정수임을 보장한다).
+        // 도색 진입 시 펜이 내려앉아야 할 자리라, 오프셋 전진 다리의 목표가 된다.
+        Pt startTgt{0, 0};
+        bool hasStartTgt = false;
+        const int v0 = q.value("v", -1);
+        if (v0 >= 0 && v0 < (int)points.size()) {
+            startTgt = points[(size_t)v0];
+            hasStartTgt = true;
+        }
+
         // 🔴 위상이 바뀌는 것도 "도색 상태가 바뀌는 것"과 똑같이 취급한다.
         //   펜을 내린 채로 제자리 회전하면 펜이 반지름 a의 호를 그어 버린다 -
         //   직선에서 호로 넘어갈 때 φ만큼 트는 것도 예외가 아니다. 그래서
         //   접합부에서는 노즐을 반드시 한 번 올렸다 내린다.
         if (isPaint) {
             if (!penDown) {
-                openPaint(g);
+                openPaint(g, hasStartTgt, startTgt);
             } else if (g.phase != penPhase) {
                 closePaint();
-                openPaint(g);
+                openPaint(g, hasStartTgt, startTgt);
             }
         } else if (penDown) {  // 도색 이탈 (turn / 비도색 이동 직전)
             closePaint();
@@ -354,7 +385,13 @@ inline PlannedPath buildDrawOps(const json& program,
             seq.arcOp(g.rRobot, angMag, dir, rPaint, g.bodyEntry, g.bodyExit,
                       hasTgt, tgt, isPaint);
         }
-        if (isPaint && hasHeading(g.bodyExit)) penBodyHeading = g.bodyExit;
+        // 다음 closePaint가 쓸 "직전 도색의 끝" 상태를 갱신한다. 방위는 후진
+        // 방향, 꼭짓점은 후진 다리의 MORE 목표가 된다.
+        if (isPaint) {
+            if (hasHeading(g.bodyExit)) penBodyHeading = g.bodyExit;
+            penEndTgt = tgt;
+            penEndHasTgt = hasTgt;
+        }
     }
 
     if (penDown) closePaint();  // 경로 끝 - 노즐 up + 중심 원복 + 위상 원복
@@ -394,7 +431,7 @@ inline PlannedPath buildApproachOps(const Pose& start, const Pt& target,
         double turn = normDeg(desired - th);
         if (std::fabs(turn) > P.min_turn_deg) seq.turnOp(turn, true, desired);
         seq.moveOp(dist, true, desired, /*hasTgt=*/true, target,
-                   /*painting=*/false);
+                   /*centerAheadByA=*/false);
         th = desired;
     }
     if (hasHeading(firstHeadingDeg)) {

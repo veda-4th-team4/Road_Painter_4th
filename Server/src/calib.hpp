@@ -5,18 +5,27 @@
 //   - CCTV는 마커 코너를 "원본 픽셀 좌표"로만 보낸다 (변환 금지).
 //   - 서버가 undistort(왜곡 보정) -> H_marker 적용으로 바닥 좌표를 계산한다.
 //   - CCTV가 보내는 H_floor/H_marker는 "왜곡 보정된 픽셀 -> 월드 평면 mm" 사영변환이다.
-//     서버는 수신 즉시 mm -> m 로 정규화(normalizeBundleMmToM, ÷1000)하므로, 아래
-//     Calib 구조체(Hf/Hm)와 이후 모든 서버 좌표(pose/POSE/BLUEPRINT/PATH)는 미터 기준이다.
 //     (H_marker = 마커 장착 높이 평면용. 마커가 바닥에서 떠 있어 생기는
 //      시차(parallax)를 캘리브레이션 단계에서 흡수한 것)
 //
-// 번들 포맷 (신규):
-//   {"version":1, "K":[[fx,0,cx],[0,fy,cy],[0,0,1]], "D":[k1,k2,p1,p2,k3],
-//    "H_floor":[[...]x3], "H_marker":[[...]x3], "marker_height_m":0.25}
-// 평면 포맷 (QT-REQ-CCTV-001 rev.2): 같은 내용이되 바닥 H의 이름이 "H"이고,
-//   설치 메타데이터가 같은 레벨에 붙는다 (calib_id/created_at/image_size/
-//   coord_mode/unit/origin_mm/canvas_mm/axis). 서버는 H를 H_floor로 읽고
-//   나머지는 손대지 않은 채 저장·중계한다.
+// 단위 규약 (QT_CCTV_SERVER_CALIBRATION_FORMAT 2026-08-11):
+//   번들은 CCTV가 보낸 **mm 그대로** 저장·중계한다. ÷1000은 서버 내부 좌표 계산용
+//   사본(Calib::Hf/Hm)에서만 일어나고, 그래서 pose/POSE/BLUEPRINT/PATH와 로봇
+//   프로토콜은 예전처럼 전부 미터다. 바뀐 것은 "저장·중계본의 단위"뿐이다.
+//
+//   예전에는 수신 즉시 번들 자체를 ÷1000 해서 저장·중계했다. 그러면 unit 필드가
+//   말하는 단위와 H에 실제로 든 단위가 어긋날 여지가 남는다 - 변환을 안 거치는
+//   경로가 하나라도 생기면 좌표가 조용히 1000배 틀어지는데 로그는 정상으로 찍힌다.
+//   단위 판단을 번들의 unit 필드 한 곳으로 모아 그 여지를 없앤 것이다.
+//
+// 번들 포맷 (2026-08-11 정규형): 아래를 전부 갖춘 오브젝트. 서버는 숫자 배열을
+//   값과 순서까지 그대로 보존해 저장·중계한다.
+//   {"calib_id","created_at","image_size":[2592,1520],"coord_mode":"undistort",
+//    "unit":"mm", "K":[[fx,0,cx],[0,fy,cy],[0,0,1]], "D":[k1,k2,p1,p2,k3],
+//    "H_floor":[[...]x3], "H_marker":[[...]x3], "marker_height_mm":160,
+//    "origin_mm":[0,0], "canvas_mm":[900,600], "axis":"x_right_y_up"}
+// 평면 포맷 (QT-REQ-CCTV-001 rev.2): 같은 내용이되 바닥 H의 이름이 "H"다.
+//   서버는 H를 H_floor로 읽고 나머지는 손대지 않은 채 저장·중계한다.
 // 레거시 포맷 (v0.2 이하): [[...]x3] 단일 H -> H_floor=H_marker=H, 왜곡 보정 생략
 #include "protocol.hpp"
 #include <array>
@@ -27,10 +36,10 @@ struct Calib {
     bool hasKD = false;      // K/D가 있어야 왜곡 보정 수행
     double fx = 1, fy = 1, cx = 0, cy = 0;   // K (내부 파라미터)
     std::array<double, 5> D{};               // 왜곡 계수 (k1,k2,p1,p2,k3)
-    double Hf[3][3] = {};    // 왜곡 보정 픽셀 -> 바닥 평면 (m)
-    double Hm[3][3] = {};    // 왜곡 보정 픽셀 -> 마커 높이 평면 (m)
+    double Hf[3][3] = {};    // 왜곡 보정 픽셀 -> 바닥 평면 (m). 서버 내부 계산용 사본
+    double Hm[3][3] = {};    // 왜곡 보정 픽셀 -> 마커 높이 평면 (m). 서버 내부 계산용 사본
     bool hasFloor = false, hasMarker = false;
-    json raw;                // 영속 저장/QT 중계용 원본 번들
+    json raw;                // 영속 저장/QT 중계용 원본 번들 (mm. 손대지 않는다)
 };
 
 inline bool parseMat3(const json& j, double m[3][3]) {
@@ -56,25 +65,53 @@ inline void scaleMat3Rows01(json& m, double s) {
     }
 }
 
-// CCTV는 항상 mm 기준(pixel -> world mm) 호모그래피를 보낸다는 전제로, 서버 입구에서
-// 미터로 정규화(÷1000)한다. 이후 pose 계산/BLUEPRINT/POSE/PATH/QT top-view가 전부
-// 미터로 통일된다 (로봇에 나가는 dist_m도 그대로 미터). H_floor/H_marker(신규) 및
-// 레거시 단일 H 배열을 처리한다. K/D는 픽셀 단위라 건드리지 않는다.
-inline void normalizeBundleMmToM(json& bundle) {
-    const double s = 0.001;  // mm -> m
-    if (bundle.is_array()) {  // 레거시: 단일 H
-        scaleMat3Rows01(bundle, s);
-        return;
+// 같은 연산의 C 배열 판 (파싱이 끝난 Calib::Hf/Hm 용).
+inline void scaleMat3Rows01(double m[3][3], double s) {
+    for (int r = 0; r < 2; ++r)
+        for (int c = 0; c < 3; ++c) m[r][c] *= s;
+}
+
+// 번들이 스스로 밝히는 단위 -> 미터 환산 계수. 단위 판단은 전부 이 함수 하나를 거친다.
+//   "mm"  : 0.001  정규 형식. CCTV 송신분이자 서버가 저장·중계하는 형태
+//   "m"   : 1.0    구 서버가 ÷1000 해서 저장해 둔 번들
+//   없음  : 1.0    구 서버 저장분 (수신 경로는 stampCalibUnit()이 "mm"을 미리 박는다)
+// 레거시 단일 H 배열은 태그할 자리가 없어 수신 때 미터로 바꿔 보관한다 -> 1.0.
+inline double bundleMeterScale(const json& bundle) {
+    if (!bundle.is_object()) return 1.0;
+    if (!bundle.contains("unit") || !bundle["unit"].is_string()) return 1.0;
+    return bundle["unit"].get<std::string>() == "mm" ? 0.001 : 1.0;
+}
+
+// 갓 수신한 번들을 저장·중계할 정규형으로 맞춘다. **mm은 mm 그대로 둔다.**
+// 반환값 = unit이 없어서 서버가 "mm"으로 가정해 박았는가 (호출부 경고 로그용).
+inline bool stampCalibUnit(json& bundle) {
+    if (bundle.is_array()) {  // 레거시 단일 H: 단위를 적어둘 자리가 없다.
+        scaleMat3Rows01(bundle, 0.001);  // 예전처럼 미터로 바꿔 보관한다.
+        return false;
     }
-    if (!bundle.is_object()) return;
+    if (!bundle.is_object()) return false;
+    if (bundle.contains("unit") && bundle["unit"].is_string()) return false;
+    bundle["unit"] = "mm";  // 규격상 필수 필드다. 없으면 옛 CCTV로 보고 mm으로 가정.
+    return true;
+}
+
+// 구 서버가 미터로 저장해 둔 번들을 규격 단위(mm)로 되돌린다.
+//
+// 저장 파일은 건드리지 않는다. 읽을 때마다 같은 결과가 나오는 순수 변환이라, 굳이
+// 현장 users.json을 다시 쓰는 위험을 질 이유가 없다. 저장분이 미터라는 것은 추론이
+// 아니다 - setCalib/setGlobalCalib을 부르는 곳이 handleHMatrix 하나뿐이었고 거기서
+// 무조건 ÷1000 한 뒤 저장했다.
+inline bool bundleToMm(json& bundle) {
+    if (!bundle.is_object()) return false;                // 레거시 배열은 대상 아님
+    if (bundleMeterScale(bundle) == 0.001) return false;  // 이미 mm
+    const double s = 1000.0;
     if (bundle.contains("H_floor")) scaleMat3Rows01(bundle["H_floor"], s);
     if (bundle.contains("H_marker")) scaleMat3Rows01(bundle["H_marker"], s);
-    // 평면 스키마(QT-REQ-CCTV-001)는 바닥 H를 "H"로 부른다. 같이 스케일하지 않으면
-    // H_marker만 미터가 되어 한 번들 안에서 두 평면의 단위가 어긋난다.
+    // 평면 스키마(QT-REQ-CCTV-001)는 바닥 H를 "H"로 부른다. 같이 환산하지 않으면
+    // 한 번들 안에서 두 평면의 단위가 어긋난다.
     if (bundle.contains("H")) scaleMat3Rows01(bundle["H"], s);
-    // 번들이 스스로 단위를 밝히면("unit") 정규화 결과와 맞춰준다. "mm"인 채로
-    // 중계하면 QT가 미터 값을 mm로 읽는다.
-    if (bundle.contains("unit") && bundle["unit"].is_string()) bundle["unit"] = "m";
+    bundle["unit"] = "mm";
+    return true;
 }
 
 // 평면 스키마의 바닥 H("H")에 "H_floor" 별칭을 달아준다.
@@ -150,6 +187,13 @@ inline bool calibFromJson(const json& bundle, Calib& out) {
         std::copy(&out.Hf[0][0], &out.Hf[0][0] + 9, &out.Hm[0][0]);
     } else if (!out.hasFloor) {
         std::copy(&out.Hm[0][0], &out.Hm[0][0] + 9, &out.Hf[0][0]);
+    }
+    // ÷1000은 여기 한 곳에서만 일어난다. out.raw(저장·중계본)는 mm 그대로 두고,
+    // 서버 내부 좌표 계산에 쓰는 Hf/Hm만 미터로 만든다.
+    const double s = bundleMeterScale(bundle);
+    if (s != 1.0) {
+        scaleMat3Rows01(out.Hf, s);
+        scaleMat3Rows01(out.Hm, s);
     }
     double K[3][3];
     if (bundle.contains("K") && parseMat3(bundle["K"], K) && bundle.contains("D") &&

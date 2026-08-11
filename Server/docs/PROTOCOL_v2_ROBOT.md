@@ -504,8 +504,22 @@ tangent_exit  = normDeg(heading_deg + (left ? +sweep : −sweep))
 | `op[k-1]`이 `role=path`인 `turn` | **ALIGN 판정** (최대 6회) | 2초 |
 | `k == 0` 이고 `phase == "draw"` | **ALIGN 판정** (첫 주행 op의 heading으로) | 2초 |
 | `op[k]`가 `role=path`인 `arc` 이고 위에 안 걸림 | **ALIGN 판정** (진입 **차체** 방위 = 접선 + φ, §5.7) | 2초 |
-| `op[k-1]`이 `role=path`인 `move` 또는 `arc` | **MORE 판정** (최대 4회) | 2초 |
-| 그 외 (`nozzle`, `role=offset`인 모든 op) | **즉시 `GO`** | 없음 |
+| `op[k-1]`이 도착 꼭짓점을 아는 `move` 또는 `arc` | **MORE 판정** (최대 4회) | 2초 |
+| 그 외 (`nozzle`, `turn`, 목표를 모르는 op) | **즉시 `GO`** | 없음 |
+
+> 🔵 **2026-08-11 변경**: MORE 판정 조건에서 `role=path` 요구를 뺐다. 기준은 이제
+> "그 op이 끝났을 때 마커 중심이 어디 있어야 하는지 서버가 아는가" 하나이고,
+> **오프셋 보정 다리(`role=offset`인 `move ±a`)도 대상**이다.
+>
+> 예전에는 그 다리들이 조건에서 통째로 빠져, 매 꼭짓점마다 150mm를 슬립계수 하나만
+> 믿고 개루프로 찍고 틀려도 아무도 고치지 않았다. 펜 오프셋 설정값이 실측과 5mm만
+> 어긋나도 그 오차가 보정 없이 꼭짓점마다 그대로 나타난다(2026-08-11 삼각형 시험
+> 관측: 꼭짓점 벌어짐 6~18mm). 목표는 §6.5 식 그대로다 —
+> `move(+a)`는 「꼭짓점 + a·û」(곧 노즐을 내리므로), `move(-a)`는 「꼭짓점」.
+>
+> 두 보정 모두 **노즐이 올라가 있는 동안** 실행된다(`move(+a)` 뒤엔 아직
+> `nozzle(down)` 전, `move(-a)` 앞엔 이미 `nozzle(up)`). 도료를 문지를 여지가 없다.
+> 회귀 테스트: `make offset_feedback_test && ./tools/offset_feedback_test`
 
 - 한 boundary에서 MORE 판정과 ALIGN 판정이 모두 걸릴 수 있다(도색 move 직후 곧바로 arc).
   이때는 **MORE를 먼저 소진하고, 그다음 ALIGN**을 돌린 뒤 `GO`.
@@ -558,11 +572,16 @@ tangent_exit  = normDeg(heading_deg + (left ? +sweep : −sweep))
   다음 path op이 없으면 `points`의 마지막 점.
 
 ```
-pen_target    = points[v_next]
-center_target = pen_target + a * û(target_heading)     if 방금 끝난 op이 도색 op
+pen_target    = points[v_next]                          (도색 move/arc, 오프셋 move(-a))
+              = points[v_self]                          (오프셋 move(+a) = 도색 시작 꼭짓점)
+center_target = pen_target + a * û(target_heading)     if 끝난 뒤 노즐이 내려가 있어야 하면
               = pen_target                             if 아니면 (노즐 up 상태)
 more_dist     = (center_target - center_actual) · û(target_heading)
 ```
+
+「끝난 뒤 노즐이 내려가 있어야 하는」 op = 도색 `move`/`arc`, 그리고 **오프셋
+`move(+a)`** (바로 다음이 `nozzle(down)`이므로 중심이 이미 a 앞이어야 한다).
+오프셋 `move(-a)`는 이미 노즐을 올린 뒤라 목표가 꼭짓점 그대로다.
 
 > 🔴 `+ a * û` 항이 **"오프셋 보정으로 인한 이탈은 정상"** 을 코드로 표현한 것이다.
 > 이 항을 빠뜨리면 도색 구간마다 서버가 15.5cm 전진 오차를 잡고 있다고 착각해

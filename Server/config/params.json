@@ -13,7 +13,7 @@
   "align_max_tries": 6,
 
   "_3_MORE": "move/arc 직후 거리 보정. more_max_m를 넘는 값은 pose가 틀렸다고 보고 판정을 폐기한다",
-  "more_deadband_m": 0.05,
+  "more_deadband_m": 0.005,
   "more_max_m": 0.5,
   "more_max_tries": 4,
 

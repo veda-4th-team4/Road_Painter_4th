@@ -445,11 +445,20 @@ void Router::clearBoundary() {
     pendingPoseN_ = 0;
 }
 
-// 직전 op(k-1)이 role=path인 move/arc면 거리 오차를 MORE로 교정한다 (§6.1).
+// 직전 op(k-1)이 도착 꼭짓점을 아는 move/arc면 거리 오차를 MORE로 교정한다 (§6.1).
+//
+// 🔴 role은 보지 않는다. 판정 기준은 hasTarget 하나다 - "이 op이 끝났을 때 마커
+//   중심이 어디 있어야 하는지 서버가 아는가". 도면 동작(role=path)뿐 아니라
+//   오프셋 보정 다리(role=offset, ±a)도 목표를 알기 때문에 대상이다.
+//
+//   예전에는 isPath를 요구해서 오프셋 다리가 조건에서 통째로 빠졌다. 그래서 매
+//   꼭짓점마다 ±a(150mm)를 슬립계수 하나만 믿고 개루프로 찍고, 틀려도 아무도
+//   고치지 않았다 - 펜 오프셋 설정값과 실측값이 5mm만 어긋나도 그 오차가 보정
+//   없이 꼭짓점마다 그대로 쌓였다(2026-08-11 삼각형 시험에서 관측).
 bool Router::needsMore(int k) const {
     if (k <= 0 || k > (int)activeMeta_.size()) return false;
     const OpMeta& m = activeMeta_[(size_t)k - 1];
-    return m.isPath && (m.op == "move" || m.op == "arc") && m.hasTarget &&
+    return (m.op == "move" || m.op == "arc") && m.hasTarget &&
            hasHeading(m.exitHeadingDeg);
 }
 
@@ -531,10 +540,11 @@ void Router::resolveBoundary() {
         const double head = m.exitHeadingDeg;
         const double ux = std::cos(head * M_PI / 180.0);
         const double uy = std::sin(head * M_PI / 180.0);
-        // 🔴 노즐이 내려가 있었다면 마커 중심의 목표는 꼭짓점보다 a 앞이다 (§5.2).
-        //   이 항을 빠뜨리면 도색 구간마다 15.5cm 전진 오차를 잡고 있다고 착각해
-        //   매번 MORE{-0.155}를 쏜다.
-        const double off = m.painting ? P.pen_offset_m : 0.0;
+        // 🔴 노즐이 내려간 상태로 끝나는 op이면 마커 중심의 목표는 꼭짓점보다
+        //   a 앞이다 (§5.2). 이 항을 빠뜨리면 도색 구간마다 15cm 전진 오차를
+        //   잡고 있다고 착각해 매번 MORE{-0.150}를 쏜다.
+        //   오프셋 전진 다리(+a)도 곧 노즐을 내리므로 같은 목표를 쓴다.
+        const double off = m.centerAheadByA ? P.pen_offset_m : 0.0;
         const double tx = m.penTarget[0] + off * ux;
         const double ty = m.penTarget[1] + off * uy;
         const double dist = (tx - cx) * ux + (ty - cy) * uy;
@@ -786,7 +796,16 @@ void Router::handleLogin(const json& payload, const std::string& replyRole) {
     currentUser_ = id;
     // 저장된 채널별 번들을 현재 세션에 통째로 복원한다. 예전에는 번들이 하나뿐이라
     // 한 줄이면 됐지만, 이제 채널마다 따로 들고 있어야 한다.
-    const json storedMap = users_.getCalibs(id);
+    json storedMap = users_.getCalibs(id);
+    // 예전 서버는 수신 즉시 ÷1000 해서 저장했으므로 파일에 남은 번들은 미터다.
+    // 규격(2026-08-11)은 Qt로 나가는 번들이 mm이어야 하니 읽는 김에 되돌린다.
+    // 저장 파일은 손대지 않는다 - 순수 변환이라 다음 로그인에도 결과가 같다.
+    int remmed = 0;
+    for (auto it = storedMap.begin(); it != storedMap.end(); ++it)
+        if (bundleToMm(*it)) ++remmed;
+    if (remmed)
+        logf("[INFO] 저장된 캘리브레이션 %d채널을 mm 규격으로 환산해 전달 "
+             "(예전 서버가 미터로 저장해 둔 번들)", remmed);
     calibs_.clear();
     for (auto it = storedMap.begin(); it != storedMap.end(); ++it) {
         if (it->is_null()) continue;
@@ -838,13 +857,43 @@ void Router::handleLogin(const json& payload, const std::string& replyRole) {
          streamStr.c_str());
 }
 
+// 수신한 캘리브레이션 번들이 이번 운용 규격(QT_CCTV_SERVER_CALIBRATION_FORMAT
+// 2026-08-11 §1/§3)에 맞는지 대조해, 어긋난 항목만 로그로 남긴다.
+//
+// 어긋나도 거절하지 않는다. 규격 위반이어도 좌표는 그럴듯하게 나오기 때문에 조용히
+// 틀리는 게 문제지, 캘리를 통째로 막는 건 현장에서 더 나쁘다. "이 값을 믿지 마라"는
+// 판단은 영상 크기를 실제로 아는 Qt가 한다(규격 §5-6). 서버는 눈에 보이게만 남긴다.
+static void warnCalibSpec(int ch, const json& bundle) {
+    if (!bundle.is_object()) return;  // 레거시 단일 H 배열은 메타데이터가 없다
+    static constexpr int kSpecW = 2592, kSpecH = 1520;  // §1 이번 운용 조건
+    const std::string unit = bundle.value("unit", std::string());
+    if (unit != "mm")
+        logf("[WARN] 캘리브레이션(채널 %d) unit=%s - 규격은 \"mm\"이다. 이 번들은 "
+             "mm로 환산되지 않은 채 저장·중계된다",
+             ch, unit.empty() ? "(없음)" : unit.c_str());
+    const std::string mode = bundle.value("coord_mode", std::string());
+    if (mode != "undistort")
+        logf("[WARN] 캘리브레이션(채널 %d) coord_mode=%s - 규격은 \"undistort\"다 "
+             "(H에 넣는 픽셀이 K/D로 왜곡 보정된 좌표라는 뜻)",
+             ch, mode.empty() ? "(없음)" : mode.c_str());
+    const json sz = bundle.value("image_size", json());
+    if (!(sz.is_array() && sz.size() == 2 && sz[0] == kSpecW && sz[1] == kSpecH))
+        logf("[WARN] 캘리브레이션(채널 %d) image_size=%s - 이번 운용 규격은 [%d,%d]다. "
+             "Qt가 디코딩하는 영상 크기와 다르면 좌표가 그만큼 틀어진다",
+             ch, sz.is_null() ? "(없음)" : sz.dump().c_str(), kSpecW, kSpecH);
+}
+
 // 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용). 세 형태를 받는다:
 //   중첩:   payload.calib = {K, D, H_floor, H_marker, marker_height_m, version}
 //   평면:   payload 자체가 번들 = {calib_id, K, D, H, H_marker, canvas_mm, ...}
 //           (QT-REQ-CCTV-001 rev.2 — 바닥 H를 H_floor가 아니라 H로 부른다)
 //   레거시: payload.H = [[...]x3] 뿐 (왜곡 보정 없이 바닥/마커 공용으로 사용)
-// CCTV는 mm 기준(pixel->world mm) 호모그래피를 보낸다. 서버 입구에서 미터로 정규화한 뒤
-// 저장/중계하므로, 이후 pose/POSE/BLUEPRINT/PATH와 QT top-view는 전부 미터로 통일된다.
+//
+// 단위 (QT_CCTV_SERVER_CALIBRATION_FORMAT 2026-08-11): CCTV가 보낸 mm 번들을 **그대로**
+// 저장·중계한다. 예전에는 여기서 번들 자체를 ÷1000 해서 저장·중계했는데, 그러면 unit
+// 필드와 실제 H 값이 어긋날 여지가 남아 좌표가 조용히 1000배 틀어질 수 있었다.
+// 미터 변환은 calibFromJson이 서버 내부 계산용 사본(Calib::Hf/Hm)에만 적용한다 -
+// pose/POSE/BLUEPRINT/PATH와 로봇 프로토콜은 예전 그대로 미터다.
 void Router::handleHMatrix(const json& msg) {
     json payload = msg.value("payload", json::object());
     // 평면 번들과 레거시는 둘 다 최상위 "H"를 갖는다. 예전엔 "calib이 없고 H가 있으면
@@ -862,8 +911,14 @@ void Router::handleHMatrix(const json& msg) {
     // "ch"가 번들 안에 남는데, calib_id처럼 손대지 않는 메타데이터로 보존한다 -
     // 저장된 번들만 봐도 어느 채널 것인지 알 수 있어 오히려 낫다.
     const int ch = channelOf(payload);
-    normalizeBundleMmToM(bundle);  // mm -> m (÷1000). 이후 번들은 미터 기준.
+    // mm은 mm 그대로 둔다. unit이 없으면 옛 CCTV로 보고 "mm"을 박아 둔다 - 이후로는
+    // 저장·중계·파싱이 전부 이 필드 하나만 보고 단위를 판단한다.
+    const bool assumedUnit = stampCalibUnit(bundle);
     aliasFloorKey(bundle);  // 평면 스키마의 "H"에 "H_floor" 별칭 (QT는 H_floor만 봄)
+    if (assumedUnit)
+        logf("[WARN] 캘리브레이션(채널 %d) unit 필드 없음 - mm으로 가정했다 "
+             "(규격상 필수. CCTV가 unit:\"mm\"을 실어 보내야 한다)", ch);
+    warnCalibSpec(ch, bundle);
     Calib c;
     if (!calibFromJson(bundle, c)) {
         logf("[WARN] H_MATRIX(채널 %d) 파싱 실패 - calib/H 형식 확인 필요: %s",
@@ -871,7 +926,7 @@ void Router::handleHMatrix(const json& msg) {
         return;
     }
     calibs_[ch] = c;
-    // 정규화된(미터) 번들로 다시 싸서 QT에 중계 + 영속 저장 - QT는 미터 H_floor로 top-view.
+    // mm 번들 그대로 다시 싸서 QT에 중계 + 영속 저장 - QT는 mm H_floor로 top-view.
     json outMsg = msg;
     if (nested) outMsg["payload"]["calib"] = bundle;
     else if (legacyH) outMsg["payload"]["H"] = bundle;
@@ -911,11 +966,11 @@ void Router::handleHMatrix(const json& msg) {
     // ch를 안 실어 보내면 전부 채널 1에 덮어써진다 - 4채널을 캘리한 줄 알았는데
     // 마지막 하나만 남는 상황이라, 어느 채널로 저장됐는지 로그에 반드시 남긴다.
     if (!currentUser_.empty() && users_.setCalib(currentUser_, ch, bundle))
-        logf("[INFO] 캘리브레이션 수신 [채널 %d] (%s, mm->m 정규화, %s%s) - "
+        logf("[INFO] 캘리브레이션 수신 [채널 %d] (%s, mm 보존, %s%s) - "
              "사용자 '%s' + 전역 슬롯에 영속 저장",
              ch, schema, detail_marker, detail_kd, currentUser_.c_str());
     else
-        logf("[INFO] 캘리브레이션 수신 [채널 %d] (%s, mm->m 정규화, %s%s) - "
+        logf("[INFO] 캘리브레이션 수신 [채널 %d] (%s, mm 보존, %s%s) - "
              "로그인 사용자 없음, 전역 슬롯에 영속 저장 (다음 로그인 때 전달됨)",
              ch, schema, detail_marker, detail_kd);
 }

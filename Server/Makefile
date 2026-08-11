@@ -56,6 +56,17 @@ cctv_pose: tools/cctv_pose.cpp tools/tls_client.hpp
 calib_channel_test: tools/calib_channel_test.cpp src/user_store.cpp src/*.hpp
 	$(CXX) $(CXXFLAGS) tools/calib_channel_test.cpp src/user_store.cpp -o tools/$@ $(LDLIBS)
 
+# 오프셋 보정 다리(±a)에 MORE 피드백이 걸리는지 못박는 회귀 테스트.
+# 이 다리가 보정에서 빠지면 에러 없이 꼭짓점만 조금씩 어긋난다 - 눈으로 못 잡는다.
+offset_feedback_test: tools/offset_feedback_test.cpp src/*.hpp
+	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
+
+# 캘리브레이션 번들 단위 규약 회귀 테스트 (2026-08-11 규격 §1/§4).
+# "번들은 mm로 저장·중계, ÷1000은 서버 내부 사본에서만"을 못박는다. 단위가 1000배
+# 어긋나도 에러가 안 나고 좌표만 조용히 틀리는 부류라, 눈으로 검수할 수가 없다.
+calib_unit_test: tools/calib_unit_test.cpp src/*.hpp
+	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
+
 # 로봇 주행 호모그래피 세션 회귀 테스트 (2026-08-10 계약 §6 시험표).
 # QT/ROBOT/CCTV 세 role로 동시에 붙어 "시작한 세션은 반드시 종결 응답 하나로
 # 닫힌다"를 못 박는다 - 응답 누락은 크래시가 아니라 조작자가 5분 갇히는 것으로만
@@ -64,5 +75,5 @@ calib_session_test: tools/calib_session_test.cpp tools/tls_client.hpp
 	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
 
 clean:
-	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose tools/calib_channel_test tools/calib_session_test
+	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose tools/calib_channel_test tools/calib_unit_test tools/offset_feedback_test tools/calib_session_test
 .PHONY: clean sim

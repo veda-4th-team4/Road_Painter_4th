@@ -9,12 +9,13 @@ config/users.json은 비밀번호 해시가 들어있어 .gitignore 대상이라
   ※ salt로 쓰는 값은 16바이트 원본이 아니라 그것을 hex로 찍은 32글자 ASCII다
     (서버가 saltHex.data()를 그대로 salt로 넘기므로 여기서도 똑같이 맞춰야 한다).
 
-호모그래피 단위(중요):
-  CCTV가 보내는 H는 pixel -> world "mm"이고, 서버는 H_MATRIX 수신 시점에만
-  mm -> m 로 정규화한다(calib.hpp normalizeBundleMmToM). 로그인 때 꺼내 쓰는
-  경로(router.cpp handleLogin -> getCalib -> calibFromJson)에는 정규화가 없다.
-  따라서 파일에 넣는 값은 "이미 미터로 정규화된" 행렬이어야 한다.
-  이 스크립트는 mm 행렬을 입력받아 0·1행에 0.001을 곱해 저장한다.
+호모그래피 단위(중요) — 2026-08-11 규격:
+  CCTV가 보내는 H는 pixel -> world "mm"이고, 서버는 그 번들을 mm 그대로 저장·중계한다.
+  ÷1000 은 서버 내부 좌표 계산용 사본에서만 일어난다(calib.hpp calibFromJson).
+  단위 판단은 번들의 "unit" 필드 한 곳만 본다(bundleMeterScale).
+  따라서 이 스크립트는 mm 행렬을 그대로 넣고 unit:"mm" 을 함께 적는다.
+  ※ 예전 이 스크립트가 만든 파일(미터, unit 없음)도 그대로 읽힌다 - 서버가 로그인
+    때 bundleToMm 으로 mm 환산해 Qt에 내보낸다(파일 자체는 안 고친다).
 
 사용:
   python3 tools/seed_user.py                 # 기본 test/1234 + 기본 H + 기본 카메라 IP
@@ -32,7 +33,6 @@ import sys
 
 PBKDF2_ITERS = 10000   # src/user_store.cpp kPbkdf2Iters
 HASH_LEN = 32          # src/user_store.cpp kHashLen (SHA-256)
-MM_TO_M = 0.001
 
 # 현장 CCTV 카메라 IP. Qt가 이 값으로 RTSP URL을 조립한다(서버는 검증 없이 저장만).
 DEFAULT_CAM_IP = "192.168.0.9"
@@ -50,17 +50,6 @@ def hash_pw(pw, salt_hex):
     return hashlib.pbkdf2_hmac(
         "sha256", pw.encode(), salt_hex.encode(), PBKDF2_ITERS, HASH_LEN
     ).hex()
-
-
-def mm_to_m(h_mm):
-    """호모그래피의 0·1행에 0.001을 곱해 mm 결과를 m 결과로 바꾼다.
-
-    world = H·[u,v,1] 의 (0행, 1행) / 2행 이므로, 0·1행만 s배하면 변환 결과가
-    s배된다. 2행(스케일 행)은 건드리지 않는다. calib.hpp scaleMat3Rows01과 동일.
-    """
-    return [[v * MM_TO_M for v in h_mm[0]],
-            [v * MM_TO_M for v in h_mm[1]],
-            list(h_mm[2])]
 
 
 def main():
@@ -99,11 +88,12 @@ def main():
                 or any(not isinstance(r, list) or len(r) != 3 for r in h_mm)):
             print("[!] --h-json은 3x3 배열이어야 합니다.")
             return 1
-        h_m = mm_to_m(h_mm)
         # K/D 없음 = 왜곡 보정 생략, H_marker=H_floor = 시차 보정 생략.
         # (현재 admin_console 캘리 도구가 올리는 번들과 같은 수준)
-        calib = {"version": 1, "H_floor": h_m, "H_marker": h_m,
-                 "marker_height_m": 0.0}
+        # unit:"mm" 을 명시해 mm 행렬을 그대로 넣는다 - 서버가 이 필드만 보고
+        # 단위를 판단하고, ÷1000 은 내부 계산용 사본에서만 한다.
+        calib = {"version": 1, "unit": "mm", "H_floor": h_mm, "H_marker": h_mm,
+                 "marker_height_mm": 0}
 
     salt_hex = secrets.token_hex(16)
     users[args.id] = {
@@ -123,7 +113,7 @@ def main():
     print(f"    비밀번호: {args.pw}")
     print(f"    카메라 IP: {args.cam_ip or '(없음 - null)'}")
     if calib:
-        print("    캘리브레이션: 있음 (mm->m 정규화 후 저장)")
+        print("    캘리브레이션: 있음 (mm 그대로 저장, unit:\"mm\")")
         print(f"      H_floor[0] = {calib['H_floor'][0]}")
     else:
         print("    캘리브레이션: 없음 (로그인 시 calib=null)")
