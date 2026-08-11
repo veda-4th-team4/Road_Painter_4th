@@ -42,7 +42,8 @@
  * 코드값과 확장보드 MODE0/MODE1/MODE2 점퍼가 반드시 같아야 합니다.
  * PDF 이론 90°=2012는 1/16 기준입니다.
  * 현재 1/16: MODE0=LOW, MODE1=LOW, MODE2=HIGH.
- * 하드웨어를 1/32로 바꾸면 이 값도 32.0f로 바꾸고 이론 펄스를 다시 계산하십시오.
+ * 하드웨어를 1/32로 바꾸면 이 값도 32.0f로 바꾸고 이론 펄스를 다시
+ * 계산하십시오.
  */
 #define ROBOT_MICROSTEP_DIVISOR 16.0f
 
@@ -57,8 +58,9 @@
 
 /**
  * @brief 실제 하중을 건 상태의 유효 바퀴 지름 [mm].
- * 현재 STM32는 sps를 그대로 실행하므로 이 값은 RPi odometry와 기구 기록용입니다.
- * 일정 누적 스텝을 저속 구동한 뒤 실제 이동거리로 유효 지름을 보정하십시오.
+ * 현재 STM32는 sps를 그대로 실행하므로 이 값은 RPi odometry와 기구
+ * 기록용입니다. 일정 누적 스텝을 저속 구동한 뒤 실제 이동거리로 유효 지름을
+ * 보정하십시오.
  */
 #define ROBOT_WHEEL_DIAMETER_MM 66.0f
 
@@ -80,8 +82,9 @@
  * 첫 공중 구동시험에서 반대로 도는 쪽만 SET <-> RESET으로 변경하십시오.
  * 좌우 모터가 거울 대칭 장착되면 두 값이 서로 다를 가능성이 큽니다.
  */
-#define ROBOT_LEFT_FORWARD_LEVEL  GPIO_PIN_SET
-/** 좌우 모터가 거울 대칭 장착이면 한쪽만 반전합니다. 전진이 회전하면 이 값을 바꾸십시오. */
+#define ROBOT_LEFT_FORWARD_LEVEL GPIO_PIN_SET
+/** 좌우 모터가 거울 대칭 장착이면 한쪽만 반전합니다. 전진이 회전하면 이 값을
+ * 바꾸십시오. */
 #define ROBOT_RIGHT_FORWARD_LEVEL GPIO_PIN_RESET
 
 /** @brief DRV8825 nENBL 출력 활성 레벨(Active-Low). */
@@ -108,8 +111,9 @@
 
 /**
  * @brief 좌우 목표 속도의 최대 절댓값 [microsteps/s].
- * @note IR/UART SPS는 이 값을 넘지 못합니다. 턴을 빠르게 하려면 여기부터 올리십시오.
- *       TIM2 20 kHz 구조상 실용 상한은 약 10000입니다. 탈조 나면 내리십시오.
+ * @note IR/UART SPS는 이 값을 넘지 못합니다. 턴을 빠르게 하려면 여기부터
+ * 올리십시오. TIM2 20 kHz 구조상 실용 상한은 약 10000입니다. 탈조 나면
+ * 내리십시오.
  */
 #define ROBOT_MAX_SPS 4000
 
@@ -117,7 +121,7 @@
  * @brief 정상 주행 가감속도 [microsteps/s^2].
  * @note IR 펄스는 정지 시 감속 거리(v^2/2a)만큼 일찍 브레이크합니다.
  */
-#define ROBOT_ACCEL_SPS2       3000U
+#define ROBOT_ACCEL_SPS2 3000U
 
 /** @brief ESTOP 감속에 적용할 가감속도 [microsteps/s^2]. */
 #define ROBOT_ESTOP_DECEL_SPS2 4000U
@@ -141,7 +145,7 @@
  * @note SPS를 5000으로 넣어도 MAX_SPS=2000이면 모터는 2000.
  *       타임아웃도 2000 기준으로 잡아야 펄스가 중간에 안 끊깁니다.
  */
-#define ROBOT_IR_EFFECTIVE_SPS(sps)                                        \
+#define ROBOT_IR_EFFECTIVE_SPS(sps)                                            \
   (((sps) < (ROBOT_MAX_SPS)) ? (sps) : (ROBOT_MAX_SPS))
 
 /** @brief 앞/뒤 속도 [microsteps/s]. */
@@ -150,12 +154,14 @@
 #define ROBOT_IR_FWD_STEPS 6400U
 #define ROBOT_IR_REV_STEPS 6400U
 
-#define ROBOT_IR_FWD_MS                                                    \
-  (((ROBOT_IR_FWD_STEPS) * 1000U) /                                        \
-       (uint32_t)ROBOT_IR_EFFECTIVE_SPS(ROBOT_MANUAL_DRIVE_SPS) + 1500U)
-#define ROBOT_IR_REV_MS                                                    \
-  (((ROBOT_IR_REV_STEPS) * 1000U) /                                        \
-       (uint32_t)ROBOT_IR_EFFECTIVE_SPS(ROBOT_MANUAL_DRIVE_SPS) + 1500U)
+#define ROBOT_IR_FWD_MS                                                        \
+  (((ROBOT_IR_FWD_STEPS) * 1000U) /                                            \
+       (uint32_t)ROBOT_IR_EFFECTIVE_SPS(ROBOT_MANUAL_DRIVE_SPS) +              \
+   1500U)
+#define ROBOT_IR_REV_MS                                                        \
+  (((ROBOT_IR_REV_STEPS) * 1000U) /                                            \
+       (uint32_t)ROBOT_IR_EFFECTIVE_SPS(ROBOT_MANUAL_DRIVE_SPS) +              \
+   1500U)
 
 /**
  * @brief 좌/우 턴 속도 [microsteps/s]. ★속도만 조절★
@@ -192,60 +198,58 @@
  * @brief ★노가다★ 슬립 보정 K_slip [milli]. 1000=1.00, 1010=1.01, 990=0.99.
  * @note IR로 90° 돌리고 덜/더 돌면 ±10씩 조정. 이론 2012는 건드리지 말 것.
  */
-#define ROBOT_TURN_K_SLIP_MILLI_LEFT  1010U
+#define ROBOT_TURN_K_SLIP_MILLI_LEFT 1010U
 #define ROBOT_TURN_K_SLIP_MILLI_RIGHT 1010U
 
 /** @brief 90° 실명령 펄스 = theory × K / 1000 (반올림). */
-#define ROBOT_TURN_CAL_PULSES_LEFT                                         \
-  ((((ROBOT_TURN_PULSE_THEORY_90) * (ROBOT_TURN_K_SLIP_MILLI_LEFT)) +      \
-    500U) /                                                                \
+#define ROBOT_TURN_CAL_PULSES_LEFT                                             \
+  ((((ROBOT_TURN_PULSE_THEORY_90) * (ROBOT_TURN_K_SLIP_MILLI_LEFT)) + 500U) /  \
    1000U)
-#define ROBOT_TURN_CAL_PULSES_RIGHT                                        \
-  ((((ROBOT_TURN_PULSE_THEORY_90) * (ROBOT_TURN_K_SLIP_MILLI_RIGHT)) +     \
-    500U) /                                                                \
+#define ROBOT_TURN_CAL_PULSES_RIGHT                                            \
+  ((((ROBOT_TURN_PULSE_THEORY_90) * (ROBOT_TURN_K_SLIP_MILLI_RIGHT)) + 500U) / \
    1000U)
 
 /**
  * @brief 각도[0.1°] → 펄스 (반올림). N도 회전에 사용.
  * @param deci 예: 90°→900, 45°→450, 0.1°→1
  */
-#define ROBOT_TURN_STEPS_FROM_DECI_DEG_LEFT(deci)                          \
-  ((((((uint32_t)(deci)) * (ROBOT_TURN_PULSE_THEORY_90) *                  \
-      (ROBOT_TURN_K_SLIP_MILLI_LEFT)) +                                    \
-     ((ROBOT_TURN_CAL_DECI_DEG) * 500U)) /                                 \
+#define ROBOT_TURN_STEPS_FROM_DECI_DEG_LEFT(deci)                              \
+  ((((((uint32_t)(deci)) * (ROBOT_TURN_PULSE_THEORY_90) *                      \
+      (ROBOT_TURN_K_SLIP_MILLI_LEFT)) +                                        \
+     ((ROBOT_TURN_CAL_DECI_DEG) * 500U)) /                                     \
     ((ROBOT_TURN_CAL_DECI_DEG) * 1000U)))
 
-#define ROBOT_TURN_STEPS_FROM_DECI_DEG_RIGHT(deci)                         \
-  ((((((uint32_t)(deci)) * (ROBOT_TURN_PULSE_THEORY_90) *                  \
-      (ROBOT_TURN_K_SLIP_MILLI_RIGHT)) +                                   \
-     ((ROBOT_TURN_CAL_DECI_DEG) * 500U)) /                                 \
+#define ROBOT_TURN_STEPS_FROM_DECI_DEG_RIGHT(deci)                             \
+  ((((((uint32_t)(deci)) * (ROBOT_TURN_PULSE_THEORY_90) *                      \
+      (ROBOT_TURN_K_SLIP_MILLI_RIGHT)) +                                       \
+     ((ROBOT_TURN_CAL_DECI_DEG) * 500U)) /                                     \
     ((ROBOT_TURN_CAL_DECI_DEG) * 1000U)))
 
 /** @brief 각도[정수 °] → 펄스. */
-#define ROBOT_TURN_STEPS_FROM_DEG_LEFT(deg)                                \
+#define ROBOT_TURN_STEPS_FROM_DEG_LEFT(deg)                                    \
   ROBOT_TURN_STEPS_FROM_DECI_DEG_LEFT(((uint32_t)(deg)) * 10U)
-#define ROBOT_TURN_STEPS_FROM_DEG_RIGHT(deg)                               \
+#define ROBOT_TURN_STEPS_FROM_DEG_RIGHT(deg)                                   \
   ROBOT_TURN_STEPS_FROM_DECI_DEG_RIGHT(((uint32_t)(deg)) * 10U)
 
 /** @brief 참고: 1° / 0.1° 당 펄스 (K 반영). */
-#define ROBOT_TURN_PULSES_PER_DEG_LEFT  ROBOT_TURN_STEPS_FROM_DEG_LEFT(1U)
+#define ROBOT_TURN_PULSES_PER_DEG_LEFT ROBOT_TURN_STEPS_FROM_DEG_LEFT(1U)
 #define ROBOT_TURN_PULSES_PER_DEG_RIGHT ROBOT_TURN_STEPS_FROM_DEG_RIGHT(1U)
-#define ROBOT_TURN_PULSES_PER_DECI_DEG_LEFT                                \
+#define ROBOT_TURN_PULSES_PER_DECI_DEG_LEFT                                    \
   ROBOT_TURN_STEPS_FROM_DECI_DEG_LEFT(1U)
-#define ROBOT_TURN_PULSES_PER_DECI_DEG_RIGHT                               \
+#define ROBOT_TURN_PULSES_PER_DECI_DEG_RIGHT                                   \
   ROBOT_TURN_STEPS_FROM_DECI_DEG_RIGHT(1U)
 
 /** @brief IR 90° 턴 = theory × K. */
-#define ROBOT_IR_TURN_90_STEPS_LEFT  (ROBOT_TURN_CAL_PULSES_LEFT)
+#define ROBOT_IR_TURN_90_STEPS_LEFT (ROBOT_TURN_CAL_PULSES_LEFT)
 #define ROBOT_IR_TURN_90_STEPS_RIGHT (ROBOT_TURN_CAL_PULSES_RIGHT)
 
-#define ROBOT_IR_TURN_90_MS_LEFT                                           \
-  (((ROBOT_IR_TURN_90_STEPS_LEFT) * 1000U) /                               \
-       (uint32_t)ROBOT_IR_EFFECTIVE_SPS(ROBOT_MANUAL_TURN_LEFT_SPS) +      \
+#define ROBOT_IR_TURN_90_MS_LEFT                                               \
+  (((ROBOT_IR_TURN_90_STEPS_LEFT) * 1000U) /                                   \
+       (uint32_t)ROBOT_IR_EFFECTIVE_SPS(ROBOT_MANUAL_TURN_LEFT_SPS) +          \
    1500U)
-#define ROBOT_IR_TURN_90_MS_RIGHT                                          \
-  (((ROBOT_IR_TURN_90_STEPS_RIGHT) * 1000U) /                              \
-       (uint32_t)ROBOT_IR_EFFECTIVE_SPS(ROBOT_MANUAL_TURN_RIGHT_SPS) +     \
+#define ROBOT_IR_TURN_90_MS_RIGHT                                              \
+  (((ROBOT_IR_TURN_90_STEPS_RIGHT) * 1000U) /                                  \
+       (uint32_t)ROBOT_IR_EFFECTIVE_SPS(ROBOT_MANUAL_TURN_RIGHT_SPS) +         \
    1500U)
 
 /* ==========================================================================
@@ -269,6 +273,6 @@
 #define ROBOT_SERVO_OFF_US 1000U
 
 /** @brief 노즐 ON 위치의 PWM HIGH 폭 [us], 실기구 시험 후 보정합니다. */
-#define ROBOT_SERVO_ON_US 2000U
+#define ROBOT_SERVO_ON_US 1600U
 
 #endif /* __ROBOT_CONFIG_H__ */

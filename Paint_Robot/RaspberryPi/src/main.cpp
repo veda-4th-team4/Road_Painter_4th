@@ -114,10 +114,12 @@ int main(int argc, char **argv) {
           } else if (cmd == "NOZZLE_DOWN" || cmd == "PAINT_ON") {
               manual_override = true; // §4.1 Fix: Enable manual override so IDLE manual nozzle persists
               manual_nozzle = 1;
+              robot_comm.SendClearEStop(); // Clear any startup/idle ESTOP latch on STM32
               robot_comm.SendControlNozzle(1);
           } else if (cmd == "NOZZLE_UP" || cmd == "PAINT_OFF") {
               manual_override = true; // §4.1 Fix: Enable manual override so IDLE manual nozzle persists
               manual_nozzle = 0;
+              robot_comm.SendClearEStop(); // Clear any startup/idle ESTOP latch on STM32
               robot_comm.SendControlNozzle(0);
           } else if (cmd == "CALIB_START") { // R-1: Homography calibration motion start request
               std::cout << GetTimestampStr() << "[MAIN] [CALIB] CALIB_START received. Initializing calibration state (nozzle UP)." << std::endl;
