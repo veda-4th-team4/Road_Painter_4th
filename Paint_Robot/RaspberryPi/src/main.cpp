@@ -169,15 +169,15 @@ int main(int argc, char **argv) {
                net_manager.ClearLatches(); // R-8: Clear any stale command latches from previous path
                robot_comm.SendClearEStop(); // Clear startup/idle ESTOP latch when applying new autonomous path
                std::string phase = net_manager.GetPathPhase();
-               std::cout << GetTimestampStr() << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2000ms for camera settling..." << std::endl;
+               std::cout << GetTimestampStr() << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2500ms for camera settling..." << std::endl;
                if (phase == "draw") {
                    imu_manager.ResetYaw(0.0f); // Reset IMU Yaw to 0 deg when entering draw phase from standstill
                }
 
-               // Settling delay: Ensure robot is fully still for 2000ms (2s) before sending initial READY for op 0
+               // Settling delay: Ensure robot is fully still for 2500ms (2.5s) before sending initial READY for op 0
                auto start_wait = std::chrono::steady_clock::now();
                while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - start_wait).count() < 2000) {
+                          std::chrono::steady_clock::now() - start_wait).count() < 2500) {
                    robot_comm.SendSetSpeed(0, 0);
                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
                }
@@ -262,13 +262,13 @@ int main(int argc, char **argv) {
                       Msg_Status_t status_snap{};
                       if (robot_comm.GetLatestStatus(status_snap)) {
                           if (path_follower.UpdateTurn(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed)) {
-                              // Micro-turn completed: Send stop & wait 2000ms for camera settling before re-sending READY for same op
+                              // Micro-turn completed: Send stop & wait 2500ms for camera settling before re-sending READY for same op
                               robot_comm.SendSetSpeed(0, 0);
-                              std::cout << GetTimestampStr() << "[MAIN ALIGN] Turn complete -> Waiting 2000ms for camera settling..." << std::endl;
+                              std::cout << GetTimestampStr() << "[MAIN ALIGN] Turn complete -> Waiting 2500ms for camera settling..." << std::endl;
                               
                               auto start_wait = std::chrono::steady_clock::now();
                               while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - start_wait).count() < 2000) {
+                                         std::chrono::steady_clock::now() - start_wait).count() < 2500) {
                                   robot_comm.SendSetSpeed(0, 0);
                                   std::this_thread::sleep_for(std::chrono::milliseconds(20));
                               }
@@ -283,13 +283,13 @@ int main(int argc, char **argv) {
                       if (robot_comm.GetLatestStatus(status_snap)) {
                           float imu_yaw = imu_manager.GetYaw();
                           if (path_follower.UpdateMove(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed, imu_yaw)) {
-                              // Micro-move completed: Send stop & wait 2000ms before re-sending READY for same op
+                              // Micro-move completed: Send stop & wait 2500ms before re-sending READY for same op
                               robot_comm.SendSetSpeed(0, 0);
-                              std::cout << GetTimestampStr() << "[MAIN MORE] Move complete -> Waiting 2000ms for camera settling..." << std::endl;
+                              std::cout << GetTimestampStr() << "[MAIN MORE] Move complete -> Waiting 2500ms for camera settling..." << std::endl;
                               
                               auto start_wait = std::chrono::steady_clock::now();
                               while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - start_wait).count() < 2000) {
+                                         std::chrono::steady_clock::now() - start_wait).count() < 2500) {
                                   robot_comm.SendSetSpeed(0, 0);
                                   std::this_thread::sleep_for(std::chrono::milliseconds(20));
                               }
