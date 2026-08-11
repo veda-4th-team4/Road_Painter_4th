@@ -57,3 +57,6 @@ calib_session_test
 start.log
 
 server.out.log
+
+# start.sh 가 남기는 기동 로그
+server_start.log
