@@ -448,7 +448,7 @@
 > 뒤바뀌거나 하나가 누락됐을 때 "섰는데 경로가 살아있는" 어중간한 상태가 생긴다.
 > `ABORT_DRAW` 하나가 정지·래치·폐기를 전부 책임진다.
 >
-> 구현 안내: [docs/ROBOT_ACTION_ITEMS_20260805.md](docs/ROBOT_ACTION_ITEMS_20260805.md) **R-11**
+> 구현 안내: [ROBOT_ACTION_ITEMS_20260805 (노션 아카이브)](https://app.notion.com/p/3b914dc6aecf812183e3c64d07c1a8ac) **R-11**
 
 - **수동 조작 명령 (조이스틱 방식 — 누르는 동안 이동, 이동량 없음)**:
   `"FORWARD"` | `"BACKWARD"` | `"TURN_LEFT"` | `"TURN_RIGHT"` | `"STOP"`
@@ -1086,7 +1086,7 @@ DRIFT를 쏴 도색 첫 MOVE의 각도오차가 -40.4°까지 벌어지는 걸 �
   🔴 **노즐은 `NOZZLE` op으로만 움직일 것** — `MOVE.paint`로 노즐을 제어하면 안 된다
   (`paint`는 표시용). 서버가 직접 만드는 하위호환 경로에도 이제 `NOZZLE`이 들어가므로
   `NOZZLE` 한 갈래만 구현하면 두 경로가 다 커버된다.
-  ⚠️ 그 전에 [docs/DRIVE_TEST_PLAN.md](docs/DRIVE_TEST_PLAN.md) 단계 A의
+  ⚠️ 그 전에 [DRIVE_TEST_PLAN (노션 아카이브)](https://app.notion.com/p/3b914dc6aecf812183e3c64d07c1a8ac) 단계 A의
   **`PATH_DONE` 송신 + `current_waypoint_idx` 진행**이 먼저다 (지금은 첫 세그먼트를 무한 실행).
 - **CCTV팀**: 변경 없음.
 
@@ -1140,7 +1140,7 @@ v0.3까지 "작업 중단"은 `ESTOP` 하나뿐이었는데 이건 **일시정�
 안 건드린다.
 
 ```json
-{"type":"LOGIN_OK","payload":{ …, "stream": {"enabled":true,"base":"rtsp://192.168.0.2:8554","channels":4}}}
+{"type":"LOGIN_OK","payload":{ …, "stream": {"enabled":true,"base":"rtsp://192.168.0.8:8554","channels":4}}}
 ```
 
 **2026-08-07 확정 (QT팀 회신, 제안 A 채택) — 세 가지 상태를 구분한다.**
@@ -1173,7 +1173,7 @@ v0.3까지 "작업 중단"은 `ESTOP` 하나뿐이었는데 이건 **일시정�
 서버 로그로 어느 상태인지 바로 알 수 있다:
 
 ```
-중계 rtsp://192.168.0.2:8554        ← enabled=true
+중계 rtsp://192.168.0.8:8554        ← enabled=true
 중계 끔 - QT에 해제 지시(직결)        ← enabled=false
 중계 설정 없음 - QT 설정값 유지        ← 파일 없음/깨짐
 ```
@@ -1197,7 +1197,7 @@ v0.3까지 "작업 중단"은 `ESTOP` 하나뿐이었는데 이건 **일시정�
    되살아나지 않게** 한다. `PATH_DONE`은 보내지 않는다 (끝낸 게 아니라 버린 것).
    - 🔴 **아직 미구현이다.** QT는 이미 `ABORT_DRAW`를 보내고 있어서, 지금은
      [작업 중단]을 눌러도 **로봇이 안 선다.** 상세 구현 안내는
-     [docs/ROBOT_ACTION_ITEMS_20260805.md](docs/ROBOT_ACTION_ITEMS_20260805.md) **R-11** 참고.
+     [ROBOT_ACTION_ITEMS_20260805 (노션 아카이브)](https://app.notion.com/p/3b914dc6aecf812183e3c64d07c1a8ac) **R-11** 참고.
    - 그 외 변경 없음. `ch`는 로봇과 무관하다 (로봇은 좌표를 모른다).
 
 **QT팀** — 4개 (2026-08-06 기준 **전부 반영 완료**)

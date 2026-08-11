@@ -299,15 +299,16 @@ POS·H_MATRIX의 하위호환용이다. **`SELECT_CHANNEL`·`CALIB_START`에는 
 
 ---
 
-## 10. 알려진 미해결
+## 10. 알려진 미해결 (2026-08-10 기준)
 
 | 항목 | 상태 |
 |---|---|
-| CCTV가 `CALIB_START` payload를 문자열 검색으로만 처리 | `ch`/`request_id` 소멸 — 카메라 앱 수정 필요 |
-| 로봇에 `CALIB_START` 핸들러 없음 | 캘리 주행 자체가 불가 |
-| `CALIB_STOPPED` 미구현 (양쪽) | 취소가 항상 `cancel_failed`로 끝남 |
-| Qt가 `VerifyNone` + `ignoreSslErrors()` | MITM 노출 |
-| 카메라 자격증명이 저장소에 평문 | 교체 권장 |
+| **CCTV가 `CALIB_START` payload를 문자열 검색으로만 처리** | 🔴 **미해결** — `ch`/`request_id`가 카메라 앱 경계에서 소멸. **종단간 시험을 막는 유일한 항목** |
+| 로봇 `CALIB_START`/`CALIB_STOPPED` | ✅ `feature/server-driven-v2` @`52aa849` — **main 미병합** |
+| 로봇 `CALIB_FAIL` | ⚠️ 송신 함수만 있고 **호출부 없음** — 주행 실패가 서버 타임아웃(3분)으로만 드러남 |
+| Qt TLS 검증 | ✅ PR #42 (`8717fc7`) — qrc 내장 + `VerifyPeer` + fail-closed |
+| **서버가 클라이언트를 인증하지 않음 (mTLS 없음)** | 🔴 누구나 `HELLO {role:"QT"}`로 진짜 Qt를 밀어낼 수 있음. Qt 수정만으로는 절반만 닫힘 |
+| 카메라 자격증명이 저장소에 평문 | ⚠️ 저장소가 공개라 이미 비밀이 아님 — 교체 권장 |
 
 ---
 
