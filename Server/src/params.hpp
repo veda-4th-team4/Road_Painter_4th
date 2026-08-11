@@ -34,19 +34,19 @@ using json = nlohmann::json;
       "도색 가능한 최소 펜 반지름. 미만이면 도면 거부(arc_too_tight). "        \
       "이론 하한은 a(0.155)지만 실제 하한은 모터가 정한다 - 아래 주석 참조")   \
     /* ---- ALIGN (turn 직후 각도 정렬) ---- */                                \
-    X(double, align_threshold_deg, 4.0,                                        \
+    X(double, align_threshold_deg, 2.0,                                        \
       "이 각도 이내면 정렬 완료로 보고 GO")                                    \
     X(int, align_max_tries, 6,                                                 \
       "한 boundary에서 ALIGN 최대 반복. 소진하면 포기하고 GO")                 \
     /* ---- MORE (move/arc 직후 거리 보정) ---- */                             \
-    X(double, more_deadband_m, 0.03,                                           \
+    X(double, more_deadband_m, 0.005,                                          \
       "이 거리 이내면 보정하지 않고 GO")                                       \
     X(double, more_max_m, 0.5,                                                 \
       "이보다 큰 보정량은 물리적으로 말이 안 되므로 판정 폐기 + GO")           \
     X(int, more_max_tries, 4,                                                  \
       "한 boundary에서 MORE 최대 반복. 소진하면 포기하고 GO")                  \
     /* ---- 피드백 판정 대기 창 ---- */                                        \
-    X(long, feedback_wait_ms, 2000,                                            \
+    X(long, feedback_wait_ms, 1000,                                            \
       "READY 수신 후 판정까지 고정 대기. 이 동안 POS를 모아 평균낸다")         \
     /* ---- DRIFT (직진 주행 중 각도 피드백) ---- */                           \
     X(long, drift_period_ms, 400, "DRIFT 최소 전송 간격")                      \
