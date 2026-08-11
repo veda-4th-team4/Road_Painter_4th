@@ -26,7 +26,7 @@ using json = nlohmann::json;
 // X(타입, 이름, 기본값, 설명)
 #define RP_PARAM_LIST(X)                                                       \
     /* ---- 기하 (로봇 하드웨어 실측값) ---- */                                \
-    X(double, pen_offset_m, 0.155,                                             \
+    X(double, pen_offset_m, 0.150,                                             \
       "펜(노즐)이 마커 중심 뒤로 떨어진 거리 a. 로봇 PathFollower.h와 같아야 함")\
     X(double, wheel_base_m, 0.166,                                             \
       "좌우 바퀴 축간거리 W(로봇팀 실측). arc 안쪽바퀴 역회전 경고 판정에만 사용")\
