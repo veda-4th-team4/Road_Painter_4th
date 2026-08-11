@@ -117,9 +117,20 @@ clients_[role] = c;
 > 방향은 **변환 후** 좌표로 계산한다. 호모그래피는 각도를 보존하지 않으므로
 > 픽셀에서 각도를 재면 틀린다. (`path_planner.hpp` `poseFromPos`)
 
-### ② 단위는 서버 입구에서 미터로 통일
-CCTV는 mm 기준 H를 보낸다. `normalizeBundleMmToM()`이 0·1행에 ÷1000을 곱한다.
-이후 pose·POSE·BLUEPRINT·PATH·Qt top-view가 전부 미터다.
+### ② 캘리 번들은 mm로 보존, ÷1000은 내부 사본에서만
+CCTV는 mm 기준 H를 보내고, **서버는 그 번들을 mm 그대로 저장·중계한다**
+(CCTV → 서버 → Qt 전 구간 mm — 2026-08-11 규격 §1/§4).
+÷1000은 `calibFromJson()`이 서버 내부 계산용 사본(`Calib::Hf/Hm`)에만 적용하므로,
+pose·POSE·BLUEPRINT·PATH와 로봇 프로토콜은 예전 그대로 **미터**다.
+
+단위 판단은 번들의 `unit` 필드 한 곳만 본다(`bundleMeterScale()`). 예전에는 수신
+즉시 번들 자체를 ÷1000 해서 저장·중계했는데, 그러면 `unit`이 말하는 단위와 H에 실제로
+든 값이 어긋날 여지가 남는다 — 변환을 안 거치는 경로가 하나만 생겨도 좌표가 조용히
+1000배 틀어지고 로그는 정상으로 찍힌다.
+
+예전 서버가 미터로 저장해 둔 파일은 로그인 때 `bundleToMm()`이 mm로 되돌려 Qt에
+내보낸다(저장 파일 자체는 안 고친다 — 읽을 때마다 같은 결과가 나오는 순수 변환).
+회귀 테스트: `make calib_unit_test && ./tools/calib_unit_test`
 
 ### ③ 서버 내부는 CCW 양수, 로봇 대면만 뒤집는다
 반전 지점은 **`toRobotDeg()` 하나뿐**이다. 호출처는 `turnOp` / `ALIGN` / `DRIFT`

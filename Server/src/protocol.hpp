@@ -298,17 +298,21 @@
 // ============================================================================
 //
 // [CCTV -> 서버]
-//   H_MATRIX payload: {"calib":{"version":1, "K":[[...]x3], "D":[k1,k2,p1,p2,k3],
-//                      "H_floor":[[...]x3], "H_marker":[[...]x3], "marker_height_m":0.25}}
+//   H_MATRIX payload: {"ch":2, "request_id":"qt-...", "calib":{ …번들… }}
+//     번들(2026-08-11 정규형) = {"calib_id","created_at","image_size":[2592,1520],
+//       "coord_mode":"undistort","unit":"mm","K":[[...]x3],"D":[k1,k2,p1,p2,k3],
+//       "H_floor":[[...]x3],"H_marker":[[...]x3],"marker_height_mm":160,
+//       "origin_mm":[0,0],"canvas_mm":[900,600],"axis":"x_right_y_up"}
 //     - 캘리브레이션 1회 수행 후 전송. 로그인 사용자에 영속 저장 + QT 중계.
-//     - H_floor  : 왜곡 보정된 픽셀 -> 바닥 평면 미터 (Qt top-view 용)
-//     - H_marker : 왜곡 보정된 픽셀 -> 마커 장착 높이 평면 미터 (로봇 측위용,
+//     - H_floor  : 왜곡 보정된 픽셀 -> 바닥 평면 (Qt top-view 용)
+//     - H_marker : 왜곡 보정된 픽셀 -> 마커 장착 높이 평면 (로봇 측위용,
 //                  마커가 바닥에서 떠 있어 생기는 시차를 흡수)
+//     - ⚠️ 단위: 번들은 **mm 그대로** 저장·중계한다 (CCTV -> 서버 -> Qt 전 구간 mm).
+//       서버가 ÷1000 하는 것은 내부 좌표 계산용 사본(Calib::Hf/Hm)뿐이고, 그래서
+//       pose/POSE/BLUEPRINT/PATH와 로봇 프로토콜은 예전과 똑같이 미터다.
+//       단위 판단은 번들의 "unit" 필드 한 곳만 본다 (calib.hpp bundleMeterScale).
 //     - 평면 스키마(QT-REQ-CCTV-001 rev.2)도 허용: payload 자체가 번들이고
-//       바닥 H의 이름이 "H"다 -> {"calib_id","created_at","image_size",
-//       "coord_mode","unit","K","D","H","H_marker","origin_mm","canvas_mm","axis"}.
-//       H를 H_floor로 읽고 K/D/H_marker까지 그대로 쓴다(보정 동작은 중첩과 동일).
-//       설치 메타데이터는 손대지 않고 저장·중계하되, "unit"만 정규화 후 "m"으로 고친다.
+//       바닥 H의 이름이 "H"다. H를 H_floor로 읽고 K/D/H_marker까지 그대로 쓴다.
 //     - 레거시 {"H":[[...]x3]}만 온 경우도 허용 (왜곡/시차 보정 없이 동작)
 //   POS      payload: {"corners":[[u,v]x4]}  로봇 마커 4점 = "원본 CCTV 픽셀" 좌표
 //     순서 = [전좌, 전우, 후우, 후좌]

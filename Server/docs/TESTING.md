@@ -157,10 +157,12 @@ make path_test
 - **스냅샷 파일**(`tools/cctv_snapshot.json`) = CCTV가 준 자료를 담는 곳:
   `H`(pixel→world **mm** 호모그래피) + `corners`(로봇 마커 4코너 원본 픽셀).
   CCTV 출력 포맷이 바뀌면 도구의 `loadSnapshot()` **한 함수만** 고치면 된다.
-- **단위**: H는 **mm 기준**으로 그대로 담는다. **mm→m 환산은 서버가 입구에서
-  수행**(`normalizeBundleMmToM`)하므로 도구는 원본 mm를 손대지 않고 올린다(여기서
-  또 환산하면 이중 스케일). `BLUEPRINT.points`와 도구가 주입하는 도착 `POS{x,y}`는
-  서버 내부 단위인 **미터**로 보낸다(도구의 `kTargetPointsMm`은 mm로 적고 전송 시 ÷1000).
+- **단위**: H는 **mm 기준**으로 그대로 담는다. 서버도 캘리 번들을 **mm 그대로**
+  저장·중계하고, ÷1000은 내부 계산용 사본에서만 하므로(`calibFromJson`) 도구는 원본
+  mm를 손대지 않고 올린다(여기서 환산하면 이중 스케일). `BLUEPRINT.points`와 도구가
+  주입하는 도착 `POS{x,y}`는 서버 내부 단위인 **미터**로 보낸다(도구의
+  `kTargetPointsMm`은 mm로 적고 전송 시 ÷1000).
+  단위 규약 회귀 테스트: `make calib_unit_test && ./tools/calib_unit_test`
 - ⚠️ **로봇은 role당 1개**: 서버는 ROBOT 재접속 시 기존 세션을 교체한다. 실제 로봇
   RPi로 테스트할 땐 다른 로봇 대역을 띄우지 말 것.
 - **2단계 진행**: 접근(→ points[0]) 후 로봇이 멈추면 도구 콘솔에서 **Enter** → 도구가

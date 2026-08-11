@@ -2,7 +2,7 @@
   "_readme": "서버 튜닝 파라미터. 값을 고치고 서버만 재시작하면 적용된다(재컴파일 불필요). 항목 설명과 기본값은 src/params.hpp, 근거는 docs/PROTOCOL_v2_ROBOT.md §10. '_'로 시작하는 키는 주석 취급하고 무시한다. 지우거나 항목을 빼도 되며, 빠진 항목은 코드의 기본값을 쓴다.",
 
   "_1_기하": "로봇 하드웨어 실측값. pen_offset_m은 로봇 PathFollower.h NOZZLE_OFFSET_M과 반드시 같아야 한다 - 자동 동기화되지 않는다. wheel_base_m은 로봇팀 실측 확정값 0.166 (calibration_test.cpp WHEELBASE_M)",
-  "pen_offset_m": 0.155,
+  "pen_offset_m": 0.150,
   "wheel_base_m": 0.166,
 
   "_1b_최소반지름": "0.200은 기하가 아니라 모터 한계다. 호에서 바깥 바퀴 SPS = 771.65 * (R_robot + W/2) / R_robot 이 1/R_robot로 발산한다. 로봇팀 회신(2026-08-07): NEMA 17 기준 2000 SPS 초과 시 탈조 위험. 0.200 -> 1278 SPS(권장), 0.180 -> 약 1450 SPS(마진 하한선). 로봇 호 주행속도(0.05 m/s)가 바뀌면 이 값도 재계산해야 한다",
@@ -13,7 +13,7 @@
   "align_max_tries": 6,
 
   "_3_MORE": "move/arc 직후 거리 보정. more_max_m를 넘는 값은 pose가 틀렸다고 보고 판정을 폐기한다",
-  "more_deadband_m": 0.05,
+  "more_deadband_m": 0.005,
   "more_max_m": 0.5,
   "more_max_tries": 4,
 
@@ -34,5 +34,9 @@
 
   "_7_경로생성": "이보다 작은 회전/이동은 op으로 만들지 않는다(로봇이 실행할 수 없는 미세 동작 제거)",
   "min_turn_deg": 2.0,
-  "min_move_m": 0.01
+  "min_move_m": 0.01,
+
+  "_8_캘리세션": "로봇 주행 호모그래피 세션(2026-08-10 계약). calib_timeout_ms는 Qt 자체 타임아웃(5분=300000)보다 반드시 짧아야 한다 - 서버가 먼저 접어야 Qt가 이유를 안 채 5분을 기다리지 않는다",
+  "calib_timeout_ms": 180000,
+  "calib_cancel_ack_ms": 5000
 }
