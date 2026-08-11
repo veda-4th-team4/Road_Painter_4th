@@ -114,12 +114,10 @@ int main(int argc, char **argv) {
           } else if (cmd == "NOZZLE_DOWN" || cmd == "PAINT_ON") {
               manual_override = true; // §4.1 Fix: Enable manual override so IDLE manual nozzle persists
               manual_nozzle = 1;
-              robot_comm.SendClearEStop(); // Clear any startup/idle ESTOP latch on STM32
               robot_comm.SendControlNozzle(1);
           } else if (cmd == "NOZZLE_UP" || cmd == "PAINT_OFF") {
               manual_override = true; // §4.1 Fix: Enable manual override so IDLE manual nozzle persists
               manual_nozzle = 0;
-              robot_comm.SendClearEStop(); // Clear any startup/idle ESTOP latch on STM32
               robot_comm.SendControlNozzle(0);
           } else if (cmd == "CALIB_START") { // R-1: Homography calibration motion start request
               std::cout << GetTimestampStr() << "[MAIN] [CALIB] CALIB_START received. Initializing calibration state (nozzle UP)." << std::endl;
@@ -169,6 +167,7 @@ int main(int argc, char **argv) {
                manual_nozzle = 0;
                has_pending_path = false;
                net_manager.ClearLatches(); // R-8: Clear any stale command latches from previous path
+               robot_comm.SendClearEStop(); // Clear startup/idle ESTOP latch when applying new autonomous path
                std::string phase = net_manager.GetPathPhase();
                std::cout << GetTimestampStr() << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2000ms for camera settling..." << std::endl;
                if (phase == "draw") {
