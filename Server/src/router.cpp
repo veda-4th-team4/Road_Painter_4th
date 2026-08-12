@@ -25,6 +25,9 @@ void Router::sweep() {
     // 캘리 세션도 같은 방식으로 회수한다. 종결 응답이 안 오는 세션을 서버가
     // 먼저 접지 않으면 calibActive_가 켜진 채 남아 이후 요청이 전부 busy가 된다.
     checkCalibTimeout();
+    // 오도메트리 캡처 ack 개별 타임아웃 - 세션 전체 타임아웃(위)보다 훨씬
+    // 짧게 걸려서 CCTV가 침묵하는 순간 3m 주행을 계속 돌리지 않는다.
+    checkOdoCaptureTimeout();
 }
 
 // 주기 호출 (main의 tick 스레드).
@@ -358,7 +361,11 @@ void Router::fromRobot(const json& msg) {
         // 판단하고, payload.phase는 어긋났을 때 경고를 남기는 용도로만 쓴다
         // (로봇이 phase를 안 실어도 동작하게 - 서버가 단계의 주인).
         std::string phase = payload.value("phase", "");
-        if (awaitingArrival_) {
+        if (activePhase_ == "calib") {
+            // 로봇 코드(main.cpp R-4)는 마지막 op 완료 후 READY 없이 곧장
+            // PATH_DONE을 보낸다 - 9번째(복귀) 캡처는 그래서 여기서 트리거한다.
+            onCalibPathDone();
+        } else if (awaitingArrival_) {
             if (!phase.empty() && phase != "approach")
                 logf("[WARN] PATH_DONE phase=%s - 서버는 접근 대기 중이라 접근 완료로 처리",
                      phase.c_str());
@@ -393,6 +400,15 @@ void Router::fromRobot(const json& msg) {
 //   빠뜨리면 로봇은 영원히 그 자리에 선다.
 void Router::onReady(int k) {
     runningOp_ = -1;  // READY = 직전 op 실행이 끝났다는 뜻 (DRIFT 중단)
+
+    // 오도메트리 캘리 경로는 별도 핸드셰이크를 탄다 (CALIB_CAPTURE ack까지
+    // GO를 미룸) - 아래 도색용 판정 로직(ALIGN/MORE 대기 창)과는 무관하다.
+    // planActive_는 sendPath()가 이미 세워뒀으므로 이 분기는 그 체크보다
+    // 먼저 와야 한다 (docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §3).
+    if (activePhase_ == "calib") {
+        onCalibReady(k);
+        return;
+    }
 
     if (!planActive_ || activeMeta_.empty()) {
         sendGo(k, "진행 중인 경로 없음");
@@ -776,6 +792,13 @@ void Router::fromCctv(const json& msg) {
         relayCalibFail(payload);
     } else if (type == "CALIB_STOPPED") {
         onCalibStopped("CCTV");
+    } else if (type == "CALIB_CAPTURE_OK") {
+        // 오도메트리 캘리 캡처 ack (2026-08-12 신설, router_odocalib.cpp).
+        // 정적 앵커 세션과는 다른 메시지 타입이라 여기서 갈릴 필요 없이
+        // onCalibCaptureAck 내부에서 calibIsOdo_를 확인한다.
+        onCalibCaptureAck(payload, true, "");
+    } else if (type == "CALIB_CAPTURE_FAIL") {
+        onCalibCaptureAck(payload, false, payload.value("reason", "unknown"));
     } else {
         logf("[WARN] CCTV로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -881,6 +904,15 @@ static void warnCalibSpec(int ch, const json& bundle) {
         logf("[WARN] 캘리브레이션(채널 %d) image_size=%s - 이번 운용 규격은 [%d,%d]다. "
              "Qt가 디코딩하는 영상 크기와 다르면 좌표가 그만큼 틀어진다",
              ch, sz.is_null() ? "(없음)" : sz.dump().c_str(), kSpecW, kSpecH);
+    // coord_mode=undistort인데 K/D가 없으면 서버는 Calib::hasKD 게이트 때문에
+    // 왜곡 보정을 조용히 건너뛰고 H를 raw 픽셀에 그대로 적용한다 - 에러 없이
+    // 좌표만 틀어진다. 이 프로젝트에서 실제로 겪은 사고 부류다
+    // (admin_console/cctv.py 주석: "K·D·H_marker를 버렸다 - 에러 없이 보정만
+    // 꺼졌다"). 거부하지 않는다(레거시 번들 호환) - 눈에 보이게만 남긴다.
+    if (mode == "undistort" && !(bundle.contains("K") && bundle.contains("D")))
+        logf("[WARN] 캘리브레이션(채널 %d) coord_mode=undistort인데 K/D가 없음 - "
+             "서버가 왜곡 보정을 건너뛰고 H를 raw 픽셀에 그대로 적용한다 "
+             "(에러 없이 좌표만 렌즈 왜곡만큼 틀어짐)", ch);
 }
 
 // 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용). 세 형태를 받는다:

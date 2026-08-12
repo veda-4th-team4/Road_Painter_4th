@@ -442,6 +442,80 @@ inline PlannedPath buildApproachOps(const Pose& start, const Pt& target,
     return seq.take();
 }
 
+// ===== 로봇 오도메트리 주행 캘리 경로 (2026-08-12) =====
+// 규격: docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §3.
+//
+// 닫힌 직사각형을 4변으로, 각 변을 반으로 쪼개 11개 op으로 돈다:
+//   MOVE(m/2) MOVE(m/2) TURN(±90) MOVE(n/2) MOVE(n/2) TURN(±90)
+//   MOVE(m/2) MOVE(m/2) TURN(±90) MOVE(n/2) MOVE(n/2)
+// ccw=true(start_corner=="bottom_left")면 TURN(+90), false(top_left)면 TURN(-90).
+//
+// 🔴 전부 hasTarget=false, headingDeg=kNoHeading, centerAheadByA=false로
+//   나간다 - MORE/ALIGN/DRIFT가 op 자체에서부터 차단된다 (isPath=false라
+//   needsAlign의 role 검사, needsMore의 hasTarget 검사, DRIFT의 isPath 검사에
+//   전부 걸린다). phase=="calib" 가드(onCalibReady)는 이중 방어다.
+// 노즐 op은 넣지 않는다 - 도색하지 않는다.
+inline PlannedPath buildCalibRectOps(double mM, double nM, bool ccw) {
+    OpSeq seq;
+    const double turnDeg = ccw ? 90.0 : -90.0;
+    for (int leg = 0; leg < 4; ++leg) {
+        const double half = (leg % 2 == 0 ? mM : nM) / 2.0;
+        seq.moveOp(half, false, kNoHeading);
+        seq.moveOp(half, false, kNoHeading);
+        if (leg < 3) seq.turnOp(turnDeg, false, kNoHeading);
+    }
+    return seq.take();
+}
+
+// READY(op_index) -> point_index (0..7, 8은 PATH_DONE에서 별도 처리).
+// -1 = 직전 op이 TURN이라 같은 물리 위치 (캡처 스킵, 즉시 GO).
+// buildCalibRectOps()의 고정 11-op 구조(op 2/5/8이 TURN)에서 나온 표라
+// m/n 값과 무관하다. docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §4.
+inline int odoReadyToPoint(int k) {
+    static constexpr int kTable[11] = {0, 1, 2, -1, 3, 4, -1, 5, 6, -1, 7};
+    return (k >= 0 && k < 11) ? kTable[k] : -2;  // -2 = 범위 밖 (호출측 방어 처리용)
+}
+
+// point_index(0~8) -> "그 지점에서 로봇이 걷고 있(었)던 변" 번호(0~3).
+// sendCalibCapture()의 마커 오프셋 보정에서 헤딩을 정하는 데 쓴다.
+inline int odoLegOfPoint(int pointIdx) {
+    static constexpr int kLeg[9] = {0, 0, 0, 1, 1, 2, 2, 3, 3};
+    return kLeg[pointIdx >= 0 && pointIdx <= 8 ? pointIdx : 0];
+}
+
+// point_index(0~8)의 물리좌표(mm) - 마커 중심 기준, 오프셋 보정 포함.
+// wire 스펙 §4 좌표표를 y0/ySign 하나의 공식으로 통일한다:
+//   bottom_left(ccw=true) : y0=0,   ySign=+1  (0,0)에서 시작해 위로 올라간다
+//   top_left   (ccw=false): y0=n,   ySign=-1  (0,n)에서 시작해 아래로 내려간다
+// markerOffsetM이 0이 아니면 그 지점의 헤딩 방향으로 오프셋만큼 이동시킨다
+// (§3-0 - 마커 중심 ≠ 회전 중심인 경우의 보정. 기본 0이면 좌표가 그대로 나간다).
+inline std::array<double, 2> odoPointWorldMm(int pointIdx, double mMm, double nMm,
+                                             bool ccw, double markerOffsetM = 0.0) {
+    const double y0 = ccw ? 0.0 : nMm;
+    const double ySign = ccw ? 1.0 : -1.0;
+    double x = 0.0, y = y0;
+    switch (pointIdx) {
+        case 0: x = 0.0;       y = y0;                     break;
+        case 1: x = mMm / 2.0; y = y0;                     break;
+        case 2: x = mMm;       y = y0;                     break;
+        case 3: x = mMm;       y = y0 + ySign * nMm / 2.0;  break;
+        case 4: x = mMm;       y = y0 + ySign * nMm;        break;
+        case 5: x = mMm / 2.0; y = y0 + ySign * nMm;        break;
+        case 6: x = 0.0;       y = y0 + ySign * nMm;        break;
+        case 7: x = 0.0;       y = y0 + ySign * nMm / 2.0;  break;
+        default: x = 0.0;      y = y0;                      break;  // 8 = 복귀(진단용)
+    }
+    const double offsetMm = markerOffsetM * 1000.0;
+    if (offsetMm != 0.0) {
+        const int leg = odoLegOfPoint(pointIdx);
+        const double headingDeg = normDeg(ccw ? 90.0 * leg : -90.0 * leg);
+        const double rad = headingDeg * M_PI / 180.0;
+        x += offsetMm * std::cos(rad);
+        y += offsetMm * std::sin(rad);
+    }
+    return {x, y};
+}
+
 // ===== 하위호환: Qt가 program 없이 points만 보낸 경우 =====
 // 도면에서 Qt 포맷(대문자·CCW 양수)의 동작 시퀀스를 만든다. 그러면 도색 경로
 // 생성은 program이 있을 때와 완전히 같은 경로(buildDrawOps)를 탄다 - 오프셋

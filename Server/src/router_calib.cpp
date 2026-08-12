@@ -35,6 +35,18 @@ void Router::clearCalib() {
     calibCancelling_ = false;
     calibCancelMs_ = 0;
     cancelAckRobot_ = cancelAckCctv_ = false;
+    // 오도메트리 세션 상태도 여기서 같이 비운다 - startCalib()가 다시 이
+    // 필드들을 세팅하기 전에 이전 세션의 잔재(예: odoPointIdx_)가 남아있으면
+    // 다음 세션의 첫 캡처 ack가 엉뚱한 boundary에 GO를 보낼 수 있다.
+    calibIsOdo_ = false;
+    odoMmm_ = odoNmm_ = 0;
+    odoCcw_ = true;
+    odoPointIdx_ = -1;
+    odoPendingGoOp_ = -2;
+    odoCaptureMs_ = 0;
+    odoValidCount_ = 0;
+    odoHaveFirstPix_ = false;
+    odoFirstPixU_ = odoFirstPixV_ = 0;
 }
 
 // 진행 중인 세션을 실패로 닫는다. ADMIN이 시작한 세션은 QT가 기다리는 것이
@@ -44,7 +56,14 @@ void Router::failCalib(const char* reason, const std::string& m) {
     const int ch = calibCh_;
     const std::string reqId = calibReqId_;
     const bool toQt = calibFromQt_;
+    // 오도메트리 세션은 sendPath()로 로봇 경로 상태(planActive_/activePhase_)를
+    // 세워뒀으므로 clearPath()로 같이 비워야 한다. 정적 앵커 세션은 애초에
+    // sendPath()를 부르지 않아 이 상태가 항상 비어 있으므로(도색 중엔 계약
+    // §4-4가 캘리 시작 자체를 막는다) 여기서 clearPath()를 불러도 안전하지만,
+    // 굳이 손대지 않는다 - calibIsOdo_로만 좁혀서 기존 경로 무변경을 보장한다.
+    const bool wasOdo = calibIsOdo_;
     clearCalib();
+    if (wasOdo) clearPath();
     if (toQt)
         srv_.sendTo("QT", makeMsg("CALIB_FAIL", {{"ch", ch},
                                                  {"request_id", reqId},
@@ -143,7 +162,26 @@ void Router::startCalib(const json& payload, const json& msg, const char* origin
         return;
     }
 
-    // ----- 수락 -----
+    // ----- method 분기: 오도메트리 주행이면 여기서 갈라진다 -----
+    // 위 검증(멱등/busy/도색중/채널/로그인/피어접속)은 두 방식 공통이라 같이
+    // 통과시켰다. 다른 건 "무엇을 로봇/CCTV에 보내는가"뿐이다 - 정적 앵커는
+    // 원본 CALIB_START를 그대로 중계하고(아래), 오도메트리는 서버가 만든
+    // 사각형 op을 PATH{phase:"calib"}로 보낸다
+    // (docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §1, §3).
+    if (payload.value("method", "") == "robot_motion") {
+        // v1은 Qt 트리거를 지원하지 않는다 (계획서 §1) - 이 방식은 세션이
+        // CALIB_DONE에서 끝나고 H_MATRIX는 나중에 별도 경로로 오므로, Qt의
+        // 대기 화면을 여닫는 CALIB_STARTED/H_MATRIX 짝이 성립하지 않는다.
+        if (fromQt) {
+            reject("unsupported_from_qt",
+                   "로봇 주행 캘리브레이션은 관리자 창에서만 시작할 수 있습니다.");
+            return;
+        }
+        startOdoCalib(payload, reqId, ch);
+        return;
+    }
+
+    // ----- 수락 (정적 앵커) -----
     calibActive_ = true;
     calibFromQt_ = fromQt;
     calibReqId_ = reqId;
@@ -218,6 +256,13 @@ void Router::cancelCalib(const json& payload, const json& msg) {
              cancelAckRobot_ ? "완료" : "대기", cancelAckCctv_ ? "완료" : "대기");
         return;
     }
+    // 오도메트리 세션은 로봇이 실제로 굴러가는 중이라 이 함수의 나머지(원본
+    // CALIB_CANCEL을 ROBOT에 그대로 중계)로는 로봇을 못 세운다 - 로봇 펌웨어에
+    // CALIB_* 핸들러가 없다. abortOdoCalib()이 대신 ABORT_DRAW로 세운다.
+    if (calibIsOdo_) {
+        abortOdoCalib("cancelled", "조작자가 취소했습니다.");
+        return;
+    }
     calibCancelling_ = true;
     calibCancelMs_ = nowMs();
     cancelAckRobot_ = cancelAckCctv_ = false;
@@ -244,7 +289,9 @@ void Router::onCalibStopped(const std::string& role) {
     const int ch = calibCh_;
     const std::string reqId = calibReqId_;
     const bool toQt = calibFromQt_;
+    const bool wasOdo = calibIsOdo_;  // clearCalib()이 지우기 전에 떼어둔다
     clearCalib();
+    if (wasOdo) clearPath();  // sendPath()로 세운 로봇 경로 상태를 같이 비운다
     if (toQt)
         srv_.sendTo("QT", makeMsg("CALIB_CANCELLED",
             {{"ch", ch}, {"request_id", reqId},
@@ -295,6 +342,18 @@ void Router::checkCalibTimeout() {
                       (cancelAckRobot_ ? "확인" : "무응답") + ", CCTV " +
                       (cancelAckCctv_ ? "확인" : "무응답") +
                       "). 로봇 상태를 직접 확인하세요.");
+        return;
+    }
+    // 오도메트리 세션은 별개 파라미터(calib_odo_timeout_ms)를 쓴다 - Qt가
+    // 관여하지 않아 calib_timeout_ms의 "Qt 5분보다 짧아야" 제약이 없다
+    // (params.hpp 참고). failCalib()을 바로 부르면 안 된다 - 그건 서버 상태만
+    // 정리하고 QT에만 통지할 뿐 로봇을 세우지 않는다. abortOdoCalib()이
+    // ABORT_DRAW로 로봇을 세운 뒤 (CCTV ack까지 받고 나서) 세션을 닫는다.
+    if (calibIsOdo_) {
+        if (now - calibStartMs_ < params().calib_odo_timeout_ms) return;
+        abortOdoCalib("timeout",
+            "제한 시간 " + std::to_string(params().calib_odo_timeout_ms / 1000) +
+                "초 안에 주행이 끝나지 않았습니다.");
         return;
     }
     if (now - calibStartMs_ < params().calib_timeout_ms) return;

@@ -67,7 +67,19 @@ using json = nlohmann::json;
       "🔴 Qt 자체 타임아웃(5분)보다 반드시 짧아야 한다 - 아래 주석 참조")      \
     X(long, calib_cancel_ack_ms, 5000,                                         \
       "CALIB_CANCEL 후 ROBOT/CCTV의 CALIB_STOPPED를 기다리는 한도. "           \
-      "넘으면 CALIB_FAIL{cancel_failed} (정지를 추정으로 확인하지 않는다)")
+      "넘으면 CALIB_FAIL{cancel_failed} (정지를 추정으로 확인하지 않는다)")     \
+    /* ---- 로봇 오도메트리 주행 캘리 (2026-08-12) ---- */                     \
+    X(long, calib_odo_timeout_ms, 300000,                                      \
+      "오도메트리 주행 세션(method=robot_motion) 전용 전체 데드라인. "         \
+      "calib_timeout_ms와 별개 값이다 - 이 방식은 Qt가 트리거하지 않으므로 "    \
+      "'Qt 5분보다 짧아야 한다'는 제약이 없다. 목적은 주행 시간을 조이는 게 "   \
+      "아니라 로봇/카메라가 죽었을 때 세션을 접는 워치독")                     \
+    X(long, calib_capture_timeout_ms, 15000,                                   \
+      "CALIB_CAPTURE 전송 후 CCTV의 ack(OK/FAIL) 한도. 카메라 자체 정지판정 "  \
+      "한도(10초)보다 여유 있게 잡는다. 넘으면 세션 중단(abortOdoCalib)")      \
+    X(double, marker_offset_m, 0.0,                                            \
+      "마커 중심이 로봇 회전 중심에서 진행방향으로 떨어진 거리. 오도메트리 "    \
+      "캘리의 world_xy_mm 계산에만 쓴다. 0이면 보정 없음 (로봇팀 실측 전 기본)")
 
 struct Params {
 #define RP_DECL(T, N, D, C) T N = D;
@@ -157,6 +169,12 @@ inline void sanitize(Params& p) {
              " 이상 - 290000으로 내림", p.calib_timeout_ms);
         p.calib_timeout_ms = 290000L;
     }
+    // calib_odo_timeout_ms는 Qt가 관여하지 않으므로(오도메트리 세션은 v1에서
+    // ADMIN 전용, docs/ROBOT_ODOMETRY_HOMOGRAPHY_PLAN_20260811.md §1) 위
+    // 300000 상한 클램프를 적용하지 않는다 - 별개 파라미터인 이유가 이것이다.
+    floorAt("calib_odo_timeout_ms", p.calib_odo_timeout_ms, 5000L);
+    floorAt("calib_capture_timeout_ms", p.calib_capture_timeout_ms, 1000L);
+    floorAt("marker_offset_m", p.marker_offset_m, 0.0);
     // min_paint_radius_m 기본값 0.200은 기하가 아니라 모터가 정한 값이다.
     // 호에서는 바깥 바퀴가 base_sps × (R_robot + W/2) / R_robot 으로 돌고,
     // 이 값이 1/R_robot 로 발산한다. 로봇팀 회신(2026-08-07): NEMA 17 기준

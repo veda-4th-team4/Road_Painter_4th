@@ -98,7 +98,8 @@ private:
     void relayCalibProgress(const json& msg);
     void relayCalibFail(const json& payload);
     // 세션이 도는 중이면 CALIB_FAIL을 QT에 보내고 상태를 접는다 (개시자가 ADMIN
-    // 이면 QT는 기다리는 게 없으므로 로그만 남긴다).
+    // 이면 QT는 기다리는 게 없으므로 로그만 남긴다). calibIsOdo_ 세션이면
+    // 대신 abortOdoCalib()으로 넘긴다 - 로봇이 실제로 굴러가고 있기 때문.
     void failCalib(const char* reason, const std::string& m);
     // 종결 응답 없이 늘어지는 세션을 서버가 먼저 접는다 (Qt 5분 한도보다 짧게).
     void checkCalibTimeout();
@@ -113,6 +114,46 @@ private:
     long calibCancelMs_ = 0;         // 중계 시각 (calib_cancel_ack_ms 기준점)
     bool cancelAckRobot_ = false;    // ROBOT의 CALIB_STOPPED를 받았나
     bool cancelAckCctv_ = false;     // CCTV의 CALIB_STOPPED를 받았나
+
+    // ----- 로봇 오도메트리 주행 캘리 (2026-08-12, router_odocalib.cpp) -----
+    // calibActive_/calibReqId_/calibCh_/calibStartMs_ 등 위 필드를 그대로
+    // 공유해서 쓴다 (busy 판정이 method 무관하게 걸리도록). calibIsOdo_만으로
+    // "지금 도는 세션이 어느 방식인가"를 구분한다. calibFromQt_는 이 방식에서
+    // 항상 false다 (Qt 트리거는 v1에서 보류, docs/ROBOT_ODOMETRY_HOMOGRAPHY_
+    // PLAN_20260811.md §1).
+    //
+    // ADMIN이 CALIB_START{method:"robot_motion", m_cm, n_cm, start_corner}를
+    // 보내면 여기로 분기한다 (startCalib() 내부에서 method를 보고 갈라짐).
+    // 검증 통과 시 사각형 op을 만들어 sendPath(..., "calib")로 로봇에 보낸다.
+    void startOdoCalib(const json& payload, const std::string& reqId, int ch);
+    // READY(k) 수신, activePhase_=="calib"일 때 onReady()가 위임한다.
+    // 캡처 대상 boundary면 CALIB_CAPTURE를 보내고 ack까지 GO를 미룬다.
+    void onCalibReady(int k);
+    // PATH_DONE(calib) 수신. 9번째(복귀) 캡처 요청 후 CALIB_DONE으로 마감한다.
+    void onCalibPathDone();
+    // CCTV의 CALIB_CAPTURE_OK/CALIB_CAPTURE_FAIL 수신.
+    void onCalibCaptureAck(const json& payload, bool ok, const std::string& reason);
+    // 캡처 1건에 대해 CALIB_CAPTURE를 보내고 대기 상태를 연다.
+    void sendCalibCapture(int pointIdx);
+    // 캡처 ack가 calib_capture_timeout_ms 안에 안 오면 호출 (sweep()에서).
+    void checkOdoCaptureTimeout();
+    // 안전 정지: 로봇은 fire-and-forget ABORT_DRAW, CCTV는 CALIB_CANCEL 후
+    // CALIB_STOPPED 대기. 정적 앵커 방식의 cancelCalib()/failCalib()과 다른
+    // 경로다 - 로봇이 실제로 주행 중이라 CALIB_CANCEL이 로봇에 안 먹는다
+    // (로봇 펌웨어에 CALIB_* 핸들러가 없음). 상세는 위 계획서 §7.
+    void abortOdoCalib(const char* reason, const std::string& msg);
+
+    bool calibIsOdo_ = false;       // 지금 세션이 robot_motion 방식인가
+    double odoMmm_ = 0, odoNmm_ = 0;  // 사각형 치수 (mm)
+    bool odoCcw_ = true;             // start_corner=="bottom_left"
+    int odoPointIdx_ = -1;           // 지금 CCTV 응답을 기다리는 point_index (-1=없음)
+    // ack를 받으면 이 op_index에 GO를 보낸다. -2 = 아직 캡처 요청 전.
+    // -1 = 이번 캡처가 PATH_DONE 트리거였다는 뜻 - ack 후 GO 대신 CALIB_DONE.
+    int odoPendingGoOp_ = -2;
+    long odoCaptureMs_ = 0;          // CALIB_CAPTURE 전송 시각 (캡처 타임아웃 기준)
+    int odoValidCount_ = 0;          // 유효 캡처 개수 (idx 0~7 중 OK, findHomography 입력)
+    bool odoHaveFirstPix_ = false;   // idx 0 픽셀을 받았나 (폐합오차 로깅용)
+    double odoFirstPixU_ = 0, odoFirstPixV_ = 0;
 
     // ----- 로봇 핸드셰이크 (§3, §6) -----
     // READY 수신. 판정이 필요 없는 boundary면 즉시 GO, 필요하면 대기 창을 연다.

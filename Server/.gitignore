@@ -54,6 +54,9 @@ offset_feedback_test
 #로봇 주행 호모그래피 세션 회귀 테스트 (2026-08-10 계약 §6)
 calib_session_test
 
+#로봇 오도메트리 주행 캘리 회귀 테스트 (2026-08-12)
+odo_calib_test
+
 start.log
 
 server.out.log

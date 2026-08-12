@@ -6,7 +6,7 @@ CXXFLAGS += -std=c++17 -O2 -Wall -Iinclude -Isrc -pthread
 LDLIBS   += -lssl -lcrypto -pthread
 
 SRCS = src/main.cpp src/tls_server.cpp src/router.cpp src/router_channel.cpp \
-       src/router_calib.cpp src/user_store.cpp
+       src/router_calib.cpp src/router_odocalib.cpp src/user_store.cpp
 
 server: $(SRCS) src/*.hpp
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $@ $(LDLIBS)
@@ -74,6 +74,14 @@ calib_unit_test: tools/calib_unit_test.cpp src/*.hpp
 calib_session_test: tools/calib_session_test.cpp tools/tls_client.hpp
 	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
 
+# 로봇 오도메트리 주행 캘리 회귀 테스트 (2026-08-12 신설).
+# ops_builder.hpp의 순수 함수(buildCalibRectOps/odoReadyToPoint/odoPointWorldMm)만
+# 검증한다 - 로봇 경로 구조와 CCTV로 보낼 좌표가 조용히 틀려도 눈에 안 띄는 부류라
+# 못박아 둔다. Router/TLS는 필요 없다 (offset_feedback_test/calib_unit_test와 같은
+# 오프라인 헤더 테스트 패턴).
+odo_calib_test: tools/odo_calib_test.cpp src/*.hpp
+	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
+
 clean:
-	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose tools/calib_channel_test tools/calib_unit_test tools/offset_feedback_test tools/calib_session_test
+	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose tools/calib_channel_test tools/calib_unit_test tools/offset_feedback_test tools/calib_session_test tools/odo_calib_test
 .PHONY: clean sim
