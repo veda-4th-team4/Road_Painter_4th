@@ -212,6 +212,18 @@ uint8_t ControlArbiter_HandleUartFrame(const UartFrame_t *frame,
     }
     return 1U;
 
+  case UART_CMD_SET_SERVO_CONFIG: {
+    uint16_t off_us;
+    uint16_t on_us;
+    if (frame->length != UART_SET_SERVO_CONFIG_PAYLOAD_LEN) {
+      return 0U;
+    }
+    off_us = UartProtocol_ReadU16Le(&frame->payload[0]);
+    on_us  = UartProtocol_ReadU16Le(&frame->payload[2]);
+    Servo_SetConfig(off_us, on_us);
+    return 1U;
+  }
+
   case UART_CMD_STATUS:
   default:
     return 0U;

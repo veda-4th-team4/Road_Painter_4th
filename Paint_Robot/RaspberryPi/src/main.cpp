@@ -29,7 +29,13 @@ int main(int argc, char **argv) {
 
   // Clear startup ESTOP latch on STM32
   robot_comm.SendClearEStop();
-  usleep(200000);
+  usleep(50000);
+
+  // Transmit dynamic RPi servo PWM configuration (RPI_SERVO_OFF_US, RPI_SERVO_ON_US) to STM32
+  robot_comm.SendSetServoConfig(RPI_SERVO_OFF_US, RPI_SERVO_ON_US);
+  std::cout << "[MAIN] Transmitted dynamic servo config to STM32: OFF="
+            << RPI_SERVO_OFF_US << "us, ON=" << RPI_SERVO_ON_US << "us" << std::endl;
+  usleep(150000);
 
   // 3. Initialize IMU sensor manager (returns false gracefully if I2C hardware is offline)
   if (!imu_manager.Init()) {
@@ -51,6 +57,8 @@ int main(int argc, char **argv) {
   bool waiting_for_go = false;
   uint32_t ready_seg_sent = 0xFFFFFFFF; // Track last segment index READY was sent for
   bool path_done_sent = false;          // Track PATH_DONE transmission per path
+  static std::vector<Segment_t> pending_path;
+  static bool has_pending_path = false;
 
   enum class NozzleSubSeq { OFFSET_MOVE, WAIT_DELAY };
 
@@ -110,19 +118,43 @@ int main(int argc, char **argv) {
               manual_override = true;
               manual_speed = {300, -300};
           } else if (cmd == "NOZZLE_DOWN" || cmd == "PAINT_ON") {
+              manual_override = true; // §4.1 Fix: Enable manual override so IDLE manual nozzle persists
               manual_nozzle = 1;
               robot_comm.SendControlNozzle(1);
           } else if (cmd == "NOZZLE_UP" || cmd == "PAINT_OFF") {
+              manual_override = true; // §4.1 Fix: Enable manual override so IDLE manual nozzle persists
               manual_nozzle = 0;
               robot_comm.SendControlNozzle(0);
+          } else if (cmd == "CALIB_START") { // R-1: Homography calibration motion start request
+              std::cout << GetTimestampStr() << "[MAIN] [CALIB] CALIB_START received. Initializing calibration state (nozzle UP)." << std::endl;
+              manual_override = false;
+              manual_speed = {0, 0};
+              manual_nozzle = 0;
+              auto_nozzle = 0;
+              robot_comm.SendControlNozzle(0); // Ensure nozzle is strictly UP during calibration
+          } else if (cmd == "CALIB_CANCEL" || cmd == "CANCEL_CALIB") { // R-2: Homography calibration cancellation ACK request
+              std::cout << GetTimestampStr() << "[MAIN] [CALIB] CALIB_CANCEL received. Stopping robot, raising nozzle, and sending CALIB_STOPPED." << std::endl;
+              manual_override = false;
+              manual_speed = {0, 0};
+              manual_nozzle = 0;
+              auto_nozzle = 0;
+              robot_comm.SendSetSpeed(0, 0);
+              robot_comm.SendControlNozzle(0);
+              path_follower.SetPath({});
+              has_pending_path = false;
+              pending_path.clear();
+              waiting_for_go = false;
+              ready_seg_sent = 0xFFFFFFFF;
+              path_done_sent = true;
+              net_manager.ClearLatches();
+              // Settling delay: Ensure robot is fully still for 100ms before transmitting CALIB_STOPPED ACK
+              std::this_thread::sleep_for(std::chrono::milliseconds(100));
+              net_manager.SendCalibStopped();
           }
       }
 
        // 3. Handle incoming PATH (segments sequence)
        // Defense logic: Buffer incoming new PATH and defer loading until current active segment movement completes!
-       static std::vector<Segment_t> pending_path;
-       static bool has_pending_path = false;
-
        std::vector<Segment_t> new_path;
        if (net_manager.GetPath(new_path)) {
            pending_path = new_path;
@@ -141,16 +173,17 @@ int main(int argc, char **argv) {
                manual_nozzle = 0;
                has_pending_path = false;
                net_manager.ClearLatches(); // R-8: Clear any stale command latches from previous path
+               robot_comm.SendClearEStop(); // Clear startup/idle ESTOP latch when applying new autonomous path
                std::string phase = net_manager.GetPathPhase();
-               std::cout << GetTimestampStr() << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2000ms for camera settling..." << std::endl;
+               std::cout << GetTimestampStr() << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2500ms for camera settling..." << std::endl;
                if (phase == "draw") {
                    imu_manager.ResetYaw(0.0f); // Reset IMU Yaw to 0 deg when entering draw phase from standstill
                }
 
-               // Settling delay: Ensure robot is fully still for 2000ms (2s) before sending initial READY for op 0
+               // Settling delay: Ensure robot is fully still for 2500ms (2.5s) before sending initial READY for op 0
                auto start_wait = std::chrono::steady_clock::now();
                while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - start_wait).count() < 2000) {
+                          std::chrono::steady_clock::now() - start_wait).count() < 2500) {
                    robot_comm.SendSetSpeed(0, 0);
                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
                }
@@ -235,13 +268,13 @@ int main(int argc, char **argv) {
                       Msg_Status_t status_snap{};
                       if (robot_comm.GetLatestStatus(status_snap)) {
                           if (path_follower.UpdateTurn(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed)) {
-                              // Micro-turn completed: Send stop & wait 2000ms for camera settling before re-sending READY for same op
+                              // Micro-turn completed: Send stop & wait 2500ms for camera settling before re-sending READY for same op
                               robot_comm.SendSetSpeed(0, 0);
-                              std::cout << GetTimestampStr() << "[MAIN ALIGN] Turn complete -> Waiting 2000ms for camera settling..." << std::endl;
+                              std::cout << GetTimestampStr() << "[MAIN ALIGN] Turn complete -> Waiting 2500ms for camera settling..." << std::endl;
                               
                               auto start_wait = std::chrono::steady_clock::now();
                               while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - start_wait).count() < 2000) {
+                                         std::chrono::steady_clock::now() - start_wait).count() < 2500) {
                                   robot_comm.SendSetSpeed(0, 0);
                                   std::this_thread::sleep_for(std::chrono::milliseconds(20));
                               }
@@ -256,13 +289,13 @@ int main(int argc, char **argv) {
                       if (robot_comm.GetLatestStatus(status_snap)) {
                           float imu_yaw = imu_manager.GetYaw();
                           if (path_follower.UpdateMove(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed, imu_yaw)) {
-                              // Micro-move completed: Send stop & wait 2000ms before re-sending READY for same op
+                              // Micro-move completed: Send stop & wait 2500ms before re-sending READY for same op
                               robot_comm.SendSetSpeed(0, 0);
-                              std::cout << GetTimestampStr() << "[MAIN MORE] Move complete -> Waiting 2000ms for camera settling..." << std::endl;
+                              std::cout << GetTimestampStr() << "[MAIN MORE] Move complete -> Waiting 2500ms for camera settling..." << std::endl;
                               
                               auto start_wait = std::chrono::steady_clock::now();
                               while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - start_wait).count() < 2000) {
+                                         std::chrono::steady_clock::now() - start_wait).count() < 2500) {
                                   robot_comm.SendSetSpeed(0, 0);
                                   std::this_thread::sleep_for(std::chrono::milliseconds(20));
                               }
@@ -291,8 +324,8 @@ int main(int argc, char **argv) {
                           robot_comm.SendControlNozzle(auto_nozzle);
                           std::cout << GetTimestampStr() << "[MAIN NOZZLE] Op " << active_op_index 
                                     << " set (down=" << (current_seg.down ? "true" : "false") 
-                                    << ", 1000ms delay)..." << std::endl;
-                          std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // R-9: 1000ms actuator delay
+                                    << ", 2500ms delay)..." << std::endl;
+                          std::this_thread::sleep_for(std::chrono::milliseconds(2500)); // 2500ms (2.5s) actuator & camera settling delay
                           // R-4: Do NOT send SendReady here! AdvanceSegment() lets next loop iteration send READY(active_op_index + 1)
                           path_follower.AdvanceSegment();
                       } else if (current_seg.op == "move") {
@@ -340,9 +373,16 @@ int main(int argc, char **argv) {
           std::cout << GetTimestampStr() << "[MAIN] All path segments completed! Transmitted PATH_DONE (phase=" << phase << ")" << std::endl;
       }
 
-      // 6. Periodic UART heartbeat: Transmit controls to STM32 (every 80ms loop iteration)
+      // 6. Periodic UART heartbeat: Transmit controls to STM32 (every 20ms loop iteration)
       robot_comm.SendSetSpeed(target_speed.left_sps, target_speed.right_sps);
-      robot_comm.SendControlNozzle(nozzle_on);
+      
+      // Only transmit SendControlNozzle when nozzle state changes to prevent continuous 20ms overwrite of IR remote commands
+      static uint8_t last_sent_nozzle = 0xFF;
+      nozzle_on = manual_override ? manual_nozzle : auto_nozzle;
+      if (nozzle_on != last_sent_nozzle) {
+          robot_comm.SendControlNozzle(nozzle_on);
+          last_sent_nozzle = nozzle_on;
+      }
 
       // 7. Periodic STATUS forwarding (every 500ms) from STM32 back to the TLS server
       auto now = std::chrono::steady_clock::now();

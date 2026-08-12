@@ -134,6 +134,13 @@ bool SerialManager::SendClearEStop() {
     return send_packet(0x04, reinterpret_cast<const uint8_t*>(&key), sizeof(uint16_t));
 }
 
+bool SerialManager::SendSetServoConfig(uint16_t off_us, uint16_t on_us) {
+    Msg_SetServoConfig_t payload;
+    payload.off_us = off_us;
+    payload.on_us = on_us;
+    return send_packet(UART_CMD_SET_SERVO_CONFIG, reinterpret_cast<const uint8_t*>(&payload), sizeof(Msg_SetServoConfig_t));
+}
+
 bool SerialManager::GetLatestStatus(Msg_Status_t& out_status) {
     std::lock_guard<std::mutex> lock(status_mutex);
     if (!status_received_once) {
