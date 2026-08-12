@@ -1,5 +1,5 @@
-#ifndef __SERIAL_MANAGER_H__
-#define __SERIAL_MANAGER_H__
+#ifndef SERIAL_MANAGER_H
+#define SERIAL_MANAGER_H
 
 #include <string>
 #include <thread>
@@ -116,4 +116,4 @@ private:
     bool parse_byte(uint8_t byte, Msg_Status_t& out_status);
 };
 
-#endif // __SERIAL_MANAGER_H__
+#endif // SERIAL_MANAGER_H

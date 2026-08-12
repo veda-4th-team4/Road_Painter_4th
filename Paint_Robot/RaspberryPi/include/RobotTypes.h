@@ -1,5 +1,5 @@
-#ifndef __ROBOT_TYPES_H__
-#define __ROBOT_TYPES_H__
+#ifndef ROBOT_TYPES_H
+#define ROBOT_TYPES_H
 
 #include <stdint.h>
 #include <string>
@@ -142,4 +142,4 @@ typedef struct {
     std::string reason;
 } HoldCmd_t;
 
-#endif /* __ROBOT_TYPES_H__ */
+#endif /* ROBOT_TYPES_H */
