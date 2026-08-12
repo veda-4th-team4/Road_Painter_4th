@@ -60,6 +60,8 @@ bool NetworkManager::Init() {
         return false;
     }
     SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, nullptr);
+    // R-4: Verify connected IP address against server certificate SAN (192.168.0.8)
+    X509_VERIFY_PARAM_set1_ip_asc(SSL_CTX_get0_param(ssl_ctx), server_ip.c_str());
 
     // 3. Create standard TCP socket
     client_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -228,6 +230,36 @@ bool NetworkManager::SendPathDone(const std::string& phase) {
 
     std::cout << "[NetworkManager] Transmitting PATH_DONE for phase=" << phase << std::endl;
     return ssl_send_line(path_done_msg.dump());
+}
+
+bool NetworkManager::SendCalibStopped() {
+    if (!is_connected || !ssl_connection) return false;
+
+    json calib_stopped_msg = {
+        {"type", "CALIB_STOPPED"},
+        {"seq", ++msg_seq},
+        {"payload", json::object()}
+    };
+
+    std::cout << "[NetworkManager] Transmitting CALIB_STOPPED ACK to vision server." << std::endl;
+    return ssl_send_line(calib_stopped_msg.dump());
+}
+
+bool NetworkManager::SendCalibFail(const std::string& reason, const std::string& msg) {
+    if (!is_connected || !ssl_connection) return false;
+
+    json payload = {
+        {"reason", reason},
+        {"msg", msg}
+    };
+    json calib_fail_msg = {
+        {"type", "CALIB_FAIL"},
+        {"seq", ++msg_seq},
+        {"payload", payload}
+    };
+
+    std::cout << "[NetworkManager] Transmitting CALIB_FAIL: reason=" << reason << " msg=" << msg << std::endl;
+    return ssl_send_line(calib_fail_msg.dump());
 }
 
 bool NetworkManager::GetAlignCommand(uint32_t active_op_index, float& out_angle_deg) {

@@ -112,6 +112,13 @@ static void debug_log_command(const UartFrame_t *frame, uint8_t handled) {
                         "[RCV VALID] CMD: 0x05 | ignored (no mode)\r\n");
       break;
 
+    case UART_CMD_SET_SERVO_CONFIG:
+      length = snprintf(message, sizeof(message),
+                        "[RCV VALID] CMD: 0x07 | Servo Config: OFF=%uus, ON=%uus\r\n",
+                        (unsigned)UartProtocol_ReadU16Le(&frame->payload[0]),
+                        (unsigned)UartProtocol_ReadU16Le(&frame->payload[2]));
+      break;
+
     default:
       length = snprintf(message, sizeof(message),
                         "[RCV VALID] CMD: 0x%02X | LEN: %u\r\n",

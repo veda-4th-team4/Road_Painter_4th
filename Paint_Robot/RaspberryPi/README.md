@@ -50,11 +50,20 @@ RaspberryPi/
     ├── arc_test.cpp       # 호(Arc) 주행 기구학 검증 툴
     ├── led_test.cpp       # 타워램프 점등 검증 전용 독립 테스트 툴
     └── imu_test.cpp       # MPU6050 I2C 실시간 센서 검증 툴
-
 ```
 
 > 타워램프는 커널 모듈과 디바이스 트리 오버레이 설치가 선행되어야 합니다.
 > 배선·설치·연동 방법은 **[LED_STRIP_KR.md](LED_STRIP_KR.md)** 를 참고하세요.
+
+---
+
+## 📐 하드웨어 기구학 규격 & 보정 계수
+
+* **바퀴 지름 (Wheel Diameter)**: $66\text{ mm}$ ($0.066\text{ m}$)
+* **차축 거리 (Wheelbase)**: $166\text{ mm}$ ($0.166\text{ m}$)
+* **1회전당 스텝 수**: $3,200\text{ steps/rev}$ (16 마이크로스텝)
+* **거리 보정 계수 (`DISTANCE_CALIB_FACTOR`)**: `1.010f` (+1% 실측 보정) $\rightarrow$ 약 $15,587\text{ steps/m}$ ($10\text{cm} = \mathbf{1,559\text{ 스텝}}$)
+* **회전 보정 계수 (`TURN_ANGLE_CALIB_FACTOR`)**: `1.030f` (+3% 실측 보정) $\rightarrow$ 약 $2,073\text{ steps/90}^\circ$ ($1^\circ = \mathbf{23.03\text{ 스텝}}$)
 
 ---
 
