@@ -1,3 +1,4 @@
+#pragma once
 #ifndef ROBOT_TYPES_H
 #define ROBOT_TYPES_H
 

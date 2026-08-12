@@ -1,3 +1,4 @@
+#pragma once
 #ifndef SERIAL_MANAGER_H
 #define SERIAL_MANAGER_H
 
