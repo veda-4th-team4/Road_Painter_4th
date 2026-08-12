@@ -373,10 +373,16 @@ int main(int argc, char **argv) {
           std::cout << GetTimestampStr() << "[MAIN] All path segments completed! Transmitted PATH_DONE (phase=" << phase << ")" << std::endl;
       }
 
-      // 6. Periodic UART heartbeat: Transmit controls to STM32 (every 80ms loop iteration)
+      // 6. Periodic UART heartbeat: Transmit controls to STM32 (every 20ms loop iteration)
       robot_comm.SendSetSpeed(target_speed.left_sps, target_speed.right_sps);
-      nozzle_on = manual_override ? manual_nozzle : auto_nozzle; // §4.2 Fix: Recalculate latest nozzle_on to avoid stale pulse
-      robot_comm.SendControlNozzle(nozzle_on);
+      
+      // Only transmit SendControlNozzle when nozzle state changes to prevent continuous 20ms overwrite of IR remote commands
+      static uint8_t last_sent_nozzle = 0xFF;
+      nozzle_on = manual_override ? manual_nozzle : auto_nozzle;
+      if (nozzle_on != last_sent_nozzle) {
+          robot_comm.SendControlNozzle(nozzle_on);
+          last_sent_nozzle = nozzle_on;
+      }
 
       // 7. Periodic STATUS forwarding (every 500ms) from STM32 back to the TLS server
       auto now = std::chrono::steady_clock::now();
