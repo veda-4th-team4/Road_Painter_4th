@@ -3,8 +3,12 @@
 - 작성일: 2026-08-11
 - 최종 수정: 2026-08-12 (CCTV팀 1·2차 회신 반영 — 마커중심 좌표 / 매칭 키 3종 /
   안전 정지 / 스케일 사각지대 명시 / 카메라 직접 산출)
-- 상태: **설계 확정. 구현은 `docs/ROBOT_ODOMETRY_HOMOGRAPHY_EXEC_PLAN_20260812.md`**
-- wire 형식 정본: `docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md`
+- 상태: **초안·개정 이력 보존용. 이 문서는 더 이상 정본이 아니다.**
+- 🔴 **정본은 `docs/ROBOT_ODOMETRY_HOMOGRAPHY.md`** — 설계·프로토콜·구현 현황이
+  거기에 통합돼 있다. 이 문서는 "어떻게 그 결론에 도달했는가"의 기록으로만 본다
+  (⚠️ 정정 각주들이 그 과정이다).
+- wire 형식 상세: `docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md`
+- 구현 지시서: `docs/ROBOT_ODOMETRY_HOMOGRAPHY_EXEC_PLAN_20260812.md`
 - 목적: 체커보드/앵커 방식 대신, 로봇이 알려진 크기의 직사각형을 주행하면서
   정지점마다 CCTV가 캡처한 픽셀 좌표와 짝지어 호모그래피를 구한다.
 

@@ -63,3 +63,4 @@ server.out.log
 
 # start.sh 가 남기는 기동 로그
 server_start.log
+server_run.log

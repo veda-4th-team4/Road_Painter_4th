@@ -1,7 +1,9 @@
 # CCTV팀 답변 — 로봇 오도메트리 주행 호모그래피
 
 - 작성일: 2026-08-12
-- 대상: [`ROBOT_ODOMETRY_HOMOGRAPHY_PLAN_20260811.md`](ROBOT_ODOMETRY_HOMOGRAPHY_PLAN_20260811.md) (2026-08-12 개정판)
+- 대상: 설계 초안 `ROBOT_ODOMETRY_HOMOGRAPHY_PLAN_20260811.md` (2026-08-12 개정판)
+  — 이후 [`ROBOT_ODOMETRY_HOMOGRAPHY.md`](ROBOT_ODOMETRY_HOMOGRAPHY.md)(정본)에
+  병합·삭제됨. 초안 원문은 git 커밋 `43c4f83` 참고
 - 작성: CCTV팀 (ArucoPosePNM)
 - 상태: **§6 질문 답변 + 인터페이스 확정 요청**
 

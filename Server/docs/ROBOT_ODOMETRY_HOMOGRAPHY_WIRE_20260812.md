@@ -2,9 +2,9 @@
 
 - 작성일: 2026-08-12
 - 상태: **확정. 서버·CCTV 양쪽 구현의 근거 문서.**
-- 이 문서는 규격서다. 왜 이렇게 정했는지는 아래 문서들에 있다 — 여기서는
-  되풀이하지 않는다.
-  - `docs/ROBOT_ODOMETRY_HOMOGRAPHY_PLAN_20260811.md`
+- 이 문서는 **wire 형식 상세 규격**이다. 기능 전체(설계·구현 현황·검증 한계)는
+  **`docs/ROBOT_ODOMETRY_HOMOGRAPHY.md`(정본)** 을 볼 것.
+- 왜 이렇게 정했는지는 아래 문서들에 있다 — 여기서는 되풀이하지 않는다.
   - `docs/ROBOT_ODOMETRY_HOMOGRAPHY_REPLY_CCTV_20260812.md`
   - `docs/ROBOT_ODOMETRY_HOMOGRAPHY_REPLY_SERVER_20260812.md`
   - `docs/ROBOT_ODOMETRY_HOMOGRAPHY_REPLY_CCTV_02_20260812.md`

@@ -1,7 +1,9 @@
 # 로봇 오도메트리 호모그래피 — 실행 계획 (서버팀)
 
 - 작성일: 2026-08-12
-- 상태: **착수 대기. 프로토콜 논의는 종료됐고 남은 것은 작업뿐이다.**
+- 상태: **Phase A~D 완료 (2026-08-12). 서버 구현·오프라인 테스트 통과.**
+- 🔴 **기능 정본은 `docs/ROBOT_ODOMETRY_HOMOGRAPHY.md`** — 이 문서는 구현
+  지시서로, 코드 앵커와 완료 기준을 담는다. 구현 현황 요약은 정본 §10에 있다.
 - 실행자에게: 이 문서는 **이 대화 맥락 없이 단독 실행**할 수 있게 쓰였다.
   §0의 배경 문서 4개를 먼저 읽고 시작할 것. 판단이 갈리는 지점은 §7에 "이미 내린
   결정"으로 박아뒀다 — 다시 논의하지 말고 그대로 따를 것.
@@ -10,7 +12,7 @@
 
 | # | 문서 | 역할 |
 |---|---|---|
-| 1 | `docs/ROBOT_ODOMETRY_HOMOGRAPHY_PLAN_20260811.md` | 설계 본문 (Phase B에서 갱신 대상) |
+| 1 | `docs/ROBOT_ODOMETRY_HOMOGRAPHY.md` | **설계 정본** (Phase B의 산출물 — 아래 참고) |
 | 2 | `docs/ROBOT_ODOMETRY_HOMOGRAPHY_REPLY_CCTV_20260812.md` | CCTV 1차 회신 |
 | 3 | `docs/ROBOT_ODOMETRY_HOMOGRAPHY_REPLY_SERVER_20260812.md` | 서버 1차 회신 |
 | 4 | `docs/ROBOT_ODOMETRY_HOMOGRAPHY_REPLY_CCTV_02_20260812.md` | CCTV 2차 회신 (확정 요청 5건) |
@@ -96,9 +98,14 @@ CCTV   → Server H_MATRIX            {ch, calib:{...}}        (기존 계약)
 
 ---
 
-## 3. Phase B — 설계 본문 갱신
+## 3. Phase B — 설계 본문 갱신 ✅ 완료
 
-**대상**: `docs/ROBOT_ODOMETRY_HOMOGRAPHY_PLAN_20260811.md`
+**당초 대상**: `ROBOT_ODOMETRY_HOMOGRAPHY_PLAN_20260811.md`(설계 초안)
+
+**실제 결과**: 아래 B1~B8을 초안에 반영한 뒤, 정정 각주가 누적되어 신규 독자에게
+읽히지 않는 문제가 남았다. 그래서 내용을 **`docs/ROBOT_ODOMETRY_HOMOGRAPHY.md`
+(정본)로 재작성해 통합하고 초안은 삭제했다**(2026-08-12). 초안 원문이 필요하면
+git 히스토리 커밋 `43c4f83`을 볼 것.
 
 1차·2차 회신에서 확정된 것을 본문에 반영한다. 개별 편집 항목:
 
