@@ -35,6 +35,12 @@ typedef enum {
     STATE_ETX
 } ParserState_t;
 
+/** @brief RPi에서 설정하여 부팅 시 STM32로 동적 전송할 서보모터 PWM 펄스 폭 [us] */
+#define RPI_SERVO_OFF_US 1600U  /* 노즐 OFF (UP) 위치 */
+#define RPI_SERVO_ON_US  1200U  /* 노즐 ON (DOWN) 위치 (200us 줄인 각도) */
+
+#define UART_CMD_SET_SERVO_CONFIG 0x07
+
 #pragma pack(push, 1)
 
 /**
@@ -58,6 +64,14 @@ typedef struct {
 typedef struct {
     uint8_t fault_reason;
 } Msg_EStop_t;
+
+/**
+ * @brief CMD 0x07: Dynamic Servo Config payload structure (4 bytes).
+ */
+typedef struct {
+    uint16_t off_us;
+    uint16_t on_us;
+} Msg_SetServoConfig_t;
 
 /**
  * @brief CMD 0x81: Status telemetry payload structure (9 bytes).

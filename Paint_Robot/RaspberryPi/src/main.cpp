@@ -29,7 +29,13 @@ int main(int argc, char **argv) {
 
   // Clear startup ESTOP latch on STM32
   robot_comm.SendClearEStop();
-  usleep(200000);
+  usleep(50000);
+
+  // Transmit dynamic RPi servo PWM configuration (RPI_SERVO_OFF_US, RPI_SERVO_ON_US) to STM32
+  robot_comm.SendSetServoConfig(RPI_SERVO_OFF_US, RPI_SERVO_ON_US);
+  std::cout << "[MAIN] Transmitted dynamic servo config to STM32: OFF="
+            << RPI_SERVO_OFF_US << "us, ON=" << RPI_SERVO_ON_US << "us" << std::endl;
+  usleep(150000);
 
   // 3. Initialize IMU sensor manager (returns false gracefully if I2C hardware is offline)
   if (!imu_manager.Init()) {
@@ -318,8 +324,8 @@ int main(int argc, char **argv) {
                           robot_comm.SendControlNozzle(auto_nozzle);
                           std::cout << GetTimestampStr() << "[MAIN NOZZLE] Op " << active_op_index 
                                     << " set (down=" << (current_seg.down ? "true" : "false") 
-                                    << ", 1000ms delay)..." << std::endl;
-                          std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // R-9: 1000ms actuator delay
+                                    << ", 2500ms delay)..." << std::endl;
+                          std::this_thread::sleep_for(std::chrono::milliseconds(2500)); // 2500ms (2.5s) actuator & camera settling delay
                           // R-4: Do NOT send SendReady here! AdvanceSegment() lets next loop iteration send READY(active_op_index + 1)
                           path_follower.AdvanceSegment();
                       } else if (current_seg.op == "move") {

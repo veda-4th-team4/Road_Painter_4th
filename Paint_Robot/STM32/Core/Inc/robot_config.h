@@ -269,10 +269,10 @@
 /** @brief 서보 PWM 주기 [us], 20 ms는 50 Hz입니다. */
 #define ROBOT_SERVO_PERIOD_US 20000U
 
-/** @brief 노즐 OFF (UP) 위치의 PWM HIGH 폭 [us], 실기구 시험 후 보정합니다. */
+/** @brief 노즐 OFF (UP) 위치의 기본 PWM HIGH 폭 [us]. RPi 0x07 명령어로 동적 변경 가능합니다. */
 #define ROBOT_SERVO_OFF_US 1600U
 
-/** @brief 노즐 ON (DOWN) 위치의 PWM HIGH 폭 [us], 실기구 시험 후 보정합니다. */
-#define ROBOT_SERVO_ON_US 1000U
+/** @brief 노즐 ON (DOWN) 위치의 기본 PWM HIGH 폭 [us]. RPi 0x07 명령어로 동적 변경 가능합니다. */
+#define ROBOT_SERVO_ON_US 1200U
 
 #endif /* __ROBOT_CONFIG_H__ */

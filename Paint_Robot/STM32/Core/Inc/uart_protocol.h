@@ -24,6 +24,7 @@
 #define UART_ESTOP_PAYLOAD_LEN             1U
 #define UART_CLEAR_ESTOP_PAYLOAD_LEN       2U
 #define UART_SET_CONTROL_MODE_PAYLOAD_LEN  1U
+#define UART_SET_SERVO_CONFIG_PAYLOAD_LEN  4U
 #define UART_STATUS_PAYLOAD_LEN            9U
 
 /** @brief 기존 RPi와 호환되는 command ID입니다. */
@@ -33,6 +34,7 @@ typedef enum {
   UART_CMD_ESTOP             = 0x03U,
   UART_CMD_CLEAR_ESTOP       = 0x04U,
   UART_CMD_SET_CONTROL_MODE  = 0x05U,
+  UART_CMD_SET_SERVO_CONFIG  = 0x07U,
   UART_CMD_STATUS            = 0x81U
 } UartCommand_t;
 

@@ -32,4 +32,11 @@ void Servo_SetNozzle(uint8_t on);
  */
 uint8_t Servo_IsNozzleOn(void);
 
+/**
+ * @brief RPi로부터 수신한 동적 서보 PWM pulse width 설정값을 갱신합니다.
+ * @param off_us 노즐 OFF (UP) PWM HIGH 폭 [us]
+ * @param on_us 노즐 ON (DOWN) PWM HIGH 폭 [us]
+ */
+void Servo_SetConfig(uint16_t off_us, uint16_t on_us);
+
 #endif /* __SERVO_H__ */

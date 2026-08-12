@@ -55,6 +55,14 @@ public:
     bool SendClearEStop();
 
     /**
+     * @brief Configures dynamic servo OFF (UP) and ON (DOWN) PWM pulse widths on STM32.
+     * @param off_us PWM pulse width [us] for nozzle OFF position.
+     * @param on_us PWM pulse width [us] for nozzle ON position.
+     * @return true if transmission succeeded.
+     */
+    bool SendSetServoConfig(uint16_t off_us, uint16_t on_us);
+
+    /**
      * @brief Thread-safely fetches the latest received status packet.
      * @param out_status Buffer to copy the fetched telemetry metrics.
      * @return true if status was ever received.
