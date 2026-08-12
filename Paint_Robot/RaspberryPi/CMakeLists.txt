@@ -53,4 +53,14 @@ set(LED_TEST_SOURCES
 add_executable(led_test ${LED_TEST_SOURCES})
 target_link_libraries(led_test pthread)
 
+# 6) Odometry Driving Homography Calibration Path Test Tool
+set(CALIB_PATH_TEST_SOURCES
+    src/calib_path_test.cpp
+    src/SerialManager.cpp
+    src/PathFollower.cpp
+    src/ImuManager.cpp
+)
+add_executable(calib_path_test ${CALIB_PATH_TEST_SOURCES})
+target_link_libraries(calib_path_test wiringPi pthread)
+
 
