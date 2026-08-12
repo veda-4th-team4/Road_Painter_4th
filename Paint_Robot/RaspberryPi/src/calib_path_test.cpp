@@ -129,14 +129,16 @@ int main(int argc, char* argv[]) {
             }
         } else if (seg.op == "turn") {
             accumulated_target_yaw += seg.angle_deg;
-            path_follower.StartTurn(seg.angle_deg, start_l, start_r);
+            float start_yaw = has_imu ? imu_manager.GetYaw() : 0.0f;
+            path_follower.StartTurn(seg.angle_deg, start_l, start_r, start_yaw);
             while (true) {
                 robot_comm.GetLatestStatus(status);
                 int32_t cur_l = static_cast<int32_t>(status.left_steps);
                 int32_t cur_r = static_cast<int32_t>(status.right_steps);
+                float cur_yaw = has_imu ? imu_manager.GetYaw() : 0.0f;
 
                 Msg_SetSpeed_t speed_cmd{};
-                bool finished = path_follower.UpdateTurn(cur_l, cur_r, speed_cmd);
+                bool finished = path_follower.UpdateTurn(cur_l, cur_r, speed_cmd, cur_yaw, has_imu);
                 robot_comm.SendSetSpeed(speed_cmd.left_sps, speed_cmd.right_sps);
 
                 if (finished) {

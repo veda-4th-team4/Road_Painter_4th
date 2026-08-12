@@ -115,7 +115,7 @@ float ImuManager::GetYaw() {
 }
 
 void ImuManager::imu_loop() {
-    const float GYRO_DEADBAND = 0.15f; 
+    const float GYRO_DEADBAND = 0.30f; 
     const float MAX_PHYSICAL_RATE = 120.0f; 
     const float MAX_SLEW_RATE = 80.0f;     
     const float IMU_ANOMALY_LIMIT = 200.0f; 

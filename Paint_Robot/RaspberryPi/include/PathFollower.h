@@ -50,13 +50,13 @@ public:
     /**
      * @brief Starts turn segment tracking.
      */
-    void StartTurn(float angle_deg, int32_t start_left_steps, int32_t start_right_steps);
+    void StartTurn(float angle_deg, int32_t start_left_steps, int32_t start_right_steps, float start_imu_yaw = 0.0f);
 
     /**
-     * @brief Updates turn execution based on latest step counts.
+     * @brief Updates turn execution based on latest step counts and optional IMU closed-loop yaw feedback.
      * @return true if target turn angle is reached.
      */
-    bool UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed);
+    bool UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed, float cur_imu_yaw = 0.0f, bool has_imu = false);
 
     /**
      * @brief Checks if a turn is currently in progress.
@@ -111,6 +111,7 @@ private:
     uint32_t turn_target_steps;
     int32_t turn_start_left_steps;
     int32_t turn_start_right_steps;
+    float turn_start_imu_yaw;
 
     // Arc tracking state
     bool is_arc;

@@ -68,18 +68,20 @@ uint32_t PathFollower::CalculateTurnSteps(float angle_deg) const {
 }
 
 void PathFollower::StartTurn(float angle_deg, int32_t start_left_steps,
-                             int32_t start_right_steps) {
+                             int32_t start_right_steps, float start_imu_yaw) {
   is_turning = true;
   turn_target_angle_deg = angle_deg;
   turn_target_steps = CalculateTurnSteps(angle_deg);
   turn_start_left_steps = start_left_steps;
   turn_start_right_steps = start_right_steps;
+  turn_start_imu_yaw = start_imu_yaw;
   std::cout << "[PathFollower] StartTurn: target angle=" << angle_deg
-            << " deg | target_steps=" << turn_target_steps << std::endl;
+            << " deg | target_steps=" << turn_target_steps 
+            << " | start IMU Yaw=" << start_imu_yaw << " deg" << std::endl;
 }
 
 bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps,
-                              Msg_SetSpeed_t &out_speed) {
+                              Msg_SetSpeed_t &out_speed, float cur_imu_yaw, bool has_imu) {
   if (!is_turning)
     return true;
 
@@ -89,13 +91,33 @@ bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps,
   uint32_t delta_right = static_cast<uint32_t>(std::abs(diff_right));
   uint32_t progress_steps = (delta_left + delta_right) / 2;
 
-  if (progress_steps >= turn_target_steps) {
-    // Turn target reached
+  bool turn_finished = false;
+
+  if (has_imu) {
+    // IMU Closed-loop feedback termination
+    float target_yaw = turn_start_imu_yaw + turn_target_angle_deg;
+    float yaw_error = std::fabs(cur_imu_yaw - target_yaw);
+
+    // Check if IMU reached within 0.8 deg of target angle OR step guard safety limit (1.35x target steps)
+    if (yaw_error <= 0.8f || progress_steps >= static_cast<uint32_t>(turn_target_steps * 1.35f)) {
+      turn_finished = true;
+      std::cout << "[PathFollower] Turn IMU Closed-loop finished! Target Yaw: " << target_yaw
+                << " deg | Final IMU Yaw: " << cur_imu_yaw << " deg (Error: " 
+                << (cur_imu_yaw - target_yaw) << " deg) | Steps: " << progress_steps << "/" << turn_target_steps << std::endl;
+    }
+  } else {
+    // Step-odometry fallback termination (when IMU is offline)
+    if (progress_steps >= turn_target_steps) {
+      turn_finished = true;
+      std::cout << "[PathFollower] Turn Step-Fallback finished! Reached " << progress_steps
+                << "/" << turn_target_steps << " steps." << std::endl;
+    }
+  }
+
+  if (turn_finished) {
     out_speed.left_sps = 0;
     out_speed.right_sps = 0;
     is_turning = false;
-    std::cout << "[PathFollower] Turn completed! Reached " << progress_steps
-              << "/" << turn_target_steps << " steps." << std::endl;
     return true;
   }
 
