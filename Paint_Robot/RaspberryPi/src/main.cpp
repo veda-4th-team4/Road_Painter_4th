@@ -42,6 +42,12 @@ int main(int argc, char **argv) {
       std::cout << "[MAIN] Warning: IMU not detected. Running on step odometry fallback." << std::endl;
   }
 
+  // =========================================================================
+  // IMU Closed-Loop Feature Flags (Toggle ON/OFF easily)
+  // =========================================================================
+  bool g_use_imu_turn = true;  // Toggle IMU closed-loop for TURN & ALIGN (default: true, needed for phase: "calib")
+  bool g_use_imu_move = false; // Toggle IMU heading correction for MOVE & MORE (default: false, enable to test)
+
   // 4. Initialize network communications
   std::cout << "[MAIN] Starting TLS network link to " << server_ip << ":"
             << server_port << "..." << std::endl;
@@ -52,6 +58,8 @@ int main(int argc, char **argv) {
   }
 
   std::cout << "[MAIN] Main Controller Sequence Active (v0.3 Protocol with IMU Support)." << std::endl;
+  std::cout << "[MAIN] IMU Configuration: TURN_IMU=" << (g_use_imu_turn ? "ENABLED" : "DISABLED")
+            << " | MOVE_IMU=" << (g_use_imu_move ? "ENABLED" : "DISABLED") << std::endl;
 
   auto last_status_time = std::chrono::steady_clock::now();
   bool waiting_for_go = false;
@@ -176,8 +184,8 @@ int main(int argc, char **argv) {
                robot_comm.SendClearEStop(); // Clear startup/idle ESTOP latch when applying new autonomous path
                std::string phase = net_manager.GetPathPhase();
                std::cout << GetTimestampStr() << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2500ms for camera settling..." << std::endl;
-               if (phase == "draw") {
-                   imu_manager.ResetYaw(0.0f); // Reset IMU Yaw to 0 deg when entering draw phase from standstill
+               if (phase == "draw" || phase == "calib") {
+                   imu_manager.ResetYaw(0.0f); // Reset IMU Yaw to 0 deg when entering new path phase from standstill
                }
 
                // Settling delay: Ensure robot is fully still for 2500ms (2.5s) before sending initial READY for op 0
@@ -259,7 +267,8 @@ int main(int argc, char **argv) {
                                     << ": " << more_dist << " m" << std::endl;
                           Msg_Status_t status_snap{};
                           if (robot_comm.GetLatestStatus(status_snap)) {
-                              path_follower.StartMove(more_dist, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
+                              // MORE micro-distance correction (0.8cm~2.0cm): Use ultra-slow 0.0065 m/s (~100 sps) micro-creeping speed!
+                              path_follower.StartMove(more_dist, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), 0.0065f);
                           }
                       }
                   }
@@ -267,7 +276,9 @@ int main(int argc, char **argv) {
                   if (path_follower.IsTurning()) {
                       Msg_Status_t status_snap{};
                       if (robot_comm.GetLatestStatus(status_snap)) {
-                          if (path_follower.UpdateTurn(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed)) {
+                          bool has_turn_imu = g_use_imu_turn && imu_manager.IsHealthy();
+                          float cur_yaw = has_turn_imu ? imu_manager.GetYaw() : 0.0f;
+                          if (path_follower.UpdateTurn(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed, cur_yaw, has_turn_imu)) {
                               // Micro-turn completed: Send stop & wait 2500ms for camera settling before re-sending READY for same op
                               robot_comm.SendSetSpeed(0, 0);
                               std::cout << GetTimestampStr() << "[MAIN ALIGN] Turn complete -> Waiting 2500ms for camera settling..." << std::endl;
@@ -287,7 +298,8 @@ int main(int argc, char **argv) {
                   if (path_follower.IsMovingStraight()) {
                       Msg_Status_t status_snap{};
                       if (robot_comm.GetLatestStatus(status_snap)) {
-                          float imu_yaw = imu_manager.GetYaw();
+                          bool has_move_imu = g_use_imu_move && imu_manager.IsHealthy();
+                          float imu_yaw = has_move_imu ? imu_manager.GetYaw() : 0.0f;
                           if (path_follower.UpdateMove(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed, imu_yaw)) {
                               // Micro-move completed: Send stop & wait 2500ms before re-sending READY for same op
                               robot_comm.SendSetSpeed(0, 0);
@@ -333,20 +345,24 @@ int main(int argc, char **argv) {
                               path_follower.StartMove(current_seg.dist_m, l_steps, r_steps);
                           }
 
-                          float imu_yaw = imu_manager.GetYaw();
+                          bool has_move_imu = g_use_imu_move && imu_manager.IsHealthy();
+                          float imu_yaw = has_move_imu ? imu_manager.GetYaw() : 0.0f;
                           if (path_follower.UpdateMove(l_steps, r_steps, target_speed, imu_yaw)) {
                               std::cout << GetTimestampStr() << "[MAIN MOVE] Op " << active_op_index << " complete." << std::endl;
                               // R-4: Do NOT send SendReady here! AdvanceSegment() lets next loop iteration send READY(active_op_index + 1)
                               path_follower.AdvanceSegment();
                           }
                       } else if (current_seg.op == "turn") {
+                          bool has_turn_imu = g_use_imu_turn && imu_manager.IsHealthy();
                           if (!path_follower.IsTurning()) {
                               // Protocol rule: positive angle = turn right (CW) -> StartTurn(-angle_deg)
                               float robot_turn_deg = -current_seg.angle_deg;
-                              path_follower.StartTurn(robot_turn_deg, l_steps, r_steps);
+                              float start_yaw = has_turn_imu ? imu_manager.GetYaw() : 0.0f;
+                              path_follower.StartTurn(robot_turn_deg, l_steps, r_steps, start_yaw);
                           }
 
-                          if (path_follower.UpdateTurn(l_steps, r_steps, target_speed)) {
+                          float cur_yaw = has_turn_imu ? imu_manager.GetYaw() : 0.0f;
+                          if (path_follower.UpdateTurn(l_steps, r_steps, target_speed, cur_yaw, has_turn_imu)) {
                               std::cout << GetTimestampStr() << "[MAIN TURN] Op " << active_op_index << " in-place turn (" 
                                         << current_seg.angle_deg << " deg) complete." << std::endl;
                               // R-4: Do NOT send SendReady here! AdvanceSegment() lets next loop iteration send READY(active_op_index + 1)

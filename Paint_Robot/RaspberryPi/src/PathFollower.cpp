@@ -68,18 +68,20 @@ uint32_t PathFollower::CalculateTurnSteps(float angle_deg) const {
 }
 
 void PathFollower::StartTurn(float angle_deg, int32_t start_left_steps,
-                             int32_t start_right_steps) {
+                             int32_t start_right_steps, float start_imu_yaw) {
   is_turning = true;
   turn_target_angle_deg = angle_deg;
   turn_target_steps = CalculateTurnSteps(angle_deg);
   turn_start_left_steps = start_left_steps;
   turn_start_right_steps = start_right_steps;
+  turn_start_imu_yaw = start_imu_yaw;
   std::cout << "[PathFollower] StartTurn: target angle=" << angle_deg
-            << " deg | target_steps=" << turn_target_steps << std::endl;
+            << " deg | target_steps=" << turn_target_steps 
+            << " | start IMU Yaw=" << start_imu_yaw << " deg" << std::endl;
 }
 
 bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps,
-                              Msg_SetSpeed_t &out_speed) {
+                              Msg_SetSpeed_t &out_speed, float cur_imu_yaw, bool has_imu) {
   if (!is_turning)
     return true;
 
@@ -89,18 +91,46 @@ bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps,
   uint32_t delta_right = static_cast<uint32_t>(std::abs(diff_right));
   uint32_t progress_steps = (delta_left + delta_right) / 2;
 
-  if (progress_steps >= turn_target_steps) {
-    // Turn target reached
+  bool turn_finished = false;
+
+  if (has_imu) {
+    // IMU Closed-loop feedback termination
+    float target_yaw = turn_start_imu_yaw + turn_target_angle_deg;
+    float yaw_error = std::fabs(cur_imu_yaw - target_yaw);
+
+    // Check if IMU reached within 0.25 deg of target angle OR step guard safety limit (1.35x target steps)
+    if (yaw_error <= 0.25f || progress_steps >= static_cast<uint32_t>(turn_target_steps * 1.35f)) {
+      turn_finished = true;
+      std::cout << "[PathFollower] Turn IMU Closed-loop finished! Target Yaw: " << target_yaw
+                << " deg | Final IMU Yaw: " << cur_imu_yaw << " deg (Error: " 
+                << (cur_imu_yaw - target_yaw) << " deg) | Steps: " << progress_steps << "/" << turn_target_steps << std::endl;
+    }
+  } else {
+    // Step-odometry fallback termination (when IMU is offline)
+    if (progress_steps >= turn_target_steps) {
+      turn_finished = true;
+      std::cout << "[PathFollower] Turn Step-Fallback finished! Reached " << progress_steps
+                << "/" << turn_target_steps << " steps." << std::endl;
+    }
+  }
+
+  if (turn_finished) {
     out_speed.left_sps = 0;
     out_speed.right_sps = 0;
     is_turning = false;
-    std::cout << "[PathFollower] Turn completed! Reached " << progress_steps
-              << "/" << turn_target_steps << " steps." << std::endl;
     return true;
   }
 
-  // Turn in progress (positive angle = left turn)
-  int16_t turn_sps = 400; // 400 sps turn speed
+  // Turn in progress (adaptive speed: 400 sps fast turn, deceleration to 180 sps when < 4.0 deg remaining)
+  int16_t turn_sps = 400; 
+  if (has_imu) {
+    float target_yaw = turn_start_imu_yaw + turn_target_angle_deg;
+    float yaw_error = std::fabs(cur_imu_yaw - target_yaw);
+    if (yaw_error <= 4.0f) {
+      turn_sps = 180; // Fine precision deceleration
+    }
+  }
+
   if (turn_target_angle_deg > 0.0f) {
     // Left turn: Left wheel backward (-sps), Right wheel forward (+sps)
     out_speed.left_sps = -turn_sps;
@@ -114,6 +144,29 @@ bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps,
   return false;
 }
 
+bool PathFollower::TrimTurn(float target_yaw, float cur_imu_yaw, Msg_SetSpeed_t &out_speed) {
+  float residual_error = cur_imu_yaw - target_yaw;
+
+  if (std::fabs(residual_error) <= 0.15f) {
+    out_speed.left_sps = 0;
+    out_speed.right_sps = 0;
+    return true; // Micro-trim complete!
+  }
+
+  // Ultra-slow micro pulse speed at 120 sps
+  int16_t trim_sps = 120;
+  if (cur_imu_yaw < target_yaw) {
+    // cur_imu_yaw < target_yaw (e.g. -90.70 deg < -90.00 deg) -> needs positive rotation back towards -90.00 deg
+    out_speed.left_sps = -trim_sps;
+    out_speed.right_sps = trim_sps;
+  } else {
+    // cur_imu_yaw > target_yaw (e.g. -89.30 deg > -90.00 deg) -> needs negative rotation further towards -90.00 deg
+    out_speed.left_sps = trim_sps;
+    out_speed.right_sps = -trim_sps;
+  }
+  return false;
+}
+
 uint32_t PathFollower::CalculateMoveSteps(float dist_m) const {
   // Straight move distance with 1.010f (+1%) hardware calibration factor
   float abs_dist = std::fabs(dist_m) * 1.010f;
@@ -122,14 +175,15 @@ uint32_t PathFollower::CalculateMoveSteps(float dist_m) const {
 }
 
 void PathFollower::StartMove(float dist_m, int32_t start_left_steps,
-                             int32_t start_right_steps) {
+                             int32_t start_right_steps, float target_v_m_s) {
   is_moving_straight = true;
   move_dist_m = dist_m;
+  move_speed_m_s = target_v_m_s;
   move_target_steps = CalculateMoveSteps(dist_m);
   move_start_left_steps = start_left_steps;
   move_start_right_steps = start_right_steps;
   std::cout << GetTimestampStr() << "[PathFollower] StartMove: target dist=" << dist_m
-            << " m | target_steps=" << move_target_steps << std::endl;
+            << " m | speed=" << target_v_m_s << " m/s | target_steps=" << move_target_steps << std::endl;
 }
 
 bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
@@ -154,8 +208,18 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
     return true;
   }
 
-  // Straight move velocity (positive dist_m -> +0.05m/s forward, negative dist_m -> -0.05m/s reverse)
-  float target_v = (move_dist_m >= 0.0f) ? 0.05f : -0.05f;
+  // Straight move velocity (positive dist_m -> +move_speed_m_s forward, negative dist_m -> -move_speed_m_s reverse)
+  float target_v = (move_dist_m >= 0.0f) ? move_speed_m_s : -move_speed_m_s;
+
+  // Smooth Linear Ramp Deceleration: When 20% or less of target steps remains, linearly ramp down speed from 100% to 20%
+  uint32_t remaining_steps = move_target_steps - progress_steps;
+  uint32_t decel_threshold = move_target_steps / 5; // 20% remaining threshold
+  if (decel_threshold > 0 && remaining_steps <= decel_threshold) {
+    float ratio = static_cast<float>(remaining_steps) / static_cast<float>(decel_threshold); // 1.0 (start) -> 0.0 (destination)
+    float speed_factor = 0.20f + 0.80f * ratio; // Linear interpolation: 100% -> 20%
+    target_v *= speed_factor;
+  }
+
   // Protocol v2 sign convention: positive drift_offset_deg = turn right (CW) -> negative angular velocity (w)
   float drift_rad = drift_offset_deg * (3.14159265f / 180.0f);
   float target_w = -0.5f * drift_rad; // P-gain 0.5 for smooth steering correction
