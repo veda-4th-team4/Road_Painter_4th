@@ -683,6 +683,66 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ok = server_send("CMD", {"cmd": cmd})
             self.send_response(200 if ok else 503)
             self.end_headers()
+        elif self.path in ("/odo/start", "/odo/cancel"):
+            # 주행 캘리(오도메트리) 세션 개시/취소. ADMIN 연결로 서버에 CMD 를
+            # 보내면 서버가 로봇 경로(PATH)를 만들고 CCTV 에 CALIB_CAPTURE 를
+            # 물린다 (wire 규격 §1).
+            #
+            # /robot/cmd 를 재사용하지 않는 이유: 그쪽은 문자열 하나를 그대로
+            # {"cmd": <문자열>} 로 감싸 보내는 통로라 ch·m_cm·start_corner 같은
+            # 필드를 실을 수 없다. 그리고 이 명령은 **로봇을 실제로 주행시킨다** —
+            # 값 검증을 브라우저에만 맡길 자리가 아니다(아래에서 다시 본다).
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                self._send_json({"ok": False, "reason": "잘못된 요청 형식"}, 400)
+                return
+            try:
+                ch = int(data.get("ch", 0))
+            except (TypeError, ValueError):
+                ch = 0
+            if not 1 <= ch <= rp_core.CAM_CHANNELS:
+                self._send_json({"ok": False, "reason": f"채널 범위 밖: {ch}"}, 400)
+                return
+            # request_id 는 브라우저가 만들어 보낸다. 서버가 세션 내내 이 값을
+            # 정본으로 쓰고(wire §1), 진행도 표도 이 값으로 자기 세션을 가려낸다.
+            rid = str(data.get("request_id") or "")[:64]
+            if not rid:
+                self._send_json({"ok": False, "reason": "request_id 없음"}, 400)
+                return
+            if self.path == "/odo/cancel":
+                ok = server_send("CMD", {"cmd": "CALIB_CANCEL", "ch": ch,
+                                         "request_id": rid})
+                self._send_json({"ok": ok} if ok else
+                                {"ok": False, "reason": "서버(9000) 미연결"},
+                                200 if ok else 503)
+                return
+            try:
+                m_cm = float(data.get("m_cm", 0))
+                n_cm = float(data.get("n_cm", 0))
+            except (TypeError, ValueError):
+                m_cm = n_cm = 0.0
+            # 상한/하한을 서버 쪽에서도 본다. 이 값이 그대로 로봇 주행 거리가
+            # 되므로, 브라우저 input 의 min/max 만 믿으면 개발자도구로 고친 값이
+            # 그대로 바닥을 가로지른다.
+            if not (20 <= m_cm <= 1000 and 20 <= n_cm <= 1000):
+                self._send_json({"ok": False,
+                                 "reason": f"사각형 크기 범위 밖: {m_cm}x{n_cm} cm"}, 400)
+                return
+            corner = data.get("start_corner", "")
+            if corner not in ("bottom_left", "top_left"):
+                self._send_json({"ok": False,
+                                 "reason": f"출발 코너가 올바르지 않습니다: {corner}"}, 400)
+                return
+            ok = server_send("CMD", {"cmd": "CALIB_START", "ch": ch,
+                                     "request_id": rid, "method": "robot_motion",
+                                     "m_cm": m_cm, "n_cm": n_cm,
+                                     "start_corner": corner})
+            self._send_json({"ok": ok} if ok else
+                            {"ok": False, "reason": "서버(9000) 미연결"},
+                            200 if ok else 503)
         elif self.path == "/server/login":
             # 사용자 로그인을 ADMIN 연결로 서버에 전달하고 응답까지 기다린다.
             # 서버는 이 role에 LOGIN_OK/LOGIN_FAIL을 돌려주고, 성공 시 캘리브레이션

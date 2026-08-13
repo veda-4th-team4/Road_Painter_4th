@@ -261,6 +261,36 @@ def _fmt_tap(payload):
     return f"[tap] {arrow} {mtype} {summary}"
 
 
+# 주행 캘리(오도메트리) 진행도용 구조화 로그.
+#
+# 지점별 성공/실패는 서버가 ADMIN에게 따로 통지하지 않는다(sendTo("ADMIN") 0건).
+# 그런데 필요 없다 — 서버는 ADMIN에게 IN/OUT 모든 메시지의 사본을 TAP으로
+# 흘려주므로(tls_server.cpp:193/254) CCTV가 올린 CALIB_CAPTURE_OK/FAIL이 이미
+# 이 링크로 들어온다. 그래서 서버(C++)를 고치지 않고 여기서 골라낸다.
+#
+# [tap] 줄을 JS가 직접 파싱하지 않는 이유: _fmt_tap()은 사람이 읽는 요약이라
+# payload를 200자에서 자른다. 진행도 표는 잘린 값을 그대로 표시하게 된다.
+_ODO_TAP_TYPES = ("CALIB_START", "CALIB_CAPTURE", "CALIB_CAPTURE_OK",
+                  "CALIB_CAPTURE_FAIL", "CALIB_DONE", "CALIB_FAIL",
+                  "CALIB_CANCEL", "CALIB_STOPPED", "H_MATRIX")
+
+
+def _odo_tap_line(tap):
+    """주행 캘리 관련 TAP이면 '[odo] {json}' 한 줄, 아니면 None."""
+    m = tap.get("msg") or {}
+    mtype = m.get("type")
+    if mtype not in _ODO_TAP_TYPES:
+        return None
+    p = dict(m.get("payload") or {})
+    # H_MATRIX의 calib 번들은 3x3 행렬 셋에 K/D까지라 로그 한 줄에 넣을 물건이
+    # 아니다. 진행도 표에 필요한 건 "번들이 나갔다"는 사실과 채널뿐이다.
+    if "calib" in p:
+        p["calib"] = "(번들 %dB)" % len(json.dumps(p["calib"], ensure_ascii=False))
+    return "[odo] " + json.dumps(
+        {"dir": tap.get("dir"), "peer": tap.get("peer"), "type": mtype, "payload": p},
+        ensure_ascii=False)
+
+
 def server_link_loop():
     """Maintain the ADMIN connection to the relay server; reconnect forever."""
     global _server_sock
@@ -299,7 +329,11 @@ def server_link_loop():
                         continue
                     mtype = msg.get("type")
                     if mtype == "TAP":
-                        broadcast(_fmt_tap(msg.get("payload", {})))
+                        tap = msg.get("payload", {})
+                        broadcast(_fmt_tap(tap))
+                        odo = _odo_tap_line(tap)
+                        if odo:
+                            broadcast(odo)
                     elif mtype == "LOG":
                         # 서버 내부 로그(logf) 중계 - 이미 "HH:MM:SS [INFO] ..."
                         # 형태라 그대로 붙인다. [srv] 접두어로 로그 모니터가
