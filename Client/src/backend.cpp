@@ -248,6 +248,7 @@ Backend::Backend(QObject *parent)
                 clearNotice(QStringLiteral("chcalib"));
             }
             m_calibs[QString::number(ch)] = calib;
+            updateLensDataWarning(ch, calib);
             emit channelChanged();
             appendLog(appliedNow
                 ? QStringLiteral("H_MATRIX 외부 결과 (CH%1) — 현재 TopView 즉시 적용: %2")
@@ -276,6 +277,9 @@ Backend::Backend(QObject *parent)
             emit channelChanged();
             setNotice(QStringLiteral("CH%1 호모그래피를 적용했습니다. 작업 화면으로 전환합니다.").arg(ch),
                       QStringLiteral("info"), QStringLiteral("homography"));
+            // 성공 안내 **뒤에** 검사한다 — 왜곡 보정 데이터가 없으면 그 경고가
+            // 마지막에 남아야 조작자가 놓치지 않는다.
+            updateLensDataWarning(ch, calib);
             startChannelWork();
             return;
         }
@@ -379,6 +383,9 @@ Backend::Backend(QObject *parent)
             return;
         }
         m_calibs = camcalib::filterUsableCalibMap(calibs, &rejected);
+        // 채널마다 따로 본다 — 한 채널의 K/D 누락이 다른 채널 경고를 바꾸면 안 된다.
+        for (int ch = 1; ch <= m_channelCount; ++ch)
+            updateLensDataWarning(ch, calibOfChannel(ch));
         emit channelChanged();
         if (!rejected.isEmpty())
             appendLog(QStringLiteral("LOGIN_OK calibs — 사용할 수 없는 번들 무시: CH%1")
@@ -435,6 +442,7 @@ Backend::Backend(QObject *parent)
             appendLog(QStringLiteral("CHANNEL_OK CH%1 — 번들에 쓸 수 있는 H 가 없어 저장하지 않습니다")
                           .arg(ch));
         if (usable) m_calibs[QString::number(ch)] = calib;
+        if (usable) updateLensDataWarning(ch, calib);
         emit channelChanged();
         if (ch != m_workingCh) return;   // 이미 다른 채널로 넘어갔으면 늦은 응답이다
         if (!usable) {
@@ -675,10 +683,13 @@ void Backend::login(const QString &id, const QString &pw)
             m_calibMissing = !hasCalib && m_calibs.isEmpty();
             // 서버는 로그인 성공 시점에 보관 중인 번들을 함께 내려준다 (QT-REQ-SRV-001 S-2).
             // 수동 입력과 같은 경로를 타야 K/D 와 coord_mode 가 함께 반영된다.
-            if (hasCalib)
+            if (hasCalib) {
                 appendLog("LOGIN_OK calib — " + applyCalibObject(calib, QStringLiteral("LOGIN_OK")));
-            else
+                // 채널이 없는 legacy 단일 번들이라 ch=0 키로 알린다 (채널별 경고와 별개).
+                updateLensDataWarning(0, calib);
+            } else {
                 m_calib = calib;
+            }
             loadHistory();
             emit sessionChanged();
             emit linkStatusChanged();
@@ -827,6 +838,42 @@ void Backend::setArucoOverlay(bool on)
                  : QStringLiteral("ArUco 검출 끔 — 검출 자체를 멈춥니다 (로봇 위치는 서버 POSE로 계속 수신)"));
 }
 
+// 번들은 예전과 똑같이 수용한다. 다만 coord_mode="undistort" 라고 선언해 놓고
+// K 또는 D 가 없으면 화면은 왜곡 보정을 할 수 없다 — 조작자에게 알린다.
+void Backend::updateLensDataWarning(int ch, const QJsonObject &calib)
+{
+    // clearNotice 는 **같은 키**일 때만 배너를 내리므로 CH1~CH4 경고가 서로를 못 지운다.
+    const QString key = camcalib::lensDataNoticeKey(ch);
+    if (camcalib::lensDataMissingForUndistort(calib)) {
+        if (!m_lensDataMissingCh.contains(ch)) {
+            m_lensDataMissingCh.insert(ch);
+            appendLog(ch >= 1
+                ? QStringLiteral("⚠️ CH%1 번들 coord_mode=undistort 인데 K/D 가 없습니다 "
+                                 "— 렌즈 왜곡 보정 없이 사용합니다").arg(ch)
+                : QStringLiteral("⚠️ 번들 coord_mode=undistort 인데 K/D 가 없습니다 "
+                                 "— 렌즈 왜곡 보정 없이 사용합니다"));
+            emit channelChanged();
+        }
+        setNotice(ch >= 1
+                      ? QStringLiteral("CH%1 캘리브레이션은 undistort 기준이라고 하는데 "
+                                       "렌즈 왜곡 보정 데이터(K/D)가 없습니다. 좌표 오차가 "
+                                       "커질 수 있으니 이 채널의 카메라 내부 보정을 다시 "
+                                       "받으세요.").arg(ch)
+                      : QStringLiteral("받은 캘리브레이션은 undistort 기준이라고 하는데 "
+                                       "렌즈 왜곡 보정 데이터(K/D)가 없습니다. 좌표 오차가 "
+                                       "커질 수 있으니 카메라 내부 보정을 다시 받으세요."),
+                  QStringLiteral("warn"), key);
+        return;
+    }
+    if (m_lensDataMissingCh.remove(ch)) {
+        appendLog(ch >= 1
+            ? QStringLiteral("CH%1 번들에 K/D 가 갖춰졌습니다 — 왜곡 보정 데이터 경고 해제").arg(ch)
+            : QStringLiteral("번들에 K/D 가 갖춰졌습니다 — 왜곡 보정 데이터 경고 해제"));
+        emit channelChanged();
+    }
+    clearNotice(key);      // 같은 채널의 경고만 내린다
+}
+
 void Backend::setNotice(const QString &text, const QString &level, const QString &key)
 {
     if (m_notice == text && m_noticeLevel == level && m_noticeKey == key) return;
@@ -865,6 +912,7 @@ void Backend::logout()
     m_highlightedCh = 0;
     m_workingCh = 0;
     m_calibs = QJsonObject();
+    m_lensDataMissingCh.clear();
     emit channelChanged();
     if (m_worker) { m_worker->stop(); m_worker->wait(); m_worker->deleteLater(); m_worker = nullptr; }
     m_workerStarted = false;
@@ -2401,6 +2449,16 @@ QVariantList Backend::calibratedChannels() const
     return out;
 }
 
+// 채널별 "왜곡 보정 데이터 없음" 표시용. 배너는 하나뿐이라 다른 통지에 덮이지만,
+// 이 목록은 그 채널에 완전한 번들이 들어올 때까지 화면에 남는다.
+QVariantList Backend::lensDataMissingChannels() const
+{
+    QVariantList out;
+    for (int ch = 1; ch <= m_channelCount; ++ch)
+        if (m_lensDataMissingCh.contains(ch)) out << ch;
+    return out;
+}
+
 void Backend::setRelayBase(const QString &base)
 {
     QString clean = base.trimmed();
@@ -2534,11 +2592,14 @@ void Backend::startChannelWork()
                   + applyCalibObject(calib, QStringLiteral("CH%1").arg(ch), &applied));
         if (applied) {
             clearNotice(QStringLiteral("chcalib"));
+            // 이 채널로 들어왔으니 K/D 누락 경고도 이 채널 기준으로 다시 평가한다.
+            updateLensDataWarning(ch, calib);
         } else {
             // 적용 실패(테스트 보정 폴백)인데 경고를 지우면, 좌표를 믿을 수 없는
             // 상태가 화면에서 정상처럼 보인다.
             m_calibMissing = true;
             m_calibs.remove(QString::number(ch));
+            updateLensDataWarning(ch, QJsonObject());   // 버린 번들의 경고는 남기지 않는다
             emit channelChanged();
             emit calibChanged();
             appendLog(QStringLiteral("⚠️ CH%1 캘리브레이션 적용 실패 — 좌표를 믿을 수 없습니다").arg(ch));
@@ -2650,21 +2711,44 @@ void Backend::failHomography(const QString &message, const QString &reason)
     appendLog(QStringLiteral("CALIB_FAIL CH%1 reason=%2 — %3").arg(ch).arg(reason, message));
 }
 
-// 사각형 한 변의 절반이 서버 min_move_m(1cm) 이상이어야 하므로 각 변 2cm 이상.
+// 사각형 한 변의 절반이 서버 min_move_m(1cm) 이상이어야 하므로 각 변 2cm 이상,
+// 상한은 서버가 정한 1000cm(10m) 이하다 (양끝 포함).
 // 서버가 invalid_param 으로 거절하기 전에 여기서 먼저 막는다 (요청서 §1).
 bool Backend::startOdometryHomography(int ch, double mCm, double nCm, bool ccw)
 {
     // QML TextField 의 Number("") 는 0, Number("abc") 는 NaN 이다. 그대로 실으면
     // 서버가 invalid_param 으로 거절하거나 로봇이 엉뚱한 거리를 돈다.
     if (!camcalib::odoSizeValidCm(mCm) || !camcalib::odoSizeValidCm(nCm)) {
-        setNotice(QStringLiteral("가로·세로 값을 확인하세요 (각 2cm 이상의 숫자)."),
+        setNotice(camcalib::odoSizeRangeText(),
                   QStringLiteral("warn"), QStringLiteral("homography"));
         return false;
     }
     m_odoMCm = mCm;
     m_odoNCm = nCm;
     m_odoCcw = ccw;
+    emit homographyChanged();     // 화면 값과 전송 값을 같은 원본으로 되돌린다
     return startHomography(ch, true);
+}
+
+// 🔴 화면에 **보이는 글자 그대로**로 시작한다. 입력칸 텍스트를 그대로 받아
+//    검증하므로, 조작자가 보는 값과 CALIB_START 로 나가는 값이 절대 갈라지지
+//    않는다. 검증 실패면 이전 유효값으로 조용히 되돌아가지 않고 시작을 막는다.
+bool Backend::startOdometryHomographyFromText(int ch, const QString &widthText,
+                                              const QString &heightText, bool ccw)
+{
+    double mCm = 0.0, nCm = 0.0;
+    if (!camcalib::parseOdoSizeCm(widthText, &mCm)
+        || !camcalib::parseOdoSizeCm(heightText, &nCm)) {
+        setNotice(camcalib::odoSizeRangeText(),
+                  QStringLiteral("warn"), QStringLiteral("homography"));
+        appendLog(QStringLiteral("주행 캘리 시작 거부 — 입력값 \"%1\" × \"%2\" 가 "
+                                 "%3~%4cm 범위의 숫자가 아닙니다")
+                      .arg(widthText.trimmed(), heightText.trimmed())
+                      .arg(camcalib::kOdoSizeMinCm, 0, 'g', 3)
+                      .arg(camcalib::kOdoSizeMaxCm, 0, 'g', 4));
+        return false;
+    }
+    return startOdometryHomography(ch, mCm, nCm, ccw);
 }
 
 bool Backend::startHomography(int ch, bool odometry)

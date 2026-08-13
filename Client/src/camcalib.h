@@ -132,11 +132,38 @@ inline int resolveHomographyChannel(int ch, const QString &requestId,
 
 // ── 오도메트리 주행 캘리브레이션 규칙 (순수 함수 — 단위 테스트 대상) ──────────
 // 사각형 각 변의 절반이 서버 min_move_m(1cm) 이상이어야 하므로 변은 2cm 이상.
+// 상한은 서버가 1000cm(10m)로 못 박았다 — 그보다 큰 값은 서버가 invalid_param
+// 으로 거절하므로 여기서 먼저 막는다. 양끝(2cm·1000cm)은 **포함**이다.
 // NaN/무한/빈 입력이 그대로 JSON 에 실리면 서버가 invalid_param 으로 거절하거나
 // 로봇이 엉뚱한 거리를 주행한다 — 전송 전에 여기서 막는다.
+inline constexpr double kOdoSizeMinCm = 2.0;
+inline constexpr double kOdoSizeMaxCm = 1000.0;
+
 inline bool odoSizeValidCm(double cm)
 {
-    return std::isfinite(cm) && cm >= 2.0;
+    return std::isfinite(cm) && cm >= kOdoSizeMinCm && cm <= kOdoSizeMaxCm;
+}
+
+// 🔴 화면에 보이는 글자 그대로를 검사한다. 예전에는 QML validator 가 범위를 벗어난
+//    입력의 editingFinished 를 막아서, 화면에는 1200 이 떠 있는데 시작 버튼은 직전
+//    유효값(예: 90)을 보냈다 — 조작자가 본 거리와 로봇이 도는 거리가 달라진다.
+//    빈 칸·문자·꼬리 문자("90cm")·NaN/inf 는 전부 실패다. 앞뒤 공백만 허용한다.
+inline bool parseOdoSizeCm(const QString &text, double *out = nullptr)
+{
+    const QString s = text.trimmed();
+    if (s.isEmpty()) return false;
+    bool ok = false;
+    const double v = s.toDouble(&ok);      // 부분 파싱을 하지 않는다 (꼬리 문자 = 실패)
+    if (!ok || !odoSizeValidCm(v)) return false;
+    if (out) *out = v;
+    return true;
+}
+
+// 두 입력의 검증 결과를 한 문장으로. Backend 통지와 단위 테스트가 같은 문구를 쓴다.
+inline QString odoSizeRangeText()
+{
+    return QStringLiteral("가로·세로 값을 확인하세요 (각 %1cm 이상 %2cm 이하의 숫자).")
+        .arg(kOdoSizeMinCm, 0, 'g', 3).arg(kOdoSizeMaxCm, 0, 'g', 4);
 }
 
 // UI 의 좌/우회전 → 서버 필드값. 🔴 이름을 바꾸면 서버가 CALIB_START 원본을
@@ -190,7 +217,7 @@ inline QString homographyFailText(const QString &reason, const QString &message,
     }
     static const QHash<QString, QString> kText = {
         { QStringLiteral("invalid_param"),
-          QStringLiteral("가로·세로 값을 확인하세요 (각 2cm 이상).") },
+          QStringLiteral("가로·세로 값을 확인하세요 (각 2cm 이상 1000cm 이하).") },
         { QStringLiteral("too_few_points"),
           QStringLiteral("카메라가 로봇을 충분히 인식하지 못했습니다. 조명과 사각형 크기를 "
                          "확인하세요.") },
@@ -351,6 +378,71 @@ inline Model parse(const QJsonObject &objIn, QString *err = nullptr)
     m.valid = true;
     if (err) err->clear();
     return m;
+}
+
+// ── 왜곡 보정 데이터 누락 판정 (순수 함수 — 단위 테스트 대상) ────────────────
+// 번들이 coord_mode="undistort" 라고 **선언**했다면 H 는 왜곡 보정된 픽셀을 받는다.
+// 그런데 그 보정을 실제로 수행할 K 또는 D(dist) 가 번들에 없으면, 화면은 원본
+// 픽셀을 그대로 쓰면서 좌표만 보정된 척하게 된다 (실측 4.3mm → 52.4mm).
+// 번들 자체는 기존과 똑같이 수용하되(H 만 유효하면 쓸 수 있다), 조작자에게는
+// "이 채널은 왜곡 보정 데이터가 없다"고 반드시 알려야 한다.
+inline QString coordModeOf(const QJsonObject &raw)
+{
+    QJsonObject o = raw;
+    if (o.contains(QStringLiteral("calib")) && o.value(QStringLiteral("calib")).isObject())
+        o = o.value(QStringLiteral("calib")).toObject();
+    QString mode = o.value(QStringLiteral("coord_mode")).toString();
+    if (mode.isEmpty()) mode = o.value(QStringLiteral("coordMode")).toString();
+    return mode;
+}
+
+inline bool declaresUndistort(const QJsonObject &raw)
+{
+    return coordModeOf(raw).compare(QStringLiteral("undistort"), Qt::CaseInsensitive) == 0;
+}
+
+// K 를 실제로 읽을 수 있는가 (parse 와 같은 기준 — fx/fy 가 정상이어야 한다).
+inline bool hasUsableK(const QJsonObject &raw)
+{
+    QJsonObject o = raw;
+    if (o.contains(QStringLiteral("calib")) && o.value(QStringLiteral("calib")).isObject())
+        o = o.value(QStringLiteral("calib")).toObject();
+    if (!o.contains(QStringLiteral("K"))) return false;
+    QJsonObject probe;
+    probe.insert(QStringLiteral("K"), o.value(QStringLiteral("K")));
+    const Model m = parse(probe);          // coord_mode 없이 K 만 본다
+    return m.valid;
+}
+
+// D(또는 dist) 가 plumb-bob 4/5 계수로 들어 있는가.
+inline bool hasUsableD(const QJsonObject &raw)
+{
+    QJsonObject o = raw;
+    if (o.contains(QStringLiteral("calib")) && o.value(QStringLiteral("calib")).isObject())
+        o = o.value(QStringLiteral("calib")).toObject();
+    QJsonArray d = o.value(QStringLiteral("D")).toArray();
+    if (d.isEmpty()) d = o.value(QStringLiteral("dist")).toArray();
+    if (d.size() != 4 && d.size() != 5) return false;
+    for (const QJsonValue &v : d)
+        if (!v.isDouble() || !std::isfinite(v.toDouble())) return false;
+    return true;
+}
+
+// 채널별 통지 키. 채널마다 달라야 한 채널의 경고가 다른 채널 경고를 지우지 않는다.
+// (ch < 1 = 채널을 알 수 없는 legacy 단일 번들)
+inline QString lensDataNoticeKey(int ch)
+{
+    return ch >= 1 ? QStringLiteral("calib-lensdata-CH%1").arg(ch)
+                   : QStringLiteral("calib-lensdata");
+}
+
+// undistort 를 선언했는데 K 또는 D 가 없거나 못 읽는 번들인가.
+// raw/빈 coord_mode 는 이 경고의 대상이 아니다 (그쪽은 보정을 쓰지 않는다).
+inline bool lensDataMissingForUndistort(const QJsonObject &raw)
+{
+    if (raw.isEmpty()) return false;
+    if (!declaresUndistort(raw)) return false;
+    return !hasUsableK(raw) || !hasUsableD(raw);
 }
 
 // 사람이 읽는 한 줄 요약. 설정 화면과 로그에 같은 문자열을 쓴다.

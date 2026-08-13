@@ -10,6 +10,7 @@
 #include <QLineF>
 #include <QList>
 #include <QPointF>
+#include <QSet>
 
 #include <cmath>
 #include <iostream>
@@ -1036,8 +1037,14 @@ void testChannelCalibAcceptanceRules()
     check(!camcalib::captureLagWarning(5, -1), "a missing valid count must not warn");
 
     // 사각형 크기 검증 — 빈 칸(0)·NaN·무한은 전송되면 안 된다.
+    // 서버가 받는 범위는 2cm~1000cm(양끝 포함)이다 (서버 회신 20260814).
     check(camcalib::odoSizeValidCm(2.0) && camcalib::odoSizeValidCm(90.0),
           "2cm and the 90cm default must be accepted");
+    check(camcalib::odoSizeValidCm(1000.0), "the 1000cm upper limit must be inclusive");
+    check(camcalib::odoSizeValidCm(999.99) && camcalib::odoSizeValidCm(2.01),
+          "values just inside both limits must be accepted");
+    check(!camcalib::odoSizeValidCm(1000.01) && !camcalib::odoSizeValidCm(1001.0),
+          "sides above 1000cm must be rejected before CALIB_START");
     check(!camcalib::odoSizeValidCm(1.9) && !camcalib::odoSizeValidCm(0.0)
               && !camcalib::odoSizeValidCm(-5.0),
           "sides under 2cm must be rejected");
@@ -1045,8 +1052,54 @@ void testChannelCalibAcceptanceRules()
           "NaN from an empty or malformed field must be rejected");
     check(!camcalib::odoSizeValidCm(std::numeric_limits<double>::infinity()),
           "an infinite side must be rejected");
-    // 상한은 카메라 화각에 달려 있어 서버가 강제하지 않는다 — Qt도 임의 상한을 두지 않는다.
-    check(camcalib::odoSizeValidCm(500.0), "no arbitrary upper bound may be imposed");
+    check(!camcalib::odoSizeValidCm(-std::numeric_limits<double>::infinity()),
+          "a negative infinite side must be rejected");
+    check(camcalib::kOdoSizeMinCm == 2.0 && camcalib::kOdoSizeMaxCm == 1000.0,
+          "the documented limits must stay 2cm and 1000cm");
+    // 🔴 화면에 보이는 글자 그대로가 검증·전송된다. QML validator 가 막던 시절에는
+    //    "화면 1200 / 전송 90" 이 가능했다 — 그 경로를 여기서 봉인한다.
+    {
+        double v = -1.0;
+        check(camcalib::parseOdoSizeCm(QStringLiteral("2"), &v) && v == 2.0,
+              "the visible value 2 must be accepted and sent as 2");
+        v = -1.0;
+        check(camcalib::parseOdoSizeCm(QStringLiteral("1000"), &v) && v == 1000.0,
+              "the visible value 1000 must be accepted and sent as 1000");
+        v = -1.0;
+        check(camcalib::parseOdoSizeCm(QStringLiteral(" 90.5 "), &v) && v == 90.5,
+              "surrounding spaces must not change the sent value");
+        // 실패 케이스는 값을 건드리지 않는다 — 이전 유효값으로 되돌아가면 안 된다.
+        double keep = 90.0;
+        check(!camcalib::parseOdoSizeCm(QStringLiteral("1200"), &keep) && keep == 90.0,
+              "a visible 1200 must block the start instead of silently sending 90");
+        check(!camcalib::parseOdoSizeCm(QStringLiteral("1"), &keep) && keep == 90.0,
+              "a visible 1 must block the start");
+        check(!camcalib::parseOdoSizeCm(QString(), &keep)
+                  && !camcalib::parseOdoSizeCm(QStringLiteral("   "), &keep),
+              "an empty field must block the start");
+        check(!camcalib::parseOdoSizeCm(QStringLiteral("abc"), &keep)
+                  && !camcalib::parseOdoSizeCm(QStringLiteral("90cm"), &keep)
+                  && !camcalib::parseOdoSizeCm(QStringLiteral("9,0"), &keep),
+              "non-numeric or partially numeric text must block the start");
+        check(!camcalib::parseOdoSizeCm(QStringLiteral("nan"), &keep)
+                  && !camcalib::parseOdoSizeCm(QStringLiteral("inf"), &keep)
+                  && !camcalib::parseOdoSizeCm(QStringLiteral("-inf"), &keep),
+              "NaN and infinite text must block the start");
+        check(!camcalib::parseOdoSizeCm(QStringLiteral("1000.01"), &keep)
+                  && !camcalib::parseOdoSizeCm(QStringLiteral("1.99"), &keep),
+              "text just outside the inclusive range must block the start");
+        check(camcalib::odoSizeRangeText().contains(QStringLiteral("2cm"))
+                  && camcalib::odoSizeRangeText().contains(QStringLiteral("1000cm")),
+              "the field-level range message must state both limits");
+    }
+
+    // 조작자 문구는 두 한계를 모두 말해야 한다 (서버 invalid_param 회신 포함).
+    {
+        const QString text = camcalib::homographyFailText(QStringLiteral("invalid_param"),
+                                                          QString(), QString());
+        check(text.contains(QStringLiteral("2cm")) && text.contains(QStringLiteral("1000cm")),
+              "invalid_param text must state both the 2cm and 1000cm limits");
+    }
 
     // 회전 방향 매핑 — 서버가 CALIB_START 원본을 그대로 중계하므로 값이 정본이다.
     check(camcalib::odoStartCorner(true) == QStringLiteral("bottom_left"),
@@ -1094,6 +1147,143 @@ void testChannelCalibAcceptanceRules()
     check(camcalib::classifyHomographyReply(4, QStringLiteral("qt-old"), false, 0, QString())
               == ReplyUse::Drop,
           "an unsolicited stale Qt result must be dropped");
+}
+
+// ── 3) coord_mode="undistort" 인데 K/D 가 없는 번들 (서버 회신 20260814 §2) ────
+// ⚠️ 순수 규칙만 검증한다. Backend 의 채널별 배너 표시/해제는 이 바이너리에서
+//    실행하지 않지만, 그 판정과 통지 키 규칙은 아래 두 함수로 결정된다.
+void testUndistortLensDataWarning()
+{
+    auto k3x3 = []() {
+        QJsonArray K, r0, r1, r2;
+        r0.append(1200.0); r0.append(0.0);    r0.append(1296.0);
+        r1.append(0.0);    r1.append(1200.0); r1.append(760.0);
+        r2.append(0.0);    r2.append(0.0);    r2.append(1.0);
+        K.append(r0); K.append(r1); K.append(r2);
+        return K;
+    };
+    auto d5 = []() {
+        QJsonArray d;
+        for (double v : { -0.32, 0.11, 0.0, 0.0, -0.02 }) d.append(v);
+        return d;
+    };
+
+    QJsonObject complete;
+    complete.insert(QStringLiteral("coord_mode"), QStringLiteral("undistort"));
+    complete.insert(QStringLiteral("K"), k3x3());
+    complete.insert(QStringLiteral("D"), d5());
+    check(!camcalib::lensDataMissingForUndistort(complete),
+          "a complete undistort bundle must not warn");
+
+    QJsonObject noD = complete;
+    noD.remove(QStringLiteral("D"));
+    check(camcalib::lensDataMissingForUndistort(noD),
+          "an undistort bundle without D must warn");
+
+    QJsonObject noK = complete;
+    noK.remove(QStringLiteral("K"));
+    check(camcalib::lensDataMissingForUndistort(noK),
+          "an undistort bundle without K must warn");
+
+    QJsonObject shortD = complete;
+    shortD.insert(QStringLiteral("D"), QJsonArray{ 0.1, 0.2, 0.3 });
+    check(camcalib::lensDataMissingForUndistort(shortD),
+          "a distortion vector that is neither 4 nor 5 long is unusable");
+
+    QJsonObject badK = complete;
+    badK.insert(QStringLiteral("K"), QJsonObject{{QStringLiteral("fx"), 0.0},
+                                                {QStringLiteral("fy"), 0.0},
+                                                {QStringLiteral("cx"), 10.0},
+                                                {QStringLiteral("cy"), 10.0}});
+    check(camcalib::lensDataMissingForUndistort(badK),
+          "an unusable K (fx/fy <= 1) must warn like a missing K");
+
+    QJsonObject objK = complete;
+    objK.insert(QStringLiteral("K"), QJsonObject{{QStringLiteral("fx"), 1200.0},
+                                                 {QStringLiteral("fy"), 1200.0},
+                                                 {QStringLiteral("cx"), 1296.0},
+                                                 {QStringLiteral("cy"), 760.0}});
+    check(!camcalib::lensDataMissingForUndistort(objK),
+          "the {fx,fy,cx,cy} K form must count as usable");
+
+    QJsonObject distAlias = complete;
+    distAlias.remove(QStringLiteral("D"));
+    distAlias.insert(QStringLiteral("dist"), QJsonArray{ -0.3, 0.1, 0.0, 0.0 });
+    check(!camcalib::lensDataMissingForUndistort(distAlias),
+          "the legacy 4-coefficient \"dist\" field must count as usable");
+
+    // 표기 흔들림: {"calib":{...}} 포장과 camelCase coordMode 도 같은 판정을 받아야 한다.
+    QJsonObject wrapped;
+    wrapped.insert(QStringLiteral("calib"), noD);
+    check(camcalib::lensDataMissingForUndistort(wrapped),
+          "a wrapped {calib:{...}} bundle must be classified the same way");
+    QJsonObject camel = noD;
+    camel.remove(QStringLiteral("coord_mode"));
+    camel.insert(QStringLiteral("coordMode"), QStringLiteral("UnDistort"));
+    check(camcalib::lensDataMissingForUndistort(camel),
+          "camelCase coordMode must be recognised case-insensitively");
+
+    // raw / 미선언 번들은 이 경고 대상이 아니다 — 그쪽은 왜곡 보정을 쓰지 않는다.
+    QJsonObject rawMode = noD;
+    rawMode.insert(QStringLiteral("coord_mode"), QStringLiteral("raw"));
+    check(!camcalib::lensDataMissingForUndistort(rawMode),
+          "a raw-space bundle must not raise the distortion-data warning");
+    QJsonObject silent = noD;
+    silent.remove(QStringLiteral("coord_mode"));
+    check(!camcalib::lensDataMissingForUndistort(silent),
+          "a bundle without coord_mode must not raise the warning");
+    check(!camcalib::lensDataMissingForUndistort(QJsonObject()),
+          "an empty bundle must not raise the warning");
+
+    // 경고가 있어도 번들 수용 규칙은 예전 그대로여야 한다 (H 만 보면 된다).
+    QJsonArray goodH, hr0, hr1, hr2;
+    hr0.append(0.5); hr0.append(0.0); hr0.append(10.0);
+    hr1.append(0.0); hr1.append(0.5); hr1.append(20.0);
+    hr2.append(0.0); hr2.append(0.0); hr2.append(1.0);
+    goodH.append(hr0); goodH.append(hr1); goodH.append(hr2);
+    QJsonObject acceptStill = noD;
+    acceptStill.insert(QStringLiteral("H"), goodH);
+    check(camcalib::calibIsUsable(acceptStill),
+          "a bundle missing K/D must still be accepted when H is valid");
+
+    // 채널 독립: 통지 키가 채널마다 달라야 다른 채널 경고를 지우지 않는다.
+    for (int ch = 1; ch <= 4; ++ch) {
+        const QString key = camcalib::lensDataNoticeKey(ch);
+        check(key.contains(QStringLiteral("CH%1").arg(ch)),
+              "each channel must own its distortion-warning notice key");
+        for (int other = 1; other <= 4; ++other)
+            if (other != ch)
+                check(key != camcalib::lensDataNoticeKey(other),
+                      "one channel's warning must never clear another channel's");
+    }
+
+    // CH1~CH4 지속 표시 모델: Backend 가 유지하는 "경고 채널 집합"과 같은 규칙으로
+    // 한 채널만 켜지고, 그 채널에 완전한 번들이 오면 그 채널만 꺼져야 한다.
+    {
+        QSet<int> warned;
+        auto feed = [&warned](int ch, const QJsonObject &bundle) {
+            if (camcalib::lensDataMissingForUndistort(bundle)) warned.insert(ch);
+            else warned.remove(ch);
+        };
+        for (int ch = 1; ch <= 4; ++ch) feed(ch, complete);
+        check(warned.isEmpty(), "complete bundles must leave no channel flagged");
+
+        feed(2, noD);
+        check(warned.contains(2) && warned.size() == 1,
+              "only the offending channel may be flagged");
+        feed(4, noK);
+        check(warned.contains(2) && warned.contains(4) && warned.size() == 2,
+              "each channel must keep its own K/D state");
+        feed(2, complete);
+        check(!warned.contains(2) && warned.contains(4),
+              "a later complete bundle must clear only that channel's indicator");
+        feed(1, rawMode);
+        feed(3, silent);
+        check(!warned.contains(1) && !warned.contains(3) && warned.contains(4),
+              "raw or undeclared bundles must not flag other channels");
+        feed(4, complete);
+        check(warned.isEmpty(), "the last channel must clear once its K/D arrives");
+    }
 }
 
 void testMissingChannelResolution()
@@ -1165,6 +1355,7 @@ int main(int argc, char **argv)
     testHomographyValidation();
     testCurveRadiusOnlyFromVerifiedCircles();
     testChannelCalibAcceptanceRules();
+    testUndistortLensDataWarning();
     testMissingChannelResolution();
     if (failures == 0) {
         std::cout << "motionprogram_tests: PASS\n";

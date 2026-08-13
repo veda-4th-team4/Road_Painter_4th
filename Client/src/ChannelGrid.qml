@@ -105,6 +105,10 @@ Rectangle {
                     //    나중에 들어와도 화면이 "없음"인 채로 남는다.
                     readonly property bool hasCalib:
                         Backend.calibratedChannels.indexOf(cell.ch) >= 0
+                    // 번들은 받았지만 coord_mode=undistort 인데 K/D 가 없는 채널.
+                    // 배너는 다른 통지에 덮이므로 채널 타일에 계속 남겨 둔다.
+                    readonly property bool lensDataMissing:
+                        Backend.lensDataMissingChannels.indexOf(cell.ch) >= 0
 
                     width: (tileGrid.width - tileGrid.spacing * (grid.cols - 1)) / grid.cols
                     height: (tileGrid.height - tileGrid.spacing * (grid.rows - 1)) / grid.rows
@@ -185,6 +189,40 @@ Rectangle {
                             color: Theme.warn
                             font.pixelSize: 11
                             font.family: Theme.fontFamily
+                        }
+                    }
+
+                    // 캘리브레이션은 있지만 렌즈 왜곡 보정 데이터(K/D)가 없는 채널.
+                    // 좌표는 나오지만 오차가 커진다 — 채널별로 계속 보이게 둔다.
+                    Rectangle {
+                        visible: cell.hasCalib && cell.lensDataMissing
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 8
+                        z: 2
+                        radius: 4
+                        color: Theme.warnSoft
+                        border.color: Theme.warn
+                        border.width: 1
+                        width: lensWarnLabel.implicitWidth + 14
+                        height: 24
+                        Text {
+                            id: lensWarnLabel
+                            anchors.centerIn: parent
+                            text: "왜곡보정 데이터 없음"
+                            color: Theme.warn
+                            font.pixelSize: 11
+                            font.family: Theme.fontFamily
+                        }
+                        ToolTip.visible: lensWarnArea.containsMouse
+                        ToolTip.text: "CH" + cell.ch + " 번들은 undistort 기준이라고 하는데 "
+                                    + "K/D 가 없습니다.\n좌표 오차가 커질 수 있으니 카메라 "
+                                    + "내부 보정을 다시 받으세요."
+                        MouseArea {
+                            id: lensWarnArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            acceptedButtons: Qt.NoButton
                         }
                     }
 

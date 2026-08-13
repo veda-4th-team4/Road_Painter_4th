@@ -2618,15 +2618,20 @@ Item {
         property bool manualCalibrationExpanded: false
         // 캘리 방식 선택. 기본은 오도메트리 주행(서버 요청서 20260813).
         property bool calibOdometry: true
+        property real dragStartPopupX: 0
+        property real dragStartPopupY: 0
+        property real dragStartPointerX: 0
+        property real dragStartPointerY: 0
         onAboutToShow: {
             calibrationChannel = Backend.workingChannel > 0
                 ? Backend.workingChannel
                 : (Backend.highlightedChannel > 0 ? Backend.highlightedChannel : 1)
             settingsScroll.contentY = 0
+            x = Math.max(12, (Overlay.overlay.width - width) / 2)
+            y = Math.max(12, (Overlay.overlay.height - height) / 2)
         }
         modal: true
-        anchors.centerIn: Overlay.overlay
-        width: 560
+        width: Math.min(560, Overlay.overlay.width - 24)
         height: Math.min(760, Overlay.overlay.height - 24)
         padding: 16
         background: Rectangle {
@@ -2648,27 +2653,61 @@ Item {
             spacing: 10
             width: settingsScroll.width - 12
 
-            Row {
+            Item {
                 width: parent.width
-                spacing: 7
+                height: 30
+
+                MouseArea {
+                    anchors.fill: parent
+                    z: 0
+                    cursorShape: Qt.OpenHandCursor
+                    hoverEnabled: true
+                    onPressed: function(mouse) {
+                        cursorShape = Qt.ClosedHandCursor
+                        const p = mapToItem(Overlay.overlay, mouse.x, mouse.y)
+                        settingsPopup.dragStartPointerX = p.x
+                        settingsPopup.dragStartPointerY = p.y
+                        settingsPopup.dragStartPopupX = settingsPopup.x
+                        settingsPopup.dragStartPopupY = settingsPopup.y
+                    }
+                    onPositionChanged: function(mouse) {
+                        if (!pressed) return
+                        const p = mapToItem(Overlay.overlay, mouse.x, mouse.y)
+                        const maxX = Math.max(12, Overlay.overlay.width - settingsPopup.width - 12)
+                        const maxY = Math.max(12, Overlay.overlay.height - settingsPopup.height - 12)
+                        settingsPopup.x = Math.max(12, Math.min(maxX,
+                            settingsPopup.dragStartPopupX + p.x - settingsPopup.dragStartPointerX))
+                        settingsPopup.y = Math.max(12, Math.min(maxY,
+                            settingsPopup.dragStartPopupY + p.y - settingsPopup.dragStartPointerY))
+                    }
+                    onReleased: cursorShape = Qt.OpenHandCursor
+                    onCanceled: cursorShape = Qt.OpenHandCursor
+                    ToolTip.visible: containsMouse && !pressed
+                    ToolTip.text: "끌어서 설정 창 이동"
+                }
                 Text {
+                    z: 1
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
                     text: "설정"
                     color: Theme.text
                     font.pixelSize: 16
                     font.bold: true
                     font.family: Theme.fontFamily
-                    anchors.verticalCenter: parent.verticalCenter
                 }
                 HelpIcon {
+                    id: settingsHelpIcon
+                    z: 2
+                    anchors.left: parent.left
+                    anchors.leftMargin: 42
                     anchors.verticalCenter: parent.verticalCenter
                     helpTitle: "설정"
                     helpText: "영상은 화면 표시와 카메라 연결, 캘리브는 Top View 좌표 보정, 서버는 로그인 서버 주소를 설정합니다. 연결 정보를 바꾸면 적용 후 미리보기가 다시 열릴 수 있습니다."
                 }
-                Item {
-                    width: Math.max(0, parent.width - 150)
-                    height: 1
-                }
                 AppButton {
+                    z: 2
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
                     width: 58
                     height: 28
                     text: "닫기"
@@ -3195,6 +3234,19 @@ Item {
                             font.family: Theme.fontFamily
                             wrapMode: Text.WordWrap
                         }
+                        // 이 채널이 undistort 를 선언해 놓고 K/D 를 안 보낸 상태인지.
+                        // 배너가 다른 통지에 덮여도 여기서 채널별로 계속 확인된다.
+                        Text {
+                            width: parent.width
+                            visible: Backend.lensDataMissingChannels.length > 0
+                            text: "⚠️ 왜곡 보정 데이터(K/D) 없음: CH"
+                                + Backend.lensDataMissingChannels.join(", CH")
+                                + " — undistort 기준이라고 하는데 K/D 가 없어 좌표 오차가 커질 수 있습니다."
+                            color: Theme.warn
+                            font.pixelSize: 11
+                            font.family: Theme.fontFamily
+                            wrapMode: Text.WordWrap
+                        }
                         Row {
                             spacing: 6
                             Repeater {
@@ -3235,17 +3287,26 @@ Item {
                             TextField {
                                 id: odoWidthField
                                 width: 64; height: 28
+                                // 🔴 validator 를 쓰지 않는다. validator 는 범위를 벗어난
+                                //    입력의 editingFinished 를 막아 "화면 1200 / 전송 90"
+                                //    이라는 조용한 불일치를 만든다. 여기서는 보이는 글자를
+                                //    그대로 시작 버튼이 검증·전송한다.
                                 text: String(Backend.odoWidthCm)
                                 color: Theme.text
                                 leftPadding: 6
                                 font.pixelSize: 11; font.family: Theme.fontFamily
                                 inputMethodHints: Qt.ImhFormattedNumbersOnly
                                 selectByMouse: true
-                                onEditingFinished: Backend.odoWidthCm = Number(text)
+                                // 유효할 때만 저장값을 갱신한다 (잘못된 값이 다음 세션으로
+                                // 넘어가지 않게). 화면 글자는 사용자가 친 그대로 남는다.
+                                onEditingFinished: if (Backend.odoSizeTextValid(text))
+                                                       Backend.odoWidthCm = Number(text)
                                 background: Rectangle {
                                     radius: 4; color: Theme.surface
                                     border.width: 1
-                                    border.color: parent.activeFocus ? Theme.accent : Theme.stroke
+                                    border.color: !Backend.odoSizeTextValid(odoWidthField.text)
+                                                  ? Theme.danger
+                                                  : (parent.activeFocus ? Theme.accent : Theme.stroke)
                                 }
                             }
                             Text {
@@ -3262,18 +3323,34 @@ Item {
                                 font.pixelSize: 11; font.family: Theme.fontFamily
                                 inputMethodHints: Qt.ImhFormattedNumbersOnly
                                 selectByMouse: true
-                                onEditingFinished: Backend.odoHeightCm = Number(text)
+                                onEditingFinished: if (Backend.odoSizeTextValid(text))
+                                                       Backend.odoHeightCm = Number(text)
                                 background: Rectangle {
                                     radius: 4; color: Theme.surface
                                     border.width: 1
-                                    border.color: parent.activeFocus ? Theme.accent : Theme.stroke
+                                    border.color: !Backend.odoSizeTextValid(odoHeightField.text)
+                                                  ? Theme.danger
+                                                  : (parent.activeFocus ? Theme.accent : Theme.stroke)
                                 }
                             }
                             Text {
                                 anchors.verticalCenter: parent.verticalCenter
-                                text: "cm"; color: Theme.sub
+                                text: "cm (각 2~1000cm)"; color: Theme.sub
                                 font.pixelSize: 11; font.family: Theme.fontFamily
                             }
+                        }
+                        // 화면에 보이는 값이 그대로 전송된다. 보낼 수 없는 값이면
+                        // 시작 버튼을 막고 이유를 여기서 먼저 말한다.
+                        Text {
+                            width: parent.width
+                            visible: settingsPopup.calibOdometry
+                                     && !(Backend.odoSizeTextValid(odoWidthField.text)
+                                          && Backend.odoSizeTextValid(odoHeightField.text))
+                            text: Backend.odoSizeRangeHint()
+                            color: Theme.danger
+                            font.pixelSize: 11
+                            font.family: Theme.fontFamily
+                            wrapMode: Text.WordWrap
                         }
                         Row {
                             spacing: 8
@@ -3304,9 +3381,12 @@ Item {
                                 id: odoPlaceText
                                 anchors.fill: parent
                                 anchors.margins: 9
-                                text: "로봇을 사각형의 시작 모서리에 놓고, 진행 방향을 맞춘 뒤 시작하세요.\n"
-                                    + "사각형 전체가 카메라 화면 안에 들어와야 합니다. "
-                                    + "각 변은 2cm 이상이어야 합니다."
+                                text: "시작 버튼을 누르는 순간의 로봇 중심이 사각형의 첫 꼭짓점입니다.\n"
+                                    + (Backend.odoCcw
+                                       ? "반시계: 왼쪽 아래에서 오른쪽으로 출발합니다. "
+                                       : "시계: 왼쪽 위에서 오른쪽으로 출발합니다. ")
+                                    + "로봇 앞면(주황색)을 출발 방향에 맞추고, 사각형 전체가 "
+                                    + "카메라 화면 안에 들어오게 배치하세요."
                                 color: Theme.text
                                 font.pixelSize: 11
                                 font.family: Theme.fontFamily
@@ -3326,7 +3406,7 @@ Item {
                                 anchors.margins: 9
                                 text: settingsPopup.calibOdometry
                                     ? "⚠️ 주행 캘리는 로봇이 실제로 사각형을 돕니다 (2~4분). 사람과 장애물을 치우고 시작하세요."
-                                    : "시작하면 로봇이 자동으로 움직일 수 있습니다. 작업 영역이 비어 있는지 확인하세요."
+                                    : "정적 앵커 방식에서는 로봇이 움직이지 않습니다. 계산이 끝날 때까지 기준 마커를 움직이지 마세요."
                                 color: Theme.text
                                 font.pixelSize: 11
                                 font.family: Theme.fontFamily
@@ -3343,11 +3423,19 @@ Item {
                                     && Backend.robotOnline && Backend.cctvOnline
                                     && !Backend.jobActive && !Backend.drawing
                                     && !Backend.homographyPending
+                                    // 주행 방식일 때만 입력값이 조건이다. 정적 앵커는
+                                    // 사각형 입력을 쓰지 않으므로 영향을 받지 않는다.
+                                    && (!settingsPopup.calibOdometry
+                                        || (Backend.odoSizeTextValid(odoWidthField.text)
+                                            && Backend.odoSizeTextValid(odoHeightField.text)))
                                 onClicked: {
+                                    // 🔴 입력칸에 **보이는 글자**를 그대로 넘긴다.
+                                    //    Backend 가 파싱·검증까지 하므로 화면 값과
+                                    //    CALIB_START 값이 갈라질 수 없다.
                                     const ok = settingsPopup.calibOdometry
-                                        ? Backend.startOdometryHomography(
+                                        ? Backend.startOdometryHomographyFromText(
                                               settingsPopup.calibrationChannel,
-                                              Backend.odoWidthCm, Backend.odoHeightCm,
+                                              odoWidthField.text, odoHeightField.text,
                                               Backend.odoCcw)
                                         : Backend.startHomography(settingsPopup.calibrationChannel, false)
                                     if (ok)

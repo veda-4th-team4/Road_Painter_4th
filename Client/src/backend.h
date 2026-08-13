@@ -12,6 +12,7 @@
 #include <QVariantList>
 #include <QPolygonF>
 #include <QHash>
+#include <QSet>
 
 #include "routeplan.h"
 #include "motionprogram.h"
@@ -97,6 +98,10 @@ class Backend : public QObject
     // 캘리브레이션이 끝난 채널 번호 목록. QML 바인딩용이다 — channelCalibrated() 는
     // Q_INVOKABLE 이라 캘리가 새로 들어와도 바인딩이 다시 계산되지 않는다.
     Q_PROPERTY(QVariantList calibratedChannels READ calibratedChannels NOTIFY channelChanged)
+    // coord_mode="undistort" 인데 K/D 가 없는 채널 목록. Q_INVOKABLE 은 바인딩
+    // 의존성이 안 잡히므로 화면 표시는 반드시 이 프로퍼티를 쓴다.
+    Q_PROPERTY(QVariantList lensDataMissingChannels READ lensDataMissingChannels
+               NOTIFY channelChanged)
     Q_PROPERTY(bool homographyPending READ homographyPending NOTIFY homographyChanged)
     Q_PROPERTY(int homographyChannel READ homographyChannel NOTIFY homographyChanged)
     Q_PROPERTY(double homographyProgress READ homographyProgress NOTIFY homographyChanged)
@@ -232,7 +237,14 @@ public:
     }
     // 그 채널에 캘리브레이션 번들이 있는가 (LOGIN_OK.calibs / CHANNEL_OK 기준)
     Q_INVOKABLE bool channelCalibrated(int ch) const;
+    // 그 채널 번들이 coord_mode="undistort" 라고 선언했는데 K/D 가 없는가.
+    // 번들은 기존과 똑같이 수용하되, 이 채널의 좌표는 렌즈 왜곡 보정 없이
+    // 쓰이고 있다는 사실을 화면에서 확인할 수 있어야 한다.
+    Q_INVOKABLE bool channelLensDataMissing(int ch) const {
+        return m_lensDataMissingCh.contains(ch);
+    }
     QVariantList calibratedChannels() const;
+    QVariantList lensDataMissingChannels() const;
     // 중계 주소 변경. 빈 문자열이면 .13 카메라 직결 템플릿으로 돌아간다.
     Q_INVOKABLE void setRelayBase(const QString &base);
     // 타일 클릭 — 하이라이트만 바뀐다 (스트림은 이미 4개 다 흐르는 중)
@@ -268,6 +280,11 @@ public:
     int homographyPointIndex() const { return m_homographyPointIndex; }
     int homographyPointTotal() const { return m_homographyPointTotal; }
     int homographyValidPoints() const { return m_homographyValidPoints; }
+    // 입력칸 글자가 그대로 전송 가능한 값인가 (QML 표시용 — 규칙은 camcalib 한 곳).
+    Q_INVOKABLE bool odoSizeTextValid(const QString &text) const {
+        return camcalib::parseOdoSizeCm(text);
+    }
+    Q_INVOKABLE QString odoSizeRangeHint() const { return camcalib::odoSizeRangeText(); }
     double odoWidthCm() const { return m_odoMCm; }
     double odoHeightCm() const { return m_odoNCm; }
     bool odoCcw() const { return m_odoCcw; }
@@ -277,6 +294,10 @@ public:
     Q_INVOKABLE bool startHomography(int ch, bool odometry = false);
     // 오도메트리 주행 캘리브레이션 (요청서 20260813 §1). ccw=true → bottom_left.
     Q_INVOKABLE bool startOdometryHomography(int ch, double mCm, double nCm, bool ccw);
+    // 입력칸 텍스트 그대로 받는 경로 (QML 시작 버튼 전용). 화면에 보이는 값과
+    // 전송 값이 갈라지지 않도록 파싱·검증·전송을 한 함수에서 처리한다.
+    Q_INVOKABLE bool startOdometryHomographyFromText(int ch, const QString &widthText,
+                                                     const QString &heightText, bool ccw);
     Q_INVOKABLE void cancelHomography();
 
     QString notice() const { return m_notice; }
@@ -481,6 +502,11 @@ private:
     //        보고 "캘리브레이션 없음" 경고를 유지/해제해야 한다.
     QString applyCalibObject(const QJsonObject &raw, const QString &source,
                              bool *okOut = nullptr);
+    // coord_mode="undistort" 인데 K/D 가 없는 번들을 채널별로 알린다.
+    // ch >= 1 이면 그 채널 전용 통지 키를 쓰므로 다른 채널 경고를 건드리지 않고,
+    // 나중에 K/D 가 갖춰진 번들이 그 채널로 오면 같은 키만 골라 내린다.
+    // ch == 0 은 채널을 알 수 없는 legacy LOGIN_OK 단일 calib 경로다.
+    void updateLensDataWarning(int ch, const QJsonObject &calib);
     void setNotice(const QString &text, const QString &level,
                    const QString &key = QString());
     void clearNotice(const QString &key);
@@ -558,6 +584,8 @@ private:
     // LOGIN_OK.calibs / CHANNEL_OK 로 받은 채널별 번들. 키는 채널 번호 문자열.
     // "어느 채널이 캘리 됐는지"를 그리드에 표시하고, 채널 전환 시 그 번들을 적용한다.
     QJsonObject m_calibs;
+    // coord_mode="undistort" 인데 K/D 가 없는 채널들 (0 = 채널 미상 legacy 번들).
+    QSet<int> m_lensDataMissingCh;
     QList<preview_worker *> m_previews;
     QHash<int, ChannelTile *> m_tiles;
     bool m_homographyPending = false;
