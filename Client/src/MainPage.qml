@@ -12,16 +12,17 @@ Item {
     property var defaultLayout: undefined
     // Top View 오른쪽 도구 팔레트를 접었는지. 접으면 그만큼 작도 캔버스가 넓어진다.
     property bool paletteCollapsed: false
+    // 방향키를 누르고 있는 중인가 (창 비활성화 시 STOP 을 보내기 위한 상태)
+    property bool dirKeyHeld: false
     readonly property bool layoutDirty: layoutTouched || paletteCollapsed
         || cctvPanel.floating || topPanel.floating || logPanel.floating
         || dashPanel.floating || manualPanel.floating
 
-    // 4채널 미리보기 화면인가. 중계 주소가 없으면(단일 채널) 언제나 false 라
-    // 예전 화면만 뜬다 — PNM 을 안 쓰는 현장은 아무것도 달라지지 않는다.
+    // .13 PNM의 CH1~CH4 미리보기 화면인가.
     // 테스트 모드도 실제 CCTV 영상을 확인할 수 있어야 하므로 같은 채널 그리드를 쓴다.
     // 서버 명령만 생략하고 RTSP 선택·미리보기 흐름은 일반 모드와 동일하다.
     readonly property bool channelGridMode:
-        Backend.channelMode && Backend.workingChannel === 0
+        Backend.workingChannel === 0
 
     function captureLayout() {
         defaultLayout = {
@@ -77,12 +78,15 @@ Item {
             }
         }
         switch (event.key) {
-        case Qt.Key_Up:    Backend.sendRobotCmd("FORWARD", "전진"); event.accepted = true; break
-        case Qt.Key_Down:  Backend.sendRobotCmd("BACKWARD", "후진"); event.accepted = true; break
-        case Qt.Key_Left:  Backend.sendRobotCmd("TURN_LEFT", "좌회전"); event.accepted = true; break
-        case Qt.Key_Right: Backend.sendRobotCmd("TURN_RIGHT", "우회전"); event.accepted = true; break
-        // 비상정지는 어느 화면에서든 받는다 — 막을 이유가 없다
-        case Qt.Key_Space: Backend.toggleEstop(); event.accepted = true; break
+        case Qt.Key_Up:    page.dirKeyHeld = true; Backend.sendRobotCmd("FORWARD", "전진"); event.accepted = true; break
+        case Qt.Key_Down:  page.dirKeyHeld = true; Backend.sendRobotCmd("BACKWARD", "후진"); event.accepted = true; break
+        case Qt.Key_Left:  page.dirKeyHeld = true; Backend.sendRobotCmd("TURN_LEFT", "좌회전"); event.accepted = true; break
+        case Qt.Key_Right: page.dirKeyHeld = true; Backend.sendRobotCmd("TURN_RIGHT", "우회전"); event.accepted = true; break
+        // ⚠️ 비상정지(Space)는 여기서 처리하지 않는다. 이 핸들러는 page 가
+        //    activeFocus 를 가진 동안에만 오는데, 버튼을 한 번 클릭하면 포커스가
+        //    그 버튼으로 넘어가 Space 가 **직전 버튼을 다시 누르는** 키가 된다
+        //    (ESTOP 버튼이었다면 그대로 해제). 아래 Shortcut 이 포커스와 무관하게
+        //    받고, 거는 방향으로만 동작한다.
         // 노즐은 누르고 있는 동작이 아니라 상태 전환이라 눌렀을 때 한 번만
         case Qt.Key_PageUp:   Backend.setNozzle(false); event.accepted = true; break
         case Qt.Key_PageDown: Backend.setNozzle(true);  event.accepted = true; break
@@ -98,14 +102,33 @@ Item {
         if (event.isAutoRepeat) return
         if (event.key === Qt.Key_Up || event.key === Qt.Key_Down ||
             event.key === Qt.Key_Left || event.key === Qt.Key_Right) {
+            page.dirKeyHeld = false
             Backend.sendRobotCmd("STOP", "정지")
             event.accepted = true
+        }
+    }
+    // 방향키를 누른 채 Alt+Tab 하면 keyRelease 가 오지 않는다. 창이 비활성화되면
+    // activeFocus 가 풀리므로, 그때 눌린 상태였다면 STOP 을 보낸다.
+    onActiveFocusChanged: {
+        if (!page.activeFocus && page.dirKeyHeld) {
+            page.dirKeyHeld = false
+            Backend.sendRobotCmd("STOP", "정지")
         }
     }
     MouseArea {
         anchors.fill: parent
         z: -1
         onClicked: page.forceActiveFocus()
+    }
+    // 🔴 비상정지 — 어떤 컨트롤이 포커스를 갖고 있어도 받는다.
+    //    Shortcut 은 키 이벤트가 포커스 아이템(Button 등)에 배달되기 전에 처리되므로
+    //    "직전에 클릭한 버튼이 Space 로 다시 눌리는" 경로 자체가 없어진다.
+    //    해제(RESUME)는 절대 이 키로 하지 않는다 — 화면의 ESTOP 버튼으로만 푼다.
+    Shortcut {
+        sequence: "Space"
+        context: Qt.WindowShortcut
+        autoRepeat: false
+        onActivated: Backend.engageEstop()
     }
     Shortcut { sequence: "Ctrl+Z"; enabled: Backend.drawing || Backend.hasPath; onActivated: Backend.undo() }
     Shortcut { sequence: "Ctrl+A"; enabled: Backend.hasPath; onActivated: topPane.view.selectAllActive() }
@@ -333,10 +356,9 @@ Item {
                     font.family: Theme.fontFamily
                 }
             }
-            // 4채널 모드에서 지금 어느 채널로 작업 중인지 + 목록으로 돌아가기.
-            // 단일 채널(중계 주소 없음)에서는 통째로 사라진다.
+            // 지금 어느 채널로 작업 중인지 + CH1~CH4 목록으로 돌아가기.
             Row {
-                visible: Backend.channelMode && Backend.workingChannel > 0
+                visible: Backend.workingChannel > 0
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 6
                 AppButton {
@@ -530,9 +552,8 @@ Item {
     }
 
     // ── 4채널 미리보기 (PNM) ─────────────────────────────────────────
-    // 중계 주소가 설정돼 있고 아직 채널을 안 골랐으면 이 화면부터 시작한다.
-    // 🔴 아래 작업 화면(outerSplit)을 갈아엎지 않고 **덮기만** 한다 — 중계 주소를
-    //    비우면 channelMode 가 꺼지면서 예전 화면이 그대로 돌아온다.
+    // 로그인 후 CH1~CH4를 모두 보여주고, 작업 채널을 고르면 작업 화면으로 전환한다.
+    // 아래 작업 화면(outerSplit)은 유지한 채 그리드만 덮는다.
     ChannelGrid {
         id: channelGridView
         anchors.left: parent.left
@@ -1461,6 +1482,9 @@ Item {
                         enabled: Backend.manualEnabled && Backend.robotState !== "ESTOPPED"
                         onPressed: Backend.sendRobotCmd("FORWARD", "전진")
                         onReleased: Backend.sendRobotCmd("STOP", "정지")
+                        // 버튼 밖에서 떼거나(그랩 취소) 창이 비활성화되면 released 가
+                        // 오지 않는다 — canceled 에도 STOP 을 보내야 로봇이 계속 달리지 않는다.
+                        onCanceled: Backend.sendRobotCmd("STOP", "정지")
                     }
                     Item { width: 48; height: 30 }
                     AppButton {
@@ -1468,6 +1492,9 @@ Item {
                         enabled: Backend.manualEnabled && Backend.robotState !== "ESTOPPED"
                         onPressed: Backend.sendRobotCmd("TURN_LEFT", "좌회전")
                         onReleased: Backend.sendRobotCmd("STOP", "정지")
+                        // 버튼 밖에서 떼거나(그랩 취소) 창이 비활성화되면 released 가
+                        // 오지 않는다 — canceled 에도 STOP 을 보내야 로봇이 계속 달리지 않는다.
+                        onCanceled: Backend.sendRobotCmd("STOP", "정지")
                     }
                     AppButton {
                         width: 48; height: 30; text: "■"
@@ -1479,6 +1506,9 @@ Item {
                         enabled: Backend.manualEnabled && Backend.robotState !== "ESTOPPED"
                         onPressed: Backend.sendRobotCmd("TURN_RIGHT", "우회전")
                         onReleased: Backend.sendRobotCmd("STOP", "정지")
+                        // 버튼 밖에서 떼거나(그랩 취소) 창이 비활성화되면 released 가
+                        // 오지 않는다 — canceled 에도 STOP 을 보내야 로봇이 계속 달리지 않는다.
+                        onCanceled: Backend.sendRobotCmd("STOP", "정지")
                     }
                     Item { width: 48; height: 30 }
                     AppButton {
@@ -1486,6 +1516,9 @@ Item {
                         enabled: Backend.manualEnabled && Backend.robotState !== "ESTOPPED"
                         onPressed: Backend.sendRobotCmd("BACKWARD", "후진")
                         onReleased: Backend.sendRobotCmd("STOP", "정지")
+                        // 버튼 밖에서 떼거나(그랩 취소) 창이 비활성화되면 released 가
+                        // 오지 않는다 — canceled 에도 STOP 을 보내야 로봇이 계속 달리지 않는다.
+                        onCanceled: Backend.sendRobotCmd("STOP", "정지")
                     }
                     Item { width: 48; height: 30 }
                 }
@@ -2583,14 +2616,18 @@ Item {
             ? Backend.workingChannel
             : (Backend.highlightedChannel > 0 ? Backend.highlightedChannel : 1)
         property bool manualCalibrationExpanded: false
+        // 캘리 방식 선택. 기본은 오도메트리 주행(서버 요청서 20260813).
+        property bool calibOdometry: true
         onAboutToShow: {
             calibrationChannel = Backend.workingChannel > 0
                 ? Backend.workingChannel
                 : (Backend.highlightedChannel > 0 ? Backend.highlightedChannel : 1)
+            settingsScroll.contentY = 0
         }
         modal: true
         anchors.centerIn: Overlay.overlay
         width: 560
+        height: Math.min(760, Overlay.overlay.height - 24)
         padding: 16
         background: Rectangle {
             radius: Theme.radius
@@ -2598,11 +2635,21 @@ Item {
             border.color: Theme.stroke
             border.width: 1
         }
-        contentItem: Column {
+        contentItem: Flickable {
+            id: settingsScroll
+            clip: true
+            contentWidth: width
+            contentHeight: settingsContent.implicitHeight
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+          Column {
+            id: settingsContent
             spacing: 10
-            width: 528
+            width: settingsScroll.width - 12
 
             Row {
+                width: parent.width
                 spacing: 7
                 Text {
                     text: "설정"
@@ -2616,6 +2663,16 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     helpTitle: "설정"
                     helpText: "영상은 화면 표시와 카메라 연결, 캘리브는 Top View 좌표 보정, 서버는 로그인 서버 주소를 설정합니다. 연결 정보를 바꾸면 적용 후 미리보기가 다시 열릴 수 있습니다."
+                }
+                Item {
+                    width: Math.max(0, parent.width - 150)
+                    height: 1
+                }
+                AppButton {
+                    width: 58
+                    height: 28
+                    text: "닫기"
+                    onClicked: settingsPopup.close()
                 }
             }
 
@@ -2660,6 +2717,7 @@ Item {
                     property string label: ""
                     property real from: -100
                     property real to: 100
+                    property real initialValue: 0
                     function setFromText(t) {
                         const n = Number(t)
                         if (!isFinite(n)) return
@@ -2684,7 +2742,11 @@ Item {
                             from: filterRow.from
                             to: filterRow.to
                             stepSize: 1
-                            value: 0
+                            value: filterRow.initialValue
+                            onValueChanged: {
+                                if (!numField.activeFocus)
+                                    numField.text = String(Math.round(value))
+                            }
                             anchors.verticalCenter: parent.verticalCenter
                             onMoved: {
                                 numField.text = String(Math.round(value))
@@ -2695,7 +2757,7 @@ Item {
                             id: numField
                             width: 72
                             height: 28
-                            text: "0"
+                            text: String(Math.round(filterRow.initialValue))
                             color: Theme.text
                             horizontalAlignment: Text.AlignHCenter
                             font.family: Theme.fontFamily
@@ -2713,10 +2775,26 @@ Item {
                         }
                     }
                 }
-                FilterRow { id: fBright; label: "밝기" }
-                FilterRow { id: fContrast; label: "대비" }
-                FilterRow { id: fSharpen; label: "선명도"; from: 0; to: 100 }
-                FilterRow { id: fSat; label: "채도" }
+                FilterRow { id: fBright; label: "밝기"; initialValue: Backend.videoBrightness }
+                FilterRow { id: fContrast; label: "대비"; initialValue: Backend.videoContrast }
+                FilterRow { id: fSharpen; label: "선명도"; from: 0; to: 100; initialValue: Backend.videoSharpen }
+                FilterRow { id: fSat; label: "채도"; initialValue: Backend.videoSaturation }
+
+                Row {
+                    width: parent.width
+                    spacing: 8
+                    AppButton {
+                        text: "권장 기본값"
+                        onClicked: settingsPopup.resetVideoFilters()
+                    }
+                    Text {
+                        text: "밝기 45 · 대비 8 · 선명도 0 · 채도 0"
+                        color: Theme.muted
+                        font.pixelSize: 10
+                        font.family: Theme.fontFamily
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                }
 
                 Row {
                     width: parent.width
@@ -2739,23 +2817,51 @@ Item {
                     width: parent.width
                     spacing: 8
                     Text {
-                        text: "도장 폭"
+                        text: "펜촉 폭"
                         color: Theme.sub
                         font.pixelSize: 12
                         font.family: Theme.fontFamily
                         anchors.verticalCenter: parent.verticalCenter
                     }
+                    AppButton {
+                        width: 44; height: 30
+                        text: "50"
+                        accent: Math.abs(Backend.strokeWidthMm - 50) < 0.01
+                        onClicked: Backend.strokeWidthMm = 50
+                        ToolTip.visible: hovered
+                        ToolTip.text: "50 mm 직각 팁"
+                    }
+                    AppButton {
+                        width: 44; height: 30
+                        text: "60"
+                        accent: Math.abs(Backend.strokeWidthMm - 60) < 0.01
+                        onClicked: Backend.strokeWidthMm = 60
+                        ToolTip.visible: hovered
+                        ToolTip.text: "60 mm 직각 팁"
+                    }
+                    Text {
+                        text: "직접"
+                        color: Theme.muted
+                        font.pixelSize: 10
+                        font.family: Theme.fontFamily
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
                     TextField {
                         id: strokeField
-                        width: 70; height: 30
+                        width: 62; height: 30
                         color: Theme.text
                         leftPadding: 8
                         selectByMouse: true
                         inputMethodHints: Qt.ImhFormattedNumbersOnly
                         font.family: Theme.fontFamily
                         font.pixelSize: 12
+                        ToolTip.visible: hovered
+                        ToolTip.text: "직접 사용할 펜촉 폭을 mm로 입력"
                         Component.onCompleted: text = Backend.strokeWidthMm.toFixed(0)
-                        onAccepted: Backend.strokeWidthMm = Number(text)
+                        onAccepted: {
+                            Backend.strokeWidthMm = Number(text)
+                            text = Backend.strokeWidthMm.toFixed(0)
+                        }
                         background: Rectangle {
                             radius: 4; color: Theme.panel
                             border.width: 1
@@ -2772,14 +2878,80 @@ Item {
                     AppButton {
                         height: 30
                         text: "적용"
-                        onClicked: Backend.strokeWidthMm = Number(strokeField.text)
+                        onClicked: {
+                            Backend.strokeWidthMm = Number(strokeField.text)
+                            strokeField.text = Backend.strokeWidthMm.toFixed(0)
+                        }
+                    }
+                    Connections {
+                        target: Backend
+                        function onStrokeWidthChanged() {
+                            if (!strokeField.activeFocus)
+                                strokeField.text = Backend.strokeWidthMm.toFixed(0)
+                        }
+                    }
+                }
+
+                Row {
+                    width: parent.width
+                    spacing: 8
+                    Text {
+                        text: "중심-펜 거리"
+                        color: Theme.sub
+                        font.pixelSize: 12
+                        font.family: Theme.fontFamily
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    TextField {
+                        id: penDisplayOffsetField
+                        width: 72; height: 30
+                        color: Theme.text
+                        leftPadding: 8
+                        selectByMouse: true
+                        inputMethodHints: Qt.ImhFormattedNumbersOnly
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 12
+                        ToolTip.visible: hovered
+                        ToolTip.text: "TopView에서 마커 중심과 펜 위치 사이의 표시 거리"
+                        Component.onCompleted: text = Backend.penDisplayOffsetMm.toFixed(0)
+                        onAccepted: {
+                            Backend.penDisplayOffsetMm = Number(text)
+                            text = Backend.penDisplayOffsetMm.toFixed(0)
+                        }
+                        background: Rectangle {
+                            radius: 4; color: Theme.panel
+                            border.width: 1
+                            border.color: penDisplayOffsetField.activeFocus ? Theme.accent : Theme.stroke
+                        }
                     }
                     Text {
-                        text: "로봇이 한 번에 칠하는 선 두께 (기본 50mm)"
+                        text: "mm"
+                        color: Theme.muted
+                        font.pixelSize: 11
+                        font.family: Theme.fontFamily
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    AppButton {
+                        height: 30
+                        text: "적용"
+                        onClicked: {
+                            Backend.penDisplayOffsetMm = Number(penDisplayOffsetField.text)
+                            penDisplayOffsetField.text = Backend.penDisplayOffsetMm.toFixed(0)
+                        }
+                    }
+                    Text {
+                        text: "TopView 표시 전용 · 서버 경로에는 영향 없음"
                         color: Theme.muted
                         font.pixelSize: 10
                         font.family: Theme.fontFamily
                         anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Connections {
+                        target: Backend
+                        function onPenDisplayOffsetChanged() {
+                            if (!penDisplayOffsetField.activeFocus)
+                                penDisplayOffsetField.text = Backend.penDisplayOffsetMm.toFixed(0)
+                        }
                     }
                 }
 
@@ -2866,23 +3038,6 @@ Item {
                 Row {
                     width: parent.width
                     spacing: 8
-                    AppButton {
-                        text: topPane.view.showLabels ? "치수·회전값 표시: 켬" : "치수·회전값 표시: 끔"
-                        accent: topPane.view.showLabels
-                        onClicked: topPane.view.showLabels = !topPane.view.showLabels
-                    }
-                    Text {
-                        text: "표시 전용 · 경로에는 영향 없음"
-                        color: Theme.muted
-                        font.pixelSize: 10
-                        font.family: Theme.fontFamily
-                        anchors.verticalCenter: parent.verticalCenter
-                    }
-                }
-
-                Row {
-                    width: parent.width
-                    spacing: 8
                     Text {
                         text: "카메라 IP"
                         color: Theme.sub
@@ -2893,15 +3048,15 @@ Item {
                     TextField {
                         id: camIpField
                         width: 150; height: 30
+                        readOnly: true
                         color: Theme.text
                         leftPadding: 8
                         selectByMouse: true
-                        placeholderText: "192.168.0.9"
+                        placeholderText: "192.168.0.13"
                         placeholderTextColor: Theme.muted
                         font.family: Theme.fontFamily
                         font.pixelSize: 12
                         Component.onCompleted: text = Backend.camIp
-                        onAccepted: Backend.applyCamIp(text)
                         background: Rectangle {
                             radius: 4; color: Theme.panel
                             border.width: 1
@@ -2910,38 +3065,11 @@ Item {
                     }
                     AppButton {
                         height: 30
-                        text: "적용 + 서버 저장"
+                        text: "서버에 저장"
                         ToolTip.visible: hovered
-                        ToolTip.text: "IP만 넣으면 RTSP 주소를 자동으로 조립하고,\n"
-                                    + "서버에도 SET_CAM_IP 로 저장해 다음 로그인부터 자동 적용됩니다.\n"
-                                    + "(비워두고 누르면 서버 등록을 해제합니다)"
-                        onClicked: Backend.applyCamIp(camIpField.text)
+                        ToolTip.text: "운영 카메라 192.168.0.13을 서버 계정에도 저장합니다."
+                        onClicked: Backend.applyCamIp(Backend.camIp)
                     }
-                }
-
-                Text { text: "RTSP 전체 주소"; color: Theme.sub; font.pixelSize: 12; font.family: Theme.fontFamily }
-                TextField {
-                    id: rtspField
-                    width: parent.width
-                    color: Theme.text
-                    leftPadding: 8
-                    selectByMouse: true
-                    Component.onCompleted: text = Backend.rtspUrl
-                    onAccepted: if (text.length) Backend.setRtsp(text)
-                    placeholderText: "rtsp://..."
-                    placeholderTextColor: Theme.muted
-                    font.family: Theme.fontFamily
-                    background: Rectangle {
-                        implicitHeight: 36
-                        radius: Theme.radius
-                        color: Theme.panel
-                        border.width: 1
-                        border.color: rtspField.activeFocus ? Theme.accent : Theme.stroke
-                    }
-                }
-                AppButton {
-                    text: "RTSP 적용"
-                    onClicked: if (rtspField.text.length) Backend.setRtsp(rtspField.text)
                 }
 
                 Rectangle { width: parent.width; height: 1; color: Theme.stroke }
@@ -3003,7 +3131,6 @@ Item {
                     }
                 }
                 Text {
-                    visible: Backend.channelMode
                     width: parent.width
                     wrapMode: Text.WordWrap
                     // 중계일 수도 카메라 직결일 수도 있어서 백엔드가 문장을 만들어 준다
@@ -3036,10 +3163,12 @@ Item {
                         anchors.top: parent.top
                         anchors.margins: 14
                         spacing: 10
-                        Row {
+                        Item {
                             width: parent.width
                             height: 20
                             Text {
+                                anchors.left: parent.left
+                                anchors.verticalCenter: parent.verticalCenter
                                 text: "로봇 주행 호모그래피"
                                 color: Theme.text
                                 font.pixelSize: 14
@@ -3048,6 +3177,7 @@ Item {
                             }
                             Text {
                                 anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
                                 text: Backend.calibratedChannels.indexOf(settingsPopup.calibrationChannel) >= 0
                                     ? "기존 보정 있음" : "보정 필요"
                                 color: Backend.calibratedChannels.indexOf(settingsPopup.calibrationChannel) >= 0
@@ -3078,6 +3208,111 @@ Item {
                                 }
                             }
                         }
+                        // ── 오도메트리 주행 캘리브레이션 입력 (서버 요청서 20260813 §5-1) ──
+                        Row {
+                            spacing: 8
+                            AppButton {
+                                width: 96
+                                text: "주행 캘리"
+                                accent: settingsPopup.calibOdometry
+                                onClicked: settingsPopup.calibOdometry = true
+                            }
+                            AppButton {
+                                width: 96
+                                text: "정적 앵커"
+                                accent: !settingsPopup.calibOdometry
+                                onClicked: settingsPopup.calibOdometry = false
+                            }
+                        }
+                        Row {
+                            spacing: 6
+                            visible: settingsPopup.calibOdometry
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "가로"; color: Theme.sub
+                                font.pixelSize: 11; font.family: Theme.fontFamily
+                            }
+                            TextField {
+                                id: odoWidthField
+                                width: 64; height: 28
+                                text: String(Backend.odoWidthCm)
+                                color: Theme.text
+                                leftPadding: 6
+                                font.pixelSize: 11; font.family: Theme.fontFamily
+                                inputMethodHints: Qt.ImhFormattedNumbersOnly
+                                selectByMouse: true
+                                onEditingFinished: Backend.odoWidthCm = Number(text)
+                                background: Rectangle {
+                                    radius: 4; color: Theme.surface
+                                    border.width: 1
+                                    border.color: parent.activeFocus ? Theme.accent : Theme.stroke
+                                }
+                            }
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "cm  세로"; color: Theme.sub
+                                font.pixelSize: 11; font.family: Theme.fontFamily
+                            }
+                            TextField {
+                                id: odoHeightField
+                                width: 64; height: 28
+                                text: String(Backend.odoHeightCm)
+                                color: Theme.text
+                                leftPadding: 6
+                                font.pixelSize: 11; font.family: Theme.fontFamily
+                                inputMethodHints: Qt.ImhFormattedNumbersOnly
+                                selectByMouse: true
+                                onEditingFinished: Backend.odoHeightCm = Number(text)
+                                background: Rectangle {
+                                    radius: 4; color: Theme.surface
+                                    border.width: 1
+                                    border.color: parent.activeFocus ? Theme.accent : Theme.stroke
+                                }
+                            }
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "cm"; color: Theme.sub
+                                font.pixelSize: 11; font.family: Theme.fontFamily
+                            }
+                        }
+                        Row {
+                            spacing: 8
+                            visible: settingsPopup.calibOdometry
+                            AppButton {
+                                width: 110
+                                text: "반시계(좌회전)"
+                                accent: Backend.odoCcw
+                                onClicked: Backend.odoCcw = true
+                            }
+                            AppButton {
+                                width: 110
+                                text: "시계(우회전)"
+                                accent: !Backend.odoCcw
+                                onClicked: Backend.odoCcw = false
+                            }
+                        }
+                        // 🔴 사각형의 원점·방향이 로봇의 현재 위치·자세다 (요청서 §5-2).
+                        Rectangle {
+                            width: parent.width
+                            height: odoPlaceText.implicitHeight + 18
+                            radius: 5
+                            visible: settingsPopup.calibOdometry
+                            color: Theme.warnSoft
+                            border.width: 1
+                            border.color: Theme.warn
+                            Text {
+                                id: odoPlaceText
+                                anchors.fill: parent
+                                anchors.margins: 9
+                                text: "로봇을 사각형의 시작 모서리에 놓고, 진행 방향을 맞춘 뒤 시작하세요.\n"
+                                    + "사각형 전체가 카메라 화면 안에 들어와야 합니다. "
+                                    + "각 변은 2cm 이상이어야 합니다."
+                                color: Theme.text
+                                font.pixelSize: 11
+                                font.family: Theme.fontFamily
+                                wrapMode: Text.WordWrap
+                            }
+                        }
                         Rectangle {
                             width: parent.width
                             height: safetyStartText.implicitHeight + 18
@@ -3089,7 +3324,9 @@ Item {
                                 id: safetyStartText
                                 anchors.fill: parent
                                 anchors.margins: 9
-                                text: "시작하면 로봇이 자동으로 움직일 수 있습니다. 작업 영역이 비어 있는지 확인하세요."
+                                text: settingsPopup.calibOdometry
+                                    ? "⚠️ 주행 캘리는 로봇이 실제로 사각형을 돕니다 (2~4분). 사람과 장애물을 치우고 시작하세요."
+                                    : "시작하면 로봇이 자동으로 움직일 수 있습니다. 작업 영역이 비어 있는지 확인하세요."
                                 color: Theme.text
                                 font.pixelSize: 11
                                 font.family: Theme.fontFamily
@@ -3100,13 +3337,20 @@ Item {
                             spacing: 8
                             AppButton {
                                 accent: true
-                                text: "CH" + settingsPopup.calibrationChannel + " 호모그래피 시작"
+                                text: "CH" + settingsPopup.calibrationChannel
+                                    + (settingsPopup.calibOdometry ? " 주행 캘리 시작" : " 호모그래피 시작")
                                 enabled: !Backend.testMode && Backend.serverConnected
                                     && Backend.robotOnline && Backend.cctvOnline
                                     && !Backend.jobActive && !Backend.drawing
                                     && !Backend.homographyPending
                                 onClicked: {
-                                    if (Backend.startHomography(settingsPopup.calibrationChannel))
+                                    const ok = settingsPopup.calibOdometry
+                                        ? Backend.startOdometryHomography(
+                                              settingsPopup.calibrationChannel,
+                                              Backend.odoWidthCm, Backend.odoHeightCm,
+                                              Backend.odoCcw)
+                                        : Backend.startHomography(settingsPopup.calibrationChannel, false)
+                                    if (ok)
                                         settingsPopup.close()
                                 }
                             }
@@ -3458,10 +3702,19 @@ Item {
                 width: parent.width
                 AppButton { accent: true; text: "닫기"; onClicked: settingsPopup.close() }
             }
+          }
         }
 
         function applyFilters() {
             Backend.setVideoFilters(fBright.value, fContrast.value, fSharpen.value, fSat.value)
+        }
+
+        function resetVideoFilters() {
+            fBright.value = 45
+            fContrast.value = 8
+            fSharpen.value = 0
+            fSat.value = 0
+            applyFilters()
         }
 
         function fillDefaultAnchors() {

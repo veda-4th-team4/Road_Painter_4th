@@ -300,12 +300,6 @@ Rectangle {
             if (!turnEditor.activeEdit)
                 turnEditor.visible = false
         }
-        function onShowLabelsChanged() {
-            if (!vv.showLabels) {
-                edgeEditor.close()
-                turnEditor.close()
-            }
-        }
     }
 
     // ── 꼭짓점 회전각(°) 직접 입력 ───────────────────────────────────
@@ -460,7 +454,7 @@ Rectangle {
             anchors.centerIn: parent
             spacing: 6
             Text {
-                text: "변 " + (edgeEditor.edgeIndex + 1)
+                text: "완성 외곽 · 변 " + (edgeEditor.edgeIndex + 1)
                 color: Theme.muted
                 font.pixelSize: 11
                 font.family: Theme.fontFamily

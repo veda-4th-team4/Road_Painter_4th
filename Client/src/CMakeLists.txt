@@ -32,10 +32,12 @@ qt_add_executable(RoadPainterQml
     # 4채널 미리보기 (PNM). 경량 캡처 + 타일 — video_worker/VideoView 와 별개다
     # (미리보기에 ArUco 검출과 3000줄짜리 작도 뷰를 재사용하면 CPU 가 녹는다)
     preview_worker.h preview_worker.cpp
+    videofilters.h
     channel_tile.h channel_tile.cpp
     serverclient.h serverclient.cpp
     routeplan.h
     motionprogram.h
+    paintgeometry.h
     motionsim.h
     camcalib.h
     strokefont.h
@@ -85,6 +87,27 @@ endif()
 set_target_properties(RoadPainterQml PROPERTIES
     OUTPUT_NAME              "RoadPainter"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dist"
+)
+
+# ToolTip is loaded lazily through the generic QtQuick.Controls module even
+# though this application imports the Basic style directly. windeployqt 6.11
+# does not detect that runtime-only dependency, leaving ToolTip creation to fail
+# with "qtquickcontrols2plugin not found". Keep the two module entry files in
+# every build output so the packaged executable works on machines without Qt.
+get_target_property(_qt_qmake_executable Qt6::qmake IMPORTED_LOCATION)
+get_filename_component(_qt_bin_dir "${_qt_qmake_executable}" DIRECTORY)
+get_filename_component(_qt_prefix_dir "${_qt_bin_dir}" DIRECTORY)
+set(_qt_controls_qml_dir "${_qt_prefix_dir}/qml/QtQuick/Controls")
+set(_app_controls_qml_dir "$<TARGET_FILE_DIR:RoadPainterQml>/qml/QtQuick/Controls")
+add_custom_command(TARGET RoadPainterQml POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${_app_controls_qml_dir}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_qt_controls_qml_dir}/qmldir"
+            "${_app_controls_qml_dir}/qmldir"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_qt_controls_qml_dir}/qtquickcontrols2plugin.dll"
+            "${_app_controls_qml_dir}/qtquickcontrols2plugin.dll"
+    VERBATIM
 )
 
 target_include_directories(RoadPainterQml PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${OpenCV_INCLUDE_DIRS})

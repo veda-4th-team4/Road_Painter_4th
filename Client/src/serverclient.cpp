@@ -42,7 +42,10 @@ ServerClient::~ServerClient()
 
 void ServerClient::connectToServer()
 {
-    if (isConnected()) return;
+    // connectToHostEncrypted()를 ConnectingState에서 다시 호출하면 Qt가 경고를
+    // 남기고 TLS 핸드셰이크/로그인 콜백이 중복될 수 있다. 연결 완료뿐 아니라
+    // 조회·접속·종료 중인 상태도 새 연결을 시작하지 않는다.
+    if (!m_socket || m_socket->state() != QAbstractSocket::UnconnectedState) return;
     if (!m_tlsCertificateReady) {
         emit socketError(QStringLiteral("내장 서버 인증서를 읽을 수 없습니다. 프로그램을 다시 배포해 주세요."));
         return;
@@ -55,6 +58,14 @@ void ServerClient::connectToServer()
     m_helloSent = false;
     m_buffer.clear();
     m_socket->connectToHostEncrypted(m_host, m_port);
+}
+
+void ServerClient::reconnectToServer()
+{
+    if (!m_socket) return;
+    if (m_socket->state() != QAbstractSocket::UnconnectedState)
+        m_socket->abort();
+    connectToServer();
 }
 
 void ServerClient::setServer(const QString &host, quint16 port)
@@ -221,13 +232,24 @@ void ServerClient::sendSelectChannel(int ch)
     sendJson("CMD", p);
 }
 
-void ServerClient::sendCalibStart(int ch, const QString &requestId)
+void ServerClient::sendCalibStart(int ch, const QString &requestId,
+                                 const QString &method, double mCm, double nCm,
+                                 const QString &startCorner)
 {
     QJsonObject p;
     p["cmd"] = QStringLiteral("CALIB_START");
     p["ch"] = ch;
     p["request_id"] = requestId;
-    p["method"] = QStringLiteral("robot_motion");
+    // 오도메트리 주행 방식만 4필드를 싣는다. method 가 없거나 다른 값이면
+    // 서버는 기존 정적 앵커 경로로 간다 (요청서 §1).
+    if (!method.isEmpty()) {
+        p["method"] = method;
+        if (method == QLatin1String("robot_motion")) {
+            p["m_cm"] = mCm;
+            p["n_cm"] = nCm;
+            p["start_corner"] = startCorner;
+        }
+    }
     sendJson("CMD", p);
 }
 
@@ -282,8 +304,7 @@ void ServerClient::dispatch(const QJsonObject &msg)
         // 채널별 맵을 loginResult **보다 먼저** 흘린다 — Backend 가 로그인 처리
         // 안에서 채널 화면을 띄우는데, 그때 이 맵이 이미 있어야 "어느 채널이
         // 캘리 됐는지"를 그리드에 바로 표시할 수 있다.
-        // v0.3 서버는 calibs 를 안 보내므로 빈 오브젝트가 나가고, 그러면
-        // channelMode 가 꺼진 단일 채널 경로라 아무도 안 본다.
+        // 서버가 아직 저장한 번들이 없으면 빈 오브젝트가 전달된다.
         emit calibChannelsReceived(payload.value("calibs").toObject(),
                                    payload.value("active_ch").toInt(1));
         // 필드가 없으면 "서버가 모름"이므로 기존 설정을 유지한다. 명시적
@@ -316,7 +337,6 @@ void ServerClient::dispatch(const QJsonObject &msg)
         emit peersReceived(payload.value("robot").toBool(),
                            payload.value("cctv").toBool());
     } else if (type == "H_MATRIX") {
-        // v0.3: calib 번들. 레거시 {"H":[[..]x3]} 도 당분간 허용.
         QJsonObject calib = payload.value("calib").toObject();
         // 평면 스키마는 payload 자체가 번들이다. K/D/H_marker 등의 보정
         // 메타데이터까지 보존하고 전송 envelope 필드만 제거한다.
@@ -325,9 +345,21 @@ void ServerClient::dispatch(const QJsonObject &msg)
             calib.remove("ch");
             calib.remove("request_id");
         }
-        // ch 없으면 1 (단일 채널 카메라·v0.3 서버 하위호환)
-        emit hMatrixReceived(payload.value("ch").toInt(1), calib,
-                             payload.value("request_id").toString());
+        // 최상위 envelope가 우선이고, 없으면 calib 내부 메타데이터를 사용한다.
+        int ch = payload.value("ch").toInt(0);
+        if (ch == 0) ch = payload.value("calib").toObject().value("ch").toInt(0);
+        QString requestId = payload.value("request_id").toString();
+        if (requestId.isEmpty())
+            requestId = payload.value("calib").toObject().value("request_id").toString();
+        // ch=0은 Backend가 단일 pending 요청으로 안전하게 복원할 수 있으므로 전달한다.
+        // 범위 밖 값만 프로토콜 오류로 거부한다.
+        if (ch < 0 || ch > 4) {
+            qWarning() << "[ServerClient] H_MATRIX 채널 범위 오류:" << ch;
+            return;
+        }
+        if (ch == 0)
+            qInfo() << "[ServerClient] H_MATRIX ch 누락 — Backend에서 pending 요청과 대조";
+        emit hMatrixReceived(ch, calib, requestId);
     } else if (type == "CALIB_STARTED") {
         emit calibStarted(payload.value("ch").toInt(),
                           payload.value("request_id").toString(),
@@ -338,12 +370,17 @@ void ServerClient::dispatch(const QJsonObject &msg)
         emit calibProgress(payload.value("ch").toInt(),
                            payload.value("request_id").toString(), progress,
                            payload.value("stage").toString(),
-                           payload.value("msg").toString());
+                           payload.value("msg").toString(),
+                           payload.value("phase").toString(),
+                           payload.value("point_index").toInt(-1),
+                           payload.value("total").toInt(-1),
+                           payload.value("valid").toInt(-1));
     } else if (type == "CALIB_FAIL") {
         emit calibFailed(payload.value("ch").toInt(),
                          payload.value("request_id").toString(),
                          payload.value("reason").toString(),
-                         payload.value("msg").toString());
+                         payload.value("msg").toString(),
+                         payload.value("owner").toString());
     } else if (type == "CALIB_CANCELLED") {
         emit calibCancelled(payload.value("ch").toInt(),
                             payload.value("request_id").toString(),

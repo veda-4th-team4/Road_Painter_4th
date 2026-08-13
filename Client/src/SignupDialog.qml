@@ -15,7 +15,7 @@ Popup {
     closePolicy: Popup.CloseOnEscape
 
     onOpened: {
-        idField.clear(); pwField.clear(); pw2Field.clear(); camField.clear()
+        idField.clear(); pwField.clear(); pw2Field.clear()
         msg.text = ""
         idField.forceActiveFocus()
     }
@@ -108,11 +108,12 @@ Popup {
                     }
                 }
 
-                Text { text: "카메라 IP (선택)"; color: Theme.sub; font.pixelSize: 12; font.family: Theme.fontFamily }
+                Text { text: "카메라 IP"; color: Theme.sub; font.pixelSize: 12; font.family: Theme.fontFamily }
                 TextField {
                     id: camField
                     width: parent.width
-                    placeholderText: "192.168.0.9 — 서버에 저장되어 로그인 시 회신됩니다"
+                    text: "192.168.0.13"
+                    readOnly: true
                     placeholderTextColor: Theme.muted
                     color: Theme.text
                     selectByMouse: true

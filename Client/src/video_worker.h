@@ -130,9 +130,10 @@ private:
     int m_searchFail = 0;       // 연속 탐색 실패 횟수 → 탐색 간격을 늘리는 데 쓴다
     int m_searchSkip = 0;
     int m_lastArucoCount = -1;
+    int m_arucoRoiPasses = 0;   // ROI에 갇힌 다른 마커를 찾기 위한 전체 재탐색 주기
     // ArUco ROI 추적 — 직전에 마커를 찾은 영역(**축소본 좌표**). 다음 프레임은 여기만
     // 본다. 전체의 10% 남짓이라 검출이 27ms → 3.3ms 로 떨어진다 (2592x1520 실측).
-    // 놓치면 valid 를 내리고 다음 프레임에 전체부터 다시 찾는다.
+    // 놓치면 valid 를 내리고, 검출 중이어도 주기적으로 전체를 다시 찾는다.
     cv::Rect m_arucoRoi;
     bool m_arucoRoiValid = false;
 

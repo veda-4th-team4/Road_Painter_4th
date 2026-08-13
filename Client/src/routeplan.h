@@ -16,7 +16,14 @@
 #include <QVector>
 #include <cmath>
 
+#include "motionprogram.h"   // 곡선 구간 검출(detail::curveRuns) — 단순화 보호에 쓴다
+
 namespace routeplan {
+
+// 두 도형을 "같은 점에서 이어진다"고 볼 수 있는 수치 오차 한계(m).
+// 도형 사이 간격이 이 값보다 크면 아무리 짧아도 사용자가 그리지 않은 구간이므로
+// 도색하지 않고 이동(pen-up)으로 낸다.
+constexpr double kSeamJoinEpsM = 1e-9;
 
 struct Route {
     QList<QPointF> pts;      // 이어붙인 폴리라인 (BLUEPRINT.points)
@@ -93,6 +100,43 @@ inline QList<QPointF> simplify(const QList<QPointF> &in, double tolM)
     QList<QPointF> out;
     for (int i = 0; i < pts.size(); ++i)
         if (keep[i]) out.append(pts[i]);
+    return out;
+}
+
+// 곡선 구간을 보존하는 단순화.
+// 일반 RDP 는 원·부분호·직선+반원 같은 혼합 도형의 곡선 샘플을 지워서, 같은 도형이
+// 입력 점 수에 따라 ARC 1개 → ARC 여러 개 → MOVE 무더기로 바뀌게 만든다.
+// 곡선으로 검출된 구간의 점은 그대로 두고, 그 사이의 직선 구간만 RDP 로 줄인다.
+// 곡선이 하나도 없으면 simplify() 와 완전히 같은 결과다(직선 도형 동작 불변).
+inline QList<QPointF> simplifyPreservingCurves(const QList<QPointF> &in, double tolM)
+{
+    if (in.size() < 3 || tolM <= 0.0) return simplify(in, tolM);
+    const QList<motionprogram::detail::CurveRun> runs =
+        motionprogram::detail::curveRuns(in, 1.0);
+    if (runs.isEmpty()) return simplify(in, tolM);
+
+    QVector<bool> keep(in.size(), false);
+    keep.first() = keep.last() = true;
+    for (const motionprogram::detail::CurveRun &r : runs)
+        for (int i = r.a; i <= r.b && i < in.size(); ++i)
+            keep[i] = true;
+
+    // 보호되지 않은 구간(=직선 구간)만 RDP 로 줄인다.
+    int spanStart = 0;
+    for (int i = 1; i < in.size(); ++i) {
+        if (!keep[i] && i + 1 < in.size()) continue;
+        if (i > spanStart + 1)
+            dpKeep(in, spanStart, i, tolM, keep);
+        spanStart = i;
+    }
+
+    QList<QPointF> out;
+    for (int i = 0; i < in.size(); ++i) {
+        if (!keep[i]) continue;
+        // 곡선 구간 밖에서만 중복 점을 눌러 없앤다 (곡선 샘플은 간격이 좁아도 필요하다)
+        if (!out.isEmpty() && QLineF(out.last(), in[i]).length() <= 1e-9) continue;
+        out.append(in[i]);
+    }
     return out;
 }
 
@@ -179,7 +223,7 @@ inline Route plan(const QList<QList<QPointF>> &paths, const QList<bool> &closed,
         // 확인한 경로는 점 순서를 그대로 보존한다.
         QList<QPointF> s = preservePoints.value(i, false)
                          ? paths[i]
-                         : simplify(paths[i], tolM);
+                         : simplifyPreservingCurves(paths[i], tolM);
         if (s.size() < 2) continue;
         shape.append(s);
         shapeClosed.append(closed.value(i, false) && s.size() > 2);
@@ -222,10 +266,18 @@ inline Route plan(const QList<QList<QPointF>> &paths, const QList<bool> &closed,
         r.order.append(origIndex[best]);
         r.flipped.append(bestC.rev);
 
-        // 앞 도형이 끝난 자리에서 그대로 이어지면 빈 이동 구간이 없다 → 두 도형을
-        // 하나의 연속 구간으로 묶는다 (그래야 도형 경계 = pen-up 구간이 된다)
-        const bool seam = !r.pts.isEmpty()
-                          && QLineF(r.pts.last(), run.first()).length() <= tolM;
+        // 앞 도형의 끝점과 다음 도형의 시작점이 **사실상 같은 점**일 때만 하나의
+        // 연속 도색 구간으로 묶는다.
+        // 🔴 예전 두 동작 모두 틀렸다:
+        //    ① 1cm 이내면 다음 도형의 첫 점을 앞 끝점으로 대체 → 그린 적 없는
+        //       반지름(500mm 원이 468mm ARC 두 개)이 만들어졌다.
+        //    ② 첫 점은 살리되 그 사이 8mm 를 paint=true 로 칠함 → 사용자가 그리지
+        //       않은 연결선을 바닥에 긋는다.
+        //    지금은 두 도형의 점을 모두 보존하고, 간격이 0 이 아니면 그 구간을
+        //    pen-up(이동)으로 낸다.
+        const double seamGap = r.pts.isEmpty()
+                             ? 0.0 : QLineF(r.pts.last(), run.first()).length();
+        const bool seam = !r.pts.isEmpty() && seamGap <= kSeamJoinEpsM;
         const int shapeNo = seam ? r.shapeOf.last() : nextShapeNo++;
 
         if (r.pts.isEmpty()) {
@@ -233,8 +285,8 @@ inline Route plan(const QList<QList<QPointF>> &paths, const QList<bool> &closed,
             r.paint.append(false);        // 시작점 — 서버가 여기까지 접근시킨다
             r.shapeOf.append(shapeNo);
         } else if (!seam) {
-            r.travelM += QLineF(r.pts.last(), run.first()).length();
-            r.pts.append(run.first());
+            r.travelM += seamGap;
+            r.pts.append(run.first());    // ← 다음 도형의 원래 첫 점을 그대로 쓴다
             r.paint.append(false);        // ← pen-up: 도형 사이 이동은 칠하지 않는다
             r.shapeOf.append(shapeNo);
         }
