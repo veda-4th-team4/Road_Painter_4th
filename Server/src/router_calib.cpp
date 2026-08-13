@@ -20,6 +20,16 @@
 //    아직 살아 있는데, 이번 계약으로 QT도 개시자가 됐다. 둘은 같은 calibActive_를
 //    공유하므로 한쪽이 도는 동안 다른 쪽은 busy로 거절된다 - 로봇이 한 대뿐이라
 //    동시에 두 세션이 돌면 서로의 주행을 자기 관측으로 착각한다.
+//
+// ⚠️ 소유권 (2026-08-13 추가). 위 "busy로 거절된다"만으로는 부족하다는 게
+//    드러났다 - 시작은 막혔지만 **취소는 아무나 할 수 있었다.** ADMIN이
+//    request_id 없이 CALIB_CANCEL을 보내면 QT 세션이 그대로 죽고, 진행 중인
+//    세션이 없을 때는 누가 눌렀든 QT에 CALIB_CANCELLED가 갔다. calibOwner_로
+//    소유자를 명시하고, 취소는 소유자만 - 단 관리자 창의 강제 회수
+//    (CALIB_CANCEL{force:true})는 예외로 둔다. 로봇이 실제로 바닥을 굴러다니는
+//    중인데 Qt 단말 앞에 사람이 없을 수 있고, 그때 관리자가 로봇을 못 세우면
+//    안 되기 때문이다. 상세는
+//    docs/ROBOT_ODOMETRY_HOMOGRAPHY_REQUEST_QT_20260813.md §3.
 #include "router.hpp"
 #include "log.hpp"
 
@@ -28,13 +38,52 @@
 //   방법이 없다 - 반드시 종결 응답을 보낸 직후에만 부른다.
 void Router::clearCalib() {
     calibActive_ = false;
-    calibFromQt_ = false;
+    calibOwner_ = CalibOwner::NONE;
     calibReqId_.clear();
     calibCh_ = 0;
     calibStartMs_ = 0;
     calibCancelling_ = false;
     calibCancelMs_ = 0;
     cancelAckRobot_ = cancelAckCctv_ = false;
+    calibAbortReason_.clear();
+    calibAbortMsg_.clear();
+    // 오도메트리 세션 상태도 여기서 같이 비운다 - startCalib()가 다시 이
+    // 필드들을 세팅하기 전에 이전 세션의 잔재(예: odoPointIdx_)가 남아있으면
+    // 다음 세션의 첫 캡처 ack가 엉뚱한 boundary에 GO를 보낼 수 있다.
+    calibIsOdo_ = false;
+    odoAwaitingResult_ = false;
+    odoResultWaitMs_ = 0;
+    odoMmm_ = odoNmm_ = 0;
+    odoCcw_ = true;
+    odoPointIdx_ = -1;
+    odoPendingGoOp_ = -2;
+    odoCaptureMs_ = 0;
+    odoValidCount_ = 0;
+    for (int i = 0; i < 9; ++i) {
+        odoPixU_[i] = odoPixV_[i] = 0.0;
+        odoPixOk_[i] = false;
+    }
+}
+
+// 세션을 시작하지 못했을 때의 거절 회신 (아직 calibActive_가 아니라
+// failCalib()을 쓸 수 없는 자리 - startCalib/startOdoCalib 공용).
+//
+// ⚠️ ADMIN에는 보내지 않고 로그만 남긴다. 관리자 창은 서버가 주고받는 모든
+//    메시지의 사본을 TAP으로 받고 서버 로그도 LOG로 중계받으므로
+//    (tls_server.cpp), 여기서 따로 보내지 않아도 거절 사실이 화면에 뜬다.
+void Router::rejectCalib(bool toQt, int ch, const std::string& reqId,
+                         const char* origin, const char* reason,
+                         const std::string& m, const json& extra) {
+    if (toQt) {
+        json p = {{"ch", ch}, {"request_id", reqId}, {"reason", reason},
+                  {"msg", m}};
+        for (auto& [k, v] : extra.items()) p[k] = v;
+        srv_.sendTo("QT", makeMsg("CALIB_FAIL", p));
+    }
+    // "요청"으로 뭉뚱그린다 - CALIB_START 거절과 CALIB_CANCEL의 not_owner가
+    // 같이 쓰는 자리라 메시지를 START로 못박으면 로그가 거짓말을 한다.
+    logf("[WARN] (%s) 캘리 요청 거절 [채널 %d] reason=%s - %s (%s)", origin, ch,
+         reason, m.c_str(), toQt ? "QT에 CALIB_FAIL 통지" : "ADMIN - 로그만");
 }
 
 // 진행 중인 세션을 실패로 닫는다. ADMIN이 시작한 세션은 QT가 기다리는 것이
@@ -43,8 +92,15 @@ void Router::failCalib(const char* reason, const std::string& m) {
     if (!calibActive_) return;
     const int ch = calibCh_;
     const std::string reqId = calibReqId_;
-    const bool toQt = calibFromQt_;
+    const bool toQt = calibToQt();
+    // 오도메트리 세션은 sendPath()로 로봇 경로 상태(planActive_/activePhase_)를
+    // 세워뒀으므로 clearPath()로 같이 비워야 한다. 정적 앵커 세션은 애초에
+    // sendPath()를 부르지 않아 이 상태가 항상 비어 있으므로(도색 중엔 계약
+    // §4-4가 캘리 시작 자체를 막는다) 여기서 clearPath()를 불러도 안전하지만,
+    // 굳이 손대지 않는다 - calibIsOdo_로만 좁혀서 기존 경로 무변경을 보장한다.
+    const bool wasOdo = calibIsOdo_;
     clearCalib();
+    if (wasOdo) clearPath();
     if (toQt)
         srv_.sendTo("QT", makeMsg("CALIB_FAIL", {{"ch", ch},
                                                  {"request_id", reqId},
@@ -74,33 +130,42 @@ void Router::startCalib(const json& payload, const json& msg, const char* origin
                    : (!hasCh && !fromQt) ? activeChannel_
                                      : 0;  // 0 = 형식 오류 (아래에서 거절)
 
+    const CalibOwner owner = fromQt ? CalibOwner::QT : CalibOwner::ADMIN;
+
     // 실패 회신용 도우미. 아직 세션이 없으므로 failCalib()를 쓸 수 없다
     // (failCalib은 calibActive_를 전제로 한다).
-    auto reject = [&](const char* reason, const std::string& m) {
-        if (fromQt)
-            srv_.sendTo("QT", makeMsg("CALIB_FAIL", {{"ch", ch},
-                                                     {"request_id", reqId},
-                                                     {"reason", reason},
-                                                     {"msg", m}}));
-        logf("[WARN] (%s) CALIB_START 거절 [채널 %d] reason=%s - %s", origin, ch,
-             reason, m.c_str());
+    auto reject = [&](const char* reason, const std::string& m,
+                      const json& extra = json::object()) {
+        rejectCalib(fromQt, ch, reqId, origin, reason, m, extra);
     };
 
     // ----- §4-5 멱등: 같은 request_id 재수신은 새 작업을 만들지 않는다 -----
     // 재전송·재접속으로 같은 요청이 두 번 오는 것은 정상이다. 여기서 걸러내지
     // 않으면 로봇이 같은 캘리 주행을 두 번 하고, 두 번째 H_MATRIX가 첫 번째
     // 세션의 종결 응답인 척 Qt의 대기를 잘못 푼다.
-    if (calibActive_ && fromQt && !reqId.empty() && reqId == calibReqId_) {
-        srv_.sendTo("QT", makeMsg("CALIB_STARTED",
-            {{"ch", calibCh_}, {"request_id", calibReqId_},
-             {"msg", "이미 진행 중인 요청입니다 (상태 재전송)"}}));
+    //
+    // ⚠️ 소유자까지 봐야 한다. request_id는 개시자가 스스로 만드는 값이라
+    //    ADMIN과 QT가 같은 문자열을 쓸 가능성이 0이 아닌데, 그때 소유자를 안
+    //    보면 남의 세션에 "재수신"으로 응답하게 된다.
+    if (calibActive_ && calibOwner_ == owner && !reqId.empty() &&
+        reqId == calibReqId_) {
+        if (fromQt)
+            srv_.sendTo("QT", makeMsg("CALIB_STARTED",
+                {{"ch", calibCh_}, {"request_id", calibReqId_},
+                 {"msg", "이미 진행 중인 요청입니다 (상태 재전송)"}}));
         logf("[INFO] (%s) CALIB_START 재수신 - 같은 request_id라 상태만 재전송 "
              "[채널 %d]", origin, calibCh_);
         return;
     }
     if (calibActive_) {
-        reject("busy", "채널 " + std::to_string(calibCh_) +
-                           " 캘리브레이션이 이미 진행 중입니다.");
+        // owner를 실어 보낸다 - Qt가 "관리자 창이 쓰는 중"과 "내가 이미 시작함"을
+        // 문구로 구분할 수 있어야 조작자가 다음 행동을 정한다 (§3-2).
+        reject("busy",
+               std::string(calibOwner_ == CalibOwner::ADMIN ? "관리자 창이 "
+                                                            : "") +
+                   "채널 " + std::to_string(calibCh_) +
+                   " 캘리브레이션을 진행 중입니다.",
+               {{"owner", ownerName(calibOwner_)}});
         return;
     }
     // ----- §4-4: 도색 중에는 시작하지 않는다 -----
@@ -143,9 +208,63 @@ void Router::startCalib(const json& payload, const json& msg, const char* origin
         return;
     }
 
-    // ----- 수락 -----
+    // ----- 방식 분기: 오도메트리 주행이면 여기서 갈라진다 -----
+    // 위 검증(멱등/busy/도색중/채널/로그인/피어접속)은 두 방식 공통이라 같이
+    // 통과시켰다. 다른 건 "무엇을 로봇/CCTV에 보내는가"뿐이다 - 정적 앵커는
+    // 원본 CALIB_START를 그대로 중계하고(아래), 오도메트리는 서버가 만든
+    // 사각형 op을 PATH{phase:"calib"}로 보낸다
+    // (docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §1, §3).
+    //
+    // 🔴 method로 가르지 않는다. 두 규격이 같은 값을 쓰기 때문이다:
+    //     - 2026-08-10 Qt 계약: Qt가 **정적 앵커** 요청에 method:"robot_motion"을
+    //       실어 보낸다 (protocol.hpp:259, QT_HOMOGRAPHY_REPLY_20260810_SERVER.md
+    //       §225 표. "로봇 주행 호모그래피"라는 기능 이름에서 온 값이다)
+    //     - 2026-08-12 오도메트리 wire 스펙: 같은 값을 **오도메트리** 방식의
+    //       판별자로 다시 썼다
+    //   그래서 2026-08-12부터 Qt의 정상적인 정적 앵커 요청이 전부 오도메트리로
+    //   해석돼 unsupported_from_qt로 거절돼 왔다 - Qt의 캘리 버튼이 그날부터
+    //   죽어 있었다는 뜻이다 (tools/calib_session_test.cpp T1a가 이걸 잡는다).
+    //
+    //   판별자를 오도메트리 **전용 필드의 존재**로 바꾼다. 이 셋은 정적 앵커
+    //   요청에 실릴 이유가 없고, 이미 배포된 Qt/CCTV/관리자 창을 하나도 안 고쳐도
+    //   된다. method는 그대로 받되 무시한다.
+    const bool hasOdoField = payload.contains("m_cm") ||
+                             payload.contains("n_cm") ||
+                             payload.contains("start_corner");
+    if (hasOdoField) {
+        // 사각형 치수 검증. startOdoCalib()이 아니라 여기서 하는 이유는
+        // reject() 하나로 QT 회신과 ADMIN 로그가 같이 처리되기 때문이다 -
+        // 예전에는 저쪽에서 로그만 남겨서, Qt를 열면 조작자가 왜 아무 일도
+        // 일어나지 않는지 알 방법이 없었다.
+        const double mCm = payload.value("m_cm", 0.0);
+        const double nCm = payload.value("n_cm", 0.0);
+        const std::string corner = payload.value("start_corner", "");
+        if (corner != "bottom_left" && corner != "top_left") {
+            reject("invalid_param",
+                   "start_corner가 \"bottom_left\"/\"top_left\"가 아닙니다: \"" +
+                       corner + "\"");
+            return;
+        }
+        // 반쪽 구간(각 변을 반으로 쪼갠 것, wire 스펙 §2-1)이 min_move_m 미만이면
+        // 그 op이 경로 생성 필터에 걸려 로봇이 실행할 수 없는 미세 동작이 된다.
+        const double halfMin = params().min_move_m;
+        if (!(mCm > 0.0) || !(nCm > 0.0) || mCm / 200.0 < halfMin ||
+            nCm / 200.0 < halfMin) {
+            char b[192];
+            snprintf(b, sizeof b,
+                     "가로/세로가 너무 작습니다 (m=%.1fcm n=%.1fcm, 각 변의 "
+                     "절반이 %.0fcm 이상이어야 합니다)",
+                     mCm, nCm, halfMin * 100.0);
+            reject("invalid_param", b);
+            return;
+        }
+        startOdoCalib(payload, msg, reqId, ch, fromQt);
+        return;
+    }
+
+    // ----- 수락 (정적 앵커) -----
     calibActive_ = true;
-    calibFromQt_ = fromQt;
+    calibOwner_ = owner;
     calibReqId_ = reqId;
     calibCh_ = ch;
     calibStartMs_ = nowMs();
@@ -190,33 +309,87 @@ void Router::startCalib(const json& payload, const json& msg, const char* origin
 //   풀고 조작자를 다시 화면 앞에 앉히는데, 그 순간 로봇이 아직 굴러가고 있으면
 //   사람이 다치는 쪽에 서 있게 된다. ROBOT/CCTV 양쪽의 CALIB_STOPPED를 받고
 //   나서야 확인해준다 (ABORT_DRAW의 DRAW_ABORTED와 의도적으로 다른 규약).
-void Router::cancelCalib(const json& payload, const json& msg) {
+void Router::cancelCalib(const json& payload, const json& msg,
+                         const char* origin) {
     const std::string reqId = payload.value("request_id", "");
     const int ch = channelOf(payload);
+    const bool fromQt = (std::string(origin) == "QT");
+    // 관리자 창의 강제 회수 (§3-3). Qt가 보내도 의미가 없다 - 아래 소유권
+    // 검사에서 QT는 ADMIN 세션을 못 건드리게 막힌다.
+    const bool force = payload.value("force", false);
 
     if (!calibActive_) {
-        // Qt만 대기 중이고 서버는 이미 세션을 접은 상태 - 여기서 침묵하면 Qt는
-        // 5분 타임아웃까지 갇힌다. 취소의 목적(대기 해제)은 이미 달성됐으므로
-        // 확인해주는 쪽이 맞다.
-        srv_.sendTo("QT", makeMsg("CALIB_CANCELLED",
-            {{"ch", ch}, {"request_id", reqId},
-             {"msg", "진행 중인 캘리브레이션이 없습니다 (이미 종료됨)."}}));
-        logf("[INFO] CALIB_CANCEL 수신 - 진행 중인 세션 없음, 대기 해제만 회신");
+        // 요청한 쪽이 대기 중이고 서버는 이미 세션을 접은 상태 - 여기서
+        // 침묵하면 Qt는 5분 타임아웃까지 갇힌다. 취소의 목적(대기 해제)은 이미
+        // 달성됐으므로 확인해주는 쪽이 맞다.
+        //
+        // 🔴 요청한 쪽에만 보낸다. 예전에는 origin을 안 받아서, 관리자 창이
+        //   취소를 누르기만 해도 Qt에 CALIB_CANCELLED가 날아갔다 - Qt가 아무
+        //   작업도 안 하고 있을 때 취소 완료 알림이 뜬다.
+        if (fromQt)
+            srv_.sendTo("QT", makeMsg("CALIB_CANCELLED",
+                {{"ch", ch}, {"request_id", reqId},
+                 {"msg", "진행 중인 캘리브레이션이 없습니다 (이미 종료됨)."}}));
+        logf("[INFO] (%s) CALIB_CANCEL 수신 - 진행 중인 세션 없음%s", origin,
+             fromQt ? ", 대기 해제만 회신" : " (로그만)");
         return;
     }
+    // ----- 소유권 (§3-3) -----
+    // 시작을 busy로 막는 것만으로는 부족하다 - 취소가 열려 있으면 남의 세션을
+    // 죽일 수 있다. 예외는 관리자 창의 강제 회수 하나다: 로봇이 실제로 굴러가는
+    // 중인데 Qt 단말 앞에 사람이 없을 수 있고, 그때 관리자가 로봇을 세울 방법이
+    // 없으면 안 된다. (ESTOP은 이 검사와 무관하게 항상 통한다 - fromQt/fromAdmin이
+    // 캘리 경로를 타지 않고 곧장 ROBOT으로 중계한다.)
+    const CalibOwner asker = fromQt ? CalibOwner::QT : CalibOwner::ADMIN;
+    bool preempting = false;
+    if (calibOwner_ != asker) {
+        if (!fromQt && force) {
+            preempting = true;
+            logf("[WARN] (ADMIN) CALIB_CANCEL{force} - %s 소유 세션을 강제 회수 "
+                 "[채널 %d]", ownerName(calibOwner_), calibCh_);
+        } else {
+            rejectCalib(fromQt, calibCh_, reqId, origin, "not_owner",
+                        std::string("이 캘리브레이션은 ") +
+                            (calibOwner_ == CalibOwner::ADMIN ? "관리자 창"
+                                                              : "Qt") +
+                            "에서 시작한 작업이라 중단할 수 없습니다.");
+            return;
+        }
+    }
     // 늦게 도착한 이전 요청의 취소가 지금 세션을 죽이면 안 된다.
-    if (!reqId.empty() && !calibReqId_.empty() && reqId != calibReqId_) {
-        srv_.sendTo("QT", makeMsg("CALIB_FAIL",
-            {{"ch", calibCh_}, {"request_id", reqId}, {"reason", "cancel_failed"},
-             {"msg", "취소 대상 요청이 현재 진행 중인 요청과 다릅니다."}}));
-        logf("[WARN] CALIB_CANCEL request_id 불일치 (요청 %s, 진행 중 %s) - 무시",
-             reqId.c_str(), calibReqId_.c_str());
+    // (강제 회수는 이 검사를 건너뛴다 - 관리자 창은 Qt의 request_id를 모른다.)
+    if (!preempting && !reqId.empty() && !calibReqId_.empty() &&
+        reqId != calibReqId_) {
+        if (fromQt)
+            srv_.sendTo("QT", makeMsg("CALIB_FAIL",
+                {{"ch", calibCh_}, {"request_id", reqId},
+                 {"reason", "cancel_failed"},
+                 {"msg", "취소 대상 요청이 현재 진행 중인 요청과 다릅니다."}}));
+        logf("[WARN] (%s) CALIB_CANCEL request_id 불일치 (요청 %s, 진행 중 %s) "
+             "- 무시", origin, reqId.c_str(), calibReqId_.c_str());
         return;
     }
     if (calibCancelling_) {
         logf("[INFO] CALIB_CANCEL 재수신 - 이미 정지 확인 대기 중 (ROBOT %s, CCTV %s)",
              cancelAckRobot_ ? "완료" : "대기", cancelAckCctv_ ? "완료" : "대기");
         return;
+    }
+    // 오도메트리 세션은 로봇이 실제로 굴러가는 중이라 이 함수의 나머지(원본
+    // CALIB_CANCEL을 ROBOT에 그대로 중계)로는 로봇을 못 세운다 - 로봇 펌웨어에
+    // CALIB_* 핸들러가 없다. abortOdoCalib()이 대신 ABORT_DRAW로 세운다.
+    if (calibIsOdo_) {
+        if (preempting)
+            abortOdoCalib("preempted",
+                          "관리자 창이 캘리브레이션을 회수했습니다.");
+        else
+            abortOdoCalib("cancelled", "조작자가 취소했습니다.");
+        return;
+    }
+    // 정적 앵커 세션. 강제 회수면 소유자(Qt)에게는 취소가 아니라 실패로 알려야
+    // 한다 - 누르지도 않은 취소가 성공한 것처럼 보이면 안 된다.
+    if (preempting) {
+        calibAbortReason_ = "preempted";
+        calibAbortMsg_ = "관리자 창이 캘리브레이션을 회수했습니다.";
     }
     calibCancelling_ = true;
     calibCancelMs_ = nowMs();
@@ -228,6 +401,13 @@ void Router::cancelCalib(const json& payload, const json& msg) {
 }
 
 // ROBOT/CCTV의 안전 정지 ACK. 둘 다 모여야 Qt의 대기를 푼다.
+//
+// 🔴 종결 응답이 두 갈래다. 정지 핸드셰이크는 "조작자가 취소했다"와 "실패해서
+//   로봇을 세웠다" 양쪽이 공유하는데, Qt에 나가는 메시지는 달라야 한다.
+//   calibAbortReason_가 비어 있으면 순수 취소(CALIB_CANCELLED), 값이 있으면
+//   실패(CALIB_FAIL{그 reason})다. 예전에는 무조건 CALIB_CANCELLED라
+//   capture_timeout으로 죽은 세션이 "안전하게 중단했습니다"로 떴다 - 조작자는
+//   자기가 누르지도 않은 취소가 성공한 줄 알고 결과를 기다린다.
 void Router::onCalibStopped(const std::string& role) {
     if (!calibCancelling_) {
         logf("[WARN] %s CALIB_STOPPED 수신 - 취소를 요청한 적이 없음 (무시)",
@@ -243,20 +423,33 @@ void Router::onCalibStopped(const std::string& role) {
     }
     const int ch = calibCh_;
     const std::string reqId = calibReqId_;
-    const bool toQt = calibFromQt_;
+    const bool toQt = calibToQt();
+    const bool wasOdo = calibIsOdo_;  // clearCalib()이 지우기 전에 떼어둔다
+    const std::string reason = calibAbortReason_;  // 비어 있으면 순수 취소
+    const std::string abortMsg = calibAbortMsg_;
     clearCalib();
-    if (toQt)
-        srv_.sendTo("QT", makeMsg("CALIB_CANCELLED",
-            {{"ch", ch}, {"request_id", reqId},
-             {"msg", "호모그래피 작업을 안전하게 중단했습니다."}}));
-    logf("[INFO] 캘리 취소 완료 [채널 %d] - ROBOT/CCTV 정지 확인됨%s", ch,
-         toQt ? ", QT에 CALIB_CANCELLED 통지" : " (ADMIN 개시)");
+    if (wasOdo) clearPath();  // sendPath()로 세운 로봇 경로 상태를 같이 비운다
+    if (toQt) {
+        if (reason.empty())
+            srv_.sendTo("QT", makeMsg("CALIB_CANCELLED",
+                {{"ch", ch}, {"request_id", reqId},
+                 {"msg", "호모그래피 작업을 안전하게 중단했습니다."}}));
+        else
+            srv_.sendTo("QT", makeMsg("CALIB_FAIL",
+                {{"ch", ch}, {"request_id", reqId}, {"reason", reason},
+                 {"msg", abortMsg}}));
+    }
+    logf("[INFO] 캘리 정지 완료 [채널 %d] reason=%s - ROBOT/CCTV 정지 확인됨%s",
+         ch, reason.empty() ? "(취소)" : reason.c_str(),
+         !toQt ? " (ADMIN 개시)"
+               : reason.empty() ? ", QT에 CALIB_CANCELLED 통지"
+                                : ", QT에 CALIB_FAIL 통지");
 }
 
 // CCTV가 올린 진행률. 서버는 진행률을 계산할 방법이 없다(샘플 개수도 알고리즘
 // 단계도 카메라만 안다). ch/request_id만 채워 그대로 넘긴다.
 void Router::relayCalibProgress(const json& msg) {
-    if (!calibActive_ || !calibFromQt_) return;  // 기다리는 Qt가 없으면 버린다
+    if (!calibActive_ || !calibToQt()) return;  // 기다리는 Qt가 없으면 버린다
     json out = msg;
     out["payload"]["ch"] = calibCh_;
     out["payload"]["request_id"] = calibReqId_;
@@ -295,6 +488,29 @@ void Router::checkCalibTimeout() {
                       (cancelAckRobot_ ? "확인" : "무응답") + ", CCTV " +
                       (cancelAckCctv_ ? "확인" : "무응답") +
                       "). 로봇 상태를 직접 확인하세요.");
+        return;
+    }
+    if (calibIsOdo_) {
+        // 주행이 끝나고 카메라의 H 계산을 기다리는 구간 (CALIB_DONE 이후).
+        // 여기서는 abortOdoCalib()을 쓰면 안 된다 - 로봇은 이미 서 있고 경로도
+        // 비웠으므로 세울 대상이 없다. CALIB_CANCEL을 보내봐야 로봇/카메라의
+        // CALIB_STOPPED를 기다리다 cancel_failed로 한 번 더 늘어질 뿐이다.
+        if (odoAwaitingResult_) {
+            if (now - odoResultWaitMs_ < params().calib_odo_result_wait_ms)
+                return;
+            failCalib("timeout",
+                "주행은 끝났지만 카메라가 " +
+                    std::to_string(params().calib_odo_result_wait_ms / 1000) +
+                    "초 안에 결과를 보내지 않았습니다. 카메라 상태를 확인하세요.");
+            return;
+        }
+        // 주행 구간. failCalib()을 바로 부르면 안 된다 - 그건 서버 상태만
+        // 정리하고 QT에만 통지할 뿐 로봇을 세우지 않는다. abortOdoCalib()이
+        // 정지 핸드셰이크로 로봇을 세운 뒤 세션을 닫는다.
+        const long budget = odoDriveBudgetMs();
+        if (now - calibStartMs_ < budget) return;
+        abortOdoCalib("timeout", "제한 시간 " + std::to_string(budget / 1000) +
+                                     "초 안에 주행이 끝나지 않았습니다.");
         return;
     }
     if (now - calibStartMs_ < params().calib_timeout_ms) return;

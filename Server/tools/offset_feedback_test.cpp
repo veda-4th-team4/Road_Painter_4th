@@ -39,7 +39,8 @@ static bool needsMore(const std::vector<OpMeta>& meta, int k) {
 static void moreTarget(const OpMeta& m, double a, double& tx, double& ty) {
     const double ux = std::cos(m.exitHeadingDeg * M_PI / 180.0);
     const double uy = std::sin(m.exitHeadingDeg * M_PI / 180.0);
-    const double off = m.centerAheadByA ? a : 0.0;
+    (void)a;
+    const double off = m.centerAheadM;
     tx = m.penTarget[0] + off * ux;
     ty = m.penTarget[1] + off * uy;
 }
@@ -48,7 +49,9 @@ static bool near(double x, double y) { return std::fabs(x - y) < 1e-6; }
 
 int main() {
     const double a = params().pen_offset_m;
-    printf("pen_offset_m = %.3f m\n\n", a);
+    const double hw = params().pen_width_m / 2.0;   // 펜 두께 보정 반폭
+    printf("pen_offset_m = %.3f m, pen_width_m = %.3f m (hw = %.3f)\n\n",
+           a, params().pen_width_m, hw);
 
     // 0.5 x 0.3 m 직사각형의 첫 두 변. 도색 -> 회전 -> 도색.
     const std::vector<Pt> points = {{0.0, 0.0}, {0.5, 0.0}, {0.5, 0.3}};
@@ -83,7 +86,7 @@ int main() {
             moreTarget(m, a, tx, ty);
             printf("  꼭짓점=(%.3f,%.3f) 중심목표=(%.3f,%.3f)%s",
                    m.penTarget[0], m.penTarget[1], tx, ty,
-                   m.centerAheadByA ? " [+a]" : "");
+                   m.centerAheadM != 0.0 ? " [ahead]" : "");
         }
         printf("\n");
     }
@@ -94,14 +97,17 @@ int main() {
         // 진행 방위 0도이므로 중심 목표는 (a, 0)이어야 한다.
         const OpMeta& m = p.meta[0];
         CHECK(m.op == "move" && !m.isPath, "op0 은 오프셋 move 다");
-        CHECK(near(p.ops[0].value("dist_m", 0.0), +a), "전진량 = +%.3f", a);
+        CHECK(near(p.ops[0].value("dist_m", 0.0), a - hw),
+              "전진량 = +%.3f (a - w/2, 펜이 꼭짓점보다 w/2 앞에 앉는다)", a - hw);
         CHECK(m.hasTarget, "목표 꼭짓점을 갖고 있다 (예전에는 없었다)");
         CHECK(near(m.penTarget[0], 0.0) && near(m.penTarget[1], 0.0),
               "목표 꼭짓점 = 도색 시작점 (0,0)");
-        CHECK(m.centerAheadByA, "중심 목표는 꼭짓점보다 a 앞 (곧 노즐을 내린다)");
+        CHECK(near(m.centerAheadM, a - hw),
+              "중심 목표는 꼭짓점보다 (a - w/2) 앞");
         double tx, ty;
         moreTarget(m, a, tx, ty);
-        CHECK(near(tx, a) && near(ty, 0.0), "중심 목표 = (%.3f, 0.000)", a);
+        CHECK(near(tx, a - hw) && near(ty, 0.0),
+              "중심 목표 = (%.3f, 0.000)", a - hw);
         CHECK(needsMore(p.meta, 1), "boundary 1 에서 MORE 판정 대상이다");
     }
 
@@ -115,12 +121,12 @@ int main() {
         CHECK(idx > 0, "오프셋 후진 move 가 존재한다 (op%d)", idx);
         if (idx > 0) {
             const OpMeta& m = p.meta[(size_t)idx];
-            CHECK(near(p.ops[(size_t)idx].value("dist_m", 0.0), -a),
-                  "후진량 = -%.3f", a);
+            CHECK(near(p.ops[(size_t)idx].value("dist_m", 0.0), -(a + hw)),
+                  "후진량 = -%.3f (a + w/2, 늘어난 도색만큼 더 물러난다)", a + hw);
             CHECK(m.hasTarget, "목표 꼭짓점을 갖고 있다 (예전에는 없었다)");
             CHECK(near(m.penTarget[0], 0.5) && near(m.penTarget[1], 0.0),
                   "목표 꼭짓점 = 도색 종료점 (0.5,0)");
-            CHECK(!m.centerAheadByA,
+            CHECK(near(m.centerAheadM, 0.0),
                   "중심 목표는 꼭짓점 그대로 (노즐을 이미 올렸다)");
             double tx, ty;
             moreTarget(m, a, tx, ty);
@@ -138,12 +144,14 @@ int main() {
         CHECK(idx >= 0, "도색 move(role=path) 가 존재한다 (op%d)", idx);
         if (idx >= 0) {
             const OpMeta& m = p.meta[(size_t)idx];
-            CHECK(m.hasTarget && m.centerAheadByA,
-                  "도착 꼭짓점 + a 앞 목표 유지");
+            CHECK(near(p.ops[(size_t)idx].value("dist_m", 0.0), 0.5 + 2.0 * hw),
+                  "도색 거리 = %.3f (L + w, 앞뒤 w/2씩 연장)", 0.5 + 2.0 * hw);
+            CHECK(m.hasTarget && near(m.centerAheadM, a + hw),
+                  "도착 꼭짓점 + (a + w/2) 앞 목표");
             double tx, ty;
             moreTarget(m, a, tx, ty);
-            CHECK(near(tx, 0.5 + a) && near(ty, 0.0),
-                  "중심 목표 = (%.3f, 0.000)", 0.5 + a);
+            CHECK(near(tx, 0.5 + a + hw) && near(ty, 0.0),
+                  "중심 목표 = (%.3f, 0.000)", 0.5 + a + hw);
         }
     }
 
@@ -183,6 +191,66 @@ int main() {
                paintDownBoundaries.size());
         for (size_t k : paintDownBoundaries) printf(" boundary %zu", k);
         printf("\n");
+    }
+
+    printf("\n[5] 펜 두께 보정 - 펜이 실제로 [V0-w/2, V1+w/2] 를 지나는가\n");
+    {
+        // 이번 보정의 존재 이유를 좌표로 못박는다. 마커 중심을 op 순서대로
+        // 누적하고, 펜 = 마커 - a (진행방향) 로 환산해 도색 시작/끝을 본다.
+        // 여기가 깨지면 꼭짓점 귀퉁이가 다시 비거나 도색이 경계를 넘친다.
+        double cx = 0.0, cy = 0.0;      // 마커 중심 (도색 시작 꼭짓점에서 출발)
+        double penDownX = 0, penDownY = 0, penUpX = 0, penUpY = 0;
+        bool down = false, sawDown = false, sawUp = false;
+        for (size_t i = 0; i < p.meta.size() && !sawUp; ++i) {
+            const OpMeta& m = p.meta[i];
+            if (m.op == "move") {
+                const double h = m.exitHeadingDeg * M_PI / 180.0;
+                const double d = p.ops[i].value("dist_m", 0.0);
+                cx += d * std::cos(h);
+                cy += d * std::sin(h);
+            } else if (m.op == "nozzle") {
+                const bool nd = p.ops[i].value("down", false);
+                // 펜은 마커보다 a 뒤. 방위는 직전 주행 op의 것을 쓴다.
+                double hb = 0.0;
+                for (size_t j = i; j-- > 0;)
+                    if (hasHeading(p.meta[j].exitHeadingDeg)) {
+                        hb = p.meta[j].exitHeadingDeg * M_PI / 180.0; break;
+                    }
+                const double px = cx - a * std::cos(hb);
+                const double py = cy - a * std::sin(hb);
+                if (nd && !down) { penDownX = px; penDownY = py; sawDown = true; }
+                if (!nd && down) { penUpX = px;   penUpY = py;   sawUp = true; }
+                down = nd;
+            }
+        }
+        CHECK(sawDown && sawUp, "첫 도색 구간의 노즐 down/up 을 찾았다");
+        if (sawDown && sawUp) {
+            // 첫 구간은 (0,0) -> (0.5,0), 진행방위 0도.
+            CHECK(near(penDownX, -hw) && near(penDownY, 0.0),
+                  "도색 시작 펜 = (%.3f, 0.000)  = V0 - w/2 (귀퉁이 메움)", -hw);
+            CHECK(near(penUpX, 0.5 + hw) && near(penUpY, 0.0),
+                  "도색 종료 펜 = (%.3f, 0.000)  = V1 + w/2 (귀퉁이 메움)",
+                  0.5 + hw);
+            CHECK(near((penUpX - penDownX), 0.5 + 2.0 * hw),
+                  "실제 도색 길이 = %.3f (= L + w)", 0.5 + 2.0 * hw);
+        }
+        // 마커가 종료 꼭짓점으로 정확히 복귀하는지 (다음 구간의 기준점).
+        double mx = 0.0, my = 0.0;
+        int firstTurn = -1;
+        for (size_t i = 0; i < p.meta.size(); ++i) {
+            if (p.meta[i].op == "turn" && p.meta[i].isPath) { firstTurn = (int)i; break; }
+        }
+        CHECK(firstTurn > 0, "도면 turn(=구간 경계)이 존재한다");
+        for (int i = 0; i < firstTurn; ++i) {
+            if (p.meta[(size_t)i].op != "move") continue;
+            const double h = p.meta[(size_t)i].exitHeadingDeg * M_PI / 180.0;
+            const double d = p.ops[(size_t)i].value("dist_m", 0.0);
+            mx += d * std::cos(h);
+            my += d * std::sin(h);
+        }
+        CHECK(near(mx, 0.5) && near(my, 0.0),
+              "turn 직전 마커 = (0.500, 0.000) = 꼭짓점 정확히 복귀 "
+              "(실제 %.3f, %.3f)", mx, my);
     }
 
     printf("\n%s (%d fail)\n", fails ? "실패" : "전부 통과", fails);
