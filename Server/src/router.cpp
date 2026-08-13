@@ -556,11 +556,16 @@ void Router::resolveBoundary() {
         const double head = m.exitHeadingDeg;
         const double ux = std::cos(head * M_PI / 180.0);
         const double uy = std::sin(head * M_PI / 180.0);
-        // 🔴 노즐이 내려간 상태로 끝나는 op이면 마커 중심의 목표는 꼭짓점보다
-        //   a 앞이다 (§5.2). 이 항을 빠뜨리면 도색 구간마다 15cm 전진 오차를
-        //   잡고 있다고 착각해 매번 MORE{-0.150}를 쏜다.
-        //   오프셋 전진 다리(+a)도 곧 노즐을 내리므로 같은 목표를 쓴다.
-        const double off = m.centerAheadByA ? P.pen_offset_m : 0.0;
+        // 🔴 마커 중심의 목표는 꼭짓점보다 진행방향으로 centerAheadM 앞이다.
+        //   이 항을 빠뜨리면 도색 구간마다 15cm 전진 오차를 잡고 있다고 착각해
+        //   매번 MORE{-0.150}를 쏜다 (§5.2).
+        //
+        //   값은 op마다 다르다 (ops_builder.hpp OpMeta::centerAheadM 참고).
+        //   예전에는 bool이라 "참이면 pen_offset_m"으로 여기서 상수를 꺼내 썼는데,
+        //   펜 두께 보정(2026-08-13)이 들어오며 진입(a-w/2)/도색(a+w/2)/이탈(0)로
+        //   갈려서 경로를 만든 쪽이 값을 실어 보내는 구조로 바꿨다. 여기서 다시
+        //   상수를 쓰면 MORE가 그 두께 보정을 매 boundary마다 되돌린다.
+        const double off = m.centerAheadM;
         const double tx = m.penTarget[0] + off * ux;
         const double ty = m.penTarget[1] + off * uy;
         const double dist = (tx - cx) * ux + (ty - cy) * uy;

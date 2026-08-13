@@ -28,6 +28,11 @@ using json = nlohmann::json;
     /* ---- 기하 (로봇 하드웨어 실측값) ---- */                                \
     X(double, pen_offset_m, 0.150,                                             \
       "펜(노즐)이 마커 중심 뒤로 떨어진 거리 a. 로봇 PathFollower.h와 같아야 함")\
+    X(double, pen_width_m, 0.05,                                               \
+      "펜이 실제로 칠하는 폭 w (마커 사양 5cm). 도색 구간을 앞뒤로 w/2씩 늘려 "\
+      "꼭짓점 귀퉁이가 비지 않게 한다 - docs/PEN_WIDTH_COMPENSATION_20260813.md. "\
+      "0으로 두면 보정이 통째로 꺼진다(예전 동작). 실측값을 넣을 것 - 마커 "   \
+      "사양보다 압력·속도에 따라 달라진다")                                    \
     X(double, wheel_base_m, 0.166,                                             \
       "좌우 바퀴 축간거리 W(로봇팀 실측). arc 안쪽바퀴 역회전 경고 판정에만 사용")\
     X(double, min_paint_radius_m, 0.200,                                       \
@@ -145,6 +150,16 @@ inline void sanitize(Params& p) {
         }
     };
     floorAt("pen_offset_m", p.pen_offset_m, 0.0);
+    floorAt("pen_width_m", p.pen_width_m, 0.0);
+    // 🔴 w/2 가 a 를 넘으면 도색 진입 오프셋(a - w/2)이 음수가 된다 - 펜을 내리기
+    // 전에 뒤로 물러나는 꼴이라 기하가 성립하지 않는다. 물리적으로도 "펜 반폭이
+    // 마커~펜 거리보다 크다"는 뜻이라 현장 오입력으로 보고 잘라낸다.
+    if (p.pen_width_m / 2.0 > p.pen_offset_m) {
+        logf("[WARN] params 'pen_width_m'=%g 의 절반이 pen_offset_m(%g)을 넘음 "
+             "- 도색 진입 오프셋이 음수가 되므로 %g 로 내림",
+             p.pen_width_m, p.pen_offset_m, p.pen_offset_m * 2.0);
+        p.pen_width_m = p.pen_offset_m * 2.0;
+    }
     floorAt("wheel_base_m", p.wheel_base_m, 0.001);
     floorAt("align_max_tries", p.align_max_tries, 0);
     floorAt("more_max_tries", p.more_max_tries, 0);
