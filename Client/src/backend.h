@@ -12,6 +12,7 @@
 #include <QVariantList>
 #include <QPolygonF>
 #include <QHash>
+#include <QSet>
 
 #include "routeplan.h"
 #include "motionprogram.h"
@@ -84,14 +85,7 @@ class Backend : public QObject
     //    개별 노출은 중복이었다. 멤버 m_calibId/m_coordMode/m_calibSource 는 그 조립과
     //    렌즈보정 판정에 계속 쓰이므로 남아 있다.
     Q_PROPERTY(QString scaleText READ scaleText NOTIFY calibChanged)
-    Q_PROPERTY(QString rtspUrl READ rtspUrl NOTIFY rtspChanged)
-
-    // ── 다채널 카메라 (PNM-C16083RVQ, 프로토콜 v0.4) ──────────────────────
-    // 🔴 relayBase **와** channelUrlTemplate 이 둘 다 비어 있으면 channelMode 가
-    //    false 고, 아래 것들은 전부 쓰이지 않는다 — 기존 PNO 단일 채널 직결 동작
-    //    그대로다. 언제든 되돌아갈 수 있어야 한다.
-    //    중계가 없어도 직결 템플릿만 있으면 4채널이 돈다 (2026-08-04).
-    Q_PROPERTY(bool channelMode READ channelMode NOTIFY channelChanged)
+    // ── 4채널 카메라 (PNM-C16083RVQ) ─────────────────────────────────────
     Q_PROPERTY(QString relayBase READ relayBase NOTIFY channelChanged)
     // 화면 표시용 — "중계 …" 또는 "카메라 직결 …". 비밀번호는 가려져 있다.
     Q_PROPERTY(QString streamSourceText READ streamSourceText NOTIFY channelChanged)
@@ -104,11 +98,27 @@ class Backend : public QObject
     // 캘리브레이션이 끝난 채널 번호 목록. QML 바인딩용이다 — channelCalibrated() 는
     // Q_INVOKABLE 이라 캘리가 새로 들어와도 바인딩이 다시 계산되지 않는다.
     Q_PROPERTY(QVariantList calibratedChannels READ calibratedChannels NOTIFY channelChanged)
+    // coord_mode="undistort" 인데 K/D 가 없는 채널 목록. Q_INVOKABLE 은 바인딩
+    // 의존성이 안 잡히므로 화면 표시는 반드시 이 프로퍼티를 쓴다.
+    Q_PROPERTY(QVariantList lensDataMissingChannels READ lensDataMissingChannels
+               NOTIFY channelChanged)
     Q_PROPERTY(bool homographyPending READ homographyPending NOTIFY homographyChanged)
     Q_PROPERTY(int homographyChannel READ homographyChannel NOTIFY homographyChanged)
     Q_PROPERTY(double homographyProgress READ homographyProgress NOTIFY homographyChanged)
     Q_PROPERTY(QString homographyStatus READ homographyStatus NOTIFY homographyChanged)
     Q_PROPERTY(bool homographyCancelPending READ homographyCancelPending NOTIFY homographyChanged)
+    // 오도메트리 주행 캘리브레이션 — 대기 화면이 "로봇이 움직이는 중"임을 구분해
+    // 보여주고, 정지점 진행(9개 중 n번째)을 표시하기 위한 값들.
+    Q_PROPERTY(bool homographyOdometry READ homographyOdometry NOTIFY homographyChanged)
+    Q_PROPERTY(bool homographyCaptureLag READ homographyCaptureLag NOTIFY homographyChanged)
+    Q_PROPERTY(bool homographyCancelUnconfirmed READ homographyCancelUnconfirmed NOTIFY homographyChanged)
+    Q_PROPERTY(QString homographyPhase READ homographyPhase NOTIFY homographyChanged)
+    Q_PROPERTY(int homographyPointIndex READ homographyPointIndex NOTIFY homographyChanged)
+    Q_PROPERTY(int homographyPointTotal READ homographyPointTotal NOTIFY homographyChanged)
+    Q_PROPERTY(int homographyValidPoints READ homographyValidPoints NOTIFY homographyChanged)
+    Q_PROPERTY(double odoWidthCm READ odoWidthCm WRITE setOdoWidthCm NOTIFY homographyChanged)
+    Q_PROPERTY(double odoHeightCm READ odoHeightCm WRITE setOdoHeightCm NOTIFY homographyChanged)
+    Q_PROPERTY(bool odoCcw READ odoCcw WRITE setOdoCcw NOTIFY homographyChanged)
 
     // 서버 통지(DRAW_FAIL 등) 배너
     Q_PROPERTY(QString notice READ notice NOTIFY noticeChanged)
@@ -122,9 +132,13 @@ class Backend : public QObject
     Q_PROPERTY(bool arucoOverlay READ arucoOverlay WRITE setArucoOverlay NOTIFY arucoChanged)
     // 로봇 도장 폭 (mm) — 고정 사양이지만 기체가 바뀌면 조정
     Q_PROPERTY(double strokeWidthMm READ strokeWidthMm WRITE setStrokeWidthMm NOTIFY strokeWidthChanged)
-    // ⚠️ penOffsetMm / penOffsetFromServer 는 지웠다 — BLUEPRINT.pen_offset_m 이
-    //    프로토콜에서 폐지되고 펜 오프셋 보정이 서버 v2/로봇 전담이 됐다.
-    //    전송에서 빠진 뒤로는 설정창에서 값만 받아두고 아무 데도 쓰이지 않았다.
+    // TopView의 마커 중심↔펜 표시 거리. BLUEPRINT 및 주행 보정에는 사용하지 않는다.
+    Q_PROPERTY(double penDisplayOffsetMm READ penDisplayOffsetMm WRITE setPenDisplayOffsetMm
+               NOTIFY penDisplayOffsetChanged)
+    Q_PROPERTY(int videoBrightness READ videoBrightness NOTIFY videoFiltersChanged)
+    Q_PROPERTY(int videoContrast READ videoContrast NOTIFY videoFiltersChanged)
+    Q_PROPERTY(int videoSharpen READ videoSharpen NOTIFY videoFiltersChanged)
+    Q_PROPERTY(int videoSaturation READ videoSaturation NOTIFY videoFiltersChanged)
     // 로봇 속도 — 도색 중에는 도료가 고르게 깔려야 해서 이동보다 느리다
     Q_PROPERTY(double travelSpeedMps READ travelSpeedMps WRITE setTravelSpeedMps NOTIFY speedChanged)
     Q_PROPERTY(double paintSpeedMps READ paintSpeedMps WRITE setPaintSpeedMps NOTIFY speedChanged)
@@ -206,18 +220,7 @@ public:
     QString calibStatus() const { return m_calibStatus; }
     bool calibMissing() const { return m_calibMissing; }
     QString scaleText() const;
-    QString rtspUrl() const { return m_rtspUrl; }
-
     // ── 다채널 ────────────────────────────────────────────────────────────
-    // 4채널 기능은 **주소를 만들 방법이 있을 때** 켜진다 — 중계 주소든 직결
-    // 템플릿이든 하나만 있으면 된다. 단 `{ip}` 직결 템플릿은 cam_ip까지 있어야
-    // 유효하다. 둘 다 비우면 예전 단일 채널 동작으로 돌아간다.
-    bool channelMode() const
-    {
-        const bool directReady = !m_channelUrlTemplate.isEmpty()
-            && (!m_channelUrlTemplate.contains(QStringLiteral("{ip}")) || !m_camIp.isEmpty());
-        return !m_relayBase.isEmpty() || directReady;
-    }
     QString relayBase() const { return m_relayBase; }
     // 지금 어디서 영상을 받고 있는지 한 줄로. 중계인지 카메라 직결인지 화면에
     // 보여주기 위한 것 — relayBase 만 표시하면 직결일 때 빈칸이라 "설정이 안 됐나"
@@ -227,19 +230,22 @@ public:
     int highlightedChannel() const { return m_highlightedCh; }
     int workingChannel() const { return m_workingCh; }
     // 채널을 고르기만 하면 들어갈 수 있다.
-    // ⚠️ "캘리브레이션이 없으면 막는다"로 만들었다가 되돌렸다. 그러면 서버가 아직
-    //    v0.4가 아니거나(=calibs 를 안 보냄) 현장이 캘리 전이면 **어느 채널도 못
-    //    열어 그리드에 갇힌다.** 영상 확인과 수동 조작은 캘리 없이도 필요하고,
-    //    단일 채널 경로도 캘리가 없을 때 막지 않고 경고만 띄운다 — 여기만 더
-    //    엄격하면 일관성도 깨진다. 대신 들어갈 때 경고를 확실히 남긴다.
+    // 캘리브레이션 전에도 영상 확인과 수동 조작은 필요하므로 진입은 허용하고,
+    // 좌표가 정확하지 않을 수 있다는 경고를 표시한다.
     bool canStartChannelWork() const {
-        return channelMode() && m_highlightedCh > 0;
+        return m_highlightedCh > 0;
     }
     // 그 채널에 캘리브레이션 번들이 있는가 (LOGIN_OK.calibs / CHANNEL_OK 기준)
     Q_INVOKABLE bool channelCalibrated(int ch) const;
+    // 그 채널 번들이 coord_mode="undistort" 라고 선언했는데 K/D 가 없는가.
+    // 번들은 기존과 똑같이 수용하되, 이 채널의 좌표는 렌즈 왜곡 보정 없이
+    // 쓰이고 있다는 사실을 화면에서 확인할 수 있어야 한다.
+    Q_INVOKABLE bool channelLensDataMissing(int ch) const {
+        return m_lensDataMissingCh.contains(ch);
+    }
     QVariantList calibratedChannels() const;
-    // 중계 주소 변경. 빈 문자열이면 카메라 직결 템플릿으로 돌아간다. 중계와
-    // 직결 템플릿이 모두 비어 있을 때만 단일 채널 동작으로 돌아간다.
+    QVariantList lensDataMissingChannels() const;
+    // 중계 주소 변경. 빈 문자열이면 .13 카메라 직결 템플릿으로 돌아간다.
     Q_INVOKABLE void setRelayBase(const QString &base);
     // 타일 클릭 — 하이라이트만 바뀐다 (스트림은 이미 4개 다 흐르는 중)
     Q_INVOKABLE void highlightChannel(int ch);
@@ -261,7 +267,37 @@ public:
     double homographyProgress() const { return m_homographyProgress; }
     QString homographyStatus() const { return m_homographyStatus; }
     bool homographyCancelPending() const { return m_homographyCancelPending; }
-    Q_INVOKABLE bool startHomography(int ch);
+    bool homographyOdometry() const { return m_homographyOdometry; }
+    // Backend 알림과 QML 경고색이 **같은 규칙**을 쓰도록 한 곳에서만 판단한다.
+    bool homographyCaptureLag() const {
+        return camcalib::captureLagWarning(m_homographyPointIndex, m_homographyValidPoints);
+    }
+    // 요청은 했는데 서버 확인이 아직/끝내 없는 상태 (QML 경고 표시용)
+    bool homographyCancelUnconfirmed() const {
+        return m_homographyCancelRequested && !m_homographyCancelPending;
+    }
+    QString homographyPhase() const { return m_homographyPhase; }
+    int homographyPointIndex() const { return m_homographyPointIndex; }
+    int homographyPointTotal() const { return m_homographyPointTotal; }
+    int homographyValidPoints() const { return m_homographyValidPoints; }
+    // 입력칸 글자가 그대로 전송 가능한 값인가 (QML 표시용 — 규칙은 camcalib 한 곳).
+    Q_INVOKABLE bool odoSizeTextValid(const QString &text) const {
+        return camcalib::parseOdoSizeCm(text);
+    }
+    Q_INVOKABLE QString odoSizeRangeHint() const { return camcalib::odoSizeRangeText(); }
+    double odoWidthCm() const { return m_odoMCm; }
+    double odoHeightCm() const { return m_odoNCm; }
+    bool odoCcw() const { return m_odoCcw; }
+    void setOdoWidthCm(double v) { if (v == m_odoMCm) return; m_odoMCm = v; emit homographyChanged(); }
+    void setOdoHeightCm(double v) { if (v == m_odoNCm) return; m_odoNCm = v; emit homographyChanged(); }
+    void setOdoCcw(bool v) { if (v == m_odoCcw) return; m_odoCcw = v; emit homographyChanged(); }
+    Q_INVOKABLE bool startHomography(int ch, bool odometry = false);
+    // 오도메트리 주행 캘리브레이션 (요청서 20260813 §1). ccw=true → bottom_left.
+    Q_INVOKABLE bool startOdometryHomography(int ch, double mCm, double nCm, bool ccw);
+    // 입력칸 텍스트 그대로 받는 경로 (QML 시작 버튼 전용). 화면에 보이는 값과
+    // 전송 값이 갈라지지 않도록 파싱·검증·전송을 한 함수에서 처리한다.
+    Q_INVOKABLE bool startOdometryHomographyFromText(int ch, const QString &widthText,
+                                                     const QString &heightText, bool ccw);
     Q_INVOKABLE void cancelHomography();
 
     QString notice() const { return m_notice; }
@@ -270,6 +306,12 @@ public:
     bool arucoOverlay() const { return m_arucoOverlay; }
     void setArucoOverlay(bool on);
     double strokeWidthMm() const { return m_strokeWidthMm; }
+    double penDisplayOffsetMm() const { return m_penDisplayOffsetMm; }
+    void setPenDisplayOffsetMm(double mm);
+    int videoBrightness() const { return m_brightness; }
+    int videoContrast() const { return m_contrast; }
+    int videoSharpen() const { return m_sharpen; }
+    int videoSaturation() const { return m_saturation; }
     double travelSpeedMps() const { return m_speeds.travelMps; }
     double paintSpeedMps() const { return m_speeds.paintMps; }
     double turnSpeedDps() const { return m_speeds.turnDps; }
@@ -324,6 +366,10 @@ public:
     // 노즐 올림/내림 — 서버는 START_DRAW 외의 CMD 를 그대로 ROBOT 에 중계한다
     Q_INVOKABLE void setNozzle(bool down);
     Q_INVOKABLE void toggleEstop();
+    // 단축키(Space)용 — **거는 방향으로만** 동작한다. 토글이면 이미 정지된 상태에서
+    // 한 번 더 눌렀을 때 비상정지가 풀린다(안전 역행). 이미 걸려 있으면 아무것도
+    // 보내지 않고 안내만 남긴다.
+    Q_INVOKABLE void engageEstop();
     Q_INVOKABLE void clearRobotLog();
     Q_INVOKABLE void dismissNotice();
 
@@ -370,10 +416,11 @@ signals:
     void registerSucceeded();
     void registerFailed(const QString &reason);
     void calibChanged();
-    void rtspChanged();
     void noticeChanged();
     void arucoChanged();
     void strokeWidthChanged();
+    void penDisplayOffsetChanged();
+    void videoFiltersChanged();
     void speedChanged();
     void simChanged();
     void lensChanged();
@@ -447,7 +494,19 @@ private:
     //   normalizeCalibObject : 표기 흔들림(H_floor, {"calib":{}}, c0..c3) 흡수
     //   applyCalibObject     : K/D 반영 + coord_mode 로 렌즈보정 자동 판정 + TopView 재구성
     static QJsonObject normalizeCalibObject(const QJsonObject &raw);
-    QString applyCalibObject(const QJsonObject &raw, const QString &source);
+    //   calibHasUsableH      : 3x3 · 유한 실수 · 특이하지 않은 H(H_floor) 인지 검사.
+    //     저장·적용 **전에** 반드시 통과해야 한다. 요청하지 않았거나 늦게 온 번들도
+    //     같은 검사를 받는다 — 그래야 화면 좌표계가 조용히 갈아엎히지 않는다.
+    static bool calibHasUsableH(const QJsonObject &raw);
+    // okOut: 실제로 TopView 에 적용됐는지. 실패(폴백)면 false — 호출부가 이 값을
+    //        보고 "캘리브레이션 없음" 경고를 유지/해제해야 한다.
+    QString applyCalibObject(const QJsonObject &raw, const QString &source,
+                             bool *okOut = nullptr);
+    // coord_mode="undistort" 인데 K/D 가 없는 번들을 채널별로 알린다.
+    // ch >= 1 이면 그 채널 전용 통지 키를 쓰므로 다른 채널 경고를 건드리지 않고,
+    // 나중에 K/D 가 갖춰진 번들이 그 채널로 오면 같은 키만 골라 내린다.
+    // ch == 0 은 채널을 알 수 없는 legacy LOGIN_OK 단일 calib 경로다.
+    void updateLensDataWarning(int ch, const QJsonObject &calib);
     void setNotice(const QString &text, const QString &level,
                    const QString &key = QString());
     void clearNotice(const QString &key);
@@ -460,7 +519,10 @@ private:
     void loadHistory();
     void saveHistory();
     QString recordJob(const QList<QList<QPointF>> &paths, const QList<bool> &closed,
-                      const QString &name, const QString &status);
+                      const QString &name, const QString &status,
+                      const QList<QList<QPointF>> &editPaths = {},
+                      const QList<bool> &editClosed = {},
+                      const QList<bool> &editOuter = {});
     void updateJobRecord(const QString &id, const QString &status, double progress);
 
     video_worker *m_worker = nullptr;
@@ -472,7 +534,13 @@ private:
     QTimer *m_jobTick = nullptr;
     QTimer *m_frameWatch = nullptr;
     QTimer *m_homographyTimer = nullptr;
+    QTimer *m_cancelWatchdog = nullptr;   // 중단 확인 감시 (성공 처리 금지)
     bool m_gotRealFrame = false;
+    // 스트림 세대(generation). 채널/주소를 바꿀 때마다 1 증가한다. 워커에서 오는
+    // 프레임·마커·통계는 **자기가 만들어진 세대와 현재 세대가 같을 때만** 반영한다.
+    // 큐드 시그널은 disconnect 시점과 무관하게 이미 보내진 것이 배달될 수 있어,
+    // 이 검사 없이는 CH1 프레임이 CH3 화면에 그려진다.
+    quint64 m_streamGen = 0;
 
     QString m_userId;
     QString m_camIp;
@@ -487,31 +555,12 @@ private:
     bool m_painting = false;
     bool m_nozzleDown = false;
     QString m_robotLog;
-    // 카메라 IP 만 알면 되도록 템플릿으로 조립한다 ({ip} 치환).
-    // ⚠️ 서버가 준 cam_ip 로 URL 을 조립할 때 쓰는 템플릿. 경로가 여기 박혀 있으므로
-    //    "카메라 IP" 칸에 IP 만 넣으면 **항상 이 프로파일**로 붙는다. 다른 프로파일을
-    //    쓰려면 아래 "RTSP 전체 주소" 칸을 써야 한다.
-    //    ⚠️ 경로는 **카메라에 실제로 존재하는 프로파일 이름**이어야 한다. 없는 이름을
-    //    적으면 스트림을 못 열고, 계정 잠김 방지 때문에 재시도도 하지 않는다 (그냥
-    //    "RTSP 연결 실패" 로그만 남고 오프라인 캔버스로 떨어진다). 한때 QT 전용
-    //    프로파일 FORQT 를 만들어 썼다가 지웠으므로 기본 프로파일 FullHD 로 되돌린다.
-    //    카메라에서 프로파일 이름을 바꾸면 여기도 같이 바꿔야 한다.
-    QString m_rtspTemplate = "rtsp://admin:5hanwha!@{ip}:554/FullHD/media.smp";
-    // 현장 카메라 (Hanwha PNO-A9081R). 경로는 **프로파일 이름**으로 쓴다 —
-    // /FullHD/ 와 /profile2/ 는 같은 스트림이지만, 프로파일을 추가·재정렬하면
-    // /profileN/ 은 다른 스트림을 가리키게 되고 이름은 따라온다.
-    // QSettings 의 camera/rtspUrl 이 있으면 그게 우선.
-    QString m_rtspUrl = "rtsp://admin:5hanwha!@192.168.0.12:554/FullHD/media.smp";
-    // 단일 채널(직결) 주소만 따로 기억한다. 4채널 모드에서는 m_rtspUrl 이
-    // "…:8554/ch2" 같은 중계 주소로 바뀌는데, 그걸 QSettings 에 저장해버리면
-    // 나중에 중계 주소를 비워 PNO 로 되돌아갈 때 돌아갈 곳이 없어진다
-    // (중계를 안 띄운 상태에서 /ch2 를 열려다 실패하고 오프라인 캔버스로 떨어진다).
-    QString m_directRtspUrl = m_rtspUrl;
-    int m_brightness = 0, m_contrast = 0, m_sharpen = 0, m_saturation = 0;
+    // 현재 작업 채널의 실제 RTSP URL. 채널 선택 시 CH1~CH4 중 하나로 바뀐다.
+    QString m_rtspUrl = "rtsp://admin:5hanwha!@192.168.0.13:554/0/profile2/media.smp";
+    int m_brightness = 45, m_contrast = 8, m_sharpen = 0, m_saturation = 0;
 
     // ── 다채널 (PNM-C16083RVQ) ────────────────────────────────────────────
-    // 비어 있으면 직결 템플릿+cam_ip로 4채널을 계속한다. 단일 채널로 완전히
-    // 돌아가려면 relayBase와 channelUrlTemplate을 모두 비워야 한다.
+    // 비어 있으면 직결 템플릿+cam_ip로 CH1~CH4를 계속한다.
     //    QSettings: camera/relayBase, camera/channelCount
     QString m_relayBase;
     // 🔴 중계 없이 **카메라에 직결**할 때 쓰는 채널 URL 템플릿.
@@ -524,7 +573,7 @@ private:
     // ⚠️ 이 카메라에는 **저해상도 서브 프로파일이 없다.** 그래서 subUrl 은 직결
     //    모드에서 메인과 같은 주소를 준다 — 미리보기 4장이 전부 같은 해상도를
     //    디코딩한다. 서브가 생기면 여기만 고치면 된다.
-    //    현장 실측(2026-08-07): profile2는 4채널 모두 1920x1080 30fps.
+    //    현장 운용(2026-08-11): profile2는 4채널 모두 2592x1520 20fps.
     QString m_channelUrlTemplate =
         QStringLiteral("rtsp://admin:5hanwha!@{ip}:554/{ch0}/profile2/media.smp");
     int m_channelCount = 4;
@@ -535,6 +584,8 @@ private:
     // LOGIN_OK.calibs / CHANNEL_OK 로 받은 채널별 번들. 키는 채널 번호 문자열.
     // "어느 채널이 캘리 됐는지"를 그리드에 표시하고, 채널 전환 시 그 번들을 적용한다.
     QJsonObject m_calibs;
+    // coord_mode="undistort" 인데 K/D 가 없는 채널들 (0 = 채널 미상 legacy 번들).
+    QSet<int> m_lensDataMissingCh;
     QList<preview_worker *> m_previews;
     QHash<int, ChannelTile *> m_tiles;
     bool m_homographyPending = false;
@@ -543,6 +594,19 @@ private:
     double m_homographyProgress = -1.0;
     QString m_homographyStatus;
     QString m_homographyRequestId;
+    // 오도메트리 주행 캘리브레이션 상태 (요청서 §2-2 진행률 · §5-1 입력값)
+    bool    m_homographyOdometry = false;
+    // 🔴 "중단을 요청한 적이 있다"와 "지금 확인을 기다린다"를 분리한다.
+    //    watchdog 이 만료되면 pending 은 내려가지만 requested 는 세션이 끝날 때까지
+    //    남는다 — 늦게 온 H_MATRIX 가 취소를 성공 완료로 뒤집지 못하게 하는 근거다.
+    bool    m_homographyCancelRequested = false;
+    QString m_homographyPhase;            // "driving" | "solving"
+    int     m_homographyPointIndex = -1;  // 0~8, 방금 캡처를 마친 정지점
+    int     m_homographyPointTotal = -1;  // 9 고정
+    int     m_homographyValidPoints = -1; // 유효 대응점 수 (6 미만이면 실패)
+    double  m_odoMCm = 90.0;              // 사각형 가로(cm) 기본 90
+    double  m_odoNCm = 60.0;              // 사각형 세로(cm) 기본 60
+    bool    m_odoCcw = true;              // true=반시계(bottom_left)
     quint64 m_homographyRequestSerial = 0;
 
     bool m_serverConnected = false;
@@ -575,6 +639,9 @@ private:
     QString m_phaseHint = "경로를 작성한 뒤 작업을 시작하세요.";
     QList<QList<QPointF>> m_missionPaths;   // 미터 좌표, 도형별
     QList<bool> m_missionClosed;            // 도형별 닫힘 여부
+    QList<QList<QPointF>> m_missionEditPaths; // 편집용 완성 외곽(미터)
+    QList<bool> m_missionEditClosed;
+    QList<bool> m_missionEditOuter;
     // 마지막으로 서버에 보낸 BLUEPRINT 그대로 — 동작 시퀀스 미리보기가 실제로
     // 전송한 경로와 어긋나지 않게 계획 결과를 붙잡아 둔다.
     QList<QPointF> m_routePts;
@@ -601,6 +668,7 @@ private:
     QString m_arucoSummary;
     bool m_arucoOverlay = true;
     double m_strokeWidthMm = 50.0;   // 로봇이 그리는 선 두께 (5 cm)
+    double m_penDisplayOffsetMm = 155.0; // TopView 표시 전용, 서버 전송에는 미사용
     motionprogram::Speeds m_speeds;
     // CCTV 가 준 정식 내부 파라미터 (K + plumb-bob 5계수). 왜곡 보정의 **유일한** 출처다.
     // ⚠️ 여기 있던 m_lensK1/m_lensK2(옛 2계수 경로)는 지웠다 — 같은 일을 하는 길이

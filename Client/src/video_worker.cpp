@@ -1,4 +1,5 @@
 #include "video_worker.h"
+#include "videofilters.h"
 #include <QDebug>
 #include <QRegularExpression>
 #include <opencv2/objdetect/aruco_detector.hpp>
@@ -149,6 +150,9 @@ void video_worker::detectArucoAlways(const cv::Mat &bgr)
     constexpr int kDictCount = 3;
     constexpr double kScale = 0.5;          // 축소 배율 (1/2 = 빠른 경로)
     constexpr double kInv   = 1.0 / kScale;
+    // 20fps에서 2프레임마다 검출하므로 약 1초마다 한 번 전체를 재탐색한다.
+    // ROI 안에서 몇 개라도 계속 잡히면 기존 코드는 ROI 밖 마커를 영원히 못 찾았다.
+    constexpr int kRoiPassesBetweenFullScans = 10;
 
     // 그레이 변환은 여기서 한 번만. detectMarkers 는 컬러를 받으면 내부에서 매번
     // 그레이로 바꾸므로, 사전 3종을 도는 탐색 모드에서는 그 변환도 3번 돌았다.
@@ -168,6 +172,8 @@ void video_worker::detectArucoAlways(const cv::Mat &bgr)
     std::vector<int> ids;
 
     auto runDetect = [&](int dict, const cv::Rect &r) {
+        corners.clear();
+        ids.clear();
         detectors[dict].detectMarkers(small(r), corners, ids);
         // ROI 로컬 좌표 → 축소본 전체 좌표
         if (r.x || r.y)
@@ -175,11 +181,19 @@ void video_worker::detectArucoAlways(const cv::Mat &bgr)
     };
 
     if (m_arucoDictLock >= 0) {
-        runDetect(m_arucoDictLock, roi);
+        const cv::Rect full(0, 0, small.cols, small.rows);
+        const bool periodicFullScan = usingRoi
+            && ++m_arucoRoiPasses >= kRoiPassesBetweenFullScans;
+        if (periodicFullScan) m_arucoRoiPasses = 0;
+
+        runDetect(m_arucoDictLock, periodicFullScan ? full : roi);
         // ROI 에서 놓쳤으면 그 프레임만 전체로 다시 본다. 로봇이 빠르게 움직여
         // ROI 를 벗어나는 경우가 여기서 회복된다.
-        if (ids.empty() && usingRoi)
-            runDetect(m_arucoDictLock, cv::Rect(0, 0, small.cols, small.rows));
+        if (ids.empty() && usingRoi && !periodicFullScan) {
+            runDetect(m_arucoDictLock, full);
+            m_arucoRoiPasses = 0;
+        }
+        if (!usingRoi) m_arucoRoiPasses = 0;
         if (ids.empty()) {
             if (++m_arucoMiss > 40) { m_arucoDictLock = -1; m_arucoMiss = 0; }
         } else {
@@ -205,6 +219,7 @@ void video_worker::detectArucoAlways(const cv::Mat &bgr)
     // 여유는 프레임 사이에 마커가 움직일 수 있는 거리 + 검출 흔들림을 덮을 정도.
     if (ids.empty()) {
         m_arucoRoiValid = false;            // 놓쳤으면 다음엔 전체부터
+        m_arucoRoiPasses = 0;
     } else {
         float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
         for (const auto &m : corners) for (const auto &p : m) {
@@ -384,7 +399,7 @@ void video_worker::run() {
         }
 
 
-        // --- [영상 변형 시작] ---
+        // 표시 필터 값은 GUI 스레드에서 바뀌므로 한 프레임 단위로 스냅샷을 잡는다.
         m_mutex.lock();
         int b = m_brightness;
         int c = m_contrast;
@@ -398,37 +413,8 @@ void video_worker::run() {
         //      · RTSP 뷰  — 도면 점을 정변환(distort)해서 왜곡 화면에 맞춰 그림
         //    ArUco 검출 좌표도 원본 픽셀이므로 위 두 경로와 좌표계가 일치한다.
 
-        // 1. 밝기 및 대비 조절
-        // 기본값(0/0)이면 alpha=1, beta=0 이라 결과가 원본과 같다. 그런데도 convertTo 는
-        // 1920x1080x3 을 통째로 곱하고 새 버퍼에 쓴다 — 매 프레임 낭비다. 건너뛴다.
-        if (b != 0 || c != 0) {
-            double alpha = (c / 100.0) + 1.0;
-            frame.convertTo(frame, -1, alpha, b);
-        }
-
-        // 2. 채도 조절
-        // ⚠️ 예전에는 at<Vec3b>() 로 200만 픽셀을 직접 돌았다 — 1080p 에서 20~40ms 라
-        //    채도를 0 이 아닌 값으로 한 번만 만져두면 캡처 스레드가 그대로 반토막 났다.
-        //    split/convertTo 는 같은 일을 SIMD 로 한다.
-        if (sat != 0) {
-            cv::Mat hsv;
-            cv::cvtColor(frame, hsv, cv::COLOR_BGR2HSV);
-            std::vector<cv::Mat> ch;
-            cv::split(hsv, ch);
-            ch[1].convertTo(ch[1], -1, 1.0, sat);   // 포화 처리는 convertTo 가 알아서 한다
-            cv::merge(ch, hsv);
-            cv::cvtColor(hsv, frame, cv::COLOR_HSV2BGR);
-        }
-
-        // 3. 선명도 조절
-        if (s > 0) {
-            cv::Mat blurred;
-            cv::GaussianBlur(frame, blurred, cv::Size(9, 9), s / 10.0);
-            cv::addWeighted(frame, 1.5, blurred, -0.5, 0, frame);
-        }
-        // --- [영상 변형 끝] ---
-
-        // 상시 ArUco 검출 (5프레임마다 1회 — 부하 억제). 프레임에는 그리지 않는다.
+        // 상시 ArUco 검출. 화면 밝기·채도 설정에 검출 결과가 흔들리지 않도록
+        // 반드시 표시 필터를 적용하기 전 카메라 원본에서 수행한다.
         //
         // 🔴 꺼져 있으면 **검출 자체를 건너뛴다.** 예전에는 `ArUco OFF` 가 화면 표시만
         //    숨기고 검출은 계속 돌았다 — 끄나 켜나 CPU 는 똑같이 태웠다.
@@ -486,6 +472,9 @@ void video_worker::run() {
         //    막힌 상황이고, 그때는 옛 프레임을 쌓는 것보다 버리는 게 맞다.
         if (m_queued.load(std::memory_order_relaxed) < 1) {
             m_queued.fetch_add(1, std::memory_order_relaxed);
+            // 표시할 최신 프레임에만 후처리한다. GUI가 막혀 버릴 프레임까지
+            // 고해상도 전체 픽셀을 변환하면 지연 회복이 더 늦어진다.
+            videofilters::apply(processedFrame, b, c, s, sat);
             QImage qimg = matToQImage(processedFrame);
             emit frameReceived(qimg);
         } else {

@@ -5,6 +5,7 @@
 #include "channel_tile.h"
 #include "serverclient.h"
 #include "routeplan.h"
+#include "paintgeometry.h"
 
 #include <QTimer>
 #include <QPointF>
@@ -28,16 +29,26 @@
 
 namespace {
 constexpr qint64 kRobotOnlineMs = 3000;
+constexpr auto kDefaultFourChannelCameraIp = "192.168.0.13";
+constexpr int kFourChannelCount = 4;
 // 작업 시작 후 이 시간까지 POSE 가 한 번도 없으면 한 번만 경고를 남긴다.
 constexpr qint64 kPoseWaitWarnMs = 5000;
-// ArUco 마커(ID 49) 중심 ↔ 노즐(펜) 거리. 로봇팀 제원 2026-07-30.
-// **바닥 평면에서의 수평거리**다 — POSE 가 이미 바닥 투영 좌표이므로 같은 평면에서 뺀다.
-// (마커는 로봇 높이 140mm 위에 있지만, 그 시차 보정은 **서버**가 하고 QT 로는 이미
-//  바닥에 투영된 값이 온다. 여기서 높이를 다시 계산하면 이중 보정이 된다.)
-// ⚠️ **표시 전용이다.** 전송 좌표에는 절대 반영하지 않는다. 실행 보정은 서버/로봇 몫.
-constexpr double kPenOffsetM = 0.155;
 // 테스트 시뮬레이션 틱. 40ms = 25fps — 4cm 후진처럼 짧은 동작도 여러 프레임에 걸친다.
 constexpr int kSimTickMs = 40;
+// 캘리브레이션 대기 한도. 정적 앵커는 기존 5분 유지, 오도메트리 주행(robot_motion)은
+// 주행 2~4분 + 카메라 H 계산까지 들어와야 해서 10분으로 늘렸다 (요청서 §4 안 A).
+constexpr int kStaticHomographyTimeoutMs = 5 * 60 * 1000;
+constexpr int kOdoHomographyTimeoutMs   = 10 * 60 * 1000;
+// 오도메트리 사각형의 정지점 수(서버 total=9 고정). 서버가 아직 total 을 안 보낸
+// 첫 화면에서도 "9개 중" 표기를 유지하기 위한 기본값일 뿐, 서버 값이 오면 덮인다.
+constexpr int kOdoStopPoints = 9;
+// 중단 요청 뒤 종결 응답(CALIB_CANCELLED/FAIL)을 기다리는 로컬 감시 시간.
+// 🔴 이 시간이 지나도 **취소 성공으로 처리하지 않는다** — 로봇이 실제로 섰다는
+//    확인은 서버만 줄 수 있다. "정지 확인 실패"만 알리고 재시도를 허용한다.
+constexpr int kCancelConfirmWatchdogMs = 15 * 1000;
+// 통지 키를 분리한다 — 캡처 지연 회복이 중단 경고를 지우면 안 된다.
+const QString kNoticeCaptureLag = QStringLiteral("calib-lag");
+const QString kNoticeCancel     = QStringLiteral("calib-cancel");
 
 double polylineLength(const QList<QPointF> &pts, bool closed)
 {
@@ -165,99 +176,192 @@ Backend::Backend(QObject *parent)
         updatePhase();
     });
     connect(m_client, &ServerClient::hMatrixReceived, this,
-            [this](int ch, const QJsonObject &calib, const QString &requestId) {
+            [this](int rawCh, const QJsonObject &calib, const QString &requestId) {
         if (m_testMode) return;
+        const int ch = camcalib::resolveHomographyChannel(
+            rawCh, requestId, m_homographyPending, m_homographyCh,
+            m_homographyRequestId, m_channelCount);
+        if (ch < 1 || ch > m_channelCount) {
+            appendLog(QStringLiteral("H_MATRIX 수신 — 채널을 확정할 수 없어 무시합니다 "
+                                     "(ch=%1, request_id=%2, pending=%3)")
+                          .arg(rawCh)
+                          .arg(requestId.isEmpty() ? QStringLiteral("없음") : requestId)
+                          .arg(m_homographyPending ? QStringLiteral("CH%1").arg(m_homographyCh)
+                                                   : QStringLiteral("없음")));
+            return;
+        }
+        // 내 요청의 실패로 인정하려면 결과가 명시적으로 내 것임을 확인한다.
+        // 채널과 request_id가 모두 없는 외부 푸시는 pending 채널에 귀속될 수 있어도
+        // 사용자가 시작한 계산을 실패시키면 안 된다.
+        const bool attributable = (rawCh >= 1)
+            || (!requestId.isEmpty() && requestId == m_homographyRequestId);
         if (calib.isEmpty()) {
             appendLog(QStringLiteral("H_MATRIX 수신 (CH%1) — calib=null (서버에 보관된 번들 없음)").arg(ch));
-            if (matchesHomographyReply(ch, requestId))
+            if (attributable && matchesHomographyReply(ch, requestId))
                 failHomography(QStringLiteral("서버가 빈 호모그래피 결과를 보냈습니다."),
                                QStringLiteral("invalid_result"));
             return;
         }
-        if (matchesHomographyReply(ch, requestId)) {
-            const QJsonObject normalized = normalizeCalibObject(calib);
-            const QJsonArray h = normalized.value(QStringLiteral("H_floor")).toArray().isEmpty()
-                ? normalized.value(QStringLiteral("H")).toArray()
-                : normalized.value(QStringLiteral("H_floor")).toArray();
-            bool validH = h.size() == 3;
-            for (const QJsonValue &row : h) {
-                if (!validH || !row.isArray() || row.toArray().size() != 3) {
-                    validH = false;
-                    break;
-                }
-                for (const QJsonValue &cell : row.toArray()) {
-                    if (!cell.isDouble() || !std::isfinite(cell.toDouble())) {
-                        validH = false;
-                        break;
-                    }
-                }
-            }
-            if (!validH) {
+        // 🔴 구조 검증은 **대기 중이던 응답인지와 무관하게** 먼저 한다.
+        //    예전에는 이 검사가 matchesHomographyReply 블록 안에 있어서, 요청하지
+        //    않은/늦게 온/깨진 번들이 검증 없이 m_calibs 에 저장되고 화면 채널이면
+        //    그대로 적용됐다 — 좌표계가 조용히 갈아엎힌다.
+        if (!calibHasUsableH(calib)) {
+            appendLog(QStringLiteral("H_MATRIX 수신 (CH%1) — 유효한 3x3 H 가 없어 버립니다").arg(ch));
+            if (attributable && matchesHomographyReply(ch, requestId))
                 failHomography(QStringLiteral("서버 결과에 유효한 3x3 H 행렬이 없습니다."),
                                QStringLiteral("invalid_result"));
+            return;
+        }
+        // 🔴 중단을 요청한 세션의 결과는 내 요청의 답이라도 통째로 버린다
+        //    (확인 대기 중 · 확인 실패 둘 다) — 저장·적용·완료·화면전환 모두 없음.
+        const camcalib::ReplyUse use = camcalib::afterCancelRequest(
+            camcalib::classifyHomographyReply(ch, requestId, m_homographyPending,
+                                              m_homographyCh, m_homographyRequestId),
+            m_homographyCancelRequested);
+        if (use == camcalib::ReplyUse::Drop) {
+            appendLog(m_homographyCancelRequested
+                ? QStringLiteral("H_MATRIX 수신 (CH%1) — 중단 요청된 세션의 결과라 폐기: %2")
+                      .arg(ch).arg(requestId.isEmpty() ? QStringLiteral("없음") : requestId)
+                : QStringLiteral("H_MATRIX 수신 (CH%1) — 늦은 Qt 요청 결과 무시: %2")
+                      .arg(ch).arg(requestId));
+            return;
+        }
+        if (use == camcalib::ReplyUse::StoreOnly) {
+            // 외부에서 시작한 결과라도 지금 작업 화면과 같은 채널이면 즉시 TopView에
+            // 적용한다. 다른 채널 결과는 화면 좌표계를 바꾸지 않고 채널 맵에만 저장한다.
+            bool appliedNow = false;
+            QString applied;
+            if (camcalib::appliesToCurrentView(ch, m_workingCh)) {
+                bool ok = false;
+                applied = applyCalibObject(
+                    calib, QStringLiteral("H_MATRIX 외부 CH%1").arg(ch), &ok);
+                if (!ok) {
+                    appendLog(QStringLiteral("H_MATRIX 외부 결과 (CH%1) — TopView 적용 실패: %2")
+                                  .arg(ch).arg(applied));
+                    setNotice(QStringLiteral("CH%1의 새 호모그래피를 화면에 적용하지 못했습니다.")
+                                  .arg(ch),
+                              QStringLiteral("error"), QStringLiteral("homography"));
+                    return;
+                }
+                appliedNow = true;
+                clearNotice(QStringLiteral("chcalib"));
+            }
+            m_calibs[QString::number(ch)] = calib;
+            updateLensDataWarning(ch, calib);
+            emit channelChanged();
+            appendLog(appliedNow
+                ? QStringLiteral("H_MATRIX 외부 결과 (CH%1) — 현재 TopView 즉시 적용: %2")
+                      .arg(ch).arg(applied)
+                : QStringLiteral("H_MATRIX 외부 결과 (CH%1) — 채널별 보관 (현재 화면 CH%2)")
+                      .arg(ch).arg(m_workingCh));
+            return;
+        }
+
+        // Apply = 지금 기다리던 결과. 구조가 유효해도 TopView 구성이 실패하면
+        // 완료로 표시하거나 채널의 정상 번들을 덮어쓰지 않는다.
+        if (use == camcalib::ReplyUse::Apply && matchesHomographyReply(ch, requestId)) {
+            bool ok = false;
+            const QString applied = applyCalibObject(
+                calib, QStringLiteral("H_MATRIX CH%1").arg(ch), &ok);
+            if (!ok) {
+                failHomography(QStringLiteral("서버 호모그래피를 TopView에 적용하지 못했습니다."),
+                               QStringLiteral("apply_failed"));
                 return;
             }
-        }
-        // 채널별 맵을 항상 최신으로 유지한다. 그리드의 "캘리 됨" 표시와
-        // [작업하기] 가능 여부가 이 맵을 본다.
-        m_calibs[QString::number(ch)] = calib;
-        emit channelChanged();
-
-        // Qt가 시작한 요청의 결과면 이것이 완료 및 대기 해제 신호다. 구형 서버는
-        // request_id를 되돌려주지 않으므로 같은 채널의 빈 ID까지는 허용한다.
-        if (matchesHomographyReply(ch, requestId)) {
-            const QString applied = applyCalibObject(calib, QStringLiteral("H_MATRIX CH%1").arg(ch));
+            m_calibs[QString::number(ch)] = calib;
+            emit channelChanged();
             appendLog(QStringLiteral("CH%1 호모그래피 완료 — %2").arg(ch).arg(applied));
             resetHomography();
             m_highlightedCh = ch;
             emit channelChanged();
             setNotice(QStringLiteral("CH%1 호모그래피를 적용했습니다. 작업 화면으로 전환합니다.").arg(ch),
                       QStringLiteral("info"), QStringLiteral("homography"));
+            // 성공 안내 **뒤에** 검사한다 — 왜곡 보정 데이터가 없으면 그 경고가
+            // 마지막에 남아야 조작자가 놓치지 않는다.
+            updateLensDataWarning(ch, calib);
             startChannelWork();
             return;
         }
-
-        // 🔴 지금 보고 있지 않은 채널의 번들로 화면을 갈아엎지 않는다. 관리자 창에서
-        //    CH3 을 캘리하는 동안 CH1 로 작업 중일 수 있는데, 그때 CH3 번들을 적용하면
-        //    화면과 좌표가 통째로 어긋난다 — 그것도 에러 없이 조용히.
-        const int shown = channelMode() ? m_workingCh : ch;
-        if (channelMode() && ch != shown) {
-            appendLog(QStringLiteral("H_MATRIX 수신 (CH%1) — 보관만 함 "
-                                     "(지금 화면은 CH%2)").arg(ch).arg(shown));
-            return;
-        }
-        // 수동 입력과 완전히 같은 경로. K/D 반영과 coord_mode 판정을 건너뛰지 않는다.
-        appendLog(QStringLiteral("H_MATRIX 수신 (CH%1) — ").arg(ch)
-                  + applyCalibObject(calib, QStringLiteral("H_MATRIX")));
     });
     connect(m_client, &ServerClient::calibStarted, this,
             [this](int ch, const QString &requestId, const QString &message) {
         if (!matchesHomographyReply(ch, requestId)) return;
+        if (m_homographyOdometry && m_homographyPhase == QLatin1String("requesting"))
+            m_homographyPhase = QStringLiteral("driving");
         m_homographyStatus = message.isEmpty()
-            ? QStringLiteral("로봇 이동과 영상 계산을 시작했습니다.") : message;
+            ? (m_homographyOdometry
+                   ? QStringLiteral("로봇이 사각형 주행을 시작했습니다.")
+                   : QStringLiteral("로봇 이동과 영상 계산을 시작했습니다."))
+            : message;
         emit homographyChanged();
         appendLog(QStringLiteral("CALIB_STARTED CH%1 request=%2").arg(ch).arg(requestId));
     });
     connect(m_client, &ServerClient::calibProgress, this,
             [this](int ch, const QString &requestId, double progress,
-                   const QString &stage, const QString &message) {
+                   const QString &stage, const QString &message,
+                   const QString &phase, int pointIndex, int total, int valid) {
         if (!matchesHomographyReply(ch, requestId)) return;
+        // 오도메트리 주행은 카메라가 진행률을 안 주고 서버가 정지점 진행으로
+        // 합성해 보낸다 (요청서 §2-2). 9개 중 몇 번째인지 = 진행률.
+        m_homographyPointIndex = pointIndex;
+        if (total > 0) m_homographyPointTotal = total;
+        m_homographyValidPoints = valid;
+        if (!phase.isEmpty()) m_homographyPhase = phase;
+        else if (m_homographyOdometry && m_homographyPhase.isEmpty())
+            m_homographyPhase = QStringLiteral("driving");
+        if (progress < 0.0 && pointIndex >= 0 && total > 0)
+            progress = double(pointIndex + 1) / double(total);
         m_homographyProgress = progress < 0.0 ? -1.0 : qBound(0.0, progress, 1.0);
+        // 🔴 중단을 요청한 세션에서는 진행 값만 갱신하고 **상태 문구와 통지는
+        //    건드리지 않는다.** 늦게 온 진행 보고가 "정지 확인 대기/실패"를 덮으면
+        //    취소를 누른 조작자에게 정상 진행 중인 화면이 보인다. 취소 상태는
+        //    일치하는 종결 응답이나 resetHomography() 만 바꿀 수 있다.
+        if (m_homographyCancelRequested) {
+            emit homographyChanged();
+            return;
+        }
         if (!message.isEmpty()) m_homographyStatus = message;
+        else if (phase == QLatin1String("solving"))
+            m_homographyStatus = QStringLiteral("주행 완료 — 카메라가 호모그래피를 계산 중입니다.");
+        else if (pointIndex >= 0 && total > 0)
+            m_homographyStatus = QStringLiteral("정지점 %1/%2 캡처 완료 (유효 %3개)")
+                                     .arg(pointIndex + 1).arg(total).arg(qMax(valid, 0));
         else if (!stage.isEmpty()) m_homographyStatus = stage;
+        // 유효 대응점이 완료 정지점보다 2 이상 뒤처지면 카메라가 로봇을 놓치고 있다.
+        // 6개 미만으로 끝나면 세션이 실패하므로 주행 중에 알려서 중단할 수 있게 한다.
+        // 판정은 homographyCaptureLag() 와 동일한 순수 함수를 쓴다 (QML 경고색과 일치).
+        // 🔴 이 경고는 **자기 키만** 세우고 내린다. 예전처럼 "homography" 키를
+        //    통째로 지우면 늦게 온 진행 보고 하나가 "정지 확인 실패" 경고까지
+        //    지워서, 취소를 요청한 세션이 정상 진행 중인 것처럼 보인다.
+        if (homographyCaptureLag())
+            setNotice(QStringLiteral("카메라가 로봇을 자주 놓치고 있습니다 (정지점 %1개 완료 · "
+                                     "유효 %2개). 조명과 사각형 크기를 확인하고, 필요하면 "
+                                     "중단하세요.")
+                          .arg(pointIndex + 1).arg(valid),
+                      QStringLiteral("warn"), kNoticeCaptureLag);
+        else
+            clearNotice(kNoticeCaptureLag);
         emit homographyChanged();
     });
     connect(m_client, &ServerClient::calibFailed, this,
             [this](int ch, const QString &requestId, const QString &reason,
-                   const QString &message) {
+                   const QString &message, const QString &owner) {
         if (!matchesHomographyReply(ch, requestId)) return;
-        failHomography(message.isEmpty()
-                           ? QStringLiteral("호모그래피 계산에 실패했습니다 (%1).").arg(reason)
-                           : message,
-                       reason);
+        failHomography(camcalib::homographyFailText(reason, message, owner), reason);
     });
     connect(m_client, &ServerClient::calibCancelled, this,
             [this](int ch, const QString &requestId, const QString &message) {
+        // 🔴 방어(요청서 §6 ③): 대기 중이 아닐 때, 또는 내 request_id 와 다른
+        //    종결 응답은 무시한다. 관리자 창이 세션 없이 누른 CALIB_CANCEL 이
+        //    QT 로 새어 나오는 서버 결함이 지금도 재현된다.
+        if (!m_homographyPending) return;
+        if (requestId.isEmpty() || requestId != m_homographyRequestId) {
+            appendLog(QStringLiteral("CALIB_CANCELLED 무시 — 내 요청(%1)과 다른 request_id(%2)")
+                          .arg(m_homographyRequestId,
+                               requestId.isEmpty() ? QStringLiteral("없음") : requestId));
+            return;
+        }
         if (!matchesHomographyReply(ch, requestId)) return;
         const QString text = message.isEmpty()
             ? QStringLiteral("CH%1 호모그래피가 중단되었습니다.").arg(ch) : message;
@@ -265,12 +369,28 @@ Backend::Backend(QObject *parent)
         setNotice(text, QStringLiteral("warn"), QStringLiteral("homography"));
         appendLog(text);
     });
-    // LOGIN_OK 의 채널별 번들 맵 (프로토콜 v0.4). 단일 채널 서버면 빈 값이 온다.
+    // LOGIN_OK의 CH1~CH4 캘리브레이션 번들 맵.
     connect(m_client, &ServerClient::calibChannelsReceived, this,
             [this](const QJsonObject &calibs, int activeCh) {
-        m_calibs = calibs;
+        // 저장 전에 채널별로 검증한다. 깨진 항목 하나가 그 채널을 "캘리 됨"으로
+        // 만들면 좌표를 믿을 수 없는 채널에서 [작업하기]가 열린다.
+        QStringList rejected;
+        // 구형 서버가 calibs를 보내지 않으면 세션 중 H_MATRIX로 저장한 채널 결과를
+        // 빈 객체로 덮어쓰지 않는다. logout()은 m_calibs를 비우므로 계정 간 값은 남지 않는다.
+        if (calibs.isEmpty() && !m_calibs.isEmpty()) {
+            appendLog(QStringLiteral("LOGIN_OK calibs 없음 — 세션 채널 캘리브 %1건 유지")
+                          .arg(m_calibs.size()));
+            return;
+        }
+        m_calibs = camcalib::filterUsableCalibMap(calibs, &rejected);
+        // 채널마다 따로 본다 — 한 채널의 K/D 누락이 다른 채널 경고를 바꾸면 안 된다.
+        for (int ch = 1; ch <= m_channelCount; ++ch)
+            updateLensDataWarning(ch, calibOfChannel(ch));
         emit channelChanged();
-        if (calibs.isEmpty()) return;
+        if (!rejected.isEmpty())
+            appendLog(QStringLiteral("LOGIN_OK calibs — 사용할 수 없는 번들 무시: CH%1")
+                          .arg(rejected.join(QStringLiteral(", CH"))));
+        if (m_calibs.isEmpty()) return;
         QStringList ready;
         for (int ch = 1; ch <= m_channelCount; ++ch)
             if (channelCalibrated(ch)) ready << QStringLiteral("CH%1").arg(ch);
@@ -286,7 +406,7 @@ Backend::Backend(QObject *parent)
     //
     // 서버가 stream 필드를 안 보내면 signal 자체가 오지 않아 기존 설정을 유지한다.
     // enabled=false를 명시하면 저장된 중계를 지우고 4채널 카메라 직결로 전환한다.
-    // ⚠️ cam_ip 의 의미는 건드리지 않는다. 그걸 바꾸면 PNO 경로가 깨진다.
+    // enabled=false면 중계만 해제하고 .13 카메라 직결을 유지한다.
     connect(m_client, &ServerClient::streamInfoReceived, this,
             [this](bool enabled, const QString &base, int channels) {
         if (!enabled) {
@@ -295,10 +415,9 @@ Backend::Backend(QObject *parent)
             return;
         }
         if (base.trimmed().isEmpty()) return;
-        if (channels > 0 && channels != m_channelCount) {
-            m_channelCount = channels;
-            saveSettings();
-        }
+        if (channels > 0 && channels != kFourChannelCount)
+            appendLog(QStringLiteral("LOGIN_OK stream.channels=%1 무시 — PNM은 4채널로 고정")
+                          .arg(channels));
         if (base.trimmed() == m_relayBase) return;     // 같은 값이면 조용히 넘어간다
         setRelayBase(base);
         appendLog(QStringLiteral("LOGIN_OK stream — 중계 주소를 서버 값으로 설정: %1 (%2채널)")
@@ -317,13 +436,22 @@ Backend::Backend(QObject *parent)
             return;
         }
         clearNotice(QStringLiteral("channel-sync"));
-        if (hasCalib) m_calibs[QString::number(ch)] = calib;
+        // 저장 전에 검증한다 (H_MATRIX 경로와 같은 규칙).
+        const bool usable = hasCalib && camcalib::calibIsUsable(calib);
+        if (hasCalib && !usable)
+            appendLog(QStringLiteral("CHANNEL_OK CH%1 — 번들에 쓸 수 있는 H 가 없어 저장하지 않습니다")
+                          .arg(ch));
+        if (usable) m_calibs[QString::number(ch)] = calib;
+        if (usable) updateLensDataWarning(ch, calib);
         emit channelChanged();
         if (ch != m_workingCh) return;   // 이미 다른 채널로 넘어갔으면 늦은 응답이다
-        if (!hasCalib) {
-            appendLog(QStringLiteral("CHANNEL_OK CH%1 — 서버에 이 채널 캘리브레이션이 없습니다").arg(ch));
-            setNotice(QStringLiteral("CH%1 은 서버에 캘리브레이션이 없습니다. 좌표를 믿을 수 "
-                                     "없으니 설정 > 캘리브에서 이 채널의 호모그래피를 계산하세요.").arg(ch),
+        if (!usable) {
+            appendLog(QStringLiteral("CHANNEL_OK CH%1 — 서버에 쓸 수 있는 채널 캘리브레이션이 없습니다").arg(ch));
+            m_calibMissing = true;
+            emit calibChanged();
+            setNotice(QStringLiteral("CH%1 은 서버에 쓸 수 있는 캘리브레이션이 없습니다. 좌표를 "
+                                     "믿을 수 없으니 설정 > 캘리브에서 이 채널의 호모그래피를 "
+                                     "계산하세요.").arg(ch),
                       QStringLiteral("warn"), QStringLiteral("chcalib"));
             return;
         }
@@ -421,13 +549,30 @@ Backend::Backend(QObject *parent)
     connect(m_linkTimer, &QTimer::timeout, this, &Backend::refreshLinkStatus);
     m_linkTimer->start();
 
+    // 중단 확인 감시. 시간이 지나도 "취소됨"으로 바꾸지 않는다 — 로봇이 실제로
+    // 섰다는 것은 서버 종결 응답만 보증한다 (요청서 §4).
+    m_cancelWatchdog = new QTimer(this);
+    m_cancelWatchdog->setSingleShot(true);
+    connect(m_cancelWatchdog, &QTimer::timeout, this, [this]() {
+        if (!m_homographyPending || !m_homographyCancelPending) return;
+        m_homographyCancelPending = false;          // 재시도 허용 (requested 는 유지)
+        m_homographyStatus = QStringLiteral("중단 확인을 받지 못했습니다. 로봇이 아직 움직이는 "
+                                            "중일 수 있습니다.");
+        emit homographyChanged();
+        setNotice(QStringLiteral("중단 요청에 대한 서버 확인이 없습니다. 로봇이 정지했는지 직접 "
+                                 "확인하고, 필요하면 비상정지를 사용하세요."),
+                  QStringLiteral("error"), kNoticeCancel);
+        appendLog(QStringLiteral("CALIB_CANCEL 확인 없음 — 취소로 처리하지 않고 대기 유지"));
+    });
+
     m_homographyTimer = new QTimer(this);
     m_homographyTimer->setSingleShot(true);
-    m_homographyTimer->setInterval(5 * 60 * 1000);
+    m_homographyTimer->setInterval(kStaticHomographyTimeoutMs);
     connect(m_homographyTimer, &QTimer::timeout, this, [this]() {
         if (!m_homographyPending) return;
-        failHomography(QStringLiteral("5분 동안 완료 응답이 없어 대기를 종료했습니다. "
-                                      "로봇과 서버 상태를 확인하세요."),
+        failHomography(QStringLiteral("%1분 동안 완료 응답이 없어 대기를 종료했습니다. "
+                                      "로봇과 서버 상태를 확인하세요.")
+                           .arg(m_homographyTimer->interval() / 60000),
                        QStringLiteral("timeout"));
     });
 
@@ -497,6 +642,9 @@ Backend::~Backend()
 
 void Backend::login(const QString &id, const QString &pw)
 {
+    // 더블클릭이 QML의 enabled 갱신보다 먼저 들어오면 같은 소켓에 로그인 절차가
+    // 두 개 붙는다. 한 번 시작한 인증이 끝날 때까지 추가 요청은 받지 않는다.
+    if (m_busy) return;
     if (id.isEmpty() || pw.isEmpty()) { emit loginFailed("아이디와 비밀번호를 입력해주세요."); return; }
 
     if (id == "test" && pw == "test") {
@@ -521,6 +669,10 @@ void Backend::login(const QString &id, const QString &pw)
     auto finish = [this, guard](bool ok, const QJsonObject &calib, bool hasCalib,
                                  const QString &camIp, const QString &responseId,
                                  const QString &reason) {
+        // loginResult/socketError/timeout이 같은 이벤트 루프에 연달아 도착해도 화면
+        // 전환과 완료 처리는 정확히 한 번만 수행한다.
+        if (guard->property("finished").toBool()) return;
+        guard->setProperty("finished", true);
         m_busy = false; emit busyChanged();
         guard->deleteLater();
         if (ok) {
@@ -531,18 +683,26 @@ void Backend::login(const QString &id, const QString &pw)
             m_calibMissing = !hasCalib && m_calibs.isEmpty();
             // 서버는 로그인 성공 시점에 보관 중인 번들을 함께 내려준다 (QT-REQ-SRV-001 S-2).
             // 수동 입력과 같은 경로를 타야 K/D 와 coord_mode 가 함께 반영된다.
-            if (hasCalib)
+            if (hasCalib) {
                 appendLog("LOGIN_OK calib — " + applyCalibObject(calib, QStringLiteral("LOGIN_OK")));
-            else
+                // 채널이 없는 legacy 단일 번들이라 ch=0 키로 알린다 (채널별 경고와 별개).
+                updateLensDataWarning(0, calib);
+            } else {
                 m_calib = calib;
+            }
             loadHistory();
             emit sessionChanged();
             emit linkStatusChanged();
             emit calibChanged();
-            // 서버에 등록해둔 카메라 IP 가 있으면 그걸로 RTSP URL 을 조립한다.
-            if (!camIp.trimmed().isEmpty())
-                setCamIp(camIp.trimmed());
-            // 4채널이면 그리드부터, 아니면 예전처럼 곧바로 작업 화면.
+            // 운영 장치는 .13 PNM 한 대다. 서버 계정에 과거 카메라 주소가 남아
+            // 있어도 CH1~CH4의 로컬 스트림 선택을 바꾸지 않는다.
+            const QString serverCamIp = camIp.trimmed();
+            if (!serverCamIp.isEmpty()
+                && serverCamIp != QLatin1String(kDefaultFourChannelCameraIp))
+                appendLog(QStringLiteral("LOGIN_OK cam_ip %1 무시 — 운영 카메라 %2 사용")
+                              .arg(serverCamIp, QLatin1String(kDefaultFourChannelCameraIp)));
+            setCamIp(QLatin1String(kDefaultFourChannelCameraIp));
+            // 항상 CH1~CH4 그리드부터 시작한다.
             enterInitialView();
             appendLog(QString("로그인 성공: %1").arg(responseId));
             if (m_calibMissing) {
@@ -584,13 +744,18 @@ void Backend::login(const QString &id, const QString &pw)
 
 void Backend::registerUser(const QString &id, const QString &pw, const QString &camIp)
 {
+    if (m_busy) return;
     if (id.isEmpty() || pw.isEmpty()) { emit registerFailed("아이디와 비밀번호를 입력해주세요."); return; }
+    Q_UNUSED(camIp);
+    const QString registeredCamIp = QLatin1String(kDefaultFourChannelCameraIp);
 
     m_busy = true; emit busyChanged();
     auto *guard = new QObject(this);
     auto *timer = new QTimer(guard);
     timer->setSingleShot(true);
     auto finish = [this, guard](bool ok, const QString &reason) {
+        if (guard->property("finished").toBool()) return;
+        guard->setProperty("finished", true);
         m_busy = false; emit busyChanged();
         guard->deleteLater();
         if (ok) emit registerSucceeded();
@@ -604,10 +769,11 @@ void Backend::registerUser(const QString &id, const QString &pw, const QString &
     });
 
     if (m_client->isEncrypted()) {
-        m_client->sendRegister(id, pw, camIp);
+        m_client->sendRegister(id, pw, registeredCamIp);
     } else {
-        connect(m_client, &ServerClient::connectedToServer, guard, [this, id, pw, camIp]() {
-            m_client->sendRegister(id, pw, camIp);
+        connect(m_client, &ServerClient::connectedToServer, guard,
+                [this, id, pw, registeredCamIp]() {
+            m_client->sendRegister(id, pw, registeredCamIp);
         });
         m_client->connectToServer();
     }
@@ -672,6 +838,42 @@ void Backend::setArucoOverlay(bool on)
                  : QStringLiteral("ArUco 검출 끔 — 검출 자체를 멈춥니다 (로봇 위치는 서버 POSE로 계속 수신)"));
 }
 
+// 번들은 예전과 똑같이 수용한다. 다만 coord_mode="undistort" 라고 선언해 놓고
+// K 또는 D 가 없으면 화면은 왜곡 보정을 할 수 없다 — 조작자에게 알린다.
+void Backend::updateLensDataWarning(int ch, const QJsonObject &calib)
+{
+    // clearNotice 는 **같은 키**일 때만 배너를 내리므로 CH1~CH4 경고가 서로를 못 지운다.
+    const QString key = camcalib::lensDataNoticeKey(ch);
+    if (camcalib::lensDataMissingForUndistort(calib)) {
+        if (!m_lensDataMissingCh.contains(ch)) {
+            m_lensDataMissingCh.insert(ch);
+            appendLog(ch >= 1
+                ? QStringLiteral("⚠️ CH%1 번들 coord_mode=undistort 인데 K/D 가 없습니다 "
+                                 "— 렌즈 왜곡 보정 없이 사용합니다").arg(ch)
+                : QStringLiteral("⚠️ 번들 coord_mode=undistort 인데 K/D 가 없습니다 "
+                                 "— 렌즈 왜곡 보정 없이 사용합니다"));
+            emit channelChanged();
+        }
+        setNotice(ch >= 1
+                      ? QStringLiteral("CH%1 캘리브레이션은 undistort 기준이라고 하는데 "
+                                       "렌즈 왜곡 보정 데이터(K/D)가 없습니다. 좌표 오차가 "
+                                       "커질 수 있으니 이 채널의 카메라 내부 보정을 다시 "
+                                       "받으세요.").arg(ch)
+                      : QStringLiteral("받은 캘리브레이션은 undistort 기준이라고 하는데 "
+                                       "렌즈 왜곡 보정 데이터(K/D)가 없습니다. 좌표 오차가 "
+                                       "커질 수 있으니 카메라 내부 보정을 다시 받으세요."),
+                  QStringLiteral("warn"), key);
+        return;
+    }
+    if (m_lensDataMissingCh.remove(ch)) {
+        appendLog(ch >= 1
+            ? QStringLiteral("CH%1 번들에 K/D 가 갖춰졌습니다 — 왜곡 보정 데이터 경고 해제").arg(ch)
+            : QStringLiteral("번들에 K/D 가 갖춰졌습니다 — 왜곡 보정 데이터 경고 해제"));
+        emit channelChanged();
+    }
+    clearNotice(key);      // 같은 채널의 경고만 내린다
+}
+
 void Backend::setNotice(const QString &text, const QString &level, const QString &key)
 {
     if (m_notice == text && m_noticeLevel == level && m_noticeKey == key) return;
@@ -710,6 +912,7 @@ void Backend::logout()
     m_highlightedCh = 0;
     m_workingCh = 0;
     m_calibs = QJsonObject();
+    m_lensDataMissingCh.clear();
     emit channelChanged();
     if (m_worker) { m_worker->stop(); m_worker->wait(); m_worker->deleteLater(); m_worker = nullptr; }
     m_workerStarted = false;
@@ -762,20 +965,22 @@ void Backend::reconnectServer()
         appendLog("테스트 모드 — 서버 재연결 없음");
         return;
     }
-    if (m_client->isConnected())
-        m_client->disconnectFromServer();
     m_serverLabel = "재연결…";
     emit linkStatusChanged();
-    m_client->connectToServer();
+    m_client->reconnectToServer();
     appendLog("서버 재연결 시도");
 }
 
 void Backend::wireWorker(video_worker *w)
 {
     if (!w) return;
+    // 이 워커가 속한 세대. 채널을 바꾸면 m_streamGen 이 올라가므로, 아래 람다들은
+    // 전부 "내 세대가 아직 현재인가"를 먼저 본다 (이전 채널 프레임 차단).
+    const quint64 gen = m_streamGen;
     // 실제 영상이 한 장이라도 들어오면 오프라인 대체 캔버스를 끈다.
     // (RTSP 주소를 바꿔 워커를 새로 만들 때도 반드시 다시 걸려야 한다)
-    connect(w, &video_worker::frameReceived, this, [this](const QImage &img) {
+    connect(w, &video_worker::frameReceived, this, [this, gen](const QImage &img) {
+        if (gen != m_streamGen) return;              // 옛 채널 워커의 늦은 프레임
         // 캘리브 해상도와 대조하는 용도. 재연결로 프로파일이 바뀌면 값도 따라와야 하므로
         // 첫 프레임만이 아니라 매번 갱신한다 (int 두 개라 비용은 무시할 수준).
         m_frameW = img.width();
@@ -787,9 +992,20 @@ void Backend::wireWorker(video_worker *w)
         // 영상이 들어왔으면 "영상 없음/연결 실패" 배너는 거짓말이 된다. 같이 내린다.
         clearNotice(QStringLiteral("camera"));
         clearNotice(QStringLiteral("rtsp"));
-        appendLog("카메라 영상 수신 시작 — 실시간 화면으로 전환");
+        appendLog(QStringLiteral("카메라 영상 수신 시작 — %1×%2, 실시간 화면으로 전환")
+                      .arg(m_frameW).arg(m_frameH));
+        if (!m_channelUrlTemplate.isEmpty()
+            && (m_frameW != 2592 || m_frameH != 1520)) {
+            appendLog(QStringLiteral("⚠️ PNM profile2 디코더 출력이 운용 기준 2592×1520과 다릅니다."));
+            setNotice(QStringLiteral("현재 영상은 %1×%2입니다. 카메라 profile2를 2592×1520으로 확인하세요.")
+                          .arg(m_frameW).arg(m_frameH),
+                      QStringLiteral("warn"), QStringLiteral("frame-size"));
+        } else {
+            clearNotice(QStringLiteral("frame-size"));
+        }
     });
-    connect(w, &video_worker::statsUpdated, this, [this](const StreamStats &s) {
+    connect(w, &video_worker::statsUpdated, this, [this, gen](const StreamStats &s) {
+        if (gen != m_streamGen) return;
         m_cctvOnline = s.isConnected;
         m_cctvFps = s.fps;
         m_cctvLatencyMs = s.latencyMs;
@@ -810,14 +1026,30 @@ void Backend::wireWorker(video_worker *w)
         appendLog(QStringLiteral("영상이 끊겨 재연결했습니다 "
                                  "(카메라 설정 저장·세션 경합 등으로 스트림이 재시작된 경우)"));
     });
-    connect(w, &video_worker::arucoDetected, this, &Backend::onAruco);
+    connect(w, &video_worker::arucoDetected, this,
+            [this, gen](const QList<int> &ids, const QList<QPolygonF> &corners) {
+        if (gen != m_streamGen) return;              // 옛 채널 마커를 새 화면에 얹지 않는다
+        onAruco(ids, corners);
+    });
     // 워커가 새로 만들어질 때마다(채널 전환·주소 변경) 현재 토글 상태를 물려준다.
     // 안 하면 껐던 사람이 채널을 바꾸는 순간 검출이 다시 켜진다.
     w->setArucoEnabled(m_arucoOverlay);
-    if (m_topView)
-        connect(w, &video_worker::frameReceived, m_topView, &VideoView::onFrame);
-    if (m_originalView)
-        connect(w, &video_worker::frameReceived, m_originalView, &VideoView::onFrame);
+    // 🔴 뷰로 가는 프레임도 세대 검사를 통과해야 한다. 워커→뷰 직결(큐드)이면
+    //    이미 큐에 들어간 이전 채널 프레임이 새 채널 화면에 그대로 그려진다.
+    if (m_topView) {
+        VideoView *view = m_topView;
+        connect(w, &video_worker::frameReceived, view, [this, gen, view](const QImage &img) {
+            if (gen != m_streamGen) return;
+            view->onFrame(img);
+        });
+    }
+    if (m_originalView) {
+        VideoView *view = m_originalView;
+        connect(w, &video_worker::frameReceived, view, [this, gen, view](const QImage &img) {
+            if (gen != m_streamGen) return;
+            view->onFrame(img);
+        });
+    }
     // 백프레셔 해제는 **맨 마지막에** 연결한다 — 큐드 연결은 연결 순서대로 배달되므로,
     // 뷰들이 프레임을 다 처리한 뒤에야 "소비했다"고 알리게 된다.
     connect(w, &video_worker::frameReceived, this, [w]() { w->frameConsumed(); });
@@ -826,7 +1058,9 @@ void Backend::wireWorker(video_worker *w)
 void Backend::startWorker()
 {
     if (m_workerStarted) return;
+    ++m_streamGen;                                   // 새 스트림 세대 시작
     m_worker = new video_worker(m_rtspUrl, this);
+    m_worker->setVideoFilters(m_brightness, m_contrast, m_sharpen, m_saturation);
     wireWorker(m_worker);
     m_worker->start();
     m_workerStarted = true;
@@ -902,7 +1136,7 @@ void Backend::configureView(VideoView *v, bool topView)
             //    예전에는 여기가 **아무 로그도 남기지 않아서**, 로그만 보면 캘리브가
             //    적용됐는지 · 단위를 뭐로 판정했는지 알 수 없었다.
             const bool ok = v->configureTopViewCalib(m_calib);
-            m_calibMissing = false;
+            m_calibMissing = !ok;   // 폴백(테스트 보정)을 "보정됨"으로 표시하지 않는다
             refreshCalibStatus();
             appendLog(ok ? QStringLiteral("캘리브 적용(지연, %1): ").arg(m_calibSource)
                                + m_calibStatus
@@ -952,6 +1186,10 @@ void Backend::registerView(VideoView *view, bool topView)
                     if (motionprogram::firstTooTightPaintArc(
                             motionprogram::build(run, paint, m_speeds), &radiusM) >= 0)
                         tightestM = std::min(tightestM, radiusM);
+                    // ARC 로 분류되지 못한 곡선(촘촘한 다각형 근사)도 같은 하한을 받는다
+                    double curveRadiusM = 0.0;
+                    if (motionprogram::firstTooTightPaintCurve(run, paint, &curveRadiusM) >= 0)
+                        tightestM = std::min(tightestM, curveRadiusM);
                 }
                 if (std::isfinite(tightestM)) {
                     setNotice(QStringLiteral(
@@ -1123,7 +1361,18 @@ void Backend::commitDrawing()
 {
     if (!m_topView) return;
     QList<bool> closed;
-    const QList<QList<QPointF>> paths = m_topView->pathsToMeters(&closed);
+    QString geometryError;
+    const QList<QList<QPointF>> paths = m_topView->pathsToMeters(&closed, &geometryError);
+    QList<bool> editClosed;
+    QList<bool> editOuter;
+    const QList<QList<QPointF>> editPaths =
+        m_topView->editablePathsToMeters(&editClosed, &editOuter);
+    if (!geometryError.isEmpty()) {
+        appendLog(QStringLiteral("도면 전송 불가: %1").arg(geometryError));
+        setNotice(QStringLiteral("도면을 확인하세요: %1").arg(geometryError),
+                  QStringLiteral("error"), QStringLiteral("path-geometry"));
+        return;
+    }
     const int n = pathsPointCount(paths);
     if (n < 2) { appendLog("작도된 경로가 없습니다."); return; }
     if (m_jobActive) { appendLog("이미 작업이 진행 중입니다."); return; }
@@ -1143,14 +1392,20 @@ void Backend::commitDrawing()
         motionprogram::build(blueprint, route.paint, m_speeds);
 
     double tightRadiusM = 0.0;
-    const int tightOp = motionprogram::firstTooTightPaintArc(program, &tightRadiusM);
+    int tightOp = motionprogram::firstTooTightPaintArc(program, &tightRadiusM);
+    if (tightOp < 0) {
+        // ARC op 이 하나도 안 나온 곡선(예: 24각형 R=15mm)도 물리적으로는 곡선이다.
+        // 여기서 막지 않으면 화면은 "도색 불가"인데 전송은 통과한다.
+        tightOp = motionprogram::firstTooTightPaintCurve(blueprint, route.paint,
+                                                        &tightRadiusM);
+    }
     if (tightOp >= 0) {
         const QString msg = QStringLiteral(
             "곡선 반지름 %1 mm는 현재 서버·로봇의 최소 도색 반지름 %2 mm보다 작습니다. "
             "도형을 키우거나 곡선을 수정하세요.")
             .arg(tightRadiusM * 1000.0, 0, 'f', 1)
             .arg(motionprogram::kServerConfirmedMinPaintRadiusM * 1000.0, 0, 'f', 0);
-        appendLog(QStringLiteral("BLUEPRINT 전송 차단 — ARC #%1, %2")
+        appendLog(QStringLiteral("BLUEPRINT 전송 차단 — 곡선 #%1, %2")
                       .arg(tightOp + 1).arg(msg));
         setNotice(msg, QStringLiteral("error"), QStringLiteral("blueprint"));
         m_blueprintSent = false;
@@ -1188,10 +1443,14 @@ void Backend::commitDrawing()
 
     // 이력에 남긴다 — 나중에 "불러와 수정" 으로 그대로 꺼내 쓴다
     m_currentJobId = recordJob(ordered, orderedClosed,
-                               m_workName == "편집 중" || m_workName == "—" ? QString() : m_workName,
-                               QStringLiteral("대기"));
+                               m_workName == "편집 중" || m_workName == "-" ? QString() : m_workName,
+                               QStringLiteral("대기"),
+                               editPaths, editClosed, editOuter);
 
     storeMission(ordered, orderedClosed);
+    m_missionEditPaths = editPaths;
+    m_missionEditClosed = editClosed;
+    m_missionEditOuter = editOuter;
     m_routePts = route.pts;
     m_routePaint = route.paint;
     m_travelLengthM = route.travelM;
@@ -1295,6 +1554,9 @@ void Backend::editMission()
     }
     const QList<QList<QPointF>> paths = m_missionPaths;
     const QList<bool> closed = m_missionClosed;
+    const QList<QList<QPointF>> editPaths = m_missionEditPaths;
+    const QList<bool> editClosed = m_missionEditClosed;
+    const QList<bool> editOuter = m_missionEditOuter;
 
     stopTestProgressSim();
     m_jobProgress = 0.0;
@@ -1304,11 +1566,16 @@ void Backend::editMission()
     m_phase = "ready";
     if (m_topView) {
         m_topView->clearMission();
-        m_topView->setEditPathsMeters(paths, closed);
+        m_topView->setEditPathsMeters(editPaths.isEmpty() ? paths : editPaths,
+                                     editPaths.isEmpty() ? closed : editClosed,
+                                     editPaths.isEmpty() ? QList<bool>() : editOuter);
     }
     if (m_originalView) m_originalView->clearMission();
     m_missionPaths.clear();
     m_missionClosed.clear();
+    m_missionEditPaths.clear();
+    m_missionEditClosed.clear();
+    m_missionEditOuter.clear();
     m_routePts.clear();
     m_routePaint.clear();
     m_program.clear();
@@ -1343,6 +1610,9 @@ void Backend::clearMission()
     stopTestProgressSim();
     m_missionPaths.clear();
     m_missionClosed.clear();
+    m_missionEditPaths.clear();
+    m_missionEditClosed.clear();
+    m_missionEditOuter.clear();
     m_routePts.clear();
     m_routePaint.clear();
     m_program.clear();
@@ -1489,7 +1759,10 @@ void Backend::saveHistory()
 }
 
 QString Backend::recordJob(const QList<QList<QPointF>> &paths, const QList<bool> &closed,
-                           const QString &name, const QString &status)
+                           const QString &name, const QString &status,
+                           const QList<QList<QPointF>> &editPaths,
+                           const QList<bool> &editClosed,
+                           const QList<bool> &editOuter)
 {
     if (paths.isEmpty()) return QString();
     QJsonArray jpaths, jclosed;
@@ -1520,6 +1793,24 @@ QString Backend::recordJob(const QList<QList<QPointF>> &paths, const QList<bool>
     o["strokeMm"] = m_strokeWidthMm;
     o["paths"] = jpaths;
     o["closed"] = jclosed;
+    if (!editPaths.isEmpty()) {
+        QJsonArray jeditPaths, jeditClosed, jeditOuter;
+        for (int i = 0; i < editPaths.size(); ++i) {
+            QJsonArray one;
+            for (const QPointF &point : editPaths[i]) {
+                QJsonArray xy;
+                xy.append(point.x());
+                xy.append(point.y());
+                one.append(xy);
+            }
+            jeditPaths.append(one);
+            jeditClosed.append(editClosed.value(i, false));
+            jeditOuter.append(editOuter.value(i, false));
+        }
+        o["editPaths"] = jeditPaths;
+        o["editClosed"] = jeditClosed;
+        o["editOuter"] = jeditOuter;
+    }
     m_history.append(o);
     saveHistory();
     return id;
@@ -1580,12 +1871,24 @@ void Backend::saveCurrentDrawing(const QString &name)
 {
     if (!m_topView) return;
     QList<bool> closed;
-    const QList<QList<QPointF>> paths = m_topView->pathsToMeters(&closed);
+    QString geometryError;
+    const QList<QList<QPointF>> paths = m_topView->pathsToMeters(&closed, &geometryError);
+    if (!geometryError.isEmpty()) {
+        appendLog(QStringLiteral("도면 저장 불가: %1").arg(geometryError));
+        setNotice(QStringLiteral("도면을 확인하세요: %1").arg(geometryError),
+                  QStringLiteral("error"), QStringLiteral("path-geometry"));
+        return;
+    }
     if (pathsPointCount(paths) < 2) {
         appendLog("저장할 경로가 없습니다.");
         return;
     }
-    recordJob(paths, closed, name, QStringLiteral("보관"));
+    QList<bool> editClosed;
+    QList<bool> editOuter;
+    const QList<QList<QPointF>> editPaths =
+        m_topView->editablePathsToMeters(&editClosed, &editOuter);
+    recordJob(paths, closed, name, QStringLiteral("보관"),
+              editPaths, editClosed, editOuter);
     appendLog(QStringLiteral("도면 저장: %1").arg(name.isEmpty() ? "이름 없음" : name));
 }
 
@@ -1615,8 +1918,32 @@ bool Backend::loadJob(const QString &id)
         for (int k = 0; k < paths.size(); ++k) closed << jc.at(k).toBool();
         if (paths.isEmpty()) return false;
 
+        QList<QList<QPointF>> editPaths;
+        QList<bool> editClosed;
+        QList<bool> editOuter;
+        for (const QJsonValue &pathValue : o.value("editPaths").toArray()) {
+            QList<QPointF> one;
+            for (const QJsonValue &pointValue : pathValue.toArray()) {
+                const QJsonArray xy = pointValue.toArray();
+                if (xy.size() >= 2)
+                    one << QPointF(xy.at(0).toDouble(), xy.at(1).toDouble());
+            }
+            if (one.size() >= 2) editPaths << one;
+        }
+        const QJsonArray jEditClosed = o.value("editClosed").toArray();
+        const QJsonArray jEditOuter = o.value("editOuter").toArray();
+        for (int k = 0; k < editPaths.size(); ++k) {
+            editClosed << (k < jEditClosed.size() && jEditClosed.at(k).toBool());
+            editOuter << (k < jEditOuter.size() && jEditOuter.at(k).toBool());
+        }
+
         clearMission();
-        if (m_topView) m_topView->setEditPathsMeters(paths, closed);
+        const double savedStroke = o.value("strokeMm").toDouble(m_strokeWidthMm);
+        if (std::isfinite(savedStroke)) setStrokeWidthMm(savedStroke);
+        if (m_topView)
+            m_topView->setEditPathsMeters(editPaths.isEmpty() ? paths : editPaths,
+                                         editPaths.isEmpty() ? closed : editClosed,
+                                         editPaths.isEmpty() ? QList<bool>() : editOuter);
         m_drawing = false;
         m_workName = o.value("name").toString();
         emit drawingChanged();
@@ -1824,22 +2151,22 @@ double Backend::progressAlongPath(const QPointF &pose) const
 //
 // ⚠️ 진행률·시작점 도착 판정은 **보정 안 한 POSE(마커)** 를 그대로 쓴다. 서버가 이탈
 //    감시를 하는 기준도 같은 POSE 라, 여기서만 다른 점을 쓰면 두 판정이 어긋난다.
-// ⚠️ 155mm 를 반영해서 로봇에 보내지 않는다. QT 는 도면 그대로만 낸다. 오프셋 보정은
+// ⚠️ 표시 거리를 반영해서 로봇에 보내지 않는다. QT 는 도면 그대로만 낸다. 오프셋 보정은
 //    서버 v2/로봇 전담이다(`pen_offset_m`은 Qt 프로토콜에서 폐지).
 void Backend::pushPoseToView(bool valid)
 {
     if (!m_topView) return;
-    const double th = m_poseTheta * 0.017453292519943295;   // deg → rad
+    const double displayOffsetM = m_penDisplayOffsetMm / 1000.0;
+    const QPointF pen = paintgeometry::penMarkerFromRobotCenter(
+        m_poseX, m_poseY, m_poseTheta, displayOffsetM);
     m_topView->setRobotPose(m_poseX, m_poseY, m_poseTheta, valid);
-    m_topView->setPenMarker(m_poseX - kPenOffsetM * std::cos(th),
-                            m_poseY - kPenOffsetM * std::sin(th),
-                            m_painting, valid);
+    m_topView->setPenMarker(pen.x(), pen.y(), m_painting, valid);
 }
 
 // 테스트 재생 화면 표시 — 위와 **정확히 거울 관계**다.
 //
-// 실주행: 마커(POSE)를 받아서   → 노즐 = 마커 − 155mm
-// 재생  : 노즐(도면 위 점)에서 → 마커 = 노즐 + 155mm
+// 실주행: 마커(POSE)를 받아서   → 노즐 = 마커 − 표시 거리
+// 재생  : 노즐(도면 위 점)에서 → 마커 = 노즐 + 표시 거리
 //
 // 재생기는 시퀀스를 그대로 굴리므로 그 좌표가 곧 노즐이다(motionsim.h 참고).
 // 🔴 예전에는 재생기 좌표를 setRobotPose 에도 그대로 넣어서, **미리보기에서는
@@ -1848,10 +2175,10 @@ void Backend::pushPoseToView(bool valid)
 void Backend::pushSimPoseToView(const QPointF &nozzleM, double headingDeg, bool down)
 {
     if (!m_topView) return;
-    const double th = headingDeg * 0.017453292519943295;    // deg → rad
-    m_topView->setRobotPose(nozzleM.x() + kPenOffsetM * std::cos(th),
-                            nozzleM.y() + kPenOffsetM * std::sin(th),
-                            headingDeg, true);
+    const double displayOffsetM = m_penDisplayOffsetMm / 1000.0;
+    const QPointF center = paintgeometry::robotCenterFromPen(
+        nozzleM.x(), nozzleM.y(), headingDeg, displayOffsetM);
+    m_topView->setRobotPose(center.x(), center.y(), headingDeg, true);
     m_topView->setPenMarker(nozzleM.x(), nozzleM.y(), down, true);
 }
 
@@ -2070,7 +2397,7 @@ QString Backend::channelUrl(int ch, bool sub) const
         return QString();
 
     // 직결. ⚠️ 이 카메라에는 저해상도 서브 프로파일이 없어서 sub 여부와 무관하게
-    //    같은 주소가 나간다 (현재 4채널 전부 H.264 1920x1080 15fps 2560kbps GOV 8).
+    //    같은 주소가 나간다 (현재 4채널 profile2는 H.264 2592x1520 20fps).
     //    서브가 생기면 여기서 sub 일 때 다른 템플릿을 쓰도록 갈라주면 된다.
     QString url = m_channelUrlTemplate;
     url.replace(QStringLiteral("{ip}"),  m_camIp);
@@ -2097,7 +2424,6 @@ static QString maskRtspPassword(const QString &url)
 
 QString Backend::streamSourceText() const
 {
-    if (!channelMode()) return QStringLiteral("단일 채널 직결");
     if (!m_relayBase.isEmpty())
         return QStringLiteral("중계 %1 · 메인 /ch1 … 서브 /ch1s").arg(m_relayBase);
     return QStringLiteral("카메라 직결 · %1 (서브 없음 — 미리보기도 풀해상도)")
@@ -2111,7 +2437,8 @@ QJsonObject Backend::calibOfChannel(int ch) const
 
 bool Backend::channelCalibrated(int ch) const
 {
-    return !calibOfChannel(ch).isEmpty();
+    // 저장 시점에 이미 걸러지지만, 옛 저장값/수동 경로까지 같은 기준으로 본다.
+    return camcalib::calibIsUsable(calibOfChannel(ch));
 }
 
 QVariantList Backend::calibratedChannels() const
@@ -2119,6 +2446,16 @@ QVariantList Backend::calibratedChannels() const
     QVariantList out;
     for (int ch = 1; ch <= m_channelCount; ++ch)
         if (channelCalibrated(ch)) out << ch;
+    return out;
+}
+
+// 채널별 "왜곡 보정 데이터 없음" 표시용. 배너는 하나뿐이라 다른 통지에 덮이지만,
+// 이 목록은 그 채널에 완전한 번들이 들어올 때까지 화면에 남는다.
+QVariantList Backend::lensDataMissingChannels() const
+{
+    QVariantList out;
+    for (int ch = 1; ch <= m_channelCount; ++ch)
+        if (m_lensDataMissingCh.contains(ch)) out << ch;
     return out;
 }
 
@@ -2152,35 +2489,8 @@ void Backend::setRelayBase(const QString &base)
         return;
     }
 
-    const bool wasChannelMode = channelMode();
     m_relayBase = clean;
     saveSettings();
-
-    if (!channelMode()) {
-        // 중계도 직결 템플릿도 둘 다 비었다 = 4채널 기능 끄기.
-        // 예전 단일 채널 동작으로 즉시 복귀한다. 재빌드가 필요 없는 되돌리기
-        // 수단이라 여기서 확실히 정리해야 한다.
-        stopPreviews();
-        m_highlightedCh = 0;
-        m_workingCh = 0;
-        appendLog(QStringLiteral("중계 주소 해제 — 단일 채널(직결) 동작으로 되돌립니다"));
-        emit channelChanged();
-        if (wasChannelMode) {
-            // `{ip}` 템플릿은 있지만 LOGIN_OK.cam_ip가 아직 안 온 로그인 중간 상태.
-            // 여기서 단일채널 /FullHD/를 열지 말고 IP 도착을 기다린다.
-            if (!m_channelUrlTemplate.isEmpty()
-                && m_channelUrlTemplate.contains(QStringLiteral("{ip}"))
-                && m_camIp.isEmpty()) {
-                setNotice(QStringLiteral("서버의 카메라 IP를 기다리는 중입니다."),
-                          QStringLiteral("warn"), QStringLiteral("camera-ip"));
-                return;
-            }
-            // 중계 URL 이 걸려 있으면 그대로 되돌아가지 못한다. 직결 주소로 되돌린다.
-            setRtsp(m_directRtspUrl);
-            if (!m_workerStarted) startWorker();
-        }
-        return;
-    }
 
     if (m_relayBase.isEmpty()) {
         // 중계만 해제됐고 직결 템플릿은 남아 있다 → 4채널을 **카메라 직결**로 계속한다.
@@ -2222,7 +2532,7 @@ void Backend::registerTile(ChannelTile *tile, int ch)
 void Backend::highlightChannel(int ch)
 {
     if (m_homographyPending) return;
-    if (!channelMode() || ch <= 0 || ch > m_channelCount) return;
+    if (ch <= 0 || ch > m_channelCount) return;
     if (m_highlightedCh == ch) return;
     m_highlightedCh = ch;
     for (auto it = m_tiles.constBegin(); it != m_tiles.constEnd(); ++it)
@@ -2277,10 +2587,37 @@ void Backend::startChannelWork()
     // 왕복을 기다리면 화면이 잠깐 옛 좌표계로 떠 있게 된다 — 갖고 있으면 먼저 쓴다.
     const QJsonObject calib = calibOfChannel(ch);
     if (!calib.isEmpty()) {
+        bool applied = false;
         appendLog(QStringLiteral("CH%1 캘리브레이션 적용 — ").arg(ch)
-                  + applyCalibObject(calib, QStringLiteral("CH%1").arg(ch)));
-        clearNotice(QStringLiteral("chcalib"));
+                  + applyCalibObject(calib, QStringLiteral("CH%1").arg(ch), &applied));
+        if (applied) {
+            clearNotice(QStringLiteral("chcalib"));
+            // 이 채널로 들어왔으니 K/D 누락 경고도 이 채널 기준으로 다시 평가한다.
+            updateLensDataWarning(ch, calib);
+        } else {
+            // 적용 실패(테스트 보정 폴백)인데 경고를 지우면, 좌표를 믿을 수 없는
+            // 상태가 화면에서 정상처럼 보인다.
+            m_calibMissing = true;
+            m_calibs.remove(QString::number(ch));
+            updateLensDataWarning(ch, QJsonObject());   // 버린 번들의 경고는 남기지 않는다
+            emit channelChanged();
+            emit calibChanged();
+            appendLog(QStringLiteral("⚠️ CH%1 캘리브레이션 적용 실패 — 좌표를 믿을 수 없습니다").arg(ch));
+            setNotice(QStringLiteral("CH%1 캘리브레이션을 적용하지 못했습니다. 좌표가 맞지 않으므로 "
+                                     "설정 > 캘리브에서 이 채널의 호모그래피를 다시 계산하세요.").arg(ch),
+                      QStringLiteral("warn"), QStringLiteral("chcalib"));
+        }
     } else {
+        // 🔴 이 채널에는 번들이 없다. **이전 채널의 호모그래피를 그대로 물려받으면
+        //    안 된다** — CH2 를 보다가 CH3 로 오면 CH3 영상이 CH2 좌표계로 펴져서
+        //    "CH3 은 캘리 결과가 안 바뀐다"처럼 보이고, 도면은 엉뚱한 곳에 칠해진다.
+        //    채널 전용 번들이 없으면 중립(테스트) 매핑으로 되돌린다.
+        if (m_topView) m_topView->configureTopViewTest();
+        m_calib = QJsonObject();
+        m_calibId.clear();
+        m_coordMode.clear();
+        m_calibSource = QStringLiteral("없음");
+        refreshCalibStatus();
         // 막지는 않는다(위 canStartChannelWork 주석 참고). 대신 좌표를 믿으면 안
         // 된다는 것을 확실히 남긴다 — 이 상태로 그린 도면은 엉뚱한 곳에 칠해진다.
         m_calibMissing = true;
@@ -2304,7 +2641,6 @@ void Backend::startChannelWork()
 
 void Backend::showChannelGrid()
 {
-    if (!channelMode()) return;
     if (m_jobActive) {
         setNotice(QStringLiteral("작업이 진행 중이라 채널을 바꿀 수 없습니다. 먼저 작업을 "
                                  "완료하거나 취소하세요."),
@@ -2321,10 +2657,13 @@ void Backend::showChannelGrid()
         video_worker *old = m_worker;
         m_worker = nullptr;
         m_workerStarted = false;
+        ++m_streamGen;                    // 그리드로 나온 뒤 도착하는 프레임은 전부 버린다
         old->disconnect();
         connect(old, &QThread::finished, old, &QObject::deleteLater);
         old->stop();
     }
+    if (m_topView) m_topView->clearFrame();
+    if (m_originalView) m_originalView->clearFrame();
     if (m_frameWatch) m_frameWatch->stop();
     startPreviews();
     appendLog(QStringLiteral("채널 목록으로 — 미리보기 %1채널").arg(m_channelCount));
@@ -2341,7 +2680,9 @@ bool Backend::matchesHomographyReply(int ch, const QString &requestId) const
 void Backend::resetHomography()
 {
     if (m_homographyTimer) m_homographyTimer->stop();
+    if (m_cancelWatchdog) m_cancelWatchdog->stop();
     const bool changed = m_homographyPending || m_homographyCancelPending
+        || m_homographyCancelRequested
         || m_homographyCh != 0 || m_homographyProgress >= 0.0
         || !m_homographyStatus.isEmpty() || !m_homographyRequestId.isEmpty();
     m_homographyPending = false;
@@ -2350,6 +2691,14 @@ void Backend::resetHomography()
     m_homographyProgress = -1.0;
     m_homographyStatus.clear();
     m_homographyRequestId.clear();
+    m_homographyOdometry = false;
+    m_homographyCancelRequested = false;
+    m_homographyPhase.clear();
+    m_homographyPointIndex = -1;
+    m_homographyPointTotal = -1;
+    m_homographyValidPoints = -1;
+    clearNotice(kNoticeCaptureLag);
+    clearNotice(kNoticeCancel);
     if (changed) emit homographyChanged();
     if (changed) emit jobChanged();
 }
@@ -2362,7 +2711,47 @@ void Backend::failHomography(const QString &message, const QString &reason)
     appendLog(QStringLiteral("CALIB_FAIL CH%1 reason=%2 — %3").arg(ch).arg(reason, message));
 }
 
-bool Backend::startHomography(int ch)
+// 사각형 한 변의 절반이 서버 min_move_m(1cm) 이상이어야 하므로 각 변 2cm 이상,
+// 상한은 서버가 정한 1000cm(10m) 이하다 (양끝 포함).
+// 서버가 invalid_param 으로 거절하기 전에 여기서 먼저 막는다 (요청서 §1).
+bool Backend::startOdometryHomography(int ch, double mCm, double nCm, bool ccw)
+{
+    // QML TextField 의 Number("") 는 0, Number("abc") 는 NaN 이다. 그대로 실으면
+    // 서버가 invalid_param 으로 거절하거나 로봇이 엉뚱한 거리를 돈다.
+    if (!camcalib::odoSizeValidCm(mCm) || !camcalib::odoSizeValidCm(nCm)) {
+        setNotice(camcalib::odoSizeRangeText(),
+                  QStringLiteral("warn"), QStringLiteral("homography"));
+        return false;
+    }
+    m_odoMCm = mCm;
+    m_odoNCm = nCm;
+    m_odoCcw = ccw;
+    emit homographyChanged();     // 화면 값과 전송 값을 같은 원본으로 되돌린다
+    return startHomography(ch, true);
+}
+
+// 🔴 화면에 **보이는 글자 그대로**로 시작한다. 입력칸 텍스트를 그대로 받아
+//    검증하므로, 조작자가 보는 값과 CALIB_START 로 나가는 값이 절대 갈라지지
+//    않는다. 검증 실패면 이전 유효값으로 조용히 되돌아가지 않고 시작을 막는다.
+bool Backend::startOdometryHomographyFromText(int ch, const QString &widthText,
+                                              const QString &heightText, bool ccw)
+{
+    double mCm = 0.0, nCm = 0.0;
+    if (!camcalib::parseOdoSizeCm(widthText, &mCm)
+        || !camcalib::parseOdoSizeCm(heightText, &nCm)) {
+        setNotice(camcalib::odoSizeRangeText(),
+                  QStringLiteral("warn"), QStringLiteral("homography"));
+        appendLog(QStringLiteral("주행 캘리 시작 거부 — 입력값 \"%1\" × \"%2\" 가 "
+                                 "%3~%4cm 범위의 숫자가 아닙니다")
+                      .arg(widthText.trimmed(), heightText.trimmed())
+                      .arg(camcalib::kOdoSizeMinCm, 0, 'g', 3)
+                      .arg(camcalib::kOdoSizeMaxCm, 0, 'g', 4));
+        return false;
+    }
+    return startOdometryHomography(ch, mCm, nCm, ccw);
+}
+
+bool Backend::startHomography(int ch, bool odometry)
 {
     if (m_homographyPending) {
         setNotice(QStringLiteral("이미 CH%1 호모그래피를 계산 중입니다.").arg(m_homographyCh),
@@ -2374,7 +2763,7 @@ bool Backend::startHomography(int ch)
                   QStringLiteral("warn"), QStringLiteral("homography"));
         return false;
     }
-    if (!channelMode() || ch < 1 || ch > m_channelCount) {
+    if (ch < 1 || ch > m_channelCount) {
         setNotice(QStringLiteral("유효한 CCTV 채널을 선택하세요."),
                   QStringLiteral("warn"), QStringLiteral("homography"));
         return false;
@@ -2395,8 +2784,17 @@ bool Backend::startHomography(int ch)
     for (auto it = m_tiles.constBegin(); it != m_tiles.constEnd(); ++it)
         if (it.value()) it.value()->setSelected(it.key() == ch);
 
+    // 🔴 방식 상태를 **emit 보다 먼저** 세운다. 순서가 뒤집히면 첫 대기 화면이
+    //    정적 앵커 화면으로 한 번 그려졌다가 서버 이벤트가 와야 주행 화면으로
+    //    바뀐다 — 로봇이 움직이는 작업인데 안전 문구가 늦게 뜨는 셈이다.
     m_homographyPending = true;
     m_homographyCancelPending = false;
+    m_homographyCancelRequested = false;
+    m_homographyOdometry = odometry;
+    m_homographyPhase = odometry ? QStringLiteral("requesting") : QString();
+    m_homographyPointIndex = -1;
+    m_homographyPointTotal = odometry ? kOdoStopPoints : -1;
+    m_homographyValidPoints = -1;
     m_homographyCh = ch;
     m_homographyProgress = -1.0;
     m_homographyStatus = QStringLiteral("서버가 시작 요청을 확인하고 있습니다.");
@@ -2406,9 +2804,27 @@ bool Backend::startHomography(int ch)
     emit channelChanged();
     emit homographyChanged();
     emit jobChanged();
+    // 주행 캘리는 로봇이 실제로 사각형을 도는 작업이라 2~4분 + 카메라 계산이
+    // 더 붙는다. 5분은 빠듯하므로 이 방식일 때만 10분으로 늘린다 (요청서 §4 안 A).
+    // 취소 버튼은 대기 내내 살아 있다 (cancelHomography).
+    m_homographyTimer->setInterval(odometry ? kOdoHomographyTimeoutMs
+                                            : kStaticHomographyTimeoutMs);
     m_homographyTimer->start();
-    m_client->sendCalibStart(ch, m_homographyRequestId);
-    appendLog(QStringLiteral("CALIB_START CH%1 request=%2").arg(ch).arg(m_homographyRequestId));
+    if (odometry) {
+        const QString corner = camcalib::odoStartCorner(m_odoCcw);
+        m_client->sendCalibStart(ch, m_homographyRequestId,
+                                 QStringLiteral("robot_motion"),
+                                 m_odoMCm, m_odoNCm, corner);
+        appendLog(QStringLiteral("CALIB_START CH%1 request=%2 method=robot_motion "
+                                 "%3×%4cm %5")
+                      .arg(ch).arg(m_homographyRequestId)
+                      .arg(m_odoMCm).arg(m_odoNCm)
+                      .arg(m_odoCcw ? QStringLiteral("반시계(bottom_left)")
+                                    : QStringLiteral("시계(top_left)")));
+    } else {
+        m_client->sendCalibStart(ch, m_homographyRequestId);
+        appendLog(QStringLiteral("CALIB_START CH%1 request=%2").arg(ch).arg(m_homographyRequestId));
+    }
     return true;
 }
 
@@ -2416,11 +2832,18 @@ void Backend::cancelHomography()
 {
     if (!m_homographyPending || m_homographyCancelPending || !m_client) return;
     m_homographyCancelPending = true;
-    m_homographyStatus = QStringLiteral("서버에 중단을 요청했습니다. 안전 정지 확인을 기다립니다.");
+    m_homographyCancelRequested = true;
+    clearNotice(kNoticeCancel);            // 재요청하면 이전 "확인 없음" 경고를 내린다
+    m_homographyStatus = QStringLiteral("서버에 중단을 요청했습니다. 로봇이 실제로 섰다는 "
+                                        "확인을 기다립니다.");
     emit homographyChanged();
     m_client->sendCalibCancel(m_homographyCh, m_homographyRequestId);
     appendLog(QStringLiteral("CALIB_CANCEL CH%1 request=%2")
                   .arg(m_homographyCh).arg(m_homographyRequestId));
+    // 🔴 종결 응답이 안 오면 "정지 중"이 캘리 한도(최대 10분)까지 그대로 남는다.
+    //    로컬 감시로 **확인 실패만** 알린다 — 취소 성공으로 바꾸지 않는다.
+    //    세션은 계속 열어 두고(로봇이 아직 돌고 있을 수 있다) 재시도를 허용한다.
+    if (m_cancelWatchdog) m_cancelWatchdog->start(kCancelConfirmWatchdogMs);
 }
 
 // 수동 새로고침. 자동 재접속이 있는데도 이게 필요한 이유는 backend.h 주석 참고.
@@ -2430,12 +2853,6 @@ void Backend::refreshStreams()
         // 작업 화면 — 메인스트림만 다시 연다. 미리보기는 일시정지 상태 그대로 둔다.
         appendLog(QStringLiteral("새로고침 — CH%1 메인스트림을 다시 엽니다").arg(m_workingCh));
         setRtsp(mainUrl(m_workingCh));
-        if (!m_workerStarted) startWorker();
-        return;
-    }
-    if (!channelMode()) {
-        appendLog(QStringLiteral("새로고침 — 스트림을 다시 엽니다"));
-        setRtsp(m_rtspUrl);
         if (!m_workerStarted) startWorker();
         return;
     }
@@ -2457,7 +2874,6 @@ void Backend::pausePreviews(bool on)
 
 void Backend::startPreviews()
 {
-    if (!channelMode()) return;
     if (m_relayBase.isEmpty() && m_camIp.isEmpty()) {
         setNotice(QStringLiteral("4채널 카메라 IP가 설정되지 않아 영상을 열지 않았습니다."),
                   QStringLiteral("warn"), QStringLiteral("camera-ip"));
@@ -2479,6 +2895,7 @@ void Backend::startPreviews()
     }
     for (int ch = 1; ch <= m_channelCount; ++ch) {
         auto *w = new preview_worker(ch, subUrl(ch), this);
+        w->setVideoFilters(m_brightness, m_contrast, m_sharpen, m_saturation);
         connect(w, &preview_worker::frameReceived, this,
                 [this](int c, const QImage &img) {
             if (ChannelTile *t = m_tiles.value(c)) t->onFrame(img);
@@ -2517,19 +2934,15 @@ void Backend::stopPreviews()
         if (it.value()) it.value()->setLive(false);
 }
 
-// 로그인 직후 어디로 갈지. 4채널이면 그리드부터, 아니면 예전처럼 바로 작업 화면.
+// 로그인 직후 .13 PNM의 CH1~CH4 그리드를 연다.
 void Backend::enterInitialView()
 {
     // 테스트 모드도 실제 CCTV 영상과 채널 선택을 검증할 수 있어야 한다. 서버 연결과
     // 채널 선택 명령은 계속 생략하지만 RTSP 미리보기 경로는 일반 모드와 공유한다.
-    if (channelMode()) {
-        m_workingCh = 0;
-        m_highlightedCh = 0;
-        startPreviews();
-        emit channelChanged();
-    } else {
-        startWorker();
-    }
+    m_workingCh = 0;
+    m_highlightedCh = 0;
+    startPreviews();
+    emit channelChanged();
 }
 
 void Backend::startTestProgressSim()
@@ -2649,6 +3062,15 @@ void Backend::toggleEstop()
         sendRobotCmd("RESUME", "재개");
 }
 
+void Backend::engageEstop()
+{
+    if (m_estopActive) {
+        appendLog(QStringLiteral("비상정지 단축키 — 이미 정지 상태입니다 (해제는 버튼으로만)"));
+        return;
+    }
+    sendRobotCmd("ESTOP", QStringLiteral("비상정지"));
+}
+
 void Backend::clearRobotLog()
 {
     m_robotLog.clear(); emit robotLogChanged();
@@ -2670,11 +3092,6 @@ void Backend::setRtsp(const QString &url)
 {
     if (url.isEmpty() || url == m_rtspUrl) return;
     m_rtspUrl = url;
-    // 중계 주소(…/chN)는 "돌아갈 직결 주소"가 아니다. 이걸 같이 덮으면 중계를
-    // 껐을 때 되돌아갈 PNO 주소가 사라진다 (m_directRtspUrl 선언부 주석 참고).
-    if (m_relayBase.isEmpty() || !url.startsWith(m_relayBase))
-        m_directRtspUrl = url;
-    emit rtspChanged();
     if (!m_worker) return;
 
     // ⚠️ 여기서 wait() 로 스레드를 기다리면 안 된다.
@@ -2683,9 +3100,17 @@ void Backend::setRtsp(const QString &url)
     // 종료만 요청해두고 스레드가 스스로 끝나면 정리되게 넘긴다.
     video_worker *old = m_worker;
     m_worker = nullptr;
+    // 🔴 세대를 **먼저** 올린다. disconnect() 는 이미 큐에 실린 프레임까지 되돌리지
+    //    못하므로, 세대가 바뀐 뒤 도착하는 옛 워커 프레임은 람다에서 버려진다.
+    ++m_streamGen;
     old->disconnect();                                   // 이 워커의 모든 신호 연결 해제
     connect(old, &QThread::finished, old, &QObject::deleteLater);
     old->stop();
+
+    // 이전 채널의 마지막 프레임을 화면에서 즉시 지운다. 안 지우면 새 스트림 첫
+    // 프레임이 올 때까지 CH1 영상이 CH3 화면인 것처럼 1~2초 남는다.
+    if (m_topView) m_topView->clearFrame();
+    if (m_originalView) m_originalView->clearFrame();
 
     m_gotRealFrame = false;                              // 새 스트림 기준으로 다시 판단
     m_worker = new video_worker(m_rtspUrl, this);
@@ -2694,7 +3119,6 @@ void Backend::setRtsp(const QString &url)
     m_worker->start();
     if (m_frameWatch) m_frameWatch->start();             // 새 주소도 안 붙으면 다시 대체 캔버스
     emit linkStatusChanged();
-    saveSettings();                                      // 다음 실행에도 이 주소를 쓴다
     appendLog("RTSP 변경: " + url);
 }
 
@@ -2703,32 +3127,21 @@ void Backend::setRtsp(const QString &url)
 void Backend::setCamIp(const QString &ip)
 {
     const QString clean = ip.trimmed();
-    if (clean.isEmpty()) return;
-    const bool changed = (clean != m_camIp);
-    m_camIp = clean;
+    if (!clean.isEmpty() && clean != QLatin1String(kDefaultFourChannelCameraIp))
+        appendLog(QStringLiteral("카메라 IP %1 요청 무시 — 운영 카메라는 %2")
+                      .arg(clean, QLatin1String(kDefaultFourChannelCameraIp)));
+    const bool changed = (m_camIp != QLatin1String(kDefaultFourChannelCameraIp));
+    m_camIp = QLatin1String(kDefaultFourChannelCameraIp);
     emit sessionChanged();
 
-    // 4채널 직결은 LOGIN_OK.cam_ip를 {ip}에 넣는다. 단일채널 FullHD URL을 열면
-    // PNM에 없는 프로파일을 두드려 계정 잠금 위험이 있으므로 이 경로로 내려가지 않는다.
-    if (!m_channelUrlTemplate.isEmpty()) {
-        appendLog(QStringLiteral("카메라 IP %1 → 4채널 직결 URL 갱신").arg(clean));
-        clearNotice(QStringLiteral("camera-ip"));
-        // test/test에는 서버가 없으므로 이 값을 QSettings에서 다시 사용한다.
-        // 서버 로그인으로 받은 IP도 저장해두면 다음 테스트 로그인이 같은 카메라를 쓴다.
-        saveSettings();
-        if (changed && m_relayBase.isEmpty()) {
-            stopPreviews();
-            if (m_workingCh > 0) setRtsp(mainUrl(m_workingCh));
-            else if (!m_userId.isEmpty()) startPreviews();
-        }
-        emit channelChanged();
-        return;
+    clearNotice(QStringLiteral("camera-ip"));
+    saveSettings();
+    if (changed && m_relayBase.isEmpty()) {
+        stopPreviews();
+        if (m_workingCh > 0) setRtsp(mainUrl(m_workingCh));
+        else if (!m_userId.isEmpty()) startPreviews();
     }
-
-    QString url = m_rtspTemplate;
-    url.replace(QStringLiteral("{ip}"), clean);
-    appendLog(QStringLiteral("카메라 IP %1 → RTSP 조립").arg(clean));
-    setRtsp(url);
+    emit channelChanged();
 }
 
 // 설정 화면에서 사용자가 바꿀 때 — 로컬 반영 + 서버에 영속 저장(SET_CAM_IP).
@@ -2736,35 +3149,47 @@ void Backend::setCamIp(const QString &ip)
 void Backend::applyCamIp(const QString &ip)
 {
     const QString clean = ip.trimmed();
-    if (!clean.isEmpty()) {
-        static const QRegularExpression re(
-            QStringLiteral("^((25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1?\\d?\\d)$"));
-        if (!re.match(clean).hasMatch()) {
-            setNotice(QStringLiteral("카메라 IP 형식이 올바르지 않습니다: %1").arg(clean),
-                      QStringLiteral("error"));
-            return;
-        }
-        setCamIp(clean);
-    } else {
-        m_camIp.clear();
-        saveSettings();
-        emit sessionChanged();
+    if (!clean.isEmpty() && clean != QLatin1String(kDefaultFourChannelCameraIp)) {
+        setNotice(QStringLiteral("운영 카메라는 %1만 사용합니다.")
+                      .arg(QLatin1String(kDefaultFourChannelCameraIp)),
+                  QStringLiteral("warn"), QStringLiteral("camera-ip"));
+        return;
     }
+    setCamIp(QLatin1String(kDefaultFourChannelCameraIp));
 
     if (m_testMode || !m_serverConnected) {
         appendLog(QStringLiteral("[로컬] 카메라 IP %1 (서버 미연결 — SET_CAM_IP 생략)")
-                      .arg(clean.isEmpty() ? QStringLiteral("해제") : clean));
+                      .arg(QLatin1String(kDefaultFourChannelCameraIp)));
         return;
     }
-    m_client->sendSetCamIp(clean);
+    m_client->sendSetCamIp(QLatin1String(kDefaultFourChannelCameraIp));
     appendLog(QStringLiteral("SET_CAM_IP %1 전송")
-                  .arg(clean.isEmpty() ? QStringLiteral("(해제)") : clean));
+                  .arg(QLatin1String(kDefaultFourChannelCameraIp)));
 }
 
 void Backend::setVideoFilters(int b, int c, int s, int sat)
 {
-    m_brightness = b; m_contrast = c; m_sharpen = s; m_saturation = sat;
+    b = qBound(-100, b, 100);
+    c = qBound(-100, c, 100);
+    s = qBound(0, s, 100);
+    sat = qBound(-100, sat, 100);
+    if (m_brightness == b && m_contrast == c
+        && m_sharpen == s && m_saturation == sat) return;
+
+    m_brightness = b;
+    m_contrast = c;
+    m_sharpen = s;
+    m_saturation = sat;
     if (m_worker) m_worker->setVideoFilters(b, c, s, sat);
+    for (preview_worker *preview : std::as_const(m_previews))
+        if (preview) preview->setVideoFilters(b, c, s, sat);
+
+    QSettings settings;
+    settings.setValue(QStringLiteral("video/brightness"), b);
+    settings.setValue(QStringLiteral("video/contrast"), c);
+    settings.setValue(QStringLiteral("video/sharpen"), s);
+    settings.setValue(QStringLiteral("video/saturation"), sat);
+    emit videoFiltersChanged();
 }
 
 // 설정창의 수동 붙여넣기. 파싱만 하고 실제 적용은 서버 경로와 똑같은 applyCalibObject 에 맡긴다.
@@ -2825,12 +3250,34 @@ QJsonObject Backend::normalizeCalibObject(const QJsonObject &raw)
     return obj;
 }
 
-// 번들이 어디서 들어오든(수동 입력 · LOGIN_OK · H_MATRIX) 여기 한 곳만 지난다.
-QString Backend::applyCalibObject(const QJsonObject &raw, const QString &source)
+// 3x3 · 유한 실수 · 특이하지 않은 H 인가. 저장/적용 전 공통 관문이다.
+bool Backend::calibHasUsableH(const QJsonObject &raw)
 {
+    const QJsonObject obj = normalizeCalibObject(raw);
+    if (obj.isEmpty()) return false;
+    const QJsonArray h = obj.value(QStringLiteral("H")).toArray().isEmpty()
+        ? obj.value(QStringLiteral("H_floor")).toArray()
+        : obj.value(QStringLiteral("H")).toArray();
+    // 행렬 규칙은 camcalib 에 둔다 — 단위 테스트가 같은 함수를 검증한다.
+    return camcalib::hasUsable3x3(h);
+}
+
+// 번들이 어디서 들어오든(수동 입력 · LOGIN_OK · H_MATRIX) 여기 한 곳만 지난다.
+QString Backend::applyCalibObject(const QJsonObject &raw, const QString &source,
+                                  bool *okOut)
+{
+    if (okOut) *okOut = false;
     const QJsonObject obj = normalizeCalibObject(raw);
     if (obj.isEmpty())
         return QStringLiteral("빈 캘리브레이션입니다.");
+
+    // H(H_floor) 가 들어 있으면 저장·적용 전에 반드시 쓸 수 있는 행렬이어야 한다.
+    // (코너만 있는 수동 번들은 H 없이 오므로 그 경우는 검사 대상이 아니다)
+    if ((obj.contains(QStringLiteral("H")) || obj.contains(QStringLiteral("H_floor")))
+        && !calibHasUsableH(obj)) {
+        appendLog(QStringLiteral("캘리브 거부(%1) — 유효한 3x3 H 가 아닙니다").arg(source));
+        return QStringLiteral("유효한 3x3 H 행렬이 아닙니다.");
+    }
 
     m_calibSource = source;
     m_calibId     = obj.value(QStringLiteral("calib_id")).toString();
@@ -2901,18 +3348,35 @@ QString Backend::applyCalibObject(const QJsonObject &raw, const QString &source)
     if (!m_topView) {
         m_calibMissing = false;
         emit calibChanged();
+        if (okOut) *okOut = true;   // 보관 성공 — 화면이 생기면 그대로 적용된다
         appendLog(QStringLiteral("캘리브 수신(%1) — TopView 생성 시 적용됩니다").arg(source));
         return QStringLiteral("보관됨 — 화면 준비 후 적용");
     }
 
+    // 🔴 채널/보정이 바뀌면 화면 픽셀 ↔ 월드 mm 대응이 통째로 바뀐다. 작도 중인
+    //    도형은 TopView 픽셀로 들고 있으므로, 새 대응이 들어오기 전에 월드 좌표(m)로
+    //    떠 두었다가 그대로 되돌린다. 안 그러면 같은 픽셀이 다른 mm 로 재해석돼
+    //    "CH2 에서 그린 도형이 CH3 좌표로 전송"되는 조용한 사고가 난다.
+    QList<bool> draftClosed, draftOuter;
+    const QList<QList<QPointF>> draftM =
+        m_topView->editablePathsToMeters(&draftClosed, &draftOuter);
+
     const bool ok = m_topView->configureTopViewCalib(obj);
-    m_calibMissing = false;
+    // TopView 구성이 실패하면 테스트 보정으로 폴백한 상태다 — 그 화면을 "보정됨"
+    // 으로 표시하면 경고가 정확히 필요한 순간에 사라진다.
+    m_calibMissing = !ok;
+    if (!draftM.isEmpty()) {
+        m_topView->setEditPathsMeters(draftM, draftClosed, draftOuter);
+        appendLog(QStringLiteral("작도 중인 도형 %1개를 월드 좌표 기준으로 유지했습니다 "
+                                 "(새 보정으로 재투영)").arg(draftM.size()));
+    }
     refreshCalibStatus();
     pushMissionToView();
     pushOverlayToOriginal();   // 좌표 변환이 바뀌었으니 원본 뷰 오버레이도 다시 만든다
     appendLog(ok ? QStringLiteral("캘리브 적용(%1): ").arg(source) + m_calibStatus
                  : QStringLiteral("캘리브 실패(%1) — 테스트 보정으로 폴백").arg(source));
     logCalibUnit(m_topView);
+    if (okOut) *okOut = ok;
     return ok ? (QStringLiteral("적용됨 · ") + m_calibStatus)
               : QStringLiteral("적용 실패 (테스트 보정 사용)");
 }
@@ -3054,13 +3518,46 @@ void Backend::scaleShape(double factor)
 
 void Backend::setStrokeWidthMm(double mm)
 {
+    if (!std::isfinite(mm)) return;
     const double v = qBound(1.0, mm, 500.0);
     if (qFuzzyCompare(m_strokeWidthMm, v)) return;
+
+    // 서버에 보낸 중심 경로는 당시 펜촉 폭으로 계산됐다. 작업 중 값을 바꾸면
+    // 화면과 실제 실행이 달라지므로 막고, 실행 전이면 외곽 편집 상태로 되돌려
+    // 새 폭으로 다시 계산·전송하게 한다.
+    if (m_jobActive) {
+        appendLog(QStringLiteral("작업 중에는 펜촉 폭을 변경할 수 없습니다."));
+        setNotice(QStringLiteral("작업을 중단하거나 완료한 뒤 펜촉 폭을 변경하세요."),
+                  QStringLiteral("warn"), QStringLiteral("stroke-width"));
+        return;
+    }
+    if (canEditMission()) {
+        editMission();
+        setNotice(QStringLiteral("펜촉 폭이 바뀌어 경로를 다시 계산해야 합니다. 도면을 확인하고 경로를 재전송하세요."),
+                  QStringLiteral("warn"), QStringLiteral("stroke-width"));
+    }
+
     m_strokeWidthMm = v;
     if (m_topView) m_topView->setStrokeWidthMm(v);
     if (m_originalView) m_originalView->setStrokeWidthMm(v);
+    QSettings().setValue(QStringLiteral("paint/strokeWidthMm"), v);
     emit strokeWidthChanged();
     appendLog(QStringLiteral("도장 폭 %1 mm 적용").arg(v, 0, 'f', 0));
+}
+
+void Backend::setPenDisplayOffsetMm(double mm)
+{
+    if (!std::isfinite(mm)) return;
+    const double value = qBound(0.0, mm, 500.0);
+    if (qFuzzyCompare(m_penDisplayOffsetMm + 1.0, value + 1.0)) return;
+
+    m_penDisplayOffsetMm = value;
+    QSettings().setValue(QStringLiteral("ui/penDisplayOffsetMm"), value);
+    emit penDisplayOffsetChanged();
+
+    // 실주행 표시는 즉시, 시뮬레이션 표시는 다음 40ms 틱에서 새 값을 사용한다.
+    if (!m_simRunning) pushPoseToView(m_poseValid);
+    appendLog(QStringLiteral("중심-펜 표시 거리 %1 mm 적용").arg(value, 0, 'f', 0));
 }
 
 // 다시 켰을 때 그대로여야 하는 값만 파일에 남긴다.
@@ -3074,17 +3571,30 @@ void Backend::loadSettings()
     m_simSpeedFactor   = qBound(0.5,  s.value("ui/simSpeed",      4.0).toDouble(), 20.0);
     m_lensOn = s.value("camera/lensCorrection", false).toBool();
     m_robotVisible = s.value("ui/robotVisible", true).toBool();
+    const double savedPenDisplayOffset = s.value("ui/penDisplayOffsetMm", 155.0).toDouble();
+    m_penDisplayOffsetMm = std::isfinite(savedPenDisplayOffset)
+        ? qBound(0.0, savedPenDisplayOffset, 500.0) : 155.0;
+    m_brightness = qBound(-100, s.value("video/brightness", 45).toInt(), 100);
+    m_contrast = qBound(-100, s.value("video/contrast", 8).toInt(), 100);
+    m_sharpen = qBound(0, s.value("video/sharpen", 0).toInt(), 100);
+    m_saturation = qBound(-100, s.value("video/saturation", 0).toInt(), 100);
+    const double savedStrokeWidth = s.value("paint/strokeWidthMm", 50.0).toDouble();
+    m_strokeWidthMm = std::isfinite(savedStrokeWidth)
+        ? qBound(1.0, savedStrokeWidth, 500.0) : 50.0;
 
-    // 마지막으로 실제로 붙었던 카메라 주소. 이게 없으면 앱이 매번 하드코딩 기본값으로
-    // 되돌아가는데, 그 IP 에 카메라가 없으면 "왜 영상이 안 나오지" 로만 보인다.
-    // 서버가 LOGIN_OK.cam_ip 를 주면 그 값이 이걸 덮는다.
-    const QString savedUrl = s.value("camera/rtspUrl").toString().trimmed();
-    if (!savedUrl.isEmpty()) m_rtspUrl = m_directRtspUrl = savedUrl;
-    const QString savedIp = s.value("camera/ip").toString().trimmed();
-    if (!savedIp.isEmpty()) m_camIp = savedIp;
+    // 운영 카메라는 .13 PNM 한 대와 CH1~CH4로 고정한다. 과거 카메라 설정이나
+    // 임의 RTSP 주소는 읽지 않고 현재 설정 키를 정상값으로 즉시 이관한다.
+    m_camIp = QLatin1String(kDefaultFourChannelCameraIp);
+    m_channelCount = kFourChannelCount;
+    m_channelUrlTemplate = QStringLiteral(
+        "rtsp://admin:5hanwha!@{ip}:554/{ch0}/profile2/media.smp");
+    s.remove("camera/rtspUrl");
+    s.setValue("camera/ip", m_camIp);
+    s.setValue("camera/channelIp", m_camIp);
+    s.setValue("camera/channelCount", m_channelCount);
+    s.setValue("camera/channelUrlTemplate", m_channelUrlTemplate);
 
-    // 4채널 중계 주소. 🔴 **비어 있는 것이 기본값**이고, 비면 위 단일 채널 경로만
-    // 돈다 — PNM 은 아직 시도 단계라 언제든 PNO 직결로 되돌아갈 수 있어야 한다.
+    // 중계 주소는 선택 사항이다. 비어 있으면 .13 카메라에 직접 연결한다.
     m_relayBase = s.value("camera/relayBase").toString().trimmed();
     while (m_relayBase.endsWith('/')) m_relayBase.chop(1);
     // 과거 UI에서 카메라의 완성된 RTSP URL을 중계 베이스로 저장한 경우
@@ -3093,24 +3603,6 @@ void Backend::loadSettings()
         m_relayBase.clear();
         s.setValue("camera/relayBase", QString());
     }
-    // 중계 없이 카메라에 직결할 때의 채널 URL 템플릿. 기본값은 현장 4채널 카메라다.
-    // ⚠️ 여기를 **비우면** 4채널 기능이 꺼지고 단일 채널 직결로 돌아간다
-    //    (relayBase 도 비어 있을 때). 재빌드 없는 되돌리기 수단이다.
-    if (s.contains("camera/channelUrlTemplate"))
-        m_channelUrlTemplate = s.value("camera/channelUrlTemplate").toString().trimmed();
-    // 2026-08-07 이전 기본값은 현장 IP가 템플릿에 박혀 있었다. 사용자가 별도로
-    // 만든 템플릿은 건드리지 않고, 정확히 옛 기본값인 경우만 {ip} 방식으로 이관한다.
-    const QString legacyFixedChannelTemplate = QStringLiteral(
-        "rtsp://admin:5hanwha!@192.168.0.13:554/{ch0}/H.264/media.smp");
-    const QString legacyDynamicChannelTemplate = QStringLiteral(
-        "rtsp://admin:5hanwha!@{ip}:554/{ch0}/H.264/media.smp");
-    if (m_channelUrlTemplate == legacyFixedChannelTemplate
-        || m_channelUrlTemplate == legacyDynamicChannelTemplate) {
-        m_channelUrlTemplate = QStringLiteral(
-            "rtsp://admin:5hanwha!@{ip}:554/{ch0}/profile2/media.smp");
-        s.setValue("camera/channelUrlTemplate", m_channelUrlTemplate);
-    }
-    m_channelCount = qBound(1, s.value("camera/channelCount", 4).toInt(), 8);
 }
 
 void Backend::saveSettings() const
@@ -3122,8 +3614,15 @@ void Backend::saveSettings() const
     s.setValue("ui/simSpeed", m_simSpeedFactor);
     s.setValue("camera/lensCorrection", m_lensOn);
     s.setValue("ui/robotVisible", m_robotVisible);
-    s.setValue("camera/rtspUrl", m_directRtspUrl);   // 중계 주소가 아니라 직결 주소
+    s.setValue("ui/penDisplayOffsetMm", m_penDisplayOffsetMm);
+    s.setValue("paint/strokeWidthMm", m_strokeWidthMm);
+    s.setValue("video/brightness", m_brightness);
+    s.setValue("video/contrast", m_contrast);
+    s.setValue("video/sharpen", m_sharpen);
+    s.setValue("video/saturation", m_saturation);
     s.setValue("camera/ip", m_camIp);
+    if (!m_channelUrlTemplate.isEmpty())
+        s.setValue("camera/channelIp", m_camIp);
     s.setValue("camera/relayBase", m_relayBase);
     s.setValue("camera/channelUrlTemplate", m_channelUrlTemplate);
     s.setValue("camera/channelCount", m_channelCount);

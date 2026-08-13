@@ -1,4 +1,5 @@
 #include "preview_worker.h"
+#include "videofilters.h"
 
 #include <QDebug>
 #include <opencv2/opencv.hpp>
@@ -6,8 +7,8 @@
 namespace {
 // 미리보기 타일에 떠 있어도 되는 프레임 수. 워커가 4개라 이 값 x4 가 큐에 뜬다.
 // ⚠️ 저해상도 서브 프로파일이 없어졌다(2026-08-04) — 미리보기도 메인과 같은
-//    1920x1080 을 받는다. 한 장이 ~6.2MB 라 4채널 x 2장이면 50MB 다.
-//    게다가 15fps 라 한 칸이 66.7ms 짜리다. 늦은 프레임은 감시 화면에서 가치가
+//    2592x1520 을 받는다. BGR 한 장이 ~11.8MB이므로 4채널 최신 프레임만
+//    유지해도 약 47MB다. 20fps의 늦은 프레임은 감시 화면에서 가치가
 //    없으므로 video_worker 와 같이 1 로 줄인다 (= 최신 것만 살린다).
 constexpr int kMaxQueued = 1;
 
@@ -45,6 +46,14 @@ preview_worker::~preview_worker()
     // ⚠️ video_worker.cpp 의 stimeout 값을 바꾸면 여기도 같이 올려야 한다.
     if (!wait(7000))
         qWarning() << "[preview] CH" << m_ch << "캡처 스레드가 7초 안에 안 끝났습니다";
+}
+
+void preview_worker::setVideoFilters(int brightness, int contrast, int sharpen, int saturation)
+{
+    m_brightness.store(qBound(-100, brightness, 100), std::memory_order_relaxed);
+    m_contrast.store(qBound(-100, contrast, 100), std::memory_order_relaxed);
+    m_sharpen.store(qBound(0, sharpen, 100), std::memory_order_relaxed);
+    m_saturation.store(qBound(-100, saturation, 100), std::memory_order_relaxed);
 }
 
 void preview_worker::stop()
@@ -138,6 +147,11 @@ void preview_worker::run()
         // 밀어넣기는 항상 성공하지만, 쌓이면 화면은 과거를 보여주고 메모리만 는다.
         if (m_queued.load(std::memory_order_relaxed) < kMaxQueued) {
             m_queued.fetch_add(1, std::memory_order_relaxed);
+            videofilters::apply(frame,
+                m_brightness.load(std::memory_order_relaxed),
+                m_contrast.load(std::memory_order_relaxed),
+                m_sharpen.load(std::memory_order_relaxed),
+                m_saturation.load(std::memory_order_relaxed));
             emit frameReceived(m_ch, matToQImage(frame));
         }
 
