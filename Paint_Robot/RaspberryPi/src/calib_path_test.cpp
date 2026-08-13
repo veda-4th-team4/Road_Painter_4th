@@ -128,9 +128,11 @@ int main(int argc, char* argv[]) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         } else if (seg.op == "turn") {
-            accumulated_target_yaw += seg.angle_deg;
+            // Protocol rule: positive angle = turn right (CW) -> StartTurn(-seg.angle_deg) to match main.cpp & PathFollower
+            float robot_turn_deg = -seg.angle_deg;
+            accumulated_target_yaw += robot_turn_deg;
             float start_yaw = has_imu ? imu_manager.GetYaw() : 0.0f;
-            path_follower.StartTurn(seg.angle_deg, start_l, start_r, start_yaw);
+            path_follower.StartTurn(robot_turn_deg, start_l, start_r, start_yaw);
             while (true) {
                 robot_comm.GetLatestStatus(status);
                 int32_t cur_l = static_cast<int32_t>(status.left_steps);
@@ -144,7 +146,7 @@ int main(int argc, char* argv[]) {
                 if (finished) {
                     robot_comm.SendSetSpeed(0, 0);
                     float final_yaw = has_imu ? imu_manager.GetYaw() : 0.0f;
-                    float relative_target_yaw = seg.angle_deg;
+                    float relative_target_yaw = robot_turn_deg;
                     float yaw_err = final_yaw - relative_target_yaw;
                     std::cout << GetTimestampStr() << "[CALIB OP " << op_idx << "/10] TURN " 
                               << std::fixed << std::setprecision(2) << seg.angle_deg << "deg -> Main Turn Complete | Target Yaw: "
