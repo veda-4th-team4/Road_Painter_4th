@@ -1,4 +1,5 @@
 #include "ImuManager.h"
+#include "RobotTypes.h"
 #include <wiringPi.h>
 #include <wiringPiI2C.h>
 #include <iostream>
@@ -167,11 +168,13 @@ void ImuManager::imu_loop() {
             current_yaw += gyro_z_deg_s * dt;
         }
 
-        static int log_counter = 0;
-        if (++log_counter >= 10) { // 10 iterations * 20ms = 200ms (5Hz)
-            log_counter = 0;
-            std::cout << "[IMU 5Hz] Yaw: " << current_yaw << " deg | Gyro Z-Rate: " << gyro_z_deg_s << " deg/s" << std::endl;
-        }
+        // Continuous logging disabled to keep stdout clean.
+        // Uncomment below for low-frequency debug logging if needed:
+        // static int log_counter = 0;
+        // if (++log_counter >= 50) { // 1Hz logging
+        //     log_counter = 0;
+        //     std::cout << GetTimestampStr() << "[IMU 1Hz] Yaw: " << current_yaw << " deg | Gyro Z-Rate: " << gyro_z_deg_s << " deg/s" << std::endl;
+        // }
 
         usleep(20000); // 20ms update interval (~50Hz)
     }

@@ -59,6 +59,12 @@ public:
     bool UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps, Msg_SetSpeed_t& out_speed, float cur_imu_yaw = 0.0f, bool has_imu = false);
 
     /**
+     * @brief Performs active post-turn micro-correction (trimming residual overshoot/undershoot).
+     * @return true when micro-correction is finished and yaw error is <= 0.15 deg.
+     */
+    bool TrimTurn(float target_yaw, float cur_imu_yaw, Msg_SetSpeed_t &out_speed);
+
+    /**
      * @brief Checks if a turn is currently in progress.
      */
     bool IsTurning() const { return is_turning; }
@@ -69,9 +75,9 @@ public:
     uint32_t CalculateMoveSteps(float dist_m) const;
 
     /**
-     * @brief Starts straight move segment tracking.
+     * @brief Starts straight move segment tracking with optional custom speed (default 0.05 m/s, e.g. 0.015 m/s for MORE micro-moves).
      */
-    void StartMove(float dist_m, int32_t start_left_steps, int32_t start_right_steps);
+    void StartMove(float dist_m, int32_t start_left_steps, int32_t start_right_steps, float target_v_m_s = 0.05f);
 
     /**
      * @brief Updates straight move execution based on latest step counts and IMU yaw heading.
@@ -126,6 +132,7 @@ private:
     // Straight move tracking state
     bool is_moving_straight;
     float move_dist_m;
+    float move_speed_m_s;
     uint32_t move_target_steps;
     int32_t move_start_left_steps;
     int32_t move_start_right_steps;

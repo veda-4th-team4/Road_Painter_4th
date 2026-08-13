@@ -144,21 +144,59 @@ int main(int argc, char* argv[]) {
                 if (finished) {
                     robot_comm.SendSetSpeed(0, 0);
                     float final_yaw = has_imu ? imu_manager.GetYaw() : 0.0f;
-                    float yaw_err = final_yaw - accumulated_target_yaw;
+                    float relative_target_yaw = seg.angle_deg;
+                    float yaw_err = final_yaw - relative_target_yaw;
                     std::cout << GetTimestampStr() << "[CALIB OP " << op_idx << "/10] TURN " 
-                              << std::fixed << std::setprecision(2) << seg.angle_deg << "deg -> Complete | Target Yaw: "
-                              << accumulated_target_yaw << " deg | IMU Yaw: " << final_yaw 
+                              << std::fixed << std::setprecision(2) << seg.angle_deg << "deg -> Main Turn Complete | Target Yaw: "
+                              << relative_target_yaw << " deg | IMU Yaw: " << final_yaw 
                               << " deg (Error: " << (yaw_err >= 0 ? "+" : "") << yaw_err << " deg)" << std::endl;
+
+                    if (has_imu) {
+                        // 1. Initial coasting pause (400ms)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+                        float settled_yaw = imu_manager.GetYaw();
+                        float residual_error = settled_yaw - relative_target_yaw;
+
+                        // 2. If residual error > 0.25 deg, run active micro-correction sequence at 120 sps
+                        if (std::fabs(residual_error) > 0.25f) {
+                            std::cout << GetTimestampStr() << "[CALIB TRIM] Active Micro-Correction Triggered! Residual Error: " 
+                                      << (residual_error >= 0 ? "+" : "") << residual_error << " deg" << std::endl;
+
+                            auto trim_start_time = std::chrono::high_resolution_clock::now();
+                            while (true) {
+                                float cur_trim_yaw = imu_manager.GetYaw();
+                                Msg_SetSpeed_t trim_speed{};
+                                bool trim_done = path_follower.TrimTurn(relative_target_yaw, cur_trim_yaw, trim_speed);
+                                robot_comm.SendSetSpeed(trim_speed.left_sps, trim_speed.right_sps);
+
+                                auto trim_elapsed = std::chrono::high_resolution_clock::now() - trim_start_time;
+                                if (trim_done || std::chrono::duration_cast<std::chrono::milliseconds>(trim_elapsed).count() > 1500) {
+                                    robot_comm.SendSetSpeed(0, 0);
+                                    float post_trim_yaw = imu_manager.GetYaw();
+                                    float post_trim_err = post_trim_yaw - relative_target_yaw;
+                                    std::cout << GetTimestampStr() << "[CALIB TRIM] Active Micro-Correction Finished! Final Yaw: " 
+                                              << post_trim_yaw << " deg (Error: " << (post_trim_err >= 0 ? "+" : "") << post_trim_err << " deg)" << std::endl;
+                                    break;
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                            }
+                        }
+                    }
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
         }
 
-        // Boundary Handshake & Camera Settling logic (§2-2: "직전 op이 TURN인 boundary는 스킵")
+        // Boundary Handshake & Camera Settling logic (2.0s delay post-TURN for complete physical rest)
         if (seg.op == "turn") {
             std::cout << GetTimestampStr() << "[CALIB BOUNDARY " << (op_idx + 1) 
-                      << "] Post-TURN Skip Camera -> Instant GO" << std::endl;
+                      << "] Post-TURN Settling Delay (2.0s)... Bringing chassis to complete rest" << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+            if (has_imu) {
+                imu_manager.ResetYaw(0.0f);
+                std::cout << GetTimestampStr() << "[CALIB CORNER] Chassis at complete rest. Resetting IMU Yaw to 0.00 deg for next segment!" << std::endl;
+            }
         } else {
             std::cout << GetTimestampStr() << "[CALIB BOUNDARY " << (op_idx + 1) 
                       << "] Camera Settling Delay (2.5s)... Sending READY(" << (op_idx + 1) << ")" << std::endl;

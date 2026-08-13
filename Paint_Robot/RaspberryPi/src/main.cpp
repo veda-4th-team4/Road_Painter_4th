@@ -259,7 +259,8 @@ int main(int argc, char **argv) {
                                     << ": " << more_dist << " m" << std::endl;
                           Msg_Status_t status_snap{};
                           if (robot_comm.GetLatestStatus(status_snap)) {
-                              path_follower.StartMove(more_dist, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
+                              // MORE micro-distance correction (0.8cm~2.0cm): Use ultra-slow 0.0065 m/s (~100 sps) micro-creeping speed!
+                              path_follower.StartMove(more_dist, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), 0.0065f);
                           }
                       }
                   }
