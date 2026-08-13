@@ -70,3 +70,9 @@ server_run.log
 
 #작업 중 만든 소스 백업본 (2026-08-13 실수로 커밋된 적 있음)
 *.bak.*
+
+# 실행 중 바이너리 사본
+server.running
+
+# 캘리 슬롯 백업본 (config/calib_latest.json 과 같은 이유로 커밋 금지)
+config/calib_latest.json.*
