@@ -59,8 +59,10 @@ void Router::clearCalib() {
     odoPendingGoOp_ = -2;
     odoCaptureMs_ = 0;
     odoValidCount_ = 0;
-    odoHaveFirstPix_ = false;
-    odoFirstPixU_ = odoFirstPixV_ = 0;
+    for (int i = 0; i < 9; ++i) {
+        odoPixU_[i] = odoPixV_[i] = 0.0;
+        odoPixOk_[i] = false;
+    }
 }
 
 // 세션을 시작하지 못했을 때의 거절 회신 (아직 calibActive_가 아니라

@@ -178,6 +178,9 @@ private:
     void sendCalibCapture(int pointIdx);
     // 캡처 ack가 calib_capture_timeout_ms 안에 안 오면 호출 (sweep()에서).
     void checkOdoCaptureTimeout();
+    // 폐합오차(idx0과 idx8은 같은 물리 지점이므로 두 픽셀은 같아야 한다)를
+    // 로그 한 줄로 남긴다. 🔴 진단 전용 - 판정도 통지도 하지 않는다.
+    void logOdoClosure();
     // 안전 정지: 로봇은 fire-and-forget ABORT_DRAW, CCTV는 CALIB_CANCEL 후
     // CALIB_STOPPED 대기. 정적 앵커 방식의 cancelCalib()/failCalib()과 다른
     // 경로다 - 로봇이 실제로 주행 중이라 CALIB_CANCEL이 로봇에 안 먹는다
@@ -202,8 +205,12 @@ private:
     int odoPendingGoOp_ = -2;
     long odoCaptureMs_ = 0;          // CALIB_CAPTURE 전송 시각 (캡처 타임아웃 기준)
     int odoValidCount_ = 0;          // 유효 캡처 개수 (idx 0~7 중 OK, findHomography 입력)
-    bool odoHaveFirstPix_ = false;   // idx 0 픽셀을 받았나 (폐합오차 로깅용)
-    double odoFirstPixU_ = 0, odoFirstPixV_ = 0;
+    // 정지점 9곳의 raw 픽셀. 폐합오차(idx0 vs idx8)와 그 mm 환산에 쓴다 -
+    // 환산 스케일을 네 변의 실측 픽셀 길이에서 뽑기 때문에 코너 픽셀이 필요하다.
+    // 진단 로그 전용이다. 서버는 이 값으로 아무 판정도 하지 않는다 (H 산출과
+    // 유효점 판정은 전부 카메라 몫, wire 스펙 §7).
+    double odoPixU_[9] = {0}, odoPixV_[9] = {0};
+    bool odoPixOk_[9] = {false};
 
     // ----- 로봇 핸드셰이크 (§3, §6) -----
     // READY 수신. 판정이 필요 없는 boundary면 즉시 GO, 필요하면 대기 창을 연다.

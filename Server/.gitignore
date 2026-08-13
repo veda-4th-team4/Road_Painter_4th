@@ -57,6 +57,9 @@ calib_session_test
 #로봇 오도메트리 주행 캘리 회귀 테스트 (2026-08-12)
 odo_calib_test
 
+#오도메트리 주행 캘리 세션 회귀 테스트 (2026-08-13, Qt 개시 지원)
+odo_session_test
+
 start.log
 
 server.out.log

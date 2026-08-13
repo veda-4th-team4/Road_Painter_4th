@@ -104,7 +104,7 @@ void Router::startOdoCalib(const json& payload, const json& msg,
     odoPointIdx_ = -1;
     odoPendingGoOp_ = -2;
     odoValidCount_ = 0;
-    odoHaveFirstPix_ = false;
+    for (int i = 0; i < 9; ++i) odoPixOk_[i] = false;
 
     // Qt에도 채널을 알린다 - 정적 앵커 경로와 같은 이유다(계약 §5). 서버가
     // 바꾼 활성 채널을 Qt가 모르면 화면과 좌표계가 어긋난다.
@@ -228,20 +228,12 @@ void Router::onCalibCaptureAck(const json& payload, bool ok, const std::string& 
             v = payload["pixel_uv"][1].get<double>();
         }
         if (pointIdx >= 0 && pointIdx <= 7) ++odoValidCount_;  // idx 8은 진단 전용
-        if (pointIdx == 0) {
-            odoHaveFirstPix_ = true;
-            odoFirstPixU_ = u;
-            odoFirstPixV_ = v;
-        } else if (pointIdx == 8 && odoHaveFirstPix_) {
-            // 폐합오차 - raw 픽셀 단위로만 로깅한다. mm 환산은 불가능하다(이
-            // 시점엔 새 캘리가 아직 없다) - mm 값은 카메라 기록이 정본이다
-            // (wire 스펙 §5).
-            const double du = u - odoFirstPixU_, dv = v - odoFirstPixV_;
-            logf("[INFO] 오도메트리 폐합오차 [채널 %d] %.1fpx "
-                 "(idx0=(%.1f,%.1f) idx8=(%.1f,%.1f))",
-                 calibCh_, std::sqrt(du * du + dv * dv),
-                 odoFirstPixU_, odoFirstPixV_, u, v);
+        if (pointIdx >= 0 && pointIdx <= 8) {
+            odoPixU_[pointIdx] = u;
+            odoPixV_[pointIdx] = v;
+            odoPixOk_[pointIdx] = true;
         }
+        if (pointIdx == 8) logOdoClosure();
         logf("[INFO] CALIB_CAPTURE_OK [채널 %d] point_index=%d pixel=(%.1f,%.1f) "
              "spread=%.2fpx", calibCh_, pointIdx, u, v,
              payload.value("spread_px", 0.0));
@@ -283,6 +275,71 @@ void Router::onCalibCaptureAck(const json& payload, bool ok, const std::string& 
         sendOdoProgress("driving", pointIdx);
         sendGo(odoPendingGoOp_, "캘리 캡처 완료");
     }
+}
+
+// 폐합오차 로그. idx 0(출발 자리, 아직 한 발도 안 움직인 상태)과 idx 8(사각형을
+// 한 바퀴 돌고 돌아온 자리)은 **같은 물리 지점**이므로(odoPointWorldMm의 case 0과
+// default가 같은 좌표), 로봇이 정확히 복귀했다면 두 픽셀이 같아야 한다. 차이가
+// 곧 한 바퀴 누적된 주행 오차다 - H가 없어도 성립하는 유일한 자기검증이다.
+//
+// 🔴 진단 전용이다. 이 값으로 세션을 실패시키거나 Qt에 알리지 않는다. 두 가지
+//   이유가 있다: (1) 유효점 판정과 H 산출은 카메라 몫이고(wire 스펙 §7) 서버가
+//   뒤집으면 권한이 겹친다, (2) 아래 한계 때문에 "작다 = 정확하다"가 성립하지
+//   않아 임계값 판정의 근거로 삼기에 약하다.
+//
+// ⚠️ 이 값의 한계 (로그를 읽는 사람이 알아야 한다)
+//   - **위치만 본다.** 제자리에 정확히 돌아왔어도 로봇이 엉뚱한 방향을 보고
+//     있을 수 있다. 마커 중심 하나만 비교하므로 자세 오차는 안 잡힌다.
+//   - **오차가 상쇄될 수 있다.** 세 코너가 같은 쪽으로 오버슛하면 사각형이 작게
+//     닫히면서 오히려 출발점 근처로 돌아온다. 작다고 정확한 게 아니다.
+//     반대는 성립한다 - 크면 확실히 틀렸다.
+//   - **mm 환산이 거칠다.** 아래 스케일은 네 변의 실측 픽셀 길이를 명령 길이로
+//     나눠 평균한 값이라, 카메라가 기울어져 있으면 화면 위치마다 실제 px/mm가
+//     다르다. 자릿수를 보는 용도지 정밀 측정이 아니다. 정본은 카메라 기록이다
+//     (wire 스펙 §5).
+void Router::logOdoClosure() {
+    if (!odoPixOk_[0] || !odoPixOk_[8]) {
+        logf("[INFO] 오도메트리 폐합오차 [채널 %d] 측정 불가 "
+             "(idx0 %s, idx8 %s - 캡처 실패)", calibCh_,
+             odoPixOk_[0] ? "OK" : "실패", odoPixOk_[8] ? "OK" : "실패");
+        return;
+    }
+    const double du = odoPixU_[8] - odoPixU_[0], dv = odoPixV_[8] - odoPixV_[0];
+    const double closurePx = std::sqrt(du * du + dv * dv);
+
+    // px/mm 스케일: 네 변의 (실측 픽셀 길이 / 명령 mm)를 평균한다. 코너 캡처가
+    // 실패한 변은 건너뛴다. 사각형이 조금 일그러져 있어도 스케일 자체는 그
+    // 일그러짐만큼만(수 %) 틀리므로 자릿수 판단에는 충분하다.
+    struct Side { int a, b; double mm; };
+    const Side sides[4] = {{0, 2, odoMmm_}, {2, 4, odoNmm_},
+                           {4, 6, odoMmm_}, {6, 0, odoNmm_}};
+    double scaleSum = 0.0;
+    int scaleN = 0;
+    for (const Side& s : sides) {
+        if (!odoPixOk_[s.a] || !odoPixOk_[s.b] || s.mm <= 0.0) continue;
+        const double sdu = odoPixU_[s.b] - odoPixU_[s.a];
+        const double sdv = odoPixV_[s.b] - odoPixV_[s.a];
+        scaleSum += std::sqrt(sdu * sdu + sdv * sdv) / s.mm;
+        ++scaleN;
+    }
+    if (scaleN == 0) {
+        // 코너 캡처가 부족해 스케일을 못 뽑는다 - 픽셀 값만 남긴다.
+        logf("[INFO] 오도메트리 폐합오차 [채널 %d] %.1fpx (mm 환산 불가 - "
+             "코너 캡처 부족) idx0=(%.1f,%.1f) idx8=(%.1f,%.1f)",
+             calibCh_, closurePx, odoPixU_[0], odoPixV_[0], odoPixU_[8],
+             odoPixV_[8]);
+        return;
+    }
+    const double pxPerMm = scaleSum / scaleN;
+    const double closureMm = closurePx / pxPerMm;
+    const double perimeterMm = 2.0 * (odoMmm_ + odoNmm_);
+    const double pct = perimeterMm > 0.0 ? closureMm / perimeterMm * 100.0 : 0.0;
+
+    logf("[INFO] 오도메트리 폐합오차 [채널 %d] %.1fpx = 약 %.0fmm "
+         "(둘레 %.0fmm의 %.2f%%) | 스케일 %.3fpx/mm (%d변 평균) | "
+         "idx0=(%.1f,%.1f) idx8=(%.1f,%.1f)",
+         calibCh_, closurePx, closureMm, perimeterMm, pct, pxPerMm, scaleN,
+         odoPixU_[0], odoPixV_[0], odoPixU_[8], odoPixV_[8]);
 }
 
 // sweep()에서 매 tick(기본 200ms) 호출. 캡처 ack가 calib_capture_timeout_ms

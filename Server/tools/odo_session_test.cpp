@@ -135,6 +135,25 @@ static json calibBundle(int ch) {
               {"axis", "x_right_y_up"}}}};
 }
 
+// 90x60 CCW 사각형 9개 정지점의 "카메라가 볼 법한" 픽셀. 서버의 폐합오차 로그
+// (logOdoClosure)가 실제로 계산되는지 보려면 아무 값이나 주면 안 된다 - 네 변의
+// 픽셀 길이에서 스케일을 뽑기 때문이다.
+//
+// 여기서는 0.5px/mm 등축 투영에 원점 (300,1200), y축 뒤집기를 썼다. 그러면
+// 서버 로그가 다음을 찍어야 한다:
+//   스케일 0.500px/mm (4변 평균), 폐합오차 15.0px = 약 30mm (둘레 3000mm의 1.00%)
+static void odoPixel(int pointIdx, double& u, double& v) {
+    // {x_mm, y_mm} - odoPointWorldMm(m=900, n=600, ccw)와 같은 표.
+    // idx 8은 복귀 지점이라 idx 0과 같은 자리여야 하지만, 폐합오차가 0이면
+    // 계산이 도는지 확인이 안 되므로 x로 30mm(=15px) 어긋나게 둔다.
+    static const double kXY[9][2] = {{0, 0},   {450, 0},   {900, 0},
+                                     {900, 300}, {900, 600}, {450, 600},
+                                     {0, 600},   {0, 300},   {30, 0}};
+    const int i = (pointIdx >= 0 && pointIdx <= 8) ? pointIdx : 0;
+    u = 300.0 + kXY[i][0] * 0.5;
+    v = 1200.0 - kXY[i][1] * 0.5;
+}
+
 // 로봇 + 카메라 대역. PATH를 받은 뒤 11개 op을 READY/GO로 끝까지 돌고
 // PATH_DONE을 보낸다. 캡처 요청이 뜨면 CCTV 몫으로 OK를 회신한다.
 //
@@ -163,11 +182,14 @@ static bool driveWholeRect(TlsLink& robot, TlsLink& cctv, Inbox& robotBox,
                 cctv.send("CALIB_CAPTURE_FAIL",
                           {{"ch", ch}, {"request_id", reqId},
                            {"point_index", pi}, {"reason", failReason}});
-            else
+            else {
+                double pu, pv;
+                odoPixel(pi, pu, pv);
                 cctv.send("CALIB_CAPTURE_OK",
                           {{"ch", ch}, {"request_id", reqId},
-                           {"point_index", pi}, {"pixel_uv", {100.0 + pi, 200.0 + pi}},
+                           {"point_index", pi}, {"pixel_uv", {pu, pv}},
                            {"spread_px", 0.4}});
+            }
         }
         if (!robotBox.wait("GO", 3000, j)) {
             tlogf("TEST", "op %d에서 GO를 받지 못했다", k);
@@ -183,9 +205,11 @@ static bool driveWholeRect(TlsLink& robot, TlsLink& cctv, Inbox& robotBox,
         return false;
     }
     const int pi = cap["payload"].value("point_index", -1);
+    double pu, pv;
+    odoPixel(pi, pu, pv);
     cctv.send("CALIB_CAPTURE_OK",
               {{"ch", ch}, {"request_id", reqId}, {"point_index", pi},
-               {"pixel_uv", {100.0, 200.0}}, {"spread_px", 0.4}});
+               {"pixel_uv", {pu, pv}}, {"spread_px", 0.4}});
     return cctvBox.wait("CALIB_DONE", 3000, cap);
 }
 
@@ -244,9 +268,16 @@ int main(int argc, char** argv) {
     check(qtBox.wait("CALIB_STARTED", 2000, j), "T0a method만으로는 오도메트리가 아니다(정적 앵커)");
     check(robotBox.absent("PATH", 800), "T0b 정적 앵커에는 PATH를 보내지 않는다");
     qt.send("CMD", {{"cmd", "CALIB_CANCEL"}, {"ch", ch}, {"request_id", "t0"}});
+    // 🔴 중계된 CALIB_CANCEL을 **받고 나서** STOPPED를 회신해야 한다. 블라인드로
+    //   먼저 쏘면 서버가 calibCancelling_을 세우기 전에 도착해 "취소를 요청한 적이
+    //   없음"으로 버려지고, 5초 뒤 cancel_failed가 나면서 이후 테스트가 전부
+    //   무너진다 (실제로 이 경쟁으로 20건 중 15건이 연쇄 실패한 적이 있다).
+    robotBox.waitCmd("CALIB_CANCEL", 2000, j);
+    cctvBox.waitCmd("CALIB_CANCEL", 2000, j);
     robot.send("CALIB_STOPPED", {{"ch", ch}});
     cctv.send("CALIB_STOPPED", {{"ch", ch}});
-    qtBox.wait("CALIB_CANCELLED", 3000, j);
+    if (!qtBox.wait("CALIB_CANCELLED", 3000, j))
+        tlogf("TEST", "⚠️ T0 정리 실패 - 세션이 안 닫혔다. 이후 결과를 믿지 말 것");
 
     // ---- T1: Qt 개시 수락 + 개시 응답 3종 ----
     qtBox.clear(); cctvBox.clear(); robotBox.clear();
