@@ -33,6 +33,16 @@ inline constexpr long kQtCalibWaitMs = 300000L;
 // 응답을 보내야 하므로 한 뼘 짧게 잡는다.
 inline constexpr long kQtCalibWaitCapMs = 290000L;
 
+// 🔴 robot_motion 은 Qt 대기 한도가 다르다 - 10분이다
+// (2026-08-13 Qt팀 회신 §6, 요청서 §4의 선택지 A 채택).
+//
+// 위의 5분을 그대로 쓰면 서버가 주행을 3분 50초(290s - 결과대기 60s)에 끊는다.
+// Qt는 6분을 더 기다릴 준비가 돼 있는데 서버가 먼저 죽이는 꼴이고, 하필 첫
+// 실기 주행이 제일 느린 조건이다 - 정지점 9개 × 카메라 정지판정 최대 10초에
+// IMU 폐루프 회전 재시도가 얹힌다. 방식별로 상수를 나눈다.
+inline constexpr long kQtOdoWaitMs = 600000L;
+inline constexpr long kQtOdoWaitCapMs = 590000L;
+
 // X(타입, 이름, 기본값, 설명)
 #define RP_PARAM_LIST(X)                                                       \
     /* ---- 기하 (로봇 하드웨어 실측값) ---- */                                \
@@ -89,7 +99,7 @@ inline constexpr long kQtCalibWaitCapMs = 290000L;
       "(CALIB_START -> CALIB_DONE). calib_timeout_ms와 별개 값이다. 목적은 "   \
       "주행 시간을 조이는 게 아니라 로봇/카메라가 죽었을 때 세션을 접는 "      \
       "워치독. ⚠️ ADMIN 개시일 때의 값이다 - QT 개시 세션은 Qt 대기 한도에 "   \
-      "맞춰 kQtCalibWaitCapMs - calib_odo_result_wait_ms 로 깎인다")           \
+      "맞춰 kQtOdoWaitCapMs - calib_odo_result_wait_ms 로 깎인다")             \
     X(long, calib_odo_result_wait_ms, 60000,                                   \
       "CALIB_DONE 전송 후 카메라의 H_MATRIX/CALIB_FAIL을 기다리는 한도. "      \
       "주행이 끝난 뒤 카메라가 findHomography + LOO를 도는 구간이다 - 이 "     \
@@ -98,6 +108,12 @@ inline constexpr long kQtCalibWaitCapMs = 290000L;
     X(long, calib_capture_timeout_ms, 15000,                                   \
       "CALIB_CAPTURE 전송 후 CCTV의 ack(OK/FAIL) 한도. 카메라 자체 정지판정 "  \
       "한도(10초)보다 여유 있게 잡는다. 넘으면 세션 중단(abortOdoCalib)")      \
+    X(double, calib_odo_max_side_m, 10.0,                                      \
+      "오도메트리 캘리 사각형 한 변의 상한. 이 값을 넘는 m_cm/n_cm은 "         \
+      "invalid_param으로 거절한다. 하한(min_move_m)과 달리 기하가 아니라 "     \
+      "**현장 안전** 값이다 - 90을 900으로 잘못 치면 로봇이 9m를 그대로 "      \
+      "달린다. Qt는 하한만 검증하고 상한이 없으므로(2026-08-13 회신 §2) "      \
+      "여기가 유일한 방어선이다. 바닥이 넓으면 올려도 된다")                    \
     X(double, marker_offset_m, 0.0,                                            \
       "마커 중심이 로봇 회전 중심에서 진행방향으로 떨어진 거리. 오도메트리 "    \
       "캘리의 world_xy_mm 계산에만 쓴다. 0이면 보정 없음 (로봇팀 실측 전 기본)")
@@ -206,18 +222,22 @@ inline void sanitize(Params& p) {
     // Qt 개시를 열면서 그 전제가 깨졌다. 그렇다고 값 자체를 깎으면 ADMIN 개시
     // 세션까지 같이 짧아진다 - 그쪽은 Qt가 기다리지 않으므로 깎을 이유가 없다.
     // 그래서 클램프를 **세션 단위**로 옮겼다: Router::odoDriveBudgetMs()가
-    // QT 개시일 때만 kQtCalibWaitCapMs - calib_odo_result_wait_ms 로 깎는다.
+    // QT 개시일 때만 kQtOdoWaitCapMs - calib_odo_result_wait_ms 로 깎는다.
     floorAt("calib_odo_timeout_ms", p.calib_odo_timeout_ms, 5000L);
     floorAt("calib_odo_result_wait_ms", p.calib_odo_result_wait_ms, 1000L);
     // 결과 대기가 Qt 예산을 통째로 먹으면 주행 데드라인이 0 이하가 된다 -
     // QT 개시 세션이 시작하자마자 타임아웃으로 죽는다. 예산의 절반으로 자른다.
-    if (p.calib_odo_result_wait_ms > kQtCalibWaitCapMs / 2) {
+    // 🔴 이 구간은 오도메트리에만 있으므로 기준은 kQtOdoWaitCapMs(10분)다.
+    if (p.calib_odo_result_wait_ms > kQtOdoWaitCapMs / 2) {
         logf("[WARN] params 'calib_odo_result_wait_ms'=%ld 은(는) Qt 예산(%ld)의 "
              "절반을 넘음 - %ld으로 내림 (QT 개시 세션의 주행 시간이 남지 않는다)",
-             p.calib_odo_result_wait_ms, kQtCalibWaitCapMs, kQtCalibWaitCapMs / 2);
-        p.calib_odo_result_wait_ms = kQtCalibWaitCapMs / 2;
+             p.calib_odo_result_wait_ms, kQtOdoWaitCapMs, kQtOdoWaitCapMs / 2);
+        p.calib_odo_result_wait_ms = kQtOdoWaitCapMs / 2;
     }
     floorAt("calib_capture_timeout_ms", p.calib_capture_timeout_ms, 1000L);
+    // 상한이 하한(min_move_m*2)보다 작으면 어떤 값도 통과하지 못한다 - 캘리가
+    // 통째로 막히고, 조작자는 무슨 값을 넣어도 invalid_param만 본다.
+    floorAt("calib_odo_max_side_m", p.calib_odo_max_side_m, p.min_move_m * 2.0);
     floorAt("marker_offset_m", p.marker_offset_m, 0.0);
     // min_paint_radius_m 기본값 0.200은 기하가 아니라 모터가 정한 값이다.
     // 호에서는 바깥 바퀴가 base_sps × (R_robot + W/2) / R_robot 으로 돌고,

@@ -43,8 +43,13 @@
   "calib_timeout_ms": 180000,
   "calib_cancel_ack_ms": 5000,
 
-  "_9_오도메트리캘리": "로봇 오도메트리 주행 캘리(2026-08-12, ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md). ADMIN 전용이라 Qt 5분 제약이 없어 calib_timeout_ms와 별개 파라미터를 쓴다. marker_offset_m은 로봇팀 실측 전까지 0.0(보정 없음)",
+  "_9_오도메트리캘리": "로봇 오도메트리 주행 캘리(2026-08-12, ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md). 🔴 2026-08-13부터 Qt도 개시할 수 있다 - 예전 주석의 'ADMIN 전용이라 Qt 5분 제약이 없다'는 더 이상 사실이 아니다. calib_odo_timeout_ms는 ADMIN 개시 세션에만 그대로 적용되고, QT 개시 세션은 Qt 대기 한도에 맞춰 (590000 - calib_odo_result_wait_ms)로 서버가 알아서 깎는다(Router::odoDriveBudgetMs). 🔴 이 방식의 Qt 대기 한도는 10분이다 - 정적 앵커(5분)와 다르다(2026-08-13 Qt팀 회신 §6). marker_offset_m은 로봇팀 실측 전까지 0.0(보정 없음)",
   "calib_odo_timeout_ms": 300000,
+  "calib_odo_result_wait_ms": 60000,
   "calib_capture_timeout_ms": 15000,
+
+  "_9a_사각형상한": "🔴 안전 장치. 이 값이 그대로 로봇의 실제 주행 거리가 된다 - 90을 900으로 잘못 치면 로봇이 9m 사각형을 그린다. Qt는 하한(2cm)만 검증하고 상한이 없으며(2026-08-13 회신 §2) 관리자 창의 브라우저 검증은 개발자도구로 우회되므로, 서버의 이 값이 두 개시 경로 공통의 유일한 방어선이다. 현장 바닥이 넓으면 올려도 된다",
+  "calib_odo_max_side_m": 10.0,
+
   "marker_offset_m": 0.0
 }
