@@ -23,6 +23,16 @@
 
 using json = nlohmann::json;
 
+// Qt가 캘리 종결 응답(H_MATRIX|CALIB_FAIL|CALIB_CANCELLED)을 기다리는 한도.
+// Qt 클라이언트 쪽 상수라 서버가 바꿀 수 없다 - params.json으로 덮어쓸 수 있게
+// 두면 "현장에서 늘렸는데 Qt는 그대로"라는 어긋남만 만든다. 그래서 코드 상수다.
+// 🔴 Qt팀이 이 값을 바꾸면 여기도 같이 바꿔야 한다
+// (docs/ROBOT_ODOMETRY_HOMOGRAPHY_REQUEST_QT_20260813.md §4).
+inline constexpr long kQtCalibWaitMs = 300000L;
+// 서버가 쓸 수 있는 실효 예산. Qt가 스스로 포기하기 전에 서버가 먼저 종결
+// 응답을 보내야 하므로 한 뼘 짧게 잡는다.
+inline constexpr long kQtCalibWaitCapMs = 290000L;
+
 // X(타입, 이름, 기본값, 설명)
 #define RP_PARAM_LIST(X)                                                       \
     /* ---- 기하 (로봇 하드웨어 실측값) ---- */                                \
@@ -75,10 +85,16 @@ using json = nlohmann::json;
       "넘으면 CALIB_FAIL{cancel_failed} (정지를 추정으로 확인하지 않는다)")     \
     /* ---- 로봇 오도메트리 주행 캘리 (2026-08-12) ---- */                     \
     X(long, calib_odo_timeout_ms, 300000,                                      \
-      "오도메트리 주행 세션(method=robot_motion) 전용 전체 데드라인. "         \
-      "calib_timeout_ms와 별개 값이다 - 이 방식은 Qt가 트리거하지 않으므로 "    \
-      "'Qt 5분보다 짧아야 한다'는 제약이 없다. 목적은 주행 시간을 조이는 게 "   \
-      "아니라 로봇/카메라가 죽었을 때 세션을 접는 워치독")                     \
+      "오도메트리 주행 세션(method=robot_motion)의 **주행** 데드라인 "         \
+      "(CALIB_START -> CALIB_DONE). calib_timeout_ms와 별개 값이다. 목적은 "   \
+      "주행 시간을 조이는 게 아니라 로봇/카메라가 죽었을 때 세션을 접는 "      \
+      "워치독. ⚠️ ADMIN 개시일 때의 값이다 - QT 개시 세션은 Qt 대기 한도에 "   \
+      "맞춰 kQtCalibWaitCapMs - calib_odo_result_wait_ms 로 깎인다")           \
+    X(long, calib_odo_result_wait_ms, 60000,                                   \
+      "CALIB_DONE 전송 후 카메라의 H_MATRIX/CALIB_FAIL을 기다리는 한도. "      \
+      "주행이 끝난 뒤 카메라가 findHomography + LOO를 도는 구간이다 - 이 "     \
+      "동안 로봇은 이미 서 있으므로 만료 시 abortOdoCalib이 아니라 "          \
+      "failCalib(timeout)으로 접는다 (세울 로봇이 없다)")                      \
     X(long, calib_capture_timeout_ms, 15000,                                   \
       "CALIB_CAPTURE 전송 후 CCTV의 ack(OK/FAIL) 한도. 카메라 자체 정지판정 "  \
       "한도(10초)보다 여유 있게 잡는다. 넘으면 세션 중단(abortOdoCalib)")      \
@@ -179,15 +195,28 @@ inline void sanitize(Params& p) {
     // 🔴 Qt는 종결 응답이 5분(300s) 없으면 스스로 대기를 푼다. 서버 타임아웃이
     // 그보다 길면 Qt는 이미 포기했는데 서버만 busy로 남아, 다음 요청이 전부
     // busy로 거절된다 (사람 눈에는 "캘리가 영영 안 되는" 상태로 보인다).
-    if (p.calib_timeout_ms >= 300000L) {
-        logf("[WARN] params 'calib_timeout_ms'=%ld 은(는) Qt 대기 한도(300000)"
-             " 이상 - 290000으로 내림", p.calib_timeout_ms);
-        p.calib_timeout_ms = 290000L;
+    if (p.calib_timeout_ms >= kQtCalibWaitMs) {
+        logf("[WARN] params 'calib_timeout_ms'=%ld 은(는) Qt 대기 한도(%ld)"
+             " 이상 - %ld으로 내림", p.calib_timeout_ms, kQtCalibWaitMs,
+             kQtCalibWaitCapMs);
+        p.calib_timeout_ms = kQtCalibWaitCapMs;
     }
-    // calib_odo_timeout_ms는 Qt가 관여하지 않으므로(오도메트리 세션은 v1에서
-    // ADMIN 전용, docs/ROBOT_ODOMETRY_HOMOGRAPHY_PLAN_20260811.md §1) 위
-    // 300000 상한 클램프를 적용하지 않는다 - 별개 파라미터인 이유가 이것이다.
+    // ⚠️ calib_odo_timeout_ms에는 여기서 상한 클램프를 걸지 않는다. 예전에는
+    // "오도메트리는 ADMIN 전용이라 Qt 제약이 없다"가 이유였는데, 2026-08-13에
+    // Qt 개시를 열면서 그 전제가 깨졌다. 그렇다고 값 자체를 깎으면 ADMIN 개시
+    // 세션까지 같이 짧아진다 - 그쪽은 Qt가 기다리지 않으므로 깎을 이유가 없다.
+    // 그래서 클램프를 **세션 단위**로 옮겼다: Router::odoDriveBudgetMs()가
+    // QT 개시일 때만 kQtCalibWaitCapMs - calib_odo_result_wait_ms 로 깎는다.
     floorAt("calib_odo_timeout_ms", p.calib_odo_timeout_ms, 5000L);
+    floorAt("calib_odo_result_wait_ms", p.calib_odo_result_wait_ms, 1000L);
+    // 결과 대기가 Qt 예산을 통째로 먹으면 주행 데드라인이 0 이하가 된다 -
+    // QT 개시 세션이 시작하자마자 타임아웃으로 죽는다. 예산의 절반으로 자른다.
+    if (p.calib_odo_result_wait_ms > kQtCalibWaitCapMs / 2) {
+        logf("[WARN] params 'calib_odo_result_wait_ms'=%ld 은(는) Qt 예산(%ld)의 "
+             "절반을 넘음 - %ld으로 내림 (QT 개시 세션의 주행 시간이 남지 않는다)",
+             p.calib_odo_result_wait_ms, kQtCalibWaitCapMs, kQtCalibWaitCapMs / 2);
+        p.calib_odo_result_wait_ms = kQtCalibWaitCapMs / 2;
+    }
     floorAt("calib_capture_timeout_ms", p.calib_capture_timeout_ms, 1000L);
     floorAt("marker_offset_m", p.marker_offset_m, 0.0);
     // min_paint_radius_m 기본값 0.200은 기하가 아니라 모터가 정한 값이다.

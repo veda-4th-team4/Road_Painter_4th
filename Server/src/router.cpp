@@ -47,7 +47,23 @@ void Router::tick() {
 void Router::onPeerChange(const std::string& role, bool connected) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (role == "QT") {
-        if (connected) sendPeers();  // 막 접속한 QT에 현재 스냅샷 1회 전송
+        if (connected) {
+            sendPeers();  // 막 접속한 QT에 현재 스냅샷 1회 전송
+            return;
+        }
+        // 🔴 QT가 소유한 캘리 세션은 주인이 사라졌다. 예전에는 여기서 그냥
+        //   return이라 세션이 그대로 남았는데, 정적 앵커 방식에서는 로봇이
+        //   움직이지 않아 "타임아웃까지 busy"로 끝났다. 오도메트리 방식은
+        //   다르다 - **주인 없는 로봇이 계속 사각형을 그린다.** 조작자는 Qt
+        //   화면이 죽은 것을 보고 자리를 뜨거나 로봇 쪽으로 걸어간다.
+        if (calibActive_ && calibOwner_ == CalibOwner::QT) {
+            if (calibIsOdo_)
+                abortOdoCalib("qt_offline",
+                              "Qt 연결이 끊겨 주행을 중단했습니다.");
+            else
+                failCalib("qt_offline",
+                          "Qt 연결이 끊겨 캘리브레이션을 중단했습니다.");
+        }
         return;
     }
     if (role != "ROBOT" && role != "CCTV") return;  // QT 관심사만 (ADMIN 등 무시)
@@ -63,10 +79,24 @@ void Router::onPeerChange(const std::string& role, bool connected) {
     // 캘리 세션도 마찬가지다. 여기서 접지 않으면 결과를 만들어줄 상대가 사라진
     // 채로 타임아웃(기본 3분)까지 Qt가 대기 화면에 갇힌다 - 원인을 이미 아는데
     // 3분을 기다리게 할 이유가 없다.
-    if (!connected && calibActive_)
-        failCalib(role == "ROBOT" ? "robot_offline" : "cctv_offline",
-                  std::string(role == "ROBOT" ? "로봇" : "카메라") +
-                      " 연결이 끊겨 캘리브레이션을 계속할 수 없습니다.");
+    if (!connected && calibActive_) {
+        const char* reason = role == "ROBOT" ? "robot_offline" : "cctv_offline";
+        const std::string m = std::string(role == "ROBOT" ? "로봇" : "카메라") +
+                              " 연결이 끊겨 캘리브레이션을 계속할 수 없습니다.";
+        // 🔴 카메라만 빠지고 로봇은 살아 있는 오도메트리 주행에서는 failCalib이
+        //   위험하다. 그건 서버 상태만 정리할 뿐 로봇을 세우지 않으므로, 아무도
+        //   보고 있지 않은 로봇이 사각형을 마저 그린다. 로봇이 아직 붙어 있으면
+        //   정지 핸드셰이크로 세운다.
+        if (calibIsOdo_ && role == "CCTV" && !odoAwaitingResult_) {
+            abortOdoCalib(reason, m);
+            // 떠난 카메라의 CALIB_STOPPED는 영영 오지 않는다. 그걸 기다리다
+            // cancel_failed로 닫으면 "로봇 상태를 직접 확인하세요"라는 엉뚱한
+            // 경고가 뜬다 - 정작 확인이 필요한 로봇은 ack를 보내올 것이다.
+            cancelAckCctv_ = true;
+        } else {
+            failCalib(reason, m);
+        }
+    }
 }
 
 // 현재 ROBOT/CCTV 접속 여부를 조회해 QT로 전송. QT 미접속이면 다른 중계와
@@ -101,8 +131,11 @@ void Router::fromAdmin(const json& msg) {
             startCalib(payload, msg, "ADMIN");
             return;
         }
+        // 관리자 창은 자기 세션만 취소할 수 있다. 단 {"force":true}면 QT 세션도
+        // 강제로 회수한다 - 로봇이 굴러가는 중인데 Qt 단말 앞에 사람이 없을 수
+        // 있고, 그때 관리자가 로봇을 세울 방법이 없으면 안 된다 (§3-3).
         if (cmd == "CALIB_CANCEL") {
-            cancelCalib(payload, msg);
+            cancelCalib(payload, msg, "ADMIN");
             return;
         }
         // 요약 INFO를 sendTo보다 먼저 (미접속 [WARN]이 뒤따르도록 - fromQt 참고)
@@ -217,7 +250,7 @@ void Router::fromQt(const json& msg) {
             return;
         }
         if (cmd == "CALIB_CANCEL") {
-            cancelCalib(payload, msg);
+            cancelCalib(payload, msg, "QT");
             return;
         }
         // 로봇을 움직이는 수동 조작 (조이스틱).
@@ -978,6 +1011,11 @@ void Router::handleHMatrix(const json& msg) {
     //   통째로 갈아치우므로 CCTV가 실어 보낸 필드가 여기서 사라진다.
     // 채널이 어긋나면 세션을 닫지 않는다 - 계약 §6 "다른 요청의 늦은 결과가 현재
     // 대기를 풀면 안 된다"와 같은 이유다. 번들 자체는 정상이므로 저장은 한다.
+    //
+    // ⚠️ 오도메트리 세션도 이 판정을 그대로 탄다. QT 개시면 CALIB_DONE 이후에도
+    //    calibActive_가 켜져 있으므로(odoAwaitingResult_) 여기서 정상적으로
+    //    종결 처리된다. ADMIN 개시면 이미 꺼져 있어 저장·중계만 하고 지나간다 -
+    //    기다리는 Qt가 없으니 그게 맞다.
     const bool closesSession = calibActive_ && ch == calibCh_;
     if (closesSession && !calibReqId_.empty())
         outMsg["payload"]["request_id"] = calibReqId_;

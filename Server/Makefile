@@ -74,6 +74,12 @@ calib_unit_test: tools/calib_unit_test.cpp src/*.hpp
 calib_session_test: tools/calib_session_test.cpp tools/tls_client.hpp
 	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
 
+# 오도메트리 주행 캘리 세션 회귀 테스트 (2026-08-13, Qt 개시 지원).
+# calib_session_test(정적 앵커)의 짝. QT/ROBOT/CCTV/ADMIN 네 role로 붙어
+# 주행 완주 -> 결과 대기 -> 종결까지 돌리고, 소유권/강제회수/판별자도 본다.
+odo_session_test: tools/odo_session_test.cpp tools/tls_client.hpp
+	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
+
 # 로봇 오도메트리 주행 캘리 회귀 테스트 (2026-08-12 신설).
 # ops_builder.hpp의 순수 함수(buildCalibRectOps/odoReadyToPoint/odoPointWorldMm)만
 # 검증한다 - 로봇 경로 구조와 CCTV로 보낼 좌표가 조용히 틀려도 눈에 안 띄는 부류라
@@ -83,5 +89,5 @@ odo_calib_test: tools/odo_calib_test.cpp src/*.hpp
 	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
 
 clean:
-	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose tools/calib_channel_test tools/calib_unit_test tools/offset_feedback_test tools/calib_session_test tools/odo_calib_test
+	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose tools/calib_channel_test tools/calib_unit_test tools/offset_feedback_test tools/calib_session_test tools/odo_session_test tools/odo_calib_test
 .PHONY: clean sim
