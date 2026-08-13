@@ -67,3 +67,6 @@ server.out.log
 # start.sh 가 남기는 기동 로그
 server_start.log
 server_run.log
+
+#작업 중 만든 소스 백업본 (2026-08-13 실수로 커밋된 적 있음)
+*.bak.*
