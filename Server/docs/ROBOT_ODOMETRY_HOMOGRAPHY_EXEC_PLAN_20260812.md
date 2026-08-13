@@ -271,7 +271,14 @@ false다. `failCalib()`이 이미 쓰는 패턴(`if (toQt) send`)과 같다. 호
 
 ### C7. 🔴 안전 정지 — 이번 작업에서 가장 중요한 항목
 
-**문제**: 지금 코드는 이 방식에서 **로봇을 못 세운다.**
+> ⚠️ **이 절의 전제는 폐기됐다 (2026-08-12, origin/main 병합 후 확인).**
+> 아래 "로봇 펌웨어에 `CALIB_*` 핸들러가 없다"는 **28커밋 뒤쳐진 로컬 트리를
+> 본 결과였다.** 로봇팀이 커밋 `52aa849`에서 R-1(`CALIB_START`)/R-2
+> (`CALIB_CANCEL` → `CALIB_STOPPED` 회신)를 이미 구현해 뒀다. 최종 구현은
+> `ABORT_DRAW`가 아니라 **기존 `CALIB_CANCEL`/`CALIB_STOPPED` 핸드셰이크를
+> 그대로 쓴다** — 정본 문서 §7 참고. 아래 서술은 판단 경위 기록으로만 남긴다.
+
+**당시 판단**: 지금 코드는 이 방식에서 **로봇을 못 세운다.**
 
 1. `cancelCalib()`(`router_calib.cpp:222`)은 `CALIB_CANCEL`을 ROBOT에 중계하고
    `CALIB_STOPPED`를 기다린다. 그런데 **로봇 펌웨어에 `CALIB_*` 핸들러가 없다**

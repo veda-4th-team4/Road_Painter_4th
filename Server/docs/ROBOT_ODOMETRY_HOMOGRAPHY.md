@@ -40,7 +40,8 @@ CCTV가 로봇 마커를 캡처한다. "물리좌표(서버가 계산) × 픽셀
 
 ```
 [1] 관리자창 → Server    CALIB_START{method:"robot_motion", ch, m_cm, n_cm, start_corner}
-[2] Server  → Robot      PATH{phase:"calib", ops:[11개]}
+[2] Server  → Robot+CCTV  CALIB_START 중계   ← 로봇 노즐 강제 UP(R-1) + 카메라 세션 개시
+    Server  → Robot      PATH{phase:"calib", ops:[11개]}
 [3] Robot   → Server      READY(k)                    ← 정지점마다
     Server  → CCTV        CALIB_CAPTURE{point_index, world_xy_mm}
     CCTV    → Server      CALIB_CAPTURE_OK{pixel_uv}  ← 카메라가 정지 판정 후
@@ -109,12 +110,31 @@ world = center + marker_offset_mm × (cos(heading), sin(heading))
 
 ## 4. 로봇 경로
 
-### 4-1. 11-op, 펌웨어 변경 없음
+### 4-1. `CALIB_START` 중계 + 11-op, 펌웨어 변경 없음
 
-서버가 사각형 op 시퀀스를 만들어 기존 `PATH{phase:"calib"}`로 보낸다. 전용
-`CALIB_START`를 로봇에 중계하지 않는다 — 로봇 펌웨어에는 `CALIB_*` 핸들러가
-아예 없고(`Paint_Robot/RaspberryPi/` 검색 0건), 만들 필요도 없다. 로봇은
-`PATH`/`READY`/`GO`/`PATH_DONE` 기존 핸드셰이크를 그대로 탄다.
+서버는 두 가지를 보낸다:
+
+```
+1. CMD{cmd:"CALIB_START", ...} 원본을 ROBOT + CCTV 양쪽에 중계
+2. 사각형 op 시퀀스를 PATH{phase:"calib"} 로 로봇에 전송
+```
+
+**`CALIB_START` 중계가 필수인 이유** — 두 가지가 여기에 달려 있다:
+
+| 수신자 | 하는 일 |
+|---|---|
+| **ROBOT** | R-1 핸들러가 `auto_nozzle = 0` + `SendControlNozzle(0)`으로 **노즐을 강제로 올린다** |
+| **CCTV** | `CALIB_START`가 **카메라 세션의 시작점**이다 (CCTV팀 2차 회신 §5-B) |
+
+> 🔴 로봇 쪽이 안전 항목이다. 노즐 출력은 `nozzle_on = manual_override ?
+> manual_nozzle : auto_nozzle`(`main.cpp:381`)로 결정되는데, **새 PATH를 적용할
+> 때 `manual_nozzle`만 0으로 되돌리고 `auto_nozzle`은 건드리지 않는다.** 직전
+> 도색이 노즐을 내린 채 비정상 종료됐다면(연결 끊김, HOLD 중 포기) `auto_nozzle`
+> 이 1로 남고, 캘리 op에는 nozzle op이 하나도 없어서 **로봇이 3m 사각형을 그리며
+> 바닥을 칠한다.** R-1이 정확히 이걸 막는 장치다.
+
+로봇은 이후 `PATH`/`READY`/`GO`/`PATH_DONE` 기존 핸드셰이크를 그대로 탄다 —
+캘리 전용 주행 로직은 없다.
 
 ```
 ops = [ MOVE(m/2), MOVE(m/2), TURN(±90°),
@@ -125,9 +145,11 @@ ops = [ MOVE(m/2), MOVE(m/2), TURN(±90°),
 
 - 회전 부호는 §3-2의 `start_corner`가 정한다
 - 기본 `m=90cm`, `n=60cm` → 반쪽 구간 45cm/30cm (`min_move_m`=1cm 여유 충분)
-- 노즐 op 없음 (도색하지 않는다)
-- 새 PATH 수신 시 로봇이 **2초 정지 대기 후 READY(0)** — 출발점의 정착 대기가
-  기존 동작으로 이미 충족된다
+- 노즐 op 없음 (도색하지 않는다 — 노즐 UP 보장은 위 R-1이 한다)
+- 새 PATH 수신 시 로봇이 **2.5초 정지 대기 후 READY(0)** — 출발점의 정착 대기가
+  기존 동작으로 이미 충족된다 (`main.cpp` 2500ms)
+- 로봇은 새 PATH를 **현재 세그먼트가 끝난 뒤에 적용**한다(IMU yaw 보호 목적,
+  커밋 `78c1005`) — 주행 중 캘리를 시작해도 중간에 경로가 갈리지 않는다
 
 **사각형을 닫는 이유**: 3구간만 달리면 꼭짓점 4 + 중점 3 = 7점뿐이다. 4구간을
 다 돌면 **8점**이 되고 로봇이 출발점으로 돌아온다(그 복귀가 폐합오차 측정이
@@ -416,34 +438,37 @@ H_marker (측정)    오도메트리 주행                    — 저장 (신�
 
 ## 7. 안전 정지
 
-**정적 앵커 방식과 다른 경로를 탄다.** `robot_motion` 세션의 취소·타임아웃에서:
+`robot_motion` 세션의 취소·타임아웃은 **정적 앵커 방식과 같은 핸드셰이크**를 쓴다:
 
 ```
-Server → Robot: CMD{cmd:"ABORT_DRAW"}   (fire-and-forget, ack 없음)
-Server → CCTV:  CALIB_CANCEL             (ack: CALIB_STOPPED, 5초 한도)
+Server → Robot: CALIB_CANCEL   (ack: CALIB_STOPPED)   ─┐ 둘 다 모여야
+Server → CCTV:  CALIB_CANCEL   (ack: CALIB_STOPPED)   ─┘ 세션을 닫는다 (5초 한도)
 ```
 
-**왜 `CALIB_CANCEL`을 로봇에 안 보내는가**: 로봇 펌웨어에 `CALIB_*` 핸들러가
-없다. 기존 `cancelCalib()`은 `CALIB_CANCEL`을 ROBOT에 중계하고 `CALIB_STOPPED`를
-기다리는데, 로봇은 그걸 무시하고 ack를 안 보내 5초 뒤 `cancel_failed`로
-떨어진다 — **그동안 로봇은 계속 굴러간다.** `failCalib()`도 QT에만 통지하고
-조용히 세션을 지워 ROBOT·CCTV 통지가 없다.
+로봇은 R-2 핸들러(`main.cpp` `"CALIB_CANCEL"` 분기)에서 속도 0 + 노즐 UP +
+경로 폐기 + 래치 클리어를 마친 뒤 **100ms 정착 후 `CALIB_STOPPED`를 회신**한다.
 
-기존 정적 앵커 방식은 로봇이 관여하지 않아 이 문제가 드러나지 않았다. 로봇을
-실제로 주행시키는 이 방식이 그 경로를 처음 밟는다. 코드에 이미 적힌 우려가
-그대로 현실이 된다:
+**`ABORT_DRAW`를 쓰지 않는 이유**: 그것도 로봇을 세우기는 하지만 **ack가 없다**
+(로봇은 수신 즉시 속도 0을 내리는 동기 처리고, `DRAW_ABORTED`는 로봇의 회신이
+아니라 서버가 QT에 보내는 통지다). 그러면 서버는 "명령을 보냈다"까지만 알 수
+있는데, 이 규약이 지키려는 것은 **"로봇이 실제로 섰다는 확인"** 이다:
 
-> 그 순간 로봇이 아직 굴러가고 있으면 사람이 다치는 쪽에 서 있게 된다
-> — `router_calib.cpp:190`
+> 중계했다는 사실만으로 `CALIB_CANCELLED`를 보내면 안 된다. 그것은 "명령을
+> 전달했다"는 뜻이지 "로봇이 섰다"는 뜻이 아니다 — 조작자는 이 응답을 보고
+> 대기를 풀고 다시 화면 앞에 앉는데, 그 순간 로봇이 아직 굴러가고 있으면
+> 사람이 다치는 쪽에 서 있게 된다. — `router_calib.cpp:190`
 
-**`ABORT_DRAW`에는 ack가 없다.** 로봇(`main.cpp:77`)은 수신 즉시 STM32에 속도
-0을 내리는 동기 처리라 돌아오는 확인 메시지가 없다(`DRAW_ABORTED`는 로봇의
-회신이 아니라 서버가 QT에 보내는 통지다). 그래서 로봇 쪽은 fire-and-forget이고
-**CCTV의 `CALIB_STOPPED` 하나만** 기다린다 — 로봇의 동기 정지가 CCTV 응답보다
-항상 먼저 끝나므로 순서 문제는 없다.
+받을 수 있는 확인을 일부러 버릴 이유가 없다. 서버는 상태를 세우고 메시지만
+보내고, 이후는 기존 상태 기계가 그대로 처리한다:
+
+| 상황 | 처리 |
+|---|---|
+| 양쪽 ACK 도착 | `onCalibStopped()` → `clearCalib()` + `clearPath()` |
+| 5초 안에 불발 | `checkCalibTimeout()` → `cancel_failed` (추정으로 확인하지 않는다) |
 
 **정적 앵커 방식(`method != "robot_motion"`)의 취소·타임아웃 동작은 한 줄도
-바뀌지 않는다.**
+바뀌지 않는다.** 두 방식이 같은 핸드셰이크를 공유하되 `calibIsOdo_`로 갈리는
+지점은 "타임아웃 파라미터 선택"과 "종료 시 `clearPath()` 여부"뿐이다.
 
 ---
 
@@ -544,6 +569,8 @@ CH2 현재 `H` 기준 화면 영역:
 | 두 방식 비교 | | ✅ 계산 + 표시 | |
 | Qt 중계 | ✅ | | |
 | 주행 실행 | | | ✅ 기존 핸드셰이크 (변경 없음) |
+| 캘리 중 노즐 UP 보장 | ✅ `CALIB_START` 중계 | | ✅ R-1 핸들러 |
+| 안전 정지 ACK | ✅ 양쪽 대기 | ✅ `CALIB_STOPPED` | ✅ R-2 핸들러 |
 | IMU yaw 리셋 | | | ⬜ `calib` 추가 (§4-4) |
 
 ---
