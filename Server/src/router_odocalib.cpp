@@ -28,7 +28,7 @@
 long Router::odoDriveBudgetMs() const {
     const long p = params().calib_odo_timeout_ms;
     if (calibOwner_ != CalibOwner::QT) return p;
-    const long cap = kQtCalibWaitCapMs - params().calib_odo_result_wait_ms;
+    const long cap = kQtOdoWaitCapMs - params().calib_odo_result_wait_ms;
     return p < cap ? p : cap;
 }
 

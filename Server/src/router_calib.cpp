@@ -258,6 +258,21 @@ void Router::startCalib(const json& payload, const json& msg, const char* origin
             reject("invalid_param", b);
             return;
         }
+        // 상한. 하한과 달리 기하가 아니라 안전 장치다 - 이 값이 그대로 로봇의
+        // 실제 주행 거리가 되므로, 90을 900으로 잘못 친 요청이 통과하면 로봇이
+        // 9m 사각형을 그린다. Qt는 하한(2cm)만 검증하고 상한이 없다고 회신했고
+        // (2026-08-13 §2), 관리자 창의 브라우저 검증은 개발자도구로 우회된다.
+        // 그래서 여기가 두 개시 경로 공통의 유일한 방어선이다.
+        const double maxCm = params().calib_odo_max_side_m * 100.0;
+        if (mCm > maxCm || nCm > maxCm) {
+            char b[192];
+            snprintf(b, sizeof b,
+                     "가로/세로가 너무 큽니다 (m=%.1fcm n=%.1fcm, 한 변은 "
+                     "%.0fcm 이하여야 합니다)",
+                     mCm, nCm, maxCm);
+            reject("invalid_param", b);
+            return;
+        }
         startOdoCalib(payload, msg, reqId, ch, fromQt);
         return;
     }
@@ -320,8 +335,8 @@ void Router::cancelCalib(const json& payload, const json& msg,
 
     if (!calibActive_) {
         // 요청한 쪽이 대기 중이고 서버는 이미 세션을 접은 상태 - 여기서
-        // 침묵하면 Qt는 5분 타임아웃까지 갇힌다. 취소의 목적(대기 해제)은 이미
-        // 달성됐으므로 확인해주는 쪽이 맞다.
+        // 침묵하면 Qt는 자체 타임아웃까지 갇힌다(정적 앵커 5분, 주행 10분).
+        // 취소의 목적(대기 해제)은 이미 달성됐으므로 확인해주는 쪽이 맞다.
         //
         // 🔴 요청한 쪽에만 보낸다. 예전에는 origin을 안 받아서, 관리자 창이
         //   취소를 누르기만 해도 Qt에 CALIB_CANCELLED가 날아갔다 - Qt가 아무
