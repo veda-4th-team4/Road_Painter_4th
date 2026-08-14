@@ -6,6 +6,7 @@
 #include "serverclient.h"
 #include "routeplan.h"
 #include "paintgeometry.h"
+#include "robottiming.h"
 
 #include <QTimer>
 #include <QPointF>
@@ -3676,8 +3677,7 @@ void Backend::setTurnSpeedDps(double v)
 //   NetworkManager.cpp 에는 이 cmd 분기가 아예 없어서 조용히 버려진다.
 //   보내봐야 아무 일도 안 일어나고 로그만 어지럽혀서 전송을 끊었다.
 //
-//   설정값(m_speeds)은 남긴다 — 화면 미리보기 재생 속도와 예상 소요시간
-//   계산에 쓰이는 **로컬 값**이다.
+//   설정값(m_speeds)은 남긴다 — 화면 미리보기 재생에만 쓰이는 **로컬 값**이다.
 void Backend::pushSpeeds()
 {
     appendLog(QStringLiteral("속도 설정(로컬) — 이동 %1 · 도색 %2 m/s · 회전 %3 °/s "
@@ -3687,13 +3687,14 @@ void Backend::pushSpeeds()
                   .arg(m_speeds.turnDps, 0, 'f', 0));
 }
 
-// 설정한 속도로 계산한 이번 도면의 예상 소요 시간 (작업 전 미리보기용).
+// 확정 로봇 사양으로 계산한 이번 도면의 최소 예상 소요 시간.
+// 카메라 피드백 보정과 통신 대기는 도면만으로 알 수 없어 제외한다.
 QString Backend::planTimeText() const
 {
     const QList<motionprogram::Op> prog = currentProgram();
     if (prog.isEmpty()) return QStringLiteral("—");
-    const int sec = int(motionprogram::totalSeconds(prog) + 0.5);
-    return QStringLiteral("%1분 %2초").arg(sec / 60).arg(sec % 60);
+    const int sec = int(robottiming::estimatedSeconds(prog) + 0.5);
+    return QStringLiteral("%1분 %2초 이상").arg(sec / 60).arg(sec % 60);
 }
 
 // ⚠️ 여기 있던 setPenOffsetMm / setPenOffsetFromServer 는 지웠다.
