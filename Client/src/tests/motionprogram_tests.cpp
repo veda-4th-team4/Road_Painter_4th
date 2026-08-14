@@ -1,4 +1,5 @@
 #include "motionprogram.h"
+#include "robottiming.h"
 #include "paintgeometry.h"
 #include "routeplan.h"
 #include "strokefont.h"
@@ -1323,6 +1324,31 @@ void testMissingChannelResolution()
           "a ch-less legacy bundle must complete the pending CH3 request");
 }
 
+void testRobotTimingEstimate()
+{
+    const double moveFactor = 0.8 + 0.2 * std::log(5.0) / 0.8;
+    check(near(robottiming::moveSeconds(1.0), moveFactor / 0.05, 1e-9),
+          "MOVE estimate must use the confirmed 0.05 m/s ramp-down model");
+    check(near(robottiming::turnSeconds(90.0), 86.0 / 16.5 + 4.0 / 7.4, 1e-9),
+          "TURN estimate must use the final four-degree slow band");
+
+    const double robotRadius = std::sqrt(0.2 * 0.2 + 0.155 * 0.155);
+    check(near(robottiming::arcSeconds(0.2, 180.0),
+               robotRadius * 180.0 * motionprogram::kDegToRad / 0.05, 1e-9),
+          "ARC estimate must use the Robot wheel-center radius");
+
+    QList<motionprogram::Op> ops;
+    motionprogram::Op nozzle; nozzle.kind = motionprogram::Op::Nozzle;
+    motionprogram::Op move; move.kind = motionprogram::Op::Move; move.dist = 1.0;
+    motionprogram::Op turn; turn.kind = motionprogram::Op::Turn; turn.angle = 90.0;
+    ops << nozzle << move << turn << nozzle;
+    const double expected = 2.0 * robottiming::kNozzleSettleSec
+                          + robottiming::moveSeconds(1.0)
+                          + robottiming::turnSeconds(90.0);
+    check(near(robottiming::estimatedSeconds(ops), expected, 1e-9),
+          "program estimate must sum read-only operation timing");
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -1357,6 +1383,7 @@ int main(int argc, char **argv)
     testChannelCalibAcceptanceRules();
     testUndistortLensDataWarning();
     testMissingChannelResolution();
+    testRobotTimingEstimate();
     if (failures == 0) {
         std::cout << "motionprogram_tests: PASS\n";
         return 0;

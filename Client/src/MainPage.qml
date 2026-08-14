@@ -1828,9 +1828,9 @@ Item {
                             v: Backend.travelLengthM > 0
                                ? Backend.travelLengthM.toFixed(2) + " m" : "없음"
                         }
-                        // 진행 중이면 실측 기반 남은 시간, 아니면 설정 속도로 계산한 예상치
+                        // 진행 중이면 실측 기반 남은 시간, 아니면 로봇 사양 기반 최소 예상치
                         KvRow {
-                            k: Backend.jobActive ? "남은 시간" : "예상 소요"
+                            k: Backend.jobActive ? "남은 시간" : "예상 소요(최소)"
                             v: Backend.jobActive ? Backend.etaText : Backend.planTimeText
                         }
                         KvRow { k: "경과 시간"; v: Backend.elapsedText }
@@ -3059,9 +3059,11 @@ Item {
                 }
                 Text {
                     width: parent.width
-                    text: "⚠️ 이 속도는 화면 미리보기·예상 소요 시간 계산에만 씁니다. "
+                    text: "⚠️ 이 속도는 화면 미리보기 재생에만 씁니다. "
                           + "프로토콜에 속도 항목이 없어 로봇으로는 전송되지 않고, "
                           + "실제 주행 속도는 로봇 펌웨어 고정값입니다."
+                          + "\n예상 소요 시간은 로봇 사양의 직진·회전·ARC·노즐 시간을 기준으로 계산합니다. "
+                          + "카메라 보정과 통신 대기는 제외되어 실제 작업은 더 걸릴 수 있습니다."
                           + "\n이 도면 예상 소요: " + Backend.planTimeText
                     color: Theme.muted
                     font.pixelSize: 10

@@ -37,6 +37,7 @@ qt_add_executable(RoadPainterQml
     serverclient.h serverclient.cpp
     routeplan.h
     motionprogram.h
+    robottiming.h
     paintgeometry.h
     motionsim.h
     camcalib.h
