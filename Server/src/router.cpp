@@ -69,6 +69,9 @@ void Router::onPeerChange(const std::string& role, bool connected) {
     if (role != "ROBOT" && role != "CCTV") return;  // QT 관심사만 (ADMIN 등 무시)
     sendPeers();
     logf("[INFO] PEERS 통지 - %s %s", role.c_str(), connected ? "접속" : "해제");
+    // 로봇이 빠지면 STATUS 로그 억제 상태를 비운다 - 재접속 후 첫 STATUS가
+    // 이전과 같은 값이어도 한 줄 남아야 "다시 붙었고 이 상태다"가 보인다.
+    if (role == "ROBOT" && !connected) clearStatusLog();
     // 로봇이 빠지면 진행 중이던 경로는 의미가 없다. 상태를 접지 않으면
     // planActive_가 켜진 채로 남아 재접속 후 START_DRAW가 "busy"로 거절된다.
     if (role == "ROBOT" && !connected && (planActive_ || awaitingArrival_)) {
@@ -377,9 +380,20 @@ void Router::fromRobot(const json& msg) {
     if (type == "STATUS") {
         lastStatus_ = payload;
         srv_.sendTo("QT", msg);  // Qt로 상태 중계 (지속 모니터링)
-        logf("[INFO] STATUS: state=%s painting=%s",
-             payload.value("state", "?").c_str(),
-             payload.value("painting", false) ? "true" : "false");
+        // 로그는 값이 바뀐 순간만 남긴다 (2026-08-18). STATUS는 2Hz 하트비트라
+        // 그대로 찍으면 초당 두 줄씩 다른 로그를 밀어내는데, 정작 알고 싶은
+        // "언제 바뀌었나"는 같은 줄 수백 개 사이에 묻힌다. 중계와 lastStatus_
+        // 갱신은 그대로이므로 Qt 화면과 서버 판단에는 아무 영향이 없다.
+        std::string state = payload.value("state", "?");
+        bool painting = payload.value("painting", false);
+        if (!lastStatusSeen_ || state != lastStatusState_ ||
+            painting != lastStatusPainting_) {
+            logf("[INFO] STATUS: state=%s painting=%s",
+                 state.c_str(), painting ? "true" : "false");
+            lastStatusState_ = state;
+            lastStatusPainting_ = painting;
+            lastStatusSeen_ = true;
+        }
     } else if (type == "READY") {
         if (!payload.contains("op_index")) {
             // v1 로봇은 READY{"seg":n}을 MOVE 앞에서만 보냈다. 그 로봇을 v2
