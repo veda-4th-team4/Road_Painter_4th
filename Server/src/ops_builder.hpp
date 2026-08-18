@@ -63,6 +63,10 @@ struct TravelGeom {
     double bodyExit = kNoHeading;   // 마쳤을 때 바라보는 방위
     double phase = 0.0;             // 접선 대비 차체 위상 (도색 호만 0이 아니다)
     double rRobot = 0.0;            // 로봇에 실어 보낼 반지름 (arc 전용)
+    // 로봇에 실어 보낼 스윕 각도 크기 (arc 전용). 도면 값이 아니라 **펜 두께
+    // 보정이 반영된 값**이다 - 도색 호는 양끝을 hw 씩 늘리므로 도면보다 크다.
+    // bodyExit도 이 값으로 계산된다 (로봇이 실제로 그만큼 더 돌기 때문).
+    double sweepDeg = 0.0;
 };
 
 // 🔴 ARC의 heading_deg는 "호에 **진입할 때**의 접선"이다 (2026-08-07 Qt팀과 확정).
@@ -78,7 +82,8 @@ struct TravelGeom {
 //   ⚠️ Qt의 해당 수정이 저장소에 push되기 전까지는 저장소 코드(출구)와 이
 //   구현(진입)이 어긋난다. 부분호에서 스윕만큼 틀어지므로, 호 도색 통합 시험은
 //   Qt push 확인 후에 잡을 것.
-inline TravelGeom travelGeom(const json& q, bool isPaint, double aM) {
+inline TravelGeom travelGeom(const json& q, bool isPaint, double aM,
+                             double hwM = 0.0) {
     TravelGeom g;
     const double head = q.value("heading_deg", kNoHeading);
     if (q.value("op", "") != "ARC") {  // 직진: 방향이 안 바뀐다
@@ -86,7 +91,7 @@ inline TravelGeom travelGeom(const json& q, bool isPaint, double aM) {
         return g;
     }
     const double rPaint = q.value("radius_m", 0.0);
-    const double sweep = std::fabs(q.value("angle_deg", 0.0));
+    double sweep = std::fabs(q.value("angle_deg", 0.0));
     const bool left = (q.value("direction", "left") != "right");
     // 도색하지 않는 호는 펜이 올라가 있어 마커 중심이 곧 도면 자취다 - 반지름도
     // 위상도 보정하지 않는다 (§5.2 불변식의 나머지 절반).
@@ -94,11 +99,26 @@ inline TravelGeom travelGeom(const json& q, bool isPaint, double aM) {
         const double inner = rPaint * rPaint - aM * aM;
         g.rRobot = inner > 0 ? std::sqrt(inner) : 0.0;
         g.phase = arcPhaseDeg(g.rRobot, aM, left);
+        // 펜 두께 보정 (2026-08-13 실기 시험에서 "호가 끝까지 안 닫힘"으로 관측).
+        //
+        // 직선은 거리를 앞뒤로 hw 씩 늘려 이음매를 겹치게 하는데(buildDrawOps의
+        // MOVE 가지), 호는 거리가 아니라 **스윕 각도**를 늘려야 한다. 펜이 그리는
+        // 원의 반지름이 rPaint 이므로 호 길이 hw 에 해당하는 각도는 hw/rPaint 다.
+        // 양끝이므로 2배 - R=0.2m, w=0.05m 이면 약 7.2도가 붙는다.
+        //
+        // 🔴 rRobot 이 아니라 rPaint 로 나눈다. 늘리려는 것은 로봇의 자취가 아니라
+        //   **펜이 실제로 칠하는 자취**다. 두 원은 반지름이 다르지만 ICR을 공유해
+        //   스윕 각도는 같으므로, 각도만 맞추면 로봇 쪽은 자동으로 따라온다.
+        if (hwM > 0.0 && rPaint > 0.0)
+            sweep += 2.0 * (hwM / rPaint) * 180.0 / M_PI;
     } else {
         g.rRobot = rPaint;
     }
+    g.sweepDeg = sweep;
     if (!hasHeading(head)) return g;
     const double tanEntry = head;
+    // 🔴 늘어난 스윕으로 출구 접선을 잡는다. 로봇이 실제로 그만큼 더 돌기
+    //   때문이다 - 도면 각도로 잡으면 호 뒤에 이어지는 op이 전부 그만큼 기운다.
     const double tanExit = normDeg(head + (left ? sweep : -sweep));
     g.bodyEntry = normDeg(tanEntry + g.phase);
     g.bodyExit = normDeg(tanExit + g.phase);
@@ -261,13 +281,17 @@ inline PlannedPath buildDrawOps(const json& program,
     //   진입 오프셋 a - hw  -> 펜이 시작 꼭짓점보다 hw 앞(전)에 내려앉는다
     //   도색 move  L + 2hw  -> 펜이 [V0 - hw, V1 + hw] 를 지난다
     //   이탈 오프셋 a + hw  -> 늘어난 만큼 되돌려 마커를 꼭짓점 위로 정확히 복귀
-    // 🔴 호(arc)는 이번 보정 대상이 아니다 - 거리가 아니라 스윕 각도를 늘려야
-    //   해서(Δθ = hw / R_paint) 별도 작업이다. 아래 penIsArc 로 갈라 예전 동작
-    //   (진입/이탈 모두 a, 스윕 그대로)을 그대로 태운다.
+    // 호(arc)도 2026-08-13부터 같은 규칙을 탄다. 늘리는 대상이 거리가 아니라
+    // 스윕 각도(Δθ = hw / R_paint, travelGeom)일 뿐, 진입/이탈 다리는 직선과
+    // 완전히 동일하다 - 그래서 여기서 호를 따로 가르지 않는다.
+    //
+    // ⚠️ 진입 다리는 접선 방향 직선이라 호를 현(chord)으로 근사한다. 오차는
+    //   O(hw²/R) 로 R=0.2m, hw=0.025m 에서 약 3mm - 펜 폭 50mm 앞에서 무시할
+    //   수준이다. 정확히 하려면 진입 자체를 호로 만들어야 하는데, 그러면 접근
+    //   경로가 세워둔 진입 자세가 깨진다.
     const double hw = params().pen_width_m / 2.0;
     OpSeq seq;
     bool penDown = false;
-    bool penIsArc = false;  // 지금 내려가 있는 펜이 호를 그리는 중인가
     // 노즐을 올릴 때 뒤로 물러날 방향 = 직전 도색 op의 **차체** 종료 방위.
     // 로봇은 회전하지 않았으므로 여전히 그쪽을 바라보고 있다. 호에서는 접선이
     // 아니라 접선 + φ다 - 접선으로 후진하면 중심이 꼭짓점에 안 돌아온다.
@@ -287,18 +311,15 @@ inline PlannedPath buildDrawOps(const json& program,
     // 꼭짓점보다 (a - w/2) 앞"이라 곧 내려올 펜이 꼭짓점보다 w/2 앞에 앉는다.
     // 🔴 이 보정은 노즐이 아직 올라가 있을 때 실행된다 (nozzle down은 다음 op).
     //   젖은 도료를 문지를 여지가 없다.
-    auto openPaint = [&](const TravelGeom& g, bool hasStart, Pt startTgt,
-                         bool isArc) {
+    auto openPaint = [&](const TravelGeom& g, bool hasStart, Pt startTgt) {
         if (g.phase != 0.0 && hasHeading(g.bodyEntry))
             seq.turnOp(g.phase, false, g.bodyEntry);  // 접선 -> 차체 방위
-        // 직선은 hw 만큼 덜 나가서 펜이 꼭짓점보다 hw 앞에 내려앉게 한다.
-        // 호는 보정 대상이 아니라 예전대로 a 전부 나간다.
-        const double lead = isArc ? a : (a - hw);
+        // hw 만큼 덜 나가서 펜이 꼭짓점보다 hw 앞에 내려앉게 한다 (직선·호 공통).
+        const double lead = a - hw;
         seq.moveOp(lead, false, g.bodyEntry, hasStart, startTgt,
                    /*centerAheadM=*/lead);
         seq.nozzleOp(true);
         penDown = true;
-        penIsArc = isArc;
         penPhase = g.phase;
     };
     // 도색 이탈: 노즐 up -> a 후진 -> 위상 원복. 원복까지 해야 뒤따르는 직선
@@ -310,15 +331,15 @@ inline PlannedPath buildDrawOps(const json& program,
     //   보낸다 - 그 한 번만 보정이 걸리지 않는다. 도색은 이미 끝난 뒤라 무해하다.
     auto closePaint = [&]() {
         seq.nozzleOp(false);
-        // 도색 구간이 hw 만큼 더 나갔으므로(직선 한정) 그만큼 더 물러나야
-        // 마커가 꼭짓점 위로 정확히 돌아온다. 목표는 꼭짓점 그대로(0)다.
-        const double back = penIsArc ? a : (a + hw);
+        // 도색 구간이 끝에서 hw 만큼 더 나갔으므로(직선은 거리, 호는 스윕으로)
+        // 그만큼 더 물러나야 마커가 꼭짓점 위로 정확히 돌아온다.
+        // 목표는 꼭짓점 그대로(0)다.
+        const double back = a + hw;
         seq.moveOp(-back, false, penBodyHeading, penEndHasTgt, penEndTgt,
                    /*centerAheadM=*/0.0);
         if (penPhase != 0.0 && hasHeading(penBodyHeading))
             seq.turnOp(-penPhase, false, normDeg(penBodyHeading - penPhase));
         penDown = false;
-        penIsArc = false;
         penPhase = 0.0;
     };
 
@@ -330,7 +351,7 @@ inline PlannedPath buildDrawOps(const json& program,
         const bool isTravel = (o == "MOVE" || o == "ARC");
         const bool isPaint = isTravel && q.value("paint", false);
         const double head = q.value("heading_deg", kNoHeading);  // CCW 절대 방위
-        const TravelGeom g = travelGeom(q, isPaint, a);
+        const TravelGeom g = travelGeom(q, isPaint, a, hw);
 
         // 도착 꼭짓점 = 그다음 Qt op의 v. 없으면 폴리라인 마지막 점 (§6.5).
         // 추측항법으로 누적하지 않고 Qt가 준 좌표만 쓴다 - 오차가 쌓이지 않는다.
@@ -367,10 +388,10 @@ inline PlannedPath buildDrawOps(const json& program,
         //   접합부에서는 노즐을 반드시 한 번 올렸다 내린다.
         if (isPaint) {
             if (!penDown) {
-                openPaint(g, hasStartTgt, startTgt, o == "ARC");
+                openPaint(g, hasStartTgt, startTgt);
             } else if (g.phase != penPhase) {
                 closePaint();
-                openPaint(g, hasStartTgt, startTgt, o == "ARC");
+                openPaint(g, hasStartTgt, startTgt);
             }
         } else if (penDown) {  // 도색 이탈 (turn / 비도색 이동 직전)
             closePaint();
@@ -388,7 +409,6 @@ inline PlannedPath buildDrawOps(const json& program,
             seq.turnOp(q.value("angle_deg", 0.0), true, head);
         } else if (o == "ARC") {
             const double rPaint = q.value("radius_m", 0.0);
-            const double angMag = std::fabs(q.value("angle_deg", 0.0));
             std::string dir = q.value("direction", "left");
             if (dir != "left" && dir != "right") dir = "left";
             // 🔴 R_robot = sqrt(R_paint² - d²) (§5.4). ICR은 반드시 좌우 바퀴
@@ -413,12 +433,12 @@ inline PlannedPath buildDrawOps(const json& program,
                 return bad;
             }
             // 🔴 arcOp에 넘기는 진입/출구 방위는 접선이 아니라 **차체 방위**다
-            //   (도색 호면 접선 + φ). ALIGN 목표와 MORE 투영축이 전부 이 값을
-            //   쓰는데, 로봇이 실제로 바라보는 방향은 차체 방위이기 때문이다.
-            // 호는 아직 펜 두께 보정을 하지 않는다(스윕 각도를 늘려야 하는
-            // 별도 작업, §6-2) - 도색 호의 목표는 예전 그대로 꼭짓점 + a 다.
-            seq.arcOp(g.rRobot, angMag, dir, rPaint, g.bodyEntry, g.bodyExit,
-                      hasTgt, tgt, /*centerAheadM=*/isPaint ? a : 0.0);
+            //   (도색 호면 접선 + φ). ALIGN 목표가 이 값을 쓰는데, 로봇이 실제로
+            //   바라보는 방향은 차체 방위이기 때문이다.
+            // 스윕은 도면의 angMag 가 아니라 g.sweepDeg 다 - 도색 호는 펜 두께
+            // 보정으로 양끝이 hw 씩 늘어나 있다(travelGeom).
+            seq.arcOp(g.rRobot, g.sweepDeg, dir, rPaint, g.bodyEntry, g.bodyExit,
+                      hasTgt, tgt, /*centerAheadM=*/isPaint ? (a + hw) : 0.0);
         }
         // 다음 closePaint가 쓸 "직전 도색의 끝" 상태를 갱신한다. 방위는 후진
         // 방향, 꼭짓점은 후진 다리의 MORE 목표가 된다.

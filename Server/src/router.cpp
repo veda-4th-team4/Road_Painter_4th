@@ -484,6 +484,7 @@ void Router::sendGo(int k, const char* why) {
     srv_.sendTo("ROBOT", makeMsg("GO", {{"op_index", k}}));
     runningOp_ = k;
     lastDriftMs_ = 0;  // 새 op 시작 - 첫 DRIFT를 기다리게 하지 않는다
+    clearDriftAvg();   // 이전 op의 heading 표본이 새 구간에 섞이면 안 된다
     if (why) logf("[INFO] GO(op %d) - %s", k, why);
     else logf("[INFO] GO(op %d)", k);
 }
@@ -504,23 +505,40 @@ void Router::clearBoundary() {
 //   꼭짓점마다 ±a(150mm)를 슬립계수 하나만 믿고 개루프로 찍고, 틀려도 아무도
 //   고치지 않았다 - 펜 오프셋 설정값과 실측값이 5mm만 어긋나도 그 오차가 보정
 //   없이 꼭짓점마다 그대로 쌓였다(2026-08-11 삼각형 시험에서 관측).
+// 🔴 arc는 대상이 아니다 (2026-08-13 실기 시험에서 "원을 망침"으로 관측).
+//   MORE는 exitHeadingDeg 방향으로 **직선 이동**을 시키는 보정이다. 직진에는
+//   맞지만 호에서는 틀린다 - 원 위의 점에서 접선으로 나가면 원을 벗어나므로,
+//   호 끝마다 접선 직선이 덧붙는다. 그것도 more_max_tries(4회)까지 반복한다.
+//   설계 의도와도 어긋났다: needsAlign 주석대로 호는 개루프 구간이고 진입
+//   pose가 원의 위치를 100% 결정한다 - 진입만 맞추고 끝까지 두는 게 규약이다.
+//   호의 거리 오차를 정말 잡으려면 직선이 아니라 추가 호(Δθ)여야 하고, 그건
+//   로봇 쪽 op이 하나 더 필요한 별도 작업이다.
 bool Router::needsMore(int k) const {
     if (k <= 0 || k > (int)activeMeta_.size()) return false;
     const OpMeta& m = activeMeta_[(size_t)k - 1];
-    return (m.op == "move" || m.op == "arc") && m.hasTarget &&
-           hasHeading(m.exitHeadingDeg);
+    return m.op == "move" && m.hasTarget && hasHeading(m.exitHeadingDeg);
 }
 
 // ALIGN 판정이 가능한 boundary인지. 목표 방위(CCW 절대각)를 targetCcw에 채운다.
-//   ① 직전 op이 role=path인 turn      -> 그 turn이 만들어야 할 방위
+//   ① 직전 op이 turn (role 무관)       -> 그 turn이 만들어야 할 방위
 //   ② k==0 이고 phase=="draw"          -> 첫 주행 op의 방위 (도색 시작 직전)
 //   ③ 다음 op이 role=path인 arc        -> 진입 접선 방향
 // ③이 별도 항인 이유: arc는 개루프 구간이라(DRIFT 없음) 진입 pose가 원의 위치를
 // 100% 결정한다. 진입 각도가 5도 틀어지면 원 전체가 통째로 어긋난다 (§4.4).
+//
+// 🔴 ①에서 role=path 요구를 걷어냈다 (2026-08-14 실기 시험).
+//   호를 빠져나온 뒤 각도를 맞추는 자리가 통째로 없었다. 호는 개루프라 스윕만큼
+//   오차가 그대로 남는데, 그 뒤에 오는 것은 closePaint가 넣는 위상 복원
+//   turn(role=offset) 하나뿐이라 ①에 걸리지 않았다. 그래서 호 다음 직선이
+//   기울어진 채로 시작했다("호 뒤에 이어 그은 선이 삐뚤어짐").
+//
+//   이 자리는 노즐이 이미 올라간 뒤라(closePaint가 먼저 올린다) 제자리 회전을
+//   시켜도 도료를 문지르지 않는다. 캘리 사각형 경로의 turn은 목표 방위를
+//   kNoHeading으로 실어 보내므로 hasHeading 검사에서 그대로 걸러진다.
 bool Router::needsAlign(int k, double& targetCcw) const {
     if (k > 0 && k <= (int)activeMeta_.size()) {
         const OpMeta& m = activeMeta_[(size_t)k - 1];
-        if (m.isPath && m.op == "turn" && hasHeading(m.exitHeadingDeg)) {
+        if (m.op == "turn" && hasHeading(m.exitHeadingDeg)) {
             targetCcw = m.exitHeadingDeg;
             return true;
         }
@@ -804,20 +822,39 @@ void Router::fromCctv(const json& msg) {
         //   15.5cm짜리라 보정할 값이 없다.
         if (runningOp_ >= 0 && runningOp_ < (int)activeMeta_.size()) {
             const OpMeta& m = activeMeta_[(size_t)runningOp_];
-            if (m.isPath && m.op == "move" && hasHeading(m.headingDeg) &&
-                nowMs() - lastDriftMs_ >= P.drift_period_ms) {
-                double err = normDeg(m.headingDeg - p.theta * 180.0 / M_PI);
-                if (std::fabs(err) >= P.drift_deadband_deg) {
-                    srv_.sendTo("ROBOT", makeMsg("DRIFT",
-                        {{"op_index", runningOp_},
-                         {"angle_deg", round1(toRobotDeg(err))}}));
-                    lastDriftMs_ = nowMs();
-                    // v1은 DRIFT를 로그에 남기지 않아 "보냈는지"를 tap_dump로만
-                    // 확인할 수 있었다. 전송률이 drift_period_ms로 제한돼 있어
-                    // (기본 2.5Hz) 로그가 뒤덮이지 않으므로 남긴다.
-                    logf("[INFO] DRIFT(op %d) %.1f도 (목표 %.1f, 현재 %.1f)",
-                         runningOp_, toRobotDeg(err), m.headingDeg,
-                         p.theta * 180.0 / M_PI);
+            if (!(m.isPath && m.op == "move")) {
+                clearDriftAvg();  // 직진 도색 구간이 아니면 표본을 섞지 않는다
+            } else if (hasHeading(m.headingDeg)) {
+                // 최근 kDriftAvgN개의 평균 heading으로 판정한다. 표본이 아직 덜
+                // 찼으면 있는 것만으로 평균한다 - 구간 첫머리에 보정을 통째로
+                // 쉬는 것보다는 낫다(그때가 제일 많이 틀어져 있다).
+                driftSin_[driftPos_] = std::sin(p.theta);
+                driftCos_[driftPos_] = std::cos(p.theta);
+                driftPos_ = (driftPos_ + 1) % kDriftAvgN;
+                if (driftN_ < kDriftAvgN) ++driftN_;
+                double ss = 0, cc = 0;
+                for (int i = 0; i < driftN_; ++i) {
+                    ss += driftSin_[i];
+                    cc += driftCos_[i];
+                }
+                const double thetaAvg = std::atan2(ss, cc) * 180.0 / M_PI;
+                if (nowMs() - lastDriftMs_ >= P.drift_period_ms) {
+                    const double err = normDeg(m.headingDeg - thetaAvg);
+                    if (std::fabs(err) >= P.drift_deadband_deg) {
+                        srv_.sendTo("ROBOT", makeMsg("DRIFT",
+                            {{"op_index", runningOp_},
+                             {"angle_deg", round1(toRobotDeg(err))}}));
+                        lastDriftMs_ = nowMs();
+                        // v1은 DRIFT를 로그에 남기지 않아 "보냈는지"를 tap_dump로만
+                        // 확인할 수 있었다. 전송률이 drift_period_ms로 제한돼 있어
+                        // (기본 2.5Hz) 로그가 뒤덮이지 않으므로 남긴다.
+                        // 평균값과 방금 들어온 값을 같이 남긴다 - 둘이 크게
+                        // 벌어져 있으면 그 구간 POS가 튀고 있다는 뜻이다.
+                        logf("[INFO] DRIFT(op %d) %.1f도 (목표 %.1f, 평균 %.1f "
+                             "/ 최근 %.1f, 표본 %d)",
+                             runningOp_, toRobotDeg(err), m.headingDeg, thetaAvg,
+                             p.theta * 180.0 / M_PI, driftN_);
+                    }
                 }
             }
         }
@@ -994,6 +1031,32 @@ void Router::handleHMatrix(const json& msg) {
         logf("[WARN] H_MATRIX(채널 %d) 파싱 실패 - calib/H 형식 확인 필요: %s",
              ch, payload.dump().c_str());
         return;
+    }
+    // 🔴 격하 감시 (2026-08-13). 이미 들고 있는 것보다 **빈약한** 번들이 덮어쓰는
+    //   상황을 크게 남긴다. 값이 그럴듯하고 에러도 안 나서, 실기 시험에서
+    //   오도메트리 결과(H_marker+K/D 포함)가 관리자 창의 floor 번들에 덮이는 걸
+    //   아무도 눈치채지 못했다 - 서버는 H_marker가 없으면 바닥 H로 대신 쓰므로
+    //   (calib.hpp) 두 평면이 조용히 하나로 붕괴하고 로봇 pose가 시차만큼 틀어진다.
+    //
+    //   막지는 않는다. "최신 번들이 이긴다"가 규약이고, 바닥 재캘리처럼 H_marker가
+    //   원래 없는 정당한 갱신도 이 모양이기 때문이다. 판단은 사람이 하되,
+    //   그러려면 보여야 한다.
+    {
+        auto prev = calibs_.find(ch);
+        if (prev != calibs_.end() && prev->second.valid) {
+            const Calib& p = prev->second;
+            std::string lost;
+            if (p.hasMarker && !c.hasMarker) lost += "H_marker ";
+            if (p.hasKD && !c.hasKD) lost += "K/D ";
+            const bool prevId = p.raw.contains("calib_id");
+            if (prevId && !bundle.contains("calib_id")) lost += "calib_id ";
+            if (!lost.empty())
+                logf("[WARN] 캘리브레이션(채널 %d) 격하 - 기존 번들에 있던 [%s]이(가) "
+                     "새 번들에 없다. 덮어쓴다(규약)지만 의도한 것인지 확인할 것 "
+                     "(기존 calib_id=%s)",
+                     ch, lost.c_str(),
+                     prevId ? p.raw["calib_id"].dump().c_str() : "(없음)");
+        }
     }
     calibs_[ch] = c;
     // mm 번들 그대로 다시 싸서 QT에 중계 + 영속 저장 - QT는 mm H_floor로 top-view.

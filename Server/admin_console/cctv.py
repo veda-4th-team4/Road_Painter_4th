@@ -398,8 +398,35 @@ def calib_channel_status():
     return {"channel": cur, "count": CAM_CHANNELS, "channels": chans}
 
 
+# 🔴 아래 두 함수는 **기록만** 한다. 서버로 보내지 않는다 (2026-08-14).
+#
+# 원래 이 자리에는 push_calib_to_server() 라는 브리지가 있었다. 카메라는 바닥 H
+# 를 자기 안에만 갖고 있었고, 서버가 그 값을 알게 되는 유일한 길이 "대시보드가
+# HG_QUERY/CALIB_K_QUERY 로 값을 받아 캐시했다가 자기가 조립한 번들을 올린다"
+# 였기 때문이다. 그 왕복이 만든 문제가 셋이었다:
+#
+#   1. 대시보드가 조립하는 번들은 대시보드가 아는 것만 담을 수 있었다.
+#      image_size 는 드롭다운 추정값, coord_mode 는 HG_COORD_MODE 명령 이력에서
+#      유추(새로고침하면 소실), K/D 는 놓치면 자리표시자. 셋 다 카메라만 아는
+#      사실인데 대시보드가 추측했다. 2026-08-11 CH2 사고(raw 로 피팅된 H 가
+#      undistort 로 라벨링돼 몇 시간 나가 있던 것)가 그 결과다.
+#   2. 관리자 창을 안 열어 두고 캘리하면 결과가 카메라 안에만 남았다.
+#   3. `HG` 는 "새 캘리"와 "단순 조회의 답"이 같은 타입으로 온다. 구분할 방법이
+#      없어 값이 변했는지로 추측해야 했고, 그 추측이 틀리면 화면을 새로 여는
+#      것만으로 서버의 캘리 슬롯이 덮였다 — 실기 시험에서 오도메트리 결과가
+#      사라진 원인이다(Qt 로그: `1200×900mm·undistort` → 새로고침 후
+#      `H만·1200×1220mm·검산 불가`).
+#
+# 이제 카메라가 피팅이 끝나는 그 자리에서 직접 보낸다(SendFloorBundle, 주행
+# 캘리의 SendCalibBundle 과 같은 모양). 새 캘리가 났다는 것을 아는 곳은 카메라
+# 뿐이므로 추측이 필요 없고, 카메라가 조립하므로 추측할 필드도 없다. 재전송이
+# 필요하면 FLOOR_RESEND / ODOM_RESEND 로 카메라에게 다시 시킨다.
+#
+# 캐시 자체는 남긴다 — 채널 상태 UI(calib_channel_status 의 has_k/has_h)가
+# "이 렌즈는 캘리가 돼 있나"를 이걸로 표시한다. 읽기 전용 거울이지 권위가 아니다.
+
 def calib_cache_k(fx, fy, cx, cy, dist, ch=None):
-    """ch: 0-based, straight off the camera's own message (msg.get("ch")).
+    """K/dist 를 채널 캐시에 기록한다 (UI 표시용). ch: 0-based, 카메라 메시지 그대로.
 
     Was: always cached under _calib_channel (the UI's selector), trusting
     that whoever is looking at the K/dist result also has the right channel
@@ -412,7 +439,7 @@ def calib_cache_k(fx, fy, cx, cy, dist, ch=None):
     that genuinely has no channel to give.
     """
     if fx is None or fy is None:
-        return
+        return None
     with _calib_lock:
         target = (ch + 1) if ch is not None else _calib_channel  # camera is 0-based, cache is 1-based
         c = _cache_for(target)
@@ -420,47 +447,17 @@ def calib_cache_k(fx, fy, cx, cy, dist, ch=None):
                   [0.0, float(fy), float(cy or 0)],
                   [0.0, 0.0, 1.0]]
         c["dist"] = [float(x) for x in (dist or [])]
-    push_calib_to_server(target)
+    return target
 
 
 def calib_cache_h(h, ch=None):
-    """ch: 0-based, straight off the camera's own message. See calib_cache_k's
-    doc comment -- same bug, same fix, same reason (H is the more damaging
-    half of the two to get wrong: a bad H silently misplaces every future
-    world coordinate this lens ever reports)."""
+    """바닥 H 를 채널 캐시에 기록한다 (UI 표시용). calib_cache_k 와 같은 규약."""
     if not isinstance(h, list) or len(h) != 9:
         return
     with _calib_lock:
         target = (ch + 1) if ch is not None else _calib_channel
-        _cache_for(target)["H"] = _reshape3x3(h)
-    push_calib_to_server(target)
-
-
-def push_calib_to_server(ch=None):
-    """Send the cached calibration for one channel (needs at least H_floor)."""
-    with _calib_lock:
-        if ch is None:
-            ch = _calib_channel
-        c = _calib_caches.get(ch, {})
-        H, K, dist = c.get("H"), c.get("K"), c.get("dist")
-    if H is None:
-        return  # 서버는 최소 H_floor가 있어야 유효 (calib.hpp)
-    bundle = {"version": 1, "H_floor": H}
-    # 카메라는 바닥 H만 계산 → H_marker 생략(서버가 floor로 대체, 시차 보정 없음)
-    if K is not None:
-        bundle["K"] = K
-        bundle["D"] = dist or [0, 0, 0, 0, 0]
-    # ADMIN 연결로 보낸다 (CCTV 연결이 아님) - 서버 fromAdmin()이 H_MATRIX를
-    # CCTV와 동일하게 처리(저장+Qt 중계)하므로 동작은 같다. CCTV 연결(cctv_link_loop)은
-    # 카메라 직결 시 꺼지는(CCTV_BRIDGE_ENABLED) 대상이라, 그 연결에 캘리 결과를
-    # 얹으면 브리지를 끄는 순간 이 관리자 창의 캘리 도구도 같이 죽는다 - ADMIN
-    # 연결은 브리지와 무관하게 항상 떠 있으므로 여기 실어야 안전하다.
-    #
-    # ch 는 payload 최상위에 붙는다 (calib "안"이 아니다 — server_PROTOCOL.md).
-    # 안 실으면 서버가 전부 채널 1로 보고, 4채널을 캘리해도 마지막 하나만 남는다.
-    if server_send("H_MATRIX", {"ch": ch, "calib": bundle}):
-        broadcast(f"[bridge] CH{ch} 캘리 결과를 서버로 전송"
-                  f"(H_MATRIX ch={ch}, role=ADMIN) — 저장+Qt 중계됨")
+        c = _cache_for(target)
+        c["H"] = _reshape3x3(h)
 
 
 # Above this, "net" is not a delay -- it is the camera and this server
@@ -600,6 +597,9 @@ def print_msg(msg, last_seq):
         # 수집이 끝났을 때(성공이든 프레임 예산 소진으로 실패든) — 전부 이
         # 하나의 타입으로 온다. ch 없이는 어느 렌즈인지 몰라 전역 변수에
         # 잘못 캐싱될 뻔한 게 바로 위 calib_cache_h()의 버그였다.
+        #
+        # 이 셋을 구분할 필요는 이제 없다 — 새 캘리가 끝나면 카메라가 서버로
+        # 직접 올리므로(SendFloorBundle), 여기서는 화면 갱신만 하면 된다.
         ch = msg.get("ch")
         if msg.get("available"):
             H = msg.get("H")
@@ -612,7 +612,7 @@ def print_msg(msg, last_seq):
             broadcast(f"[calib] ch={ch} HOMOGRAPHY H={H} "
                       f"mappable={msg.get('mappable')} camera_z_mm={msg.get('camera_z_mm')} "
                       f"undistorted={msg.get('undistorted')}")
-            calib_cache_h(H, ch)  # 서버로 H_MATRIX 전송 (실제 응답 채널로)
+            calib_cache_h(H, ch)  # 채널 상태 UI 용 기록만 (전송은 카메라가 한다)
         else:
             broadcast(f"[calib] ch={ch} 호모그래피 아직 계산 안 됨")
         return last_seq
@@ -637,6 +637,35 @@ def print_msg(msg, last_seq):
             note = " — ⚠ 측정 당시와 " + ("K 가 " if msg.get("k_stale") else "") \
                  + ("마커 높이가 " if msg.get("height_stale") else "") + "달라졌습니다"
         broadcast(f"[calib] ch={msg.get('ch')} 로봇 측위 H_marker = {which}{note}")
+        return last_seq
+    if mtype == "ODOM_RESEND":
+        # 주행 캘리 번들 수동 재전송의 ack (2026-08-13). 조립은 카메라가 하므로
+        # 여기서는 성공 여부와 사유만 흘려보낸다 — 번들 내용은 서버가 받은 것이
+        # 정본이고, 그건 TAP 의 H_MATRIX 줄로 따로 보인다.
+        broadcast("[odo] " + json.dumps(
+            {"dir": "IN", "peer": "CAM", "type": "ODOM_RESEND", "payload": msg},
+            ensure_ascii=False))
+        if msg.get("ok"):
+            broadcast(f"[calib] ch={msg.get('ch')} 주행 캘리 번들 재전송됨 (H_MATRIX)")
+        else:
+            broadcast(f"[calib] ch={msg.get('ch')} 주행 캘리 번들 재전송 거부"
+                      f" — {msg.get('reason', '')}")
+        return last_seq
+    if mtype == "FLOOR_RESEND":
+        # 앵커 캘리 번들 수동 재전송의 ack (2026-08-14). ODOM_RESEND 와 완전히
+        # 같은 모양이다 — 조립은 카메라가 하고 여기서는 성공/사유만 흘려보낸다.
+        #
+        # [odo] 접두사를 쓰는 건 이게 주행 캘리라서가 아니라, **카메라의 구조화된
+        # 응답이 브라우저로 가는 통로**가 그것 하나뿐이기 때문이다(handleOdo 의
+        # ev.type 스위치). ODOM_PREFER 도 같은 이유로 여기 실린다.
+        broadcast("[odo] " + json.dumps(
+            {"dir": "IN", "peer": "CAM", "type": "FLOOR_RESEND", "payload": msg},
+            ensure_ascii=False))
+        if msg.get("ok"):
+            broadcast(f"[calib] ch={msg.get('ch')} 앵커 캘리 번들 재전송됨 (H_MATRIX)")
+        else:
+            broadcast(f"[calib] ch={msg.get('ch')} 앵커 캘리 번들 재전송 거부"
+                      f" — {msg.get('reason', '')}")
         return last_seq
     if mtype == "ODOM_DONE":
         # 주행 캘리의 종결 보고. 서버로 가는 H_MATRIX/CALIB_FAIL 과 달리 이건
@@ -792,8 +821,12 @@ def print_msg(msg, last_seq):
                       f"views={msg.get('views')} pruned={msg.get('pruned')} "
                       f"fx={msg.get('fx')} fy={msg.get('fy')} "
                       f"cx={msg.get('cx')} cy={msg.get('cy')} dist={msg.get('dist')}")
+            # 채널 상태 UI 용 기록. 서버로는 안 보낸다 — 새 K/D 를 실은 번들은
+            # 카메라가 다음 캘리 완료 때(또는 FLOOR_RESEND/ODOM_RESEND 로) 직접
+            # 올린다. 여기서 보내면 대시보드가 조립한 번들이 카메라가 올린 것을
+            # 덮는다.
             calib_cache_k(msg.get("fx"), msg.get("fy"), msg.get("cx"),
-                          msg.get("cy"), msg.get("dist"), msg.get("ch"))  # 서버로 K/D 반영
+                          msg.get("cy"), msg.get("dist"), msg.get("ch"))
         else:
             broadcast(f"[calib-K] FAILED: {msg.get('reason')}")
         return last_seq
@@ -947,18 +980,13 @@ def print_msg(msg, last_seq):
         if msg.get("available"):
             broadcast(f"[calib-K] ch={ch} CURRENT VALUES: fx={msg.get('fx')} fy={msg.get('fy')} "
                       f"cx={msg.get('cx')} cy={msg.get('cy')} dist={msg.get('dist')}")
-            # 조회 응답으로도 캐시를 채운다 (2026-08-13).
+            # 조회 응답으로도 채널 상태 UI 를 갱신한다. 예전에는 CALIB_K_RESULT
+            # (캘리가 *완료되는 순간*)에서만 캐시해서, 이 대시보드를 재시작하면
+            # 카메라에는 K/dist 가 멀쩡히 저장돼 있는데도 화면은 "K 없음"이었다.
             #
-            # 예전에는 CALIB_K_RESULT(캘리가 *완료되는 순간*)에서만 캐시했다. 그래서
-            # 이 대시보드를 재시작하면 카메라에는 K/dist가 멀쩡히 저장돼 있는데도
-            # _calib_caches 는 빈 채로 남았고, 그 상태에서 계산한 H가 올라가면
-            # push_calib_to_server()가 K/D 없는 번들을 보냈다 — 서버는 K/D가 없으면
-            # 왜곡 보정을 조용히 건너뛰므로(calib.hpp Calib::hasKD) 좌표가 렌즈
-            # 왜곡만큼 틀린 채로 운용된다. 에러도 안 나고 값도 그럴듯하다.
-            # 서버팀이 8/13 문의에서 보고한 "K/D 없음" 90건이 이 경로다.
-            #
-            # 조회는 카메라가 지금 들고 있는 값을 그대로 돌려주는 응답이라, 완료
-            # 시점 값과 다를 이유가 없다. 캐시하지 않을 근거가 없었던 셈이다.
+            # 이 캐시가 번들에 실릴 K/D 의 출처이던 시절에는 그 공백이 실제 사고로
+            # 이어졌다(서버팀 8/13 문의의 "K/D 없음" 90건). 지금은 카메라가 자기
+            # K/D 를 직접 실어 보내므로 여기 있는 값은 화면 표시 이상의 의미가 없다.
             calib_cache_k(msg.get("fx"), msg.get("fy"), msg.get("cx"),
                           msg.get("cy"), msg.get("dist"), ch)
         else:
@@ -2223,20 +2251,21 @@ PAGE = """<!doctype html>
   <details class="group wide fold panel" id="foldHgSendFloor" data-hg-section="compute">
     <summary>4. 서버 송신 — H_MATRIX</summary>
     <div class="foldbody">
-      <p class="sub">여기서 계산한 <code>H_floor</code>가 실린 캘리 번들을 중앙 서버로 보냅니다.
-        <code>H_marker</code>는 카메라가 마커 높이로 파생한 값이 들어갑니다.
-        조립은 <b>서버 송신 탭과 똑같은 함수</b>가 하므로 두 자리의 형식이 갈라지지 않습니다.</p>
+      <div class="hint" style="margin-bottom:8px">
+        ℹ️ <b>앵커 캘리가 성공하면 카메라가 <code>H_MATRIX</code>를 자동으로 보냅니다</b> —
+        평소에는 누를 일이 없습니다. 그 번들은 <code>H_floor</code>=<b>앵커로 직접 측정한 값</b>,
+        <code>H_marker</code>=<b>마커 높이만큼 파생시킨 값</b>,
+        <code>method</code>=<code>static_anchors</code> 입니다(주행 캘리와 정확히 반대 방향).<br>
+        이 버튼은 <b>그때 링크가 끊겼거나 서버가 저장분을 잃었을 때 쓰는 재전송</b>입니다.
+        브라우저가 JSON 을 조립하지 않고 <b>카메라가 자기 상태에서 다시 조립</b>하므로,
+        자동 전송과 <b>정의상 같은 번들</b>이 나갑니다.
+      </div>
       <div class="row go">
-        <button type="button" onclick="fillCentralHmatrixTemplate('hgSendFloor','hgSendFloorNote')">미리보기 채우기</button>
-        <button type="button" onclick="sendCentralHmatrix('hgSendFloor')">서버로 전송<span class="cmd">CENTRAL_HMATRIX</span></button>
+        <button type="button" onclick="floorResendBundle()">바닥 H 재전송<span class="cmd">FLOOR_RESEND</span></button>
       </div>
-      <div class="row">
-        <textarea id="hgSendFloor" spellcheck="false"
-                  style="width:100%;min-height:150px;font-family:monospace;font-size:12px"></textarea>
-      </div>
-      <div id="hgSendFloorNote" class="hint">[미리보기 채우기]를 누르면 지금 선택된 채널의 값으로 채워집니다.</div>
-      <div class="hint"><code>calib_id</code>·<code>canvas_mm</code>을 직접 지정하려면 <b>서버 송신</b> 탭의
-        입력칸을 쓰세요 — 여기서도 그 값을 그대로 읽습니다.</div>
+      <div id="hgSendFloorNote" class="hint">
+        앵커 캘리를 아직 완주하지 않은 채널이면 카메라가 거부하고 사유를 알려줍니다
+        (바닥 H 없음 / K·dist 없음 / 프레임 크기 미수신 / 링크 끊김).</div>
     </div>
   </details>
 
@@ -2328,20 +2357,19 @@ PAGE = """<!doctype html>
     <div class="foldbody">
       <div class="hint" style="margin-bottom:8px">
         ℹ️ <b>주행 캘리가 성공하면 카메라가 <code>H_MATRIX</code>를 자동으로 보냅니다</b> —
-        여기서 누를 필요가 없습니다(<code>H_marker</code>=측정값, <code>H_floor</code>=역산값,
-        <code>method</code>=<code>robot_motion</code>).
-        이 상자는 <b>수동 재전송용</b>입니다. 지금 누르면 카메라에 저장된 값으로 채워지는데,
-        주행 캘리를 아직 안 돌린 채널이면 <b>기존(체커보드) 값</b>이 실립니다 — floor 탭과 같은 번들입니다.
+        평소에는 누를 일이 없습니다. 그 번들은 <code>H_marker</code>=<b>주행으로 직접 측정한 값</b>,
+        <code>H_floor</code>=<b>그 <code>H_marker</code>를 역산한 값</b>,
+        <code>method</code>=<code>robot_motion</code> 입니다.<br>
+        이 버튼은 <b>그때 링크가 끊겼거나 서버가 저장분을 잃었을 때 쓰는 재전송</b>입니다.
+        브라우저가 JSON 을 조립하지 않고 <b>카메라가 자기 상태에서 다시 조립</b>하므로,
+        자동 전송과 <b>정의상 같은 번들</b>이 나갑니다.
       </div>
       <div class="row go">
-        <button type="button" onclick="fillCentralHmatrixTemplate('hgSendOdom','hgSendOdomNote')">미리보기 채우기</button>
-        <button type="button" onclick="sendCentralHmatrix('hgSendOdom')">서버로 전송<span class="cmd">CENTRAL_HMATRIX</span></button>
+        <button type="button" onclick="odoResendBundle()">측정 H 재전송<span class="cmd">ODOM_RESEND</span></button>
       </div>
-      <div class="row">
-        <textarea id="hgSendOdom" spellcheck="false"
-                  style="width:100%;min-height:150px;font-family:monospace;font-size:12px"></textarea>
-      </div>
-      <div id="hgSendOdomNote" class="hint">[미리보기 채우기]를 누르면 지금 선택된 채널의 값으로 채워집니다.</div>
+      <div id="hgSendOdomNote" class="hint">
+        주행 캘리를 아직 완주하지 않은 채널이면 카메라가 거부하고 사유를 알려줍니다
+        (측정 <code>H_marker</code> 없음 / K·dist 없음 / 프레임 크기 미수신 / 링크 끊김).</div>
     </div>
   </details>
 
@@ -3512,8 +3540,9 @@ function renderCalibChannel(st) {
     renderRawLatency();  // proc/fps/검출률/seq 누락도 채널별이니 즉시 다시 그림
     syncCalibFromChannel();
   }
-  // 어느 채널이 아직 안 끝났는지 한눈에. H 가 없으면 서버로 전송 자체가 안 되므로
-  // (push_calib_to_server) 그 채널은 Qt 에서 여전히 "캘리브레이션 없음"으로 보인다.
+  // 어느 채널이 아직 안 끝났는지 한눈에. H 가 없으면 카메라가 번들을 조립하지
+  // 못하므로(SendFloorBundle 이 "바닥 H 없음"으로 거부) 그 채널은 Qt 에서
+  // 여전히 "캘리브레이션 없음"으로 보인다.
   const left = st.channels.filter(c => !c.has_h).map(c => 'CH' + c.ch);
   document.getElementById('chHint').textContent =
     left.length ? ('미완료: ' + left.join(' ')) : '전 채널 완료';
@@ -4220,6 +4249,59 @@ function odoSetPrefer(on) {
                      '계속할까요?')) return;
   send('ODOM_PREFER ' + chArg() + ' ' + (on ? 1 : 0));
 }
+// ODOM_RESEND <ch> — 주행 캘리 번들 재전송 (2026-08-13).
+//
+// 예전에는 이 자리에 fillCentralHmatrixTemplate + sendCentralHmatrix 가 있었다.
+// 그 경로는 브라우저 캐시(hgHfloor/mpPlane)로 번들을 조립하는데, **그 캐시는
+// 정적 앵커(floor) 탭 흐름에서만 채워진다** — 주행 캘리 결과는 카메라가 서버로
+// 직접 보내고 이 대시보드는 저장하지 않는다. 그래서 Odometry 탭에서 눌러도
+// 실제로는 체커보드 번들이 나갔다: H_marker 가 측정값이 아니라 floor H 에서
+// 파생된 값이었고, 역산 방향도 자동 경로와 정반대였다.
+//
+// 지금은 카메라에 "다시 보내라"고만 시킨다. 조립 주체가 하나뿐이라 자동 전송과
+// 어긋날 수가 없다.
+function odoResendBundle() {
+  const ch = odoCurrentCh();
+  if (!confirm('CH' + ch + ' 의 주행 캘리 번들을 서버로 다시 보냅니다.\\n\\n' +
+               '카메라가 지금 들고 있는 측정 H_marker 로 번들을 다시 조립해\\n' +
+               '서버에 저장되고 QT로 중계됩니다. 계속할까요?')) return;
+  const el = document.getElementById('hgSendOdomNote');
+  if (el) el.textContent = 'ODOM_RESEND 전송됨 — 카메라 응답 대기…';
+  sendCh('ODOM_RESEND');
+}
+function odoRenderResend(p) {
+  const el = document.getElementById('hgSendOdomNote');
+  if (!el) return;
+  el.innerHTML = p.ok
+    ? '<span class="odo-st-ok">CH' + ((Number(p.ch) || 0) + 1) +
+      ' 번들을 서버로 재전송했습니다 (H_marker=측정값, H_floor=역산값).</span>'
+    : '<span class="odo-st-fail">재전송 거부 — ' + (p.reason || '사유 없음') + '</span>';
+}
+
+// FLOOR_RESEND <ch> — 앵커 캘리 번들 재전송 (2026-08-14). ODOM_RESEND 와 같은
+// 이유로 브라우저는 JSON 을 조립하지 않는다.
+//
+// 예전에는 이 자리에 fillCentralHmatrixTemplate + sendCentralHmatrix 가 있었다.
+// 그 조립기가 채우던 image_size(드롭다운 추정)·coord_mode(명령 이력 유추)·
+// K/D(놓치면 자리표시자)는 전부 **카메라만 아는 사실**이었다 — 브라우저가 그걸
+// 추측해서 라벨을 붙이고 있었고, 2026-08-11 CH2 사고가 그 결과다.
+function floorResendBundle() {
+  const ch = curCh();
+  if (!confirm('CH' + (ch + 1) + ' 의 앵커 캘리 번들을 서버로 다시 보냅니다.\\n\\n' +
+               '카메라가 지금 들고 있는 바닥 H 로 번들을 다시 조립해\\n' +
+               '서버에 저장되고 QT로 중계됩니다. 계속할까요?')) return;
+  const el = document.getElementById('hgSendFloorNote');
+  if (el) el.textContent = 'FLOOR_RESEND 전송됨 — 카메라 응답 대기…';
+  sendCh('FLOOR_RESEND');
+}
+function floorRenderResend(p) {
+  const el = document.getElementById('hgSendFloorNote');
+  if (!el) return;
+  el.innerHTML = p.ok
+    ? '<span class="odo-st-ok">CH' + ((Number(p.ch) || 0) + 1) +
+      ' 번들을 서버로 재전송했습니다 (H_floor=측정값, H_marker=파생값).</span>'
+    : '<span class="odo-st-fail">재전송 거부 — ' + (p.reason || '사유 없음') + '</span>';
+}
 function odoRenderPrefer(p) {
   const el = document.getElementById('odoPreferNote');
   if (!el) return;
@@ -4261,6 +4343,12 @@ function handleOdo(line) {
   } else if (ev.type === 'ODOM_PREFER') {
     odoRenderPrefer(p);
     return;   // 진행도 표와 무관한 설정 응답 — 표를 다시 그릴 이유가 없다
+  } else if (ev.type === 'ODOM_RESEND') {
+    odoRenderResend(p);
+    return;   // 재전송 ack — 진행도 표와 무관하다(ODOM_PREFER 와 같은 이유)
+  } else if (ev.type === 'FLOOR_RESEND') {
+    floorRenderResend(p);
+    return;   // 앵커 탭의 ack — 주행 진행도와는 아무 관계가 없다
   } else if (ev.type === 'ODOM_DONE') {
     odoProg.done = p;
     odoProg.state = p.ok ? '완료' : '실패';
@@ -5033,10 +5121,15 @@ function fillCentralHmatrixTemplate(outId, noteId) {
   const bundle = {
     // ch는 payload 최상위에 실어야 한다(server_PROTOCOL.md, docs/08.06/
     // CCTV_ACTION_ITEMS_20260806.md C-3) — 안 실으면 서버가 전부 채널 1로
-    // 보고, 4채널을 캘리해도 마지막 하나만 남는다. push_calib_to_server()
-    // (자동 경로)는 이미 이렇게 하고 있었는데, 이 수동 버튼(대시보드 조작자가
-    // 직접 편집해서 CENTRAL_HMATRIX로 보내는 경로)은 빠져 있었다(2026-08-11
-    // 발견 — 사용자가 원본 요청서를 다시 대조해달라고 해서 잡음).
+    // 보고, 4채널을 캘리해도 마지막 하나만 남는다. 그때의 자동 경로
+    // (push_calib_to_server)는 이미 이렇게 하고 있었는데, 이 수동 버튼은
+    // 빠져 있었다(2026-08-11 발견).
+    //
+    // 2026-08-14: 자동 경로는 카메라로 옮겨졌고(SendFloorBundle) 이 조립기는
+    // **탈출구로만** 남는다 — 서버가 요구하는 형식이 바뀌었는데 카메라를 아직
+    // 못 고친 상황 같은 때. 평소 캘리에는 쓰지 말 것. 여기서 채우는
+    // image_size/coord_mode/K/D 는 브라우저의 추측이고, 카메라가 보내는 것은
+    // 사실이다. 이걸 보내면 카메라가 올린 정본을 덮는다.
     ch:         curCh() + 1,   // 1-based (SELECT_CHANNEL과 동일 규약)
     calib_id:   calibId || 'MISSING',
     created_at: isoWithOffset(new Date()),

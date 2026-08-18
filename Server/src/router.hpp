@@ -299,6 +299,17 @@ private:
     int pendingPoseN_ = 0;
     long lastDriftMs_ = 0;     // 마지막 DRIFT 전송 시각 (전송률 제한용)
 
+    // ----- 주행 중 각도의 이동평균 (2026-08-14) -----
+    // 꼭짓점 판정(ALIGN/MORE)은 1초간 모은 POS의 평균을 쓰는데, 주행 중
+    // DRIFT는 방금 들어온 값 하나로 바로 계산해 쏘고 있었다. 이상치 게이트를
+    // 통과할 만큼 작게 튀는 잡음(몇 도)은 그대로 실려 로봇을 틀어버린다.
+    // 직진 중 목표 heading은 상수이므로 평균이 정당하다 - 지연 대신 잡음을
+    // 1/sqrt(N)로 줄인다. 도 단위로 더하면 ±180도 경계에서 깨지므로 sin/cos.
+    static constexpr int kDriftAvgN = 3;
+    double driftSin_[kDriftAvgN] = {0}, driftCos_[kDriftAvgN] = {0};
+    int driftN_ = 0, driftPos_ = 0;   // 채워진 개수, 다음에 덮어쓸 자리
+    void clearDriftAvg() { driftN_ = 0; driftPos_ = 0; }
+
     // ----- POS 두절 (§7) -----
     bool holdActive_ = false;  // HOLD{true}를 보내 로봇을 세워둔 상태
     int posRecoverN_ = 0;      // HOLD 중 연속으로 채택된 POS 장수
