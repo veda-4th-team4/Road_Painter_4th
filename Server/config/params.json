@@ -2,17 +2,17 @@
   "_readme": "서버 튜닝 파라미터. 값을 고치고 서버만 재시작하면 적용된다(재컴파일 불필요). 항목 설명과 기본값은 src/params.hpp, 근거는 docs/PROTOCOL_v2_ROBOT.md §10. '_'로 시작하는 키는 주석 취급하고 무시한다. 지우거나 항목을 빼도 되며, 빠진 항목은 코드의 기본값을 쓴다.",
 
   "_1_기하": "로봇 하드웨어 실측값. pen_offset_m은 로봇 PathFollower.h NOZZLE_OFFSET_M과 반드시 같아야 한다 - 자동 동기화되지 않는다. wheel_base_m은 로봇팀 실측 확정값 0.166 (calibration_test.cpp WHEELBASE_M)",
-  "pen_offset_m": 0.150,
+  "pen_offset_m": 0.172,
   "wheel_base_m": 0.166,
 
   "_1a_펜두께": "펜이 실제로 칠하는 폭. 도색 구간을 앞뒤로 w/2씩 늘려 꼭짓점 귀퉁이가 비지 않게 한다(docs/PEN_WIDTH_COMPENSATION_20260813.md). 0으로 두면 보정이 통째로 꺼진다(2026-08-13 이전 동작). 🔴 마커 사양(5cm)이 아니라 직선 한 줄 긋고 자로 잰 실측값을 넣을 것 - 압력·속도·노면에 따라 달라진다",
-  "pen_width_m": 0.05,
+  "pen_width_m": 0.06,
 
   "_1b_최소반지름": "0.200은 기하가 아니라 모터 한계다. 호에서 바깥 바퀴 SPS = 771.65 * (R_robot + W/2) / R_robot 이 1/R_robot로 발산한다. 로봇팀 회신(2026-08-07): NEMA 17 기준 2000 SPS 초과 시 탈조 위험. 0.200 -> 1278 SPS(권장), 0.180 -> 약 1450 SPS(마진 하한선). 로봇 호 주행속도(0.05 m/s)가 바뀌면 이 값도 재계산해야 한다",
   "min_paint_radius_m": 0.200,
 
   "_2_ALIGN": "turn 직후 각도 정렬. 임계값 2.0은 v1 현장 튜닝값(로봇 1틱 오버슛 1.42도 + 마커 코너 노이즈 0.7도). 로봇이 감속 접근으로 오버슛을 줄이면 내릴 것",
-  "align_threshold_deg": 2.0,
+  "align_threshold_deg": 1.0,
   "align_max_tries": 6,
 
   "_3_MORE": "move/arc 직후 거리 보정. more_max_m를 넘는 값은 pose가 틀렸다고 보고 판정을 폐기한다",
@@ -25,7 +25,7 @@
 
   "_5_DRIFT": "직진 주행 중 각도 피드백. 현장 POS 실측이 1~2Hz라 400ms(2.5Hz)보다 촘촘하게 해도 의미가 없다",
   "drift_period_ms": 400,
-  "drift_deadband_deg": 1.0,
+  "drift_deadband_deg": 10.0,
 
   "_6_POS": "두절 감시와 이상치 게이트. 허용 각도변화 = pose_gate_base_deg + pose_gate_rate_dps * 경과초. 상한을 두지 말 것 - POS가 느린 현장에서 정상 회전을 잘라낸다",
   "pos_lost_ms": 2000,

@@ -70,3 +70,8 @@ server_run.log
 
 #작업 중 만든 소스 백업본 (2026-08-13 실수로 커밋된 적 있음)
 *.bak.*
+
+# 실행 부산물 (수동 기동 로그 / 바이너리 사본)
+server.running
+start_manual_*.log
+config/calib_latest.json.*
