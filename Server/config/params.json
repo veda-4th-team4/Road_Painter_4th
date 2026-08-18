@@ -25,7 +25,7 @@
 
   "_5_DRIFT": "직진 주행 중 각도 피드백. 현장 POS 실측이 1~2Hz라 400ms(2.5Hz)보다 촘촘하게 해도 의미가 없다",
   "drift_period_ms": 400,
-  "drift_deadband_deg": 3.0,
+  "drift_deadband_deg": 10.0,
 
   "_6_POS": "두절 감시와 이상치 게이트. 허용 각도변화 = pose_gate_base_deg + pose_gate_rate_dps * 경과초. 상한을 두지 말 것 - POS가 느린 현장에서 정상 회전을 잘라낸다",
   "pos_lost_ms": 2000,
