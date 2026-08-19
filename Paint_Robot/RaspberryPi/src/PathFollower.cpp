@@ -121,14 +121,10 @@ bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps,
     return true;
   }
 
-  // Turn in progress (adaptive speed: 400 sps fast turn, deceleration to 180 sps when < 4.0 deg remaining)
-  int16_t turn_sps = 400; 
-  if (has_imu) {
-    float target_yaw = turn_start_imu_yaw + turn_target_angle_deg;
-    float yaw_error = std::fabs(cur_imu_yaw - target_yaw);
-    if (yaw_error <= 4.0f) {
-      turn_sps = 180; // Fine precision deceleration
-    }
+  // Turn in progress (No deceleration to prevent resonance and stalling)
+  int16_t turn_sps = 250; // Lowered from 400 to 250 to reduce inertia/overshoot
+  if (std::fabs(turn_target_angle_deg) <= 10.0f) {
+    turn_sps = 200; // Gentle turn speed for ALIGN micro-turns
   }
 
   if (turn_target_angle_deg > 0.0f) {
@@ -153,8 +149,8 @@ bool PathFollower::TrimTurn(float target_yaw, float cur_imu_yaw, Msg_SetSpeed_t 
     return true; // Micro-trim complete!
   }
 
-  // Ultra-slow micro pulse speed at 120 sps
-  int16_t trim_sps = 120;
+  // Ultra-slow micro pulse speed (raised to 350 sps to prevent resonance)
+  int16_t trim_sps = 350;
   if (cur_imu_yaw < target_yaw) {
     // cur_imu_yaw < target_yaw (e.g. -90.70 deg < -90.00 deg) -> needs positive rotation back towards -90.00 deg
     out_speed.left_sps = -trim_sps;
@@ -168,8 +164,8 @@ bool PathFollower::TrimTurn(float target_yaw, float cur_imu_yaw, Msg_SetSpeed_t 
 }
 
 uint32_t PathFollower::CalculateMoveSteps(float dist_m) const {
-  // Straight move distance with 1.010f (+1%) hardware calibration factor
-  float abs_dist = std::fabs(dist_m) * 1.010f;
+  // Straight move distance with 1.040f hardware calibration factor (updated for 1.195m -> 1.2m correction)
+  float abs_dist = std::fabs(dist_m) * 1.040f;
   float steps = abs_dist * 15433.09f;
   return static_cast<uint32_t>(std::round(steps));
 }
@@ -211,12 +207,25 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
   // Straight move velocity (positive dist_m -> +move_speed_m_s forward, negative dist_m -> -move_speed_m_s reverse)
   float target_v = (move_dist_m >= 0.0f) ? move_speed_m_s : -move_speed_m_s;
 
-  // Smooth Linear Ramp Deceleration: When 20% or less of target steps remains, linearly ramp down speed from 100% to 20%
+  // Staircase Deceleration: When 10% or less of target steps remains, step down speed in 3 discrete chunks
   uint32_t remaining_steps = move_target_steps - progress_steps;
-  uint32_t decel_threshold = move_target_steps / 5; // 20% remaining threshold
+  uint32_t decel_threshold = move_target_steps / 10; // 10% remaining threshold
   if (decel_threshold > 0 && remaining_steps <= decel_threshold) {
     float ratio = static_cast<float>(remaining_steps) / static_cast<float>(decel_threshold); // 1.0 (start) -> 0.0 (destination)
-    float speed_factor = 0.20f + 0.80f * ratio; // Linear interpolation: 100% -> 20%
+    float speed_factor;
+    
+    float base_sps = (std::abs(move_speed_m_s) / (M_PI * wheel_diameter_m)) * steps_per_rev * gear_ratio;
+    float min_factor = 200.0f / (base_sps > 0.1f ? base_sps : 0.1f); // Reduced from 350 to 200 SPS to fix 2~3mm inertia overshoot
+    if (min_factor > 1.0f) min_factor = 1.0f; // Do not exceed max speed
+
+    if (ratio > 0.66f) {
+      speed_factor = 1.0f;
+    } else if (ratio > 0.33f) {
+      speed_factor = 1.0f - (1.0f - min_factor) * 0.5f; // Middle step
+    } else {
+      speed_factor = min_factor; // Lowest step (350 SPS)
+    }
+
     target_v *= speed_factor;
   }
 
@@ -285,11 +294,11 @@ bool PathFollower::UpdateArc(int32_t cur_l_steps, int32_t cur_r_steps,
   int32_t dl = std::abs(cur_l_steps - arc_start_l_steps);
   int32_t dr = std::abs(cur_r_steps - arc_start_r_steps);
 
-  // Outer wheel completion evaluation: Prevents premature termination when r_in ~ 0
-  bool outer_completed = arc_is_left ? (static_cast<uint32_t>(dr) >= arc_target_r_steps)
-                                     : (static_cast<uint32_t>(dl) >= arc_target_l_steps);
+  uint32_t outer_progress = arc_is_left ? static_cast<uint32_t>(dr) : static_cast<uint32_t>(dl);
+  uint32_t outer_target = arc_is_left ? arc_target_r_steps : arc_target_l_steps;
 
-  if (outer_completed) {
+  // Outer wheel completion evaluation: Prevents premature termination when r_in ~ 0
+  if (outer_progress >= outer_target) {
     out_speed.left_sps = 0;
     out_speed.right_sps = 0;
     is_arc = false;
@@ -297,8 +306,29 @@ bool PathFollower::UpdateArc(int32_t cur_l_steps, int32_t cur_r_steps,
     return true;
   }
 
-  out_speed.left_sps = arc_sps_l;
-  out_speed.right_sps = arc_sps_r;
+  // Staircase Deceleration: When 10% or less of target steps remains, step down speed in 3 discrete chunks
+  uint32_t remaining_steps = outer_target - outer_progress;
+  uint32_t decel_threshold = outer_target / 10; // 10% remaining threshold
+  float speed_factor = 1.0f;
+
+  if (decel_threshold > 0 && remaining_steps <= decel_threshold) {
+    float ratio = static_cast<float>(remaining_steps) / static_cast<float>(decel_threshold); // 1.0 (start) -> 0.0 (destination)
+    
+    float base_sps = std::max(std::abs((float)arc_sps_l), std::abs((float)arc_sps_r));
+    float min_factor = 200.0f / (base_sps > 0.1f ? base_sps : 0.1f); // Reduced from 350 to 200 SPS
+    if (min_factor > 1.0f) min_factor = 1.0f; // Do not exceed max speed
+
+    if (ratio > 0.66f) {
+      speed_factor = 1.0f;
+    } else if (ratio > 0.33f) {
+      speed_factor = 1.0f - (1.0f - min_factor) * 0.5f; // Middle step
+    } else {
+      speed_factor = min_factor; // Lowest step (350 SPS)
+    }
+  }
+
+  out_speed.left_sps = static_cast<int16_t>(arc_sps_l * speed_factor);
+  out_speed.right_sps = static_cast<int16_t>(arc_sps_r * speed_factor);
   return false;
 }
 

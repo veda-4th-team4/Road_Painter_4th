@@ -2,6 +2,7 @@
 #include "PathFollower.h"
 #include "SerialManager.h"
 #include "ImuManager.h"
+#include "LedStripManager.h"
 #include <algorithm>
 #include <iostream>
 #include <string>
@@ -19,6 +20,11 @@ int main(int argc, char **argv) {
   NetworkManager net_manager(server_ip, server_port);
   PathFollower path_follower;
   ImuManager imu_manager;
+  LedStripManager tower_lamp(5); // Changed from 7 to 5 LEDs
+  if (!tower_lamp.Open()) {
+      std::cerr << "[MAIN] Warning: Tower lamp failed to open." << std::endl;
+  }
+  tower_lamp.SetState(LedState::IDLE);
 
   // 2. Initialize serial communications
   if (!robot_comm.Init()) {
@@ -46,7 +52,7 @@ int main(int argc, char **argv) {
   // IMU Closed-Loop Feature Flags (Toggle ON/OFF easily)
   // =========================================================================
   bool g_use_imu_turn = true;  // Toggle IMU closed-loop for TURN & ALIGN (default: true, needed for phase: "calib")
-  bool g_use_imu_move = false; // Toggle IMU heading correction for MOVE & MORE (default: false, enable to test)
+  bool g_use_imu_move = true; // Toggle IMU heading correction for MOVE & MORE (default: false, enable to test)
 
   // 4. Initialize network communications
   std::cout << "[MAIN] Starting TLS network link to " << server_ip << ":"
@@ -84,6 +90,7 @@ int main(int argc, char **argv) {
       if (net_manager.GetLatestCommand(cmd)) {
           std::cout << GetTimestampStr() << "[MAIN] Processing server CMD: " << cmd << std::endl;
           if (cmd == "ESTOP") {
+              tower_lamp.SetState(LedState::ESTOP);
               robot_comm.SendEmergencyStop(0x01);
               manual_override = true;
               manual_speed = {0, 0};
@@ -91,6 +98,7 @@ int main(int argc, char **argv) {
               auto_nozzle = 0;
               robot_comm.SendControlNozzle(0);
           } else if (cmd == "ABORT_DRAW" || cmd == "CANCEL_DRAW") {
+              tower_lamp.SetState(LedState::IDLE);
               std::cout << GetTimestampStr() << "[MAIN] [ABORT] Aborting active path execution and stopping robot." << std::endl;
               manual_override = false;
               manual_speed = {0, 0};
@@ -106,23 +114,29 @@ int main(int argc, char **argv) {
               path_done_sent = true; // A-3: Prevent false PATH_DONE reporting
               net_manager.ClearLatches();
           } else if (cmd == "STOP") { // A-4: STOP only clears manual speed
+              if (tower_lamp.GetState() != LedState::ESTOP) tower_lamp.SetState(LedState::IDLE);
               manual_speed = {0, 0};
               robot_comm.SendSetSpeed(0, 0);
           } else if (cmd == "RESUME") {
+              tower_lamp.SetState(LedState::IDLE);
               robot_comm.SendClearEStop();
               manual_override = false;
               manual_speed = {0, 0};
               manual_nozzle = 0;
           } else if (cmd == "FORWARD") {
+              tower_lamp.SetState(LedState::MANUAL);
               manual_override = true;
               manual_speed = {500, 500};
           } else if (cmd == "BACKWARD") {
+              tower_lamp.SetState(LedState::MANUAL);
               manual_override = true;
               manual_speed = {-500, -500};
           } else if (cmd == "TURN_LEFT") {
+              tower_lamp.SetState(LedState::MANUAL);
               manual_override = true;
               manual_speed = {-300, 300};
           } else if (cmd == "TURN_RIGHT") {
+              tower_lamp.SetState(LedState::MANUAL);
               manual_override = true;
               manual_speed = {300, -300};
           } else if (cmd == "NOZZLE_DOWN" || cmd == "PAINT_ON") {
@@ -181,6 +195,7 @@ int main(int argc, char **argv) {
                manual_nozzle = 0;
                has_pending_path = false;
                net_manager.ClearLatches(); // R-8: Clear any stale command latches from previous path
+               tower_lamp.SetState(LedState::DRIVING);
                robot_comm.SendClearEStop(); // Clear startup/idle ESTOP latch when applying new autonomous path
                std::string phase = net_manager.GetPathPhase();
                std::cout << GetTimestampStr() << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2500ms for camera settling..." << std::endl;
@@ -235,10 +250,23 @@ int main(int argc, char **argv) {
 
               // R-5: Unified READY -> GO handshake for ALL ops ("nozzle", "move", "turn", "arc")
               if (ready_seg_sent != active_op_index) {
+                  robot_comm.SendSetSpeed(0, 0);
+
+                  // Mechanical settling delay before sending READY to server
+                  // (skip for op 0 since we already did a 2.5s wait at the start of the path)
+                  if (active_op_index > 0) {
+                      // std::cout << GetTimestampStr() << "[MAIN] Waiting 500ms for mechanical settling..." << std::endl;
+                      auto start_wait = std::chrono::steady_clock::now();
+                      while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - start_wait).count() < 500) {
+                          robot_comm.SendSetSpeed(0, 0);
+                          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                      }
+                  }
+
                   net_manager.SendReady(active_op_index);
                   ready_seg_sent = active_op_index;
                   waiting_for_go = true;
-                  robot_comm.SendSetSpeed(0, 0);
                   std::cout << GetTimestampStr() << "[MAIN] Sent READY for op " << active_op_index << " (" << current_seg.op 
                             << "), waiting for GO/ALIGN/MORE..." << std::endl;
               }
@@ -254,7 +282,8 @@ int main(int argc, char **argv) {
                                     << ": server=" << align_deg << " deg -> robot=" << robot_turn_deg << " deg" << std::endl;
                           Msg_Status_t status_snap{};
                           if (robot_comm.GetLatestStatus(status_snap)) {
-                              path_follower.StartTurn(robot_turn_deg, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps));
+                              float cur_yaw = g_use_imu_turn ? imu_manager.GetYaw() : 0.0f;
+                              path_follower.StartTurn(robot_turn_deg, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), cur_yaw);
                           }
                       }
                   }
@@ -267,8 +296,8 @@ int main(int argc, char **argv) {
                                     << ": " << more_dist << " m" << std::endl;
                           Msg_Status_t status_snap{};
                           if (robot_comm.GetLatestStatus(status_snap)) {
-                              // MORE micro-distance correction (0.8cm~2.0cm): Use ultra-slow 0.0065 m/s (~100 sps) micro-creeping speed!
-                              path_follower.StartMove(more_dist, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), 0.0065f);
+                              // MORE micro-distance correction (0.8cm~2.0cm): Use 0.013 m/s (~200 sps) micro-creeping speed
+                              path_follower.StartMove(more_dist, static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), 0.013f);
                           }
                       }
                   }
@@ -383,6 +412,7 @@ int main(int argc, char **argv) {
               }
           }
       } else if (path_follower.IsPathFinished() && !path_done_sent) {
+          tower_lamp.SetState(LedState::IDLE);
           std::string phase = net_manager.GetPathPhase();
           net_manager.SendPathDone(phase);
           path_done_sent = true;
