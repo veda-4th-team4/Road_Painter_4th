@@ -272,7 +272,16 @@ def _fmt_tap(payload):
 # payload를 200자에서 자른다. 진행도 표는 잘린 값을 그대로 표시하게 된다.
 _ODO_TAP_TYPES = ("CALIB_START", "CALIB_CAPTURE", "CALIB_CAPTURE_OK",
                   "CALIB_CAPTURE_FAIL", "CALIB_DONE", "CALIB_FAIL",
-                  "CALIB_CANCEL", "CALIB_STOPPED", "H_MATRIX")
+                  "CALIB_CANCEL", "CALIB_STOPPED", "H_MATRIX",
+                  # 채널 간 정합(registration, 2026-08-15 신설) - 같은 이유로
+                  # 여기 얹는다. 별도 튜플/[reg] 접두어를 새로 만들지 않는 이유는
+                  # 이미 H_MATRIX가 이 목록에 있어서다 - 정합 결과도 그 안의
+                  # reg_* 필드로 오므로, 이미 필터링되는 메시지 위에 타입만
+                  # 몇 개 더 얹으면 된다. JS 쪽(cctv.py)은 "[odo] {json}" 줄을
+                  # 파싱한 뒤 ev.type으로 다시 갈라 쓰므로 접두어가 "odo"라는
+                  # 이름과 무관하게 그대로 동작한다.
+                  "REGISTER_CAPTURE", "REGISTER_CAPTURE_OK",
+                  "REGISTER_CAPTURE_FAIL", "REGISTER_FAIL", "REGISTER_STOPPED")
 
 
 def _odo_tap_line(tap):

@@ -23,6 +23,10 @@ config/camera.json
 # (users.json 단독 패턴은 .bak-* 변형을 안 잡아서 실제로 새 나갈 뻔한 적 있음)
 config/users.json*
 
+# 카메라 관리자 계정 (WiseAI IVA push용, admin_console/cctv.py가 env로 읽음)
+# - 평문 비번이 그대로 들어있어 절대 커밋 금지
+admin_console/cam_creds.sh
+
 # 파이썬
 __pycache__/
 calib_frames/

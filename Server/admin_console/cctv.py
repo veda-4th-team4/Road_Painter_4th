@@ -17,8 +17,11 @@ import os
 import socket
 import ssl
 import struct
+import sys      # forward_event() 진단 출력
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 
 from rp_core import (
@@ -51,8 +54,65 @@ HG_REFERENCE_PATH = f"{SNAPSHOT_DIR}/homography_reference.jpg"
 HG_META_PATH = f"{SNAPSHOT_DIR}/homography_reference.json"
 HG_EXPERIMENT_DIR = f"{SNAPSHOT_DIR}/homography_experiments"
 
+# --- WiseAI IVA area push (2026-08-18) --------------------------------------
+# Env, not a config file or a source constant: the camera's admin password has
+# no business sitting in this repo (see build_install.sh/calib_backup.sh,
+# which read the same two names from the operator's shell rather than a
+# checked-in file). Read once at import so a typo shows up immediately in
+# push_iva_area()'s "not set" branch rather than failing silently mid-session.
+# ── 이벤트 UDP 중계 (테스트용) ────────────────────────────────────────────
+# ZONE_FORWARD="host:port" 가 있으면 ZONE_EVENT/IVA_EVENT 를 그 주소로 그대로
+# 한 줄씩 흘린다. 형식은 서버가 브라우저에 보내는 것과 같은 JSON.
+#
+# UDP인 이유: 이 전송이 print_msg 안, 즉 카메라 메시지 루프 위에서 일어난다.
+# TCP였다면 상대가 꺼져 있을 때 connect 타임아웃만큼 루프가 멈추고 그 뒤의
+# 카메라 메시지가 전부 밀린다 -- 테스트용 수신기 하나 때문에 본 기능이 서는 건
+# 말이 안 된다. UDP는 받는 쪽이 없으면 그냥 버려지고, 테스트 탭으로는 그게
+# 올바른 실패 방식이다.
+_FWD_ADDR = None
+_fwd_sock = None
+_fwd_fail_logged = False
+_fwd = os.environ.get("ZONE_FORWARD", "").strip()
+if _fwd:
+    try:
+        _h, _p = _fwd.rsplit(":", 1)
+        _FWD_ADDR = (_h, int(_p))
+        _fwd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except (ValueError, OSError) as _e:
+        print(f"[iva] ZONE_FORWARD={_fwd!r} 해석 실패: {_e}", file=sys.stderr)
+        _FWD_ADDR = None
+
+
+def forward_event(line):
+    """Best-effort UDP tap. Never raises -- a test tap must not be able to
+    break the message loop it is spliced into."""
+    global _fwd_fail_logged
+    if not (_fwd_sock and _FWD_ADDR):
+        return
+    try:
+        _fwd_sock.sendto(line.encode("utf-8"), _FWD_ADDR)
+    except OSError as e:
+        if not _fwd_fail_logged:      # 한 번만 -- 매 이벤트마다 찍으면 로그가 잠긴다
+            _fwd_fail_logged = True
+            print(f"[iva] forward 실패 ({_FWD_ADDR}): {e}", file=sys.stderr)
+
+
+CAMERA_USER = os.environ.get("CAMERA_USER", "")
+CAMERA_PASS = os.environ.get("CAMERA_PASS", "")
+# The AppID WiseAI.html's Servers block documents as the default -- override
+# only if this camera's WiseAI instance was installed under a different name.
+WISEAI_APP_ID = os.environ.get("WISEAI_APP_ID", "WiseAI")
+# 카메라 자체 서명 인증서라 이 프로젝트 전체의 curl -k 관례와 동일하게 검증을 끈다.
+_INSECURE_SSL_CTX = ssl.create_default_context()
+_INSECURE_SSL_CTX.check_hostname = False
+_INSECURE_SSL_CTX.verify_mode = ssl.CERT_NONE
+
 current_conn = None
 conn_lock = threading.Lock()
+# 연결된 카메라의 LAN IP. handle_client()의 TCP peer 주소에서 캡처한다 --
+# push_iva_area()가 PUT할 곳을 알아야 하는데, 이 하네스는 그 외엔 카메라로
+# 먼저 접속을 거는 일이 없다(늘 카메라가 이쪽 7100으로 붙는다).
+current_cam_ip = None
 
 # One local timestamp per camera-side calibration session, keyed by the id the
 # camera stamps into every CALIB_K_VIEW (its epoch_ms at CALIB_K_START).
@@ -220,6 +280,70 @@ def send_command(cmd):
         broadcast(f"[>] sent: {cmd}")
     except OSError as e:
         broadcast(f"[!] send failed: {e}")
+
+
+def push_iva_area(cam_ip, channel, points_px, enable=True, name="ArucoPose_calib"):
+    """PUT a pixel polygon to WiseAI's own IVA area API on this camera.
+
+    Not called automatically when an IVA_SYNC reply arrives (print_msg below)
+    -- the operator reviews the computed hull in the browser and pushes it
+    explicitly (POST /iva_push), the same "compute, then a separate confirmed
+    step to commit" shape as HG_SAVE/MARKER_PLANE_SAVE. Auto-pushing on
+    receipt would mean a stale or wrong hull (bad anchors, a fit run before
+    the last marker move) reaches the camera's live detection area with
+    nobody having looked at it.
+
+    Digest, not Basic: WiseAI.html documents digestAuth (RFC 7616) as the
+    only scheme /opensdk/{AppID}/... accepts. urllib's own
+    HTTPDigestAuthHandler does the challenge/response handshake -- no
+    external dependency, matching this project's stdlib-only convention.
+
+    Returns (ok, detail) -- detail is the response body on success, an error
+    message on failure. Never raises: the only caller is a request handler,
+    and an uncaught exception there is a 500 with no explanation on the
+    browser end.
+    """
+    if not CAMERA_USER or not CAMERA_PASS:
+        return False, "CAMERA_USER/CAMERA_PASS not set in this server's environment"
+    if not cam_ip:
+        return False, "no camera connected (current_cam_ip is empty)"
+    if len(points_px) < 3:
+        return False, f"need at least 3 points for a polygon, got {len(points_px)}"
+
+    url = f"https://{cam_ip}/opensdk/{WISEAI_APP_ID}/configuration/ivaarea"
+    body = json.dumps({
+        "channel": channel,
+        "enable": enable,
+        "definedArea": [{
+            "index": 1,
+            "name": name,
+            "areaCoordinates": [
+                {"x": int(round(x)), "y": int(round(y))} for x, y in points_px[:8]
+            ],
+            "detectionModes": ["Entering", "Exiting"],
+            "appearanceDuration": 10,
+            "intrusionDuration": 2,
+            "loiteringDuration": 10,
+            "objectTypeFilter": ["Person"],
+            "ruleOverlay": True,
+        }],
+    }).encode("utf-8")
+
+    pwd_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    pwd_mgr.add_password(None, url, CAMERA_USER, CAMERA_PASS)
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPDigestAuthHandler(pwd_mgr),
+        urllib.request.HTTPSHandler(context=_INSECURE_SSL_CTX),
+    )
+    req = urllib.request.Request(url, data=body, method="PUT",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with opener.open(req, timeout=10) as resp:
+            return True, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')}"
+    except OSError as e:
+        return False, str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -923,6 +1047,66 @@ def print_msg(msg, last_seq):
         # and re-parsing prose on the client is how those get silently dropped.
         broadcast("[calib] MARKER_PLANE " + json.dumps(msg, ensure_ascii=False))
         return last_seq
+    if mtype == "IVA_SYNC":
+        # IVA_SYNC <ch>의 응답: 등록된 앵커의 raw 픽셀 convex hull. MARKER_PLANE과
+        # 같은 이유로 그대로 JSON을 넘긴다 -- 브라우저가 ch/points/ok/reason을
+        # 그대로 써야 하고(hull 미리보기 + /iva_push에 되먹임), 문장으로 포맷해
+        # 다시 파싱시키면 그 값들이 조용히 빠지기 쉽다.
+        broadcast("[calib] IVA_SYNC " + json.dumps(msg, ensure_ascii=False))
+        return last_seq
+    if mtype == "IVA_EVENT":
+        # 사람/차량이 WiseAI IVA 영역 규칙을 넘었다는 알림 (카메라 쪽 파서 +
+        # 와이어 형식은 2026-08-19 실측으로 확인 -- 카메라 앱의
+        # ParseWiseAiIvaAreaEvents() 참고). IVA_SYNC와 같은 이유로 그대로
+        # JSON을 넘긴다 -- 브라우저가 ch/rule/object_id/action/state를
+        # 각각 열로 로그해야 하고, 문장으로 포맷해 다시 파싱시키면 그 값들이
+        # 조용히 빠지기 쉽다.
+        #
+        # 아직 소리/릴레이 알람은 안 붙어있다 -- 그 방식(스피커 vs 릴레이)이
+        # 아직 안 정해져서, 지금은 파이프라인이 눈에 보이는 것까지만 한다.
+        # 도착 시각을 파이 시계로 찍어 같이 넘긴다 -- 카메라의 t_ms와 빼면
+        # 링크(재시도 큐 포함)가 실제로 얼마나 밀렸는지가 나온다. 브라우저에서
+        # 재면 뷰어 PC 시계가 섞여 들어가 측정이 안 된다.
+        msg["rx_ms"] = int(now_ms)
+        forward_event(json.dumps(msg, ensure_ascii=False))
+        broadcast("[iva] EVENT " + json.dumps(msg, ensure_ascii=False))
+        return last_seq
+    if mtype == "ZONE_EVENT":
+        # IVA_EVENT와 같은 사건에 대한 카메라 앱 자신의 판정이다. 둘 다 흘리는 게
+        # 중복이 아닌 이유: WiseAI는 bbox '중심'으로 안/밖을 가르는데 중심은 바닥
+        # 평면 위에 있지 않고, IVA 영역은 바닥 앵커로 만든 것이다. 2026-08-19 실측
+        # 9건 -- Exit 4건이 전부 사람 발은 아직 영역 안일 때 발생했고, 중심과 발끝의
+        # 픽셀 차는 원근에 따라 162~402px로 변해 상수 보정이 불가능했다. 그래서
+        # 카메라가 발끝(bbox 아래변 중점 -- 유일하게 바닥 평면 위에 있는 점)으로
+        # 다시 판정한 결과를 별도 타입으로 보낸다.
+        #
+        # IVA_EVENT를 지우지 않고 나란히 두는 건 교차 검증용이다 -- 둘이 갈리는
+        # 지점이 곧 위 오차이고, 화면에서 바로 보이는 편이 낫다.
+        msg["rx_ms"] = int(now_ms)  # PY1과 같은 이유 -- 위 주석 참고
+        forward_event(json.dumps(msg, ensure_ascii=False))
+        broadcast("[iva] ZONE " + json.dumps(msg, ensure_ascii=False))
+        return last_seq
+    if mtype == "IVA_ZONE_SET":
+        # 폴리곤을 직접 주입해 존을 무장한 결과. IVA_SYNC 응답과 같은 모양이고
+        # 브라우저도 같은 캐시에 넣어 오버레이에 그린다 -- 존이 어디서 왔든
+        # (앵커 hull이든 손으로 넣은 값이든) 화면에 보이는 건 같아야 한다.
+        broadcast("[calib] IVA_ZONE_SET " + json.dumps(msg, ensure_ascii=False))
+        return last_seq
+    if mtype in ("ZONE_BAND", "ZONE_BANDS"):
+        # ZONE_BAND = 밴드 하나의 외곽선(이미 raw 픽셀로 투영된 점 목록),
+        # ZONE_BANDS = on/off 와 거리 설정. 둘 다 그리기용이라 그대로 넘긴다.
+        broadcast("[calib] " + mtype + " " + json.dumps(msg, ensure_ascii=False))
+        return last_seq
+    if mtype == "DET_STREAM":
+        broadcast("[calib] DET_STREAM " + json.dumps(msg, ensure_ascii=False))
+        return last_seq
+    if mtype == "WISEAI_DET":
+        # 사람 검출 위치 실시간 피드 (DET_STREAM 이 켜져 있을 때만 온다).
+        # 초당 수십 건이라 '[det]' 접두어를 따로 둔다 -- 브라우저의 텍스트 로그
+        # 창은 이 접두어를 걸러내고 오버레이만 소비한다. 걸러내지 않으면 이
+        # 스트림이 로그를 잠가서 다른 메시지가 안 보인다.
+        broadcast("[det] " + json.dumps(msg, ensure_ascii=False))
+        return last_seq
     if mtype == "DYNROI":
         # ReportDynRoi()가 채널마다 한 번씩(4번) 이 타입을 보낸다 — on/margin/
         # max_miss는 이제 렌즈별로 다를 수 있어(DYNROI_CH, 2026-08-11) ch를
@@ -1086,7 +1270,7 @@ def print_msg(msg, last_seq):
 
 
 def handle_client(conn, addr):
-    global current_conn, _clock_warned, _clock_offset_note
+    global current_conn, current_cam_ip, _clock_warned, _clock_offset_note
     broadcast(f"[+] camera connected: {addr}")
     _reset_clock_offset()
     _clock_offset_note = False
@@ -1096,6 +1280,7 @@ def handle_client(conn, addr):
     _clock_warned = False
     with conn_lock:
         current_conn = conn
+        current_cam_ip = addr[0]
     conn.settimeout(WATCHDOG_S)
     buf = b""
     last_seq = None
@@ -1143,6 +1328,7 @@ def handle_client(conn, addr):
     finally:
         with conn_lock:
             current_conn = None
+            current_cam_ip = None
         conn.close()
 
 
@@ -2111,6 +2297,7 @@ PAGE = """<!doctype html>
          data-hg-section 을 전부 건드리지 않으려고). -->
     <button type="button" class="hg-subtab active" id="hgSubCompute" onclick="showHgSection('compute')">floor</button>
     <button type="button" class="hg-subtab" id="hgSubOdom" onclick="showHgSection('odom')">Odometry</button>
+    <button type="button" class="hg-subtab" id="hgSubRegister" onclick="showHgSection('register')">정합</button>
     <!-- "고급" 탭은 2026-08-12 요청으로 뺐다. 패널(data-hg-section="advanced")은
          지우지 않고 그대로 뒀다 — 버튼이 없으면 showHgSection 이 어떤 섹션으로도
          선택하지 않아 계속 숨겨진다. 되살리려면 이 자리에 버튼 한 줄만 다시 넣으면 된다. -->
@@ -2269,6 +2456,57 @@ PAGE = """<!doctype html>
     </div>
   </details>
 
+  <details class="group wide fold panel" id="foldIvaSync" data-hg-section="compute">
+    <summary>5. WiseAI IVA 영역 반영</summary>
+    <div class="foldbody">
+      <p class="sub">등록된 앵커들의 raw 픽셀 convex hull을 이 채널의 WiseAI IVA 영역으로 밀어넣습니다.
+        앵커 hull이 곧 "호모그래피가 실제로 캘리브레이션된 영역"이라, 그 바깥의 검출은 애초에
+        정확한 월드 좌표가 없습니다.</p>
+      <div class="row">
+        <button type="button" onclick="sendCh('IVA_SYNC')">다각형 계산<span class="cmd">IVA_SYNC</span></button>
+      </div>
+      <div id="ivaSyncStatus" class="qbox"><span class="none">다각형 계산을 누르세요</span></div>
+      <div class="row" style="margin-top:8px">
+        <button type="button" id="zoneBandsBtn" onclick="toggleZoneBands()">완충 밴드 켜기<span class="cmd">ZONE_BANDS</span></button>
+        <label class="kparam">접근금지
+          <input id="zoneDangerMm" type="number" min="0" max="20000" step="50" value="300" style="width:6em">mm
+        </label>
+        <label class="kparam">주의
+          <input id="zoneWarnMm" type="number" min="0" max="20000" step="50" value="500" style="width:6em">mm
+        </label>
+        <button type="button" onclick="sendZoneMargin()">적용<span class="cmd">ZONE_MARGIN</span></button>
+      </div>
+      <div class="hint">
+        존 경계 바깥으로 <b style="color:#ef4444">접근금지</b>(빨강) ·
+        <b style="color:#eab308">주의</b>(노랑) 띠를 바닥 평면에 그립니다. 거리는 화면
+        픽셀이 아니라 <b>실제 mm</b>라, 사람이 카메라에서 멀든 가깝든 같은 뜻입니다
+        (화면에서는 가까운 쪽이 넓게 보이는 게 정상 — 그게 올바른 원근입니다).
+        <b>이 채널에 호모그래피가 있어야 동작합니다</b> — 없으면 밴드는 안 그려지고
+        발끝 판정도 예전 픽셀 방식으로 떨어집니다.
+      </div>
+      <div class="row go">
+        <button type="button" id="ivaPushBtn" onclick="pushIvaArea()" disabled>WiseAI에 반영<span class="cmd">PUT /configuration/ivaarea</span></button>
+        <span class="desc">카메라 관리자 계정 Digest 인증으로 이 서버가 직접 PUT합니다
+          (이 서버 프로세스의 환경변수 CAMERA_USER/CAMERA_PASS 필요). 계산 결과를 검토한 뒤에만 누르세요.</span>
+      </div>
+      <div id="ivaPushStatus" class="qbox"><span class="none">아직 반영하지 않음</span></div>
+    </div>
+  </details>
+
+  <details class="group wide fold panel" id="foldIvaEvent" data-hg-section="compute">
+    <summary>6. IVA 이벤트 로그</summary>
+    <div class="foldbody">
+      <p class="sub">카메라가 WiseAI IVA 영역 진입/이탈을 감지하면 여기 실시간으로 쌓입니다.
+        와이어 형식은 2026-08-19 실측으로 확인됨 — 카메라 쪽
+        <code>ParseWiseAiIvaAreaEvents()</code>가 파싱해 <code>pose_sender_send_control_line()</code>로
+        (재시도 큐 있는 채널) 보내는 것을 그대로 받는다.</p>
+      <div class="hint"><b>아직 소리/릴레이 알람은 안 붙어있다</b> — 그 방식(스피커 vs 릴레이)이
+        아직 안 정해져서, 지금은 파이프라인이 눈에 보이는 것까지만 한다. 여기 로그에 뜨는 걸
+        확인한 뒤에 다음 단계로.</div>
+      <div id="ivaEventLog" class="qbox"><span class="none">아직 이벤트 없음</span></div>
+    </div>
+  </details>
+
   <div class="group wide" data-hg-section="odom">
     <h2>Odometry — 로봇 주행 호모그래피</h2>
     <p class="sub">로봇이 알려진 크기의 사각형을 돌며 정지점마다 CCTV가 마커 픽셀을 캡처하고,
@@ -2372,6 +2610,50 @@ PAGE = """<!doctype html>
         (측정 <code>H_marker</code> 없음 / K·dist 없음 / 프레임 크기 미수신 / 링크 끊김).</div>
     </div>
   </details>
+
+  <div class="group wide" data-hg-section="register">
+    <h2>정합(Registration) — 채널 간 좌표계 통일</h2>
+    <p class="sub">두 채널을 각각 오도메트리로 캘리한 뒤, 겹치는 FOV 구역에서
+       로봇을 <b>조이스틱으로 직접 몰면서</b> 두 채널이 동시에 잡은 위치를 짝지어
+       ch_b의 좌표를 ch_a 기준 좌표계로 옮기는 닮음변환을 구합니다.</p>
+    <div class="hint">
+      🔴 <b>자동 경로가 없습니다</b> — 두 렌즈의 FOV가 어디서 겹치는지 아직 실측되지
+      않아, 오도메트리처럼 서버가 사각형 경로를 짤 근거가 없습니다. [시작]을 누른 뒤
+      <b>로봇 탭(조이스틱)으로 로봇을 겹침 구역에 직접 몰 것</b> — 그동안 서버가
+      <code>REGISTER_CAPTURE</code>를 주기적으로 반복 전송하고, 로봇이 실제로 두
+      채널 시야 안에 있을 때만 카메라가 성공으로 답합니다.<br>
+      wire 규격: <code>~/Road_Painter_4th/Server/docs/REGISTER_WIRE_20260815.md</code>
+    </div>
+    <div class="hint">
+      ⚠️ 정합은 두 채널 모두 <b>오도메트리를 먼저 완주</b>하고, <b>Odometry 탭에서
+      양쪽 다 [측정 (주행)]<span class="cmd">ODOM_PREFER 1</span>을 켜둔 상태</b>여야
+      의미가 있습니다. 꺼져 있으면 카메라가 거부하거나(체커보드 H도 없는 채널),
+      더 위험하게는 <b>체커보드 좌표 기준으로 조용히 정합이 계산</b>됩니다 —
+      정합이 풀려는 문제(오도메트리 원점이 채널마다 다르다)와 무관한 값입니다.
+    </div>
+    <div class="row">
+      <label class="kparam">기준 채널 ch_a<select id="registerChA"></select></label>
+      <label class="kparam">대상 채널 ch_b<select id="registerChB"></select></label>
+    </div>
+    <div class="row go" style="margin-top:8px">
+      <button type="button" onclick="registerStartCollect()">수집 시작<span class="cmd">REGISTER_COLLECT_START</span></button>
+      <button type="button" onclick="registerStopCollect()">완료<span class="cmd">REGISTER_COLLECT_STOP</span></button>
+      <button type="button" onclick="registerCancelCollect()">취소<span class="cmd">REGISTER_COLLECT_CANCEL</span></button>
+    </div>
+    <div id="registerSendNote" class="hint" style="margin-top:4px"></div>
+    <div class="qbox" style="margin-top:10px">
+      <div class="qtitle">진행도</div>
+      <div id="registerSession" class="hint" style="margin:0 0 6px">세션 없음.</div>
+      <div id="registerSummary" class="hint"></div>
+      <div class="hint">
+        <b>스스로 갱신됩니다</b> — Odometry 탭과 같은 방식으로 서버의 TAP을 통해
+        <code>REGISTER_CAPTURE_OK/FAIL</code>이 그대로 들어옵니다.<br>
+        <code>not_both_seen</code>은 로봇이 아직 겹침 구역 밖이라는 뜻으로, 이
+        방식에서는 정상적으로 계속 나는 실패입니다 — 겹침 구역에 들어가면 자연히
+        성공이 섞이기 시작합니다.
+      </div>
+    </div>
+  </div>
 
   <div class="group wide" data-hg-section="advanced">
     <h2>고급 분석 — 검출 기록, PC 결과 적용, H 행렬</h2>
@@ -3037,6 +3319,9 @@ function emptyChOverlay() {
   return { rawFrame: {}, rawBuilding: {}, rawSeq: null,
            dynRoiMargin: 240, dynRoiTracking: false, dynRoiTrackSize: null,
            procs: [], dets: [], hits: [], arrivals: [],
+           wdets: {},   // WISEAI_DET: object_id -> {foot_u,foot_v,foot_r,inside,ts}
+           bands: {},   // ZONE_BAND: kind -> {mm, points[]} (raw 픽셀, 그리기 전용)
+
            lastNet: null, lastSeqSeen: null, seqGaps: 0 };
 }
 let chOverlay = {0: emptyChOverlay(), 1: emptyChOverlay(), 2: emptyChOverlay(), 3: emptyChOverlay()};
@@ -3048,7 +3333,7 @@ function curOverlay() { return chOverlay[curCh()]; }
 // 코드가 파일 곳곳에 많아서, 여기서는 "지금 선택된 채널의 값을 그 전역에
 // 넣어두는" 방식을 쓴다(dynRoiTracking을 curOverlay()로 옮긴 것과 달리).
 // syncCalibFromChannel()이 채널 전환 때마다 그 동기화를 한다.
-function emptyChHg() { return { Hfloor: null, mpPlane: null, anchors: null, fit: null, fitPts: {}, undistorted: null }; }
+function emptyChHg() { return { Hfloor: null, mpPlane: null, anchors: null, fit: null, fitPts: {}, undistorted: null, ivaSync: null }; }
 // 번들 coord_mode 의 근거. 1순위는 카메라가 보고한 "이 H 가 피팅된 공간"이고,
 // 2순위가 이 브라우저 세션의 HG_COORD_MODE 이력이다. 순서가 중요하다 — 후자는
 // 새로고침하면 사라지는데, 그때 coord_mode 가 "unknown" 이 되어 번들이 반려됐다.
@@ -3570,7 +3855,7 @@ function showHgSection(section) {
   });
   // 'advanced' 는 버튼이 없어져서(2026-08-12) 여기에도 없다 — 그 패널은 어떤 섹션으로도
   // 선택되지 않아 계속 숨겨진 상태로 남는다.
-  const map = {compute: 'hgSubCompute', odom: 'hgSubOdom'};
+  const map = {compute: 'hgSubCompute', odom: 'hgSubOdom', register: 'hgSubRegister'};
   for (const name in map) {
     const b = document.getElementById(map[name]);
     if (b) b.classList.toggle('active', name === section);
@@ -3584,6 +3869,8 @@ function showHgSection(section) {
     // 한다 — 조회를 눌러야만 알 수 있으면 안 누른 사람은 계속 모른다.
     if (typeof sendCh === 'function') sendCh('ODOM_PREFER_QUERY');
   }
+  if (section === 'register' && typeof registerPopulateChannelSelects === 'function')
+    registerPopulateChannelSelects();
 }
 showHgSection('compute');
 
@@ -4269,6 +4556,123 @@ function odoResendBundle() {
   if (el) el.textContent = 'ODOM_RESEND 전송됨 — 카메라 응답 대기…';
   sendCh('ODOM_RESEND');
 }
+
+// ===== 채널 간 정합 (Registration, 2026-08-15 신설) =====
+//
+// odoProg/handleOdo와 같은 패턴이다 — 서버가 REGISTER_* 관련 TAP도 같은
+// '[odo] {json}' 접두어로 흘려주므로(rp_core.py _ODO_TAP_TYPES에 REGISTER_*
+// 추가) 별도 프로토콜 없이 handleOdo와 나란히 handleRegister를 둔다.
+let regProg = {chA: null, chB: null, rid: null, okN: 0, failN: 0, state: ''};
+
+function registerPopulateChannelSelects() {
+  // #calibCh(공용 채널 셀렉트, RP_CAM_CHANNELS만큼 1-based 옵션)를 그대로
+  // 복제한다 — 채널 개수 판정 로직을 여기서 새로 만들지 않기 위해서다.
+  const src = document.getElementById('calibCh');
+  if (!src || !src.innerHTML) return;
+  ['registerChA', 'registerChB'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el && el.innerHTML !== src.innerHTML) el.innerHTML = src.innerHTML;
+  });
+}
+
+function registerSendNote(msg, bad) {
+  const el = document.getElementById('registerSendNote');
+  if (el) el.innerHTML = '<span class="' + (bad ? 'odo-st-fail' : 'odo-st-ok') + '">' + msg + '</span>';
+}
+
+function registerRenderProgress() {
+  const el = document.getElementById('registerSession');
+  if (el) {
+    if (!regProg.rid && !regProg.state) {
+      el.textContent = '세션 없음.';
+    } else {
+      const total = regProg.okN + regProg.failN;
+      el.innerHTML = '세션 <b>' + (regProg.state || '-') + '</b>' +
+        (regProg.chA != null ? ' · ch_a=CH' + regProg.chA : '') +
+        (regProg.chB != null ? ' · ch_b=CH' + regProg.chB : '') +
+        (regProg.rid ? ' · <code>' + regProg.rid + '</code>' : '') +
+        ' · 유효 ' + regProg.okN + '/' + total;
+    }
+  }
+  const sum = document.getElementById('registerSummary');
+  if (sum) sum.textContent = '';  // 결과(reg_scale 등)는 H_MATRIX 전문 로그에서 확인
+}
+
+async function registerStartCollect() {
+  const chA = Number(document.getElementById('registerChA').value || 0);
+  const chB = Number(document.getElementById('registerChB').value || 0);
+  if (!chA || !chB || chA === chB) {
+    registerSendNote('ch_a/ch_b를 확인하세요 (서로 달라야 함)', true);
+    return;
+  }
+  if (!confirm('CH' + chA + ' 기준으로 CH' + chB + ' 정합 수집을 시작합니다.\\n\\n' +
+               '자동 경로가 없습니다 — 시작 후 조이스틱으로 로봇을 겹침 구역에\\n' +
+               '직접 몰아야 합니다. 계속할까요?')) return;
+  try {
+    const r = await fetch('/register/start', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ch_a: chA, ch_b: chB})});
+    const j = await r.json();
+    if (!j.ok) { registerSendNote('전송 실패 — ' + (j.reason || r.status), true); return; }
+    regProg = {chA: chA, chB: chB, rid: null, okN: 0, failN: 0, state: '수집 중 (로봇을 겹침 구역으로 몰 것)'};
+    registerSendNote('REGISTER_COLLECT_START 전송됨');
+    registerRenderProgress();
+  } catch (e) {
+    registerSendNote('전송 실패 — ' + e, true);
+  }
+}
+async function registerStopCollect() {
+  if (!confirm('정합 수집을 마칩니다 (REGISTER_DONE) — 지금까지 모은 점으로 피팅합니다.')) return;
+  try {
+    const r = await fetch('/register/stop', {method: 'POST'});
+    const j = await r.json();
+    registerSendNote(j.ok ? 'REGISTER_COLLECT_STOP 전송됨' : '전송 실패 — ' + (j.reason || r.status), !j.ok);
+  } catch (e) {
+    registerSendNote('전송 실패 — ' + e, true);
+  }
+}
+async function registerCancelCollect() {
+  if (!confirm('정합 수집을 취소합니다 — 지금까지 모은 점을 버립니다.')) return;
+  try {
+    const r = await fetch('/register/cancel', {method: 'POST'});
+    const j = await r.json();
+    registerSendNote(j.ok ? 'REGISTER_COLLECT_CANCEL 전송됨' : '전송 실패 — ' + (j.reason || r.status), !j.ok);
+  } catch (e) {
+    registerSendNote('전송 실패 — ' + e, true);
+  }
+}
+
+function handleRegister(line) {
+  if (line.indexOf('[odo] ') === -1) return;
+  let ev;
+  try { ev = JSON.parse(line.slice(line.indexOf('[odo] ') + 6)); } catch (e) { return; }
+  const p = ev.payload || {};
+  if (ev.type === 'REGISTER_CAPTURE') {
+    if (p.request_id && !regProg.rid) regProg.rid = p.request_id;
+    regProg.state = '캡처 중 (idx ' + p.point_index + ')';
+  } else if (ev.type === 'REGISTER_CAPTURE_OK') {
+    ++regProg.okN;
+    regProg.state = '수집 중';
+  } else if (ev.type === 'REGISTER_CAPTURE_FAIL') {
+    ++regProg.failN;
+    // not_both_seen은 이 방식에서 정상적으로 계속 나는 실패라 상태 문구를
+    // 실패로 바꾸지 않는다 — Odometry의 지점 실패와 달리 세션이 안 접힌다.
+    regProg.state = (p.reason === 'not_both_seen') ? '수집 중 (아직 겹침 구역 밖)'
+                                                    : '수집 중 (실패: ' + p.reason + ')';
+  } else if (ev.type === 'REGISTER_FAIL') {
+    regProg.state = '실패 (' + (p.reason || '') + ')';
+  } else if (ev.type === 'REGISTER_STOPPED') {
+    regProg.state = '취소됨';
+  } else if (ev.type === 'H_MATRIX' && ('reg_scale' in (p.calib || {}))) {
+    // 정합 성공 종료 — SendCalibBundle()이 실은 reg_* 필드로 판별한다.
+    const c = p.calib;
+    regProg.state = '완료 — scale=' + Number(c.reg_scale).toFixed(4) +
+      ' rmse=' + c.reg_rmse_mm + 'mm n=' + c.reg_n;
+  } else {
+    return;  // 관계없는 [odo] 이벤트 (Odometry용) — 무시
+  }
+  registerRenderProgress();
+}
 function odoRenderResend(p) {
   const el = document.getElementById('hgSendOdomNote');
   if (!el) return;
@@ -4604,6 +5008,12 @@ function syncCalibFromChannel() {
   sendCh('HG_QUERY');
   sendCh('MARKER_PLANE_QUERY');
   sendCh('ANCHOR_QUERY');
+  // IVA_SYNC엔 조회(QUERY) 명령이 없다 -- 카메라 상태가 아니라 "그때 계산한
+  // 결과"라, 채널을 되돌아와도 다시 계산하기 전엔 캐시를 그대로 보여준다.
+  // 반영(push) 결과는 채널이 다를 수 있으니 항상 초기 문구로 되돌린다.
+  renderIvaSync(st.ivaSync);
+  const ivaPushBox = document.getElementById('ivaPushStatus');
+  if (ivaPushBox) ivaPushBox.innerHTML = '<span class="none">아직 반영하지 않음</span>';
 
   kCalib = chKCalib[curCh()] || null;
   renderKQuery(!!kCalib, kCalib?.fx, kCalib?.fy, kCalib?.cx, kCalib?.cy, kCalib?.dist);
@@ -4755,6 +5165,219 @@ function normH(flat) {
   const s = Number(flat[8]);
   if (!Number.isFinite(s) || Math.abs(s) < 1e-18) return flat.slice(0, 9);
   return flat.slice(0, 9).map(v => v / s);
+}
+
+// IVA_SYNC 결과(앵커 hull, raw 픽셀) 렌더. 값은 chHg[ch].ivaSync에 캐시되고
+// (handleIvaSync가 채움, syncCalibFromChannel이 채널 전환 때 다시 그려줌),
+// pushIvaArea()가 화면에 보이는 것과 정확히 같은 객체를 /iva_push로 되먹인다
+// -- 서버가 계산을 다시 하지 않으므로 "화면에 보인 것 = 반영되는 것"이 항상
+// 성립해야 한다.
+function renderIvaSync(d) {
+  const box = document.getElementById('ivaSyncStatus');
+  const pushBtn = document.getElementById('ivaPushBtn');
+  if (!box) return;
+  if (!d) {
+    box.innerHTML = '<span class="none">다각형 계산을 누르세요</span>';
+    if (pushBtn) pushBtn.disabled = true;
+    return;
+  }
+  if (!d.ok) {
+    box.innerHTML = '<span class="qtitle" style="color:var(--red)">계산 실패</span> ' +
+                    (d.reason || '알 수 없는 원인');
+    if (pushBtn) pushBtn.disabled = true;
+    return;
+  }
+  if (pushBtn) pushBtn.disabled = false;
+  const pts = (d.points || []).map(p => `(${p.x.toFixed(0)},${p.y.toFixed(0)})`).join(' ');
+  box.innerHTML = `<span class="qtitle" style="color:var(--green)">계산 완료</span> ` +
+                  `ch${d.ch} ${d.points.length}점<br><span class="desc">${pts}</span>`;
+}
+
+function handleIvaSync(line) {
+  const m = line.match(/^\\[calib\\] IVA_SYNC (\\{.*\\})$/);
+  if (!m) return;
+  let d;
+  try { d = JSON.parse(m[1]); } catch (_) { return; }
+  if (d.ch === undefined) return;
+  chHg[d.ch] = chHg[d.ch] || emptyChHg();
+  chHg[d.ch].ivaSync = d;
+  if (d.ch !== curCh()) return;   // 지금 보이는 채널이 아니면 화면은 그대로 둔다
+  renderIvaSync(d);
+}
+
+function pushIvaArea() {
+  const ch = curCh();
+  const d = chHg[ch] && chHg[ch].ivaSync;
+  if (!d || !d.ok) { alert('먼저 [다각형 계산]을 눌러 hull을 받아오세요.'); return; }
+  if (!confirm(`ch${ch}의 WiseAI IVA 영역을 지금 계산된 ${d.points.length}점 ` +
+              '다각형으로 덮어씁니다. 계속할까요?'))
+    return;
+  const box = document.getElementById('ivaPushStatus');
+  if (box) box.innerHTML = '<span class="none">반영 중...</span>';
+  fetch('/iva_push', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ch: ch, points: d.points, enable: true}),
+  })
+    .then(r => r.json())
+    .then(res => {
+      if (!box) return;
+      box.innerHTML = res.ok
+        ? `<span class="qtitle" style="color:var(--green)">반영 완료</span> ${res.detail || ''}`
+        : `<span class="qtitle" style="color:var(--red)">반영 실패</span> ${res.detail || ''}`;
+    })
+    .catch(e => { if (box) box.innerHTML = `<span class="qtitle" style="color:var(--red)">요청 실패</span> ${e}`; });
+}
+
+// 최근 IVA_EVENT 기록 (링버퍼). 새로고침하면 사라진다 -- 카메라 쪽에 이력이
+// 없으니(이벤트가 오는 순간만 안다) 여기서도 영구 보관할 근거가 없다. 채널별로
+// 나누지 않는다 -- IVA_SYNC의 chHg[ch]와 달리 이 로그는 여러 채널이 섞여도
+// 문제없고(ch는 그냥 테이블의 한 열), 오히려 채널 전환할 때마다 로그가 사라지면
+// 더 불편하다. 알람/소리 액션은 아직 여기 안 붙어있다 -- 릴레이냐 스피커냐부터
+// 미정이라, 지금은 파이프라인이 눈에 보이는 것까지만.
+const ivaEventLog = [];
+const IVA_EVENT_LOG_MAX = 30;
+
+function handleIvaEvent(line) {
+  // 한 테이블에 두 갈래를 모은다 -- WiseAI 자신의 판정([iva] EVENT)과 카메라 앱이
+  // 발끝으로 다시 내린 판정([iva] ZONE). 나란히 놓아야 둘이 갈리는 지점이 보이고,
+  // 그 갈림이 ZONE 쪽이 존재하는 이유다 (서버 쪽 ZONE_EVENT 분기 주석 참고).
+  let d, src;
+  let m = line.match(/^\\[iva\\] EVENT (\\{.*\\})$/);
+  if (m) {
+    src = 'WiseAI';
+  } else {
+    m = line.match(/^\\[iva\\] ZONE (\\{.*\\})$/);
+    if (!m) return;
+    src = '발끝';
+  }
+  try { d = JSON.parse(m[1]); } catch (_) { return; }
+
+  // 시각은 카메라가 실제로 본 순간(t_ms)을 우선한다 -- 도착 시각은 링크가 밀린
+  // 만큼 늦다. t_ms가 없는 이벤트(카메라가 프레임 시각을 안 실어준 경우)만
+  // 도착 시각으로 떨어지고, 그 사실이 보이도록 '~'를 붙인다.
+  const tf = ms => {
+    const dt = new Date(ms);
+    return dt.toLocaleTimeString() + '.' + String(dt.getMilliseconds()).padStart(3, '0');
+  };
+  const shown = (d.t_ms !== undefined) ? tf(d.t_ms)
+              : (d.rx_ms !== undefined) ? '~' + tf(d.rx_ms)
+              : '~' + new Date().toLocaleTimeString();
+  ivaEventLog.unshift({...d, src, t: shown});
+  if (ivaEventLog.length > IVA_EVENT_LOG_MAX) ivaEventLog.length = IVA_EVENT_LOG_MAX;
+
+  const box = document.getElementById('ivaEventLog');
+  if (!box) return;
+  if (ivaEventLog.length === 0) {
+    box.innerHTML = '<span class="none">아직 이벤트 없음</span>';
+    return;
+  }
+  // left/top/right/bottom are present only when the camera's recent-bbox
+  // cache had a hit for this object_id (see RecentWiseAiObjectBbox() on the
+  // camera side) -- absent, not zero, on a miss. '-' rather than blank so a
+  // scanning eye can tell "no match" apart from a column that failed to
+  // render.
+  const dim = 'color:var(--fg-dim,#888)';
+  // 필드가 없는 것과 0인 것은 다르다 -- 없는 쪽은 '-'로 비워둬야 "매칭 실패"와
+  // "화면 왼쪽 위"가 구분된다. 두 이벤트 종류가 서로 다른 필드를 채우므로
+  // (WiseAI는 rule/state, 발끝은 foot_*) 빈칸은 정상이다.
+  const cell = (v, fmt) => (v === undefined)
+    ? `<td style="text-align:center;${dim}">-</td>` : `<td>${fmt ? fmt(v) : v}</td>`;
+  const bboxCell = e => (e.left === undefined)
+    ? `<td colspan="4" style="text-align:center;${dim}">-</td>`
+    : `<td>${e.left.toFixed(0)}</td><td>${e.top.toFixed(0)}</td>` +
+      `<td>${e.right.toFixed(0)}</td><td>${e.bottom.toFixed(0)}</td>`;
+  const footCell = e => (e.foot_u === undefined)
+    ? `<td style="text-align:center;${dim}">-</td>`
+    : `<td>${e.foot_u.toFixed(0)},${e.foot_v.toFixed(0)}</td>`;
+  const worldCell = e => (e.foot_wx === undefined)
+    ? `<td style="text-align:center;${dim}">-</td>`
+    : `<td>${e.foot_wx.toFixed(0)},${e.foot_wy.toFixed(0)}</td>`;
+  // 카메라가 본 시각과 파이가 받은 시각의 차 = 링크 지연. 둘 다 NTP 동기된
+  // 시계라 뺄셈이 성립한다. 음수가 나오면 그 전제가 깨진 것(둘 중 하나가 동기를
+  // 잃음)이므로 숨기지 않고 그대로 보여준다 -- 조용히 0으로 만들면 시계가
+  // 틀어진 걸 영영 모르게 된다.
+  const lagCell = e => (e.t_ms === undefined || e.rx_ms === undefined)
+    ? `<td style="text-align:center;${dim}">-</td>`
+    : `<td${(e.rx_ms - e.t_ms) > 1000 ? ' style="color:var(--red)"' : ''}>` +
+      `${e.rx_ms - e.t_ms}ms</td>`;
+  const rows = ivaEventLog.map(e => {
+    const tone = e.action === 'Enter' ? 'var(--red)' : 'var(--fg-dim, #888)';
+    // 출처를 색으로도 구분 -- 한 테이블에 섞여 있어 열을 읽지 않고도 갈라 보게.
+    const stone = e.src === '발끝' ? 'var(--accent, #4a9)' : 'var(--fg-dim, #888)';
+    return `<tr><td>${e.t}</td><td style="color:${stone}">${e.src || '?'}</td>` +
+           `<td>ch${e.ch}</td>${cell(e.rule)}` +
+           `<td style="color:${tone}">${e.action}</td><td>${e.object_id}</td>` +
+           `${cell(e.state, v => String(v))}${lagCell(e)}${footCell(e)}${worldCell(e)}${bboxCell(e)}</tr>`;
+  }).join('');
+  box.innerHTML = `<table style="width:100%;font-size:0.9em"><thead><tr>` +
+                  `<th>시각</th><th>출처</th><th>ch</th><th>rule</th><th>action</th>` +
+                  `<th>object_id</th><th>state</th><th>지연</th><th>발끝(px)</th><th>발끝(mm)</th>` +
+                  `<th>left</th><th>top</th><th>right</th><th>bottom</th>` +
+                  `</tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// 검출 위치가 이만큼 지나면 오버레이에서 지운다. WiseAI 가 사람을 놓치면
+// WISEAI_DET 도 그냥 끊기므로(“사라졌다”는 메시지는 따로 없다), 마지막으로 본
+// 시각을 기준으로 스스로 흐려져야 화면에 유령이 남지 않는다.
+const WDET_TTL_MS = 1500;
+
+function handleWiseAiDet(line) {
+  if (line.indexOf('[det] ') !== 0) return;
+  let d;
+  try { d = JSON.parse(line.slice(6)); } catch (_) { return; }
+  if (d.type !== 'WISEAI_DET') return;
+  const st = chOverlay[d.ch];
+  if (!st) return;
+  st.wdets[d.object_id] = {
+    foot_u: d.foot_u, foot_v: d.foot_v, foot_r: d.foot_r,
+    inside: d.inside, zone_d: d.zone_d,
+    zone_mm: d.zone_mm, level: d.level,
+    left: d.left, top: d.top, right: d.right, bottom: d.bottom,
+    ts: Date.now(),
+  };
+  if (rawOverlayOn && d.ch === curCh()) redrawRawCanvas();
+}
+
+function handleZoneBand(line) {
+  const p = '[calib] ZONE_BAND ';
+  if (line.indexOf(p) !== 0) return;
+  let d;
+  try { d = JSON.parse(line.slice(p.length)); } catch (_) { return; }
+  const st = chOverlay[d.ch];
+  if (!st) return;
+  st.bands[d.kind] = { mm: d.mm, points: d.points || [] };
+  if (rawOverlayOn && d.ch === curCh()) redrawRawCanvas();
+}
+
+function handleZoneBandsState(line) {
+  const p = '[calib] ZONE_BANDS ';
+  if (line.indexOf(p) !== 0) return;
+  let d;
+  try { d = JSON.parse(line.slice(p.length)); } catch (_) { return; }
+  const btn = document.getElementById('zoneBandsBtn');
+  if (btn) {
+    btn.textContent = d.on ? '완충 밴드 끄기' : '완충 밴드 켜기';
+    btn.classList.toggle('on', !!d.on);
+  }
+  const dEl = document.getElementById('zoneDangerMm');
+  const wEl = document.getElementById('zoneWarnMm');
+  if (dEl && d.danger_mm !== undefined) dEl.value = d.danger_mm;
+  if (wEl && d.warn_mm !== undefined) wEl.value = d.warn_mm;
+  // 껐으면 캐시도 비운다 -- 안 그러면 마지막 밴드가 화면에 남아 살아있는 척한다.
+  if (!d.on) for (const k in chOverlay) chOverlay[k].bands = {};
+  if (rawOverlayOn) redrawRawCanvas();
+}
+
+function handleIvaZoneSet(line) {
+  const p = '[calib] IVA_ZONE_SET ';
+  if (line.indexOf(p) !== 0) return;
+  let d;
+  try { d = JSON.parse(line.slice(p.length)); } catch (_) { return; }
+  if (!chHg[d.ch]) return;
+  // IVA_SYNC 와 같은 칸에 넣는다 -- 오버레이 입장에서 둘은 구분할 이유가 없다.
+  chHg[d.ch].ivaZone = d;
+  if (rawOverlayOn && d.ch === curCh()) redrawRawCanvas();
 }
 
 // 마커 검출 탭의 바닥 투영 오버레이가 쓰는 값. 카메라가 분해해 준 H_marker를
@@ -5466,12 +6089,35 @@ let rawOverlayOn = false;
 const rawCanvas = document.getElementById('rawCanvas');
 const rawCtx = rawCanvas ? rawCanvas.getContext('2d') : null;
 
+let zoneBandsOn = false;
+function toggleZoneBands() {
+  zoneBandsOn = !zoneBandsOn;
+  send('ZONE_BANDS ' + (zoneBandsOn ? '1' : '0'));
+  // 버튼 문구는 카메라 응답(handleZoneBandsState)이 확정한다 -- 여기서 먼저
+  // 바꾸면 명령이 실패했을 때 화면만 켜진 척한다.
+}
+
+function sendZoneMargin() {
+  const d = Number(document.getElementById('zoneDangerMm').value);
+  const w = Number(document.getElementById('zoneWarnMm').value);
+  if (!(d >= 0 && w > d && w <= 20000)) {
+    alert('접근금지 < 주의 여야 하고, 0..20000mm 범위여야 합니다');
+    return;
+  }
+  send('ZONE_MARGIN ' + d + ' ' + w);
+}
+
 function toggleRawOverlay() {
   rawOverlayOn = !rawOverlayOn;
   const b = document.getElementById('rawOverlayBtn');
   b.textContent = rawOverlayOn ? '오버레이 정지' : '오버레이 보기 시작';
   b.classList.toggle('on', rawOverlayOn);
   if (rawOverlayOn && showUndist && !kCalib) sendCh('CALIB_K_QUERY');
+  // 검출 위치 피드는 이 오버레이가 켜져 있을 때만 의미가 있다. 카메라 쪽
+  // 기본값이 꺼짐이라, 켜고 끄는 책임을 화면에 둔다 -- 아무도 안 보는데 초당
+  // 수십 건이 계속 흐르는 걸 막는 가장 단순한 방법이다.
+  send('DET_STREAM ' + (rawOverlayOn ? '1' : '0'));
+  if (!rawOverlayOn) for (const k in chOverlay) chOverlay[k].wdets = {};
   redrawRawCanvas();
 }
 function drawQuad(ctx, c, col, lw) {
@@ -5563,6 +6209,79 @@ function drawRawHud(W, H) {
   rawCtx.textBaseline = 'alphabetic';               // 마커 라벨 기준선 복원
 }
 
+// IVA 존(고정 다각형)과 그 안팎을 오가는 발끝 원판(사람마다 하나)을 그린다.
+// 이 둘은 다른 것이다 -- 존은 바닥에 정해둔 경보 구역이고, 원판은 사람 발이
+// 차지하는 면적이다. 판정은 "원판이 존에 닿았는가"이고, 그래서 둘을 겹쳐
+// 보여야 왜 그런 판정이 나왔는지가 눈으로 읽힌다.
+function fillBand(ctx, pts, col) {
+  if (!pts || pts.length < 3) return;
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.closePath();
+  ctx.fillStyle = col;
+  ctx.fill();
+}
+
+function drawIvaZone(ctx) {
+  // 밴드를 먼저, 넓은 것부터 -- 좁은 밴드가 위에 덮여야 경계가 보인다. 화면에서
+  // 이 띠는 카메라에 가까운 쪽이 넓고 먼 쪽이 좁게 나오는데, 그게 "바닥에서
+  // 일정한 폭"의 올바른 투영이다.
+  const bands = curOverlay().bands;
+  if (bands) {
+    fillBand(ctx, bands.warn && bands.warn.points, 'rgba(234,179,8,0.18)');    // 노랑 = 주의
+    fillBand(ctx, bands.danger && bands.danger.points, 'rgba(239,68,68,0.22)'); // 빨강 = 접근금지
+  }
+  const hg = chHg[curCh()];
+  const z = hg && (hg.ivaZone || hg.ivaSync);
+  const pts = z && z.ok !== false && z.points;
+  if (pts && pts.length >= 3) {
+    ctx.strokeStyle = '#22c55e';            // 초록 = IVA 존
+    ctx.lineWidth = 4;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(34,197,94,0.10)';
+    ctx.fill();
+    ctx.fillStyle = '#22c55e';
+    ctx.fillText('IVA 존', pts[0].x + 8, pts[0].y - 10);
+  }
+
+  const st = curOverlay();
+  const now = Date.now();
+  for (const id in st.wdets) {
+    const w = st.wdets[id];
+    if (now - w.ts > WDET_TTL_MS) { delete st.wdets[id]; continue; }
+    // 안에 있으면 빨강, 밖이면 파랑. 존이 없는 채널이면 inside 가 undefined 라
+    // 회색 -- "밖"과 "판정할 존이 없음"은 다른 상태다.
+    // level: 3 존 내부, 2 접근금지(<=danger), 1 주의(<=warn), 0 정상.
+    // level 이 없으면(호모그래피 없는 채널) 예전 2단계 판정으로 떨어진다.
+    const col = (w.level !== undefined)
+        ? (['#38bdf8', '#eab308', '#ef4444', '#dc2626'][w.level] || '#94a3b8')
+        : (w.inside === undefined) ? '#94a3b8'
+        : (w.inside ? '#ef4444' : '#38bdf8');
+    if (w.left !== undefined) {          // bbox (얇게)
+      ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+      ctx.strokeRect(w.left, w.top, w.right - w.left, w.bottom - w.top);
+      ctx.setLineDash([]);
+    }
+    ctx.strokeStyle = col; ctx.lineWidth = 3;   // 발끝 원판
+    ctx.beginPath(); ctx.arc(w.foot_u, w.foot_v, Math.max(2, w.foot_r), 0, 7); ctx.stroke();
+    ctx.fillStyle = col;                        // 발끝 점
+    ctx.beginPath(); ctx.arc(w.foot_u, w.foot_v, 5, 0, 7); ctx.fill();
+    // 밀리미터가 있으면 그걸 보여준다 -- 픽셀 거리는 화면 위치에 따라 의미가
+    // 달라져서 사람이 읽을 값이 못 된다.
+    const txt = (w.zone_mm !== undefined)
+        ? (w.zone_mm === 0 ? '존 내부' : (w.zone_mm / 1000).toFixed(2) + 'm')
+        : 'r' + w.foot_r.toFixed(0) +
+          (w.zone_d === undefined ? '' : ' · d' + w.zone_d.toFixed(0));
+    ctx.fillText(txt, w.foot_u + 10, w.foot_v + 20);
+  }
+}
+
 function redrawRawCanvas() {
   if (!rawCtx) return;
   // 캔버스 해상도: K가 있으면 (cx*2, cy*2), 없으면 #camRes 선택값(기본
@@ -5608,6 +6327,9 @@ function redrawRawCanvas() {
       rawCtx.fillText('SEARCH — 전체 화면 재탐색 중', 12, 26);
     }
   }
+  // 마커보다 먼저 -- 동적 ROI 박스와 같은 이유로, 코너를 가리지 않게.
+  drawIvaZone(rawCtx);
+
   for (const id in curOverlay().rawFrame) {
     const c = curOverlay().rawFrame[id];
     drawQuad(rawCtx, c, '#f59e0b', 3);              // raw = 주황
@@ -6193,10 +6915,20 @@ es.onmessage = (e) => {
   handleCpu(e.data);
   handleCentralStatus(e.data);
   handleMarkerPlane(e.data);
+  handleIvaSync(e.data);
+  handleIvaEvent(e.data);
+  handleIvaZoneSet(e.data);
+  handleZoneBand(e.data);
+  handleZoneBandsState(e.data);
+  handleWiseAiDet(e.data);
   handleOdo(e.data);
+  handleRegister(e.data);
   // 이 탭 로그는 카메라 위주로 - 로봇/QT 트래픽은 로봇 탭(/robot)이나
   // 로그 모니터(/logs)에서 본다 (내부 상태 파싱은 위에서 이미 끝났으니 표시만 거른다).
   if (logSubject(e.data) === 'robot' || logSubject(e.data) === 'qt') return;
+  // 검출 위치 피드는 로그에 안 찍는다 -- 초당 수십 건이라 다른 메시지를
+  // 밀어내 버린다. 오버레이가 이미 소비했으므로 여기서 버려도 잃는 게 없다.
+  if (e.data.indexOf('[det] ') === 0) return;
   if (hideLost && e.data.includes('MARKER LOST')) return;
   const stick = isNearBottom();
   log.textContent += e.data + "\\n";

@@ -116,7 +116,19 @@ inline constexpr long kQtOdoWaitCapMs = 590000L;
       "여기가 유일한 방어선이다. 바닥이 넓으면 올려도 된다")                    \
     X(double, marker_offset_m, 0.0,                                            \
       "마커 중심이 로봇 회전 중심에서 진행방향으로 떨어진 거리. 오도메트리 "    \
-      "캘리의 world_xy_mm 계산에만 쓴다. 0이면 보정 없음 (로봇팀 실측 전 기본)")
+      "캘리의 world_xy_mm 계산에만 쓴다. 0이면 보정 없음 (로봇팀 실측 전 기본)")\
+    /* ---- 채널 간 정합 (registration, 2026-08-15) ---- */                     \
+    X(long, reg_capture_interval_ms, 800,                                       \
+      "REGISTER_CAPTURE 자동 반복 주기. 로봇 경로가 없어(FOV 겹침 미실측) "      \
+      "조이스틱으로 겹침 구역을 지나가는 동안 여러 지점을 모으려면 계속 "        \
+      "쏴야 한다 - 오도메트리의 READY/GO 같은 동기화 지점이 없다")               \
+    X(long, reg_capture_ack_timeout_ms, 3000,                                   \
+      "REGISTER_DONE/CANCEL 전송 후 CCTV의 응답(H_MATRIX|REGISTER_FAIL|"        \
+      "REGISTER_STOPPED)을 기다리는 한도의 1/3 단위 (실제 한도는 이 값의 "       \
+      "3배 - checkRegistrationTick() 참고). 링크가 끊긴 채로 굳는 것을 막는다")  \
+    X(long, reg_session_timeout_ms, 600000,                                     \
+      "정합 수집 세션 전체 데드라인. 켜둔 채 잊어버렸을 때의 워치독 - "          \
+      "calib_odo_timeout_ms와 같은 역할")
 
 struct Params {
 #define RP_DECL(T, N, D, C) T N = D;
@@ -234,6 +246,11 @@ inline void sanitize(Params& p) {
              p.calib_odo_result_wait_ms, kQtOdoWaitCapMs, kQtOdoWaitCapMs / 2);
         p.calib_odo_result_wait_ms = kQtOdoWaitCapMs / 2;
     }
+    // 0을 넣으면 checkRegistrationTick()이 매 tick(200ms)마다 REGISTER_CAPTURE를
+    // 쏜다 - 카메라가 감당 못 할 정도는 아니지만 의도한 값은 아닐 가능성이 높다.
+    floorAt("reg_capture_interval_ms", p.reg_capture_interval_ms, 100L);
+    floorAt("reg_capture_ack_timeout_ms", p.reg_capture_ack_timeout_ms, 500L);
+    floorAt("reg_session_timeout_ms", p.reg_session_timeout_ms, 10000L);
     floorAt("calib_capture_timeout_ms", p.calib_capture_timeout_ms, 1000L);
     // 상한이 하한(min_move_m*2)보다 작으면 어떤 값도 통과하지 못한다 - 캘리가
     // 통째로 막히고, 조작자는 무슨 값을 넣어도 invalid_param만 본다.
