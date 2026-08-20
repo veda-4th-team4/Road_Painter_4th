@@ -28,6 +28,9 @@ void Router::sweep() {
     // 오도메트리 캡처 ack 개별 타임아웃 - 세션 전체 타임아웃(위)보다 훨씬
     // 짧게 걸려서 CCTV가 침묵하는 순간 3m 주행을 계속 돌리지 않는다.
     checkOdoCaptureTimeout();
+    // 채널 간 정합 수집 - 주기적으로 REGISTER_CAPTURE를 다시 쏘고, 세션
+    // 데드라인/종료 ack 타임아웃을 본다 (router_registration.cpp).
+    checkRegistrationTick();
 }
 
 // 주기 호출 (main의 tick 스레드).
@@ -139,6 +142,21 @@ void Router::fromAdmin(const json& msg) {
         // 있고, 그때 관리자가 로봇을 세울 방법이 없으면 안 된다 (§3-3).
         if (cmd == "CALIB_CANCEL") {
             cancelCalib(payload, msg, "ADMIN");
+            return;
+        }
+        // 채널 간 정합(registration) 수집 - ADMIN 전용, router_registration.cpp.
+        // 로봇에는 아무것도 안 보낸다 - 이 세션은 조이스틱 수동 조작을 전제로
+        // 하므로(자동 경로 없음), 로봇 쪽에 새로 알려야 할 상태가 없다.
+        if (cmd == "REGISTER_COLLECT_START") {
+            startRegistrationCollect(payload);
+            return;
+        }
+        if (cmd == "REGISTER_COLLECT_STOP") {
+            stopRegistrationCollect(false, "operator_stop");
+            return;
+        }
+        if (cmd == "REGISTER_COLLECT_CANCEL") {
+            stopRegistrationCollect(true, "operator_cancel");
             return;
         }
         // 요약 INFO를 sendTo보다 먼저 (미접속 [WARN]이 뒤따르도록 - fromQt 참고)
@@ -888,6 +906,15 @@ void Router::fromCctv(const json& msg) {
         onCalibCaptureAck(payload, true, "");
     } else if (type == "CALIB_CAPTURE_FAIL") {
         onCalibCaptureAck(payload, false, payload.value("reason", "unknown"));
+    } else if (type == "REGISTER_CAPTURE_OK") {
+        // 채널 간 정합 캡처 ack (2026-08-15 신설, router_registration.cpp).
+        onRegisterCaptureAck(payload, true, "");
+    } else if (type == "REGISTER_CAPTURE_FAIL") {
+        onRegisterCaptureAck(payload, false, payload.value("reason", "unknown"));
+    } else if (type == "REGISTER_FAIL") {
+        onRegisterFail(payload);
+    } else if (type == "REGISTER_STOPPED") {
+        onRegisterStopped(payload);
     } else {
         logf("[WARN] CCTV로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -1104,6 +1131,25 @@ void Router::handleHMatrix(const json& msg) {
         logf("[INFO] 캘리 세션 성공 종료 [채널 %d] request_id=%s", ch,
              calibReqId_.empty() ? "(없음)" : calibReqId_.c_str());
         clearCalib();  // 종결 응답(H_MATRIX)을 이미 보낸 뒤라 안전하다
+    }
+    // ----- 채널 간 정합(registration) 세션의 종결 (2026-08-15 신설) -----
+    // REGISTER_COLLECT_STOP -> REGISTER_DONE 을 보낸 뒤 카메라가 성공하면
+    // (실패는 REGISTER_FAIL, onRegisterFail()이 따로 접는다) 이 번들로 알려온다
+    // - reg_* 필드는 위에서 이미 bundle 그대로 실려 나갔다(손대지 않는다).
+    // 여기서는 세션 로컬 상태(regActive_)를 접는 것만 한다. calib* 세션과는
+    // 완전히 별개 상태라 위 closesSession 판정과 겹치지 않는다 - 같은
+    // H_MATRIX 하나가 두 세션을 동시에 닫을 수도 있다(오도메트리 결과 대기 중에
+    // 그 채널을 ch_b로 정합까지 걸어놨다면).
+    if (regActive_ && regStopping_ && ch == regChB_) {
+        const double regScale = bundle.value("reg_scale", 0.0);
+        logf("[INFO] 정합 세션 성공 종료 [ch_a=%d ch_b=%d] request_id=%s "
+             "reg_scale=%.4f reg_rmse_mm=%.1f reg_n=%d%s",
+             regChA_, regChB_, regReqId_.c_str(), regScale,
+             bundle.value("reg_rmse_mm", -1.0), bundle.value("reg_n", 0),
+             (regScale > 0.0 && std::fabs(regScale - 1.0) > 0.05)
+                 ? " - ⚠️ 스케일이 1.0에서 크게 벗어남, 두 채널 중 한쪽 오도메트리 캘리를 의심할 것"
+                 : "");
+        clearRegistration();
     }
     // 어느 스키마로 읽혔는지 남긴다 - 평면 번들을 보냈는데 "레거시"로 찍히면
     // K/D가 빠졌다는 뜻이라, 로그만 보고 바로 알 수 있어야 한다.
