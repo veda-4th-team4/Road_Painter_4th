@@ -1,0 +1,20 @@
+{
+	"LibraryFileName": "libapp_dispatcher_model.so",
+	"Instance": {
+		"InstanceName": "AppDispatcher",
+		"SchedulerName": "EComponents::eScheduler1",
+		"ReceiverNames": [
+			"Stub::Dispatcher::OpenAPI",
+			"SampleComponent"
+		],
+		"SourceNames": [
+			{
+				"Source": "Stub::Dispatcher::OpenAPI",
+				"GroupName": "OpenSDK::ArucoPosePNM::Dispatcher"
+			}
+		],
+		"Channel": 0,
+		"ModelPath": "",
+		"SettingPath": ""
+	}
+}
