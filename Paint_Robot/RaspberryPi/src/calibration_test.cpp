@@ -14,6 +14,7 @@ void PrintHelp() {
   std::cout << "\n========== [ Calibration Test CLI Helper (CLOSED-LOOP IMU) ] ==========\n";
   std::cout << "  move <dist_m>      : Straight move in meters with IMU yaw correction\n";
   std::cout << "  turn <angle_deg>   : Turn in degrees with IMU yaw correction\n";
+  std::cout << "  turn_step <angle>  : Turn purely using step odometry (NO IMU)\n";
   std::cout << "  nozzle <1|0>       : Control nozzle actuator (1=DOWN/ON, 0=UP/OFF)\n";
   std::cout << "  status             : Read latest telemetry status from STM32\n";
   std::cout << "  help               : Show this help message\n";
@@ -146,7 +147,8 @@ int main(int argc, char **argv) {
       std::cout << "  Step Delta    : " << (final_avg - target_steps) << " steps\n";
       std::cout << "=================================\n";
 
-    } else if (cmd == "turn") {
+    } else if (cmd == "turn" || cmd == "turn_step") {
+      bool use_imu = (cmd == "turn");
       float angle_deg = 0.0f;
       if (!(iss >> angle_deg)) {
         std::cout << "[CALIB] Usage: turn <angle_deg> (e.g. turn 20)" << std::endl;
@@ -161,7 +163,7 @@ int main(int argc, char **argv) {
       int32_t start_r = static_cast<int32_t>(start_status.right_steps);
       float start_yaw = imu_manager.GetYaw();
 
-      std::cout << GetTimestampStr() << "[CALIB TURN] Command: " << angle_deg
+      std::cout << GetTimestampStr() << "[CALIB " << (use_imu ? "TURN" : "TURN_STEP") << "] Command: " << angle_deg
                 << " deg (" << (angle_deg > 0.0f ? "CW Right" : "CCW Left") << ")\n";
       std::cout << "             Target Steps: " << target_steps << std::endl;
 
@@ -177,7 +179,7 @@ int main(int argc, char **argv) {
           float cur_yaw = imu_manager.GetYaw();
 
           Msg_SetSpeed_t out_speed{};
-          completed = path_follower.UpdateTurn(cur_l, cur_r, out_speed, cur_yaw, true);
+          completed = path_follower.UpdateTurn(cur_l, cur_r, out_speed, cur_yaw, use_imu);
           robot_comm.SendSetSpeed(out_speed.left_sps, out_speed.right_sps);
         }
 

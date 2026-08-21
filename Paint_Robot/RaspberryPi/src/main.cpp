@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <chrono>
 #include <vector>
+#include <cmath>
 
 int main(int argc, char **argv) {
   // Parse target server IP (default: 192.168.0.8)
@@ -200,7 +201,7 @@ int main(int argc, char **argv) {
                std::string phase = net_manager.GetPathPhase();
                std::cout << GetTimestampStr() << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2500ms for camera settling..." << std::endl;
                if (phase == "draw" || phase == "calib") {
-                   imu_manager.ResetYaw(0.0f); // Reset IMU Yaw to 0 deg when entering new path phase from standstill
+                   imu_manager.Calibrate(); // Dynamically recalibrate IMU Gyro Z offset during the 2.5s settling time
                }
 
                // Settling delay: Ensure robot is fully still for 2500ms (2.5s) before sending initial READY for op 0
@@ -308,17 +309,10 @@ int main(int argc, char **argv) {
                           bool has_turn_imu = g_use_imu_turn && imu_manager.IsHealthy();
                           float cur_yaw = has_turn_imu ? imu_manager.GetYaw() : 0.0f;
                           if (path_follower.UpdateTurn(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed, cur_yaw, has_turn_imu)) {
-                              // Micro-turn completed: Send stop & wait 2500ms for camera settling before re-sending READY for same op
+                              // Micro-turn completed: Send stop & immediately send READY (Server handles 1s camera settling)
                               robot_comm.SendSetSpeed(0, 0);
-                              std::cout << GetTimestampStr() << "[MAIN ALIGN] Turn complete -> Waiting 2500ms for camera settling..." << std::endl;
+                              std::cout << GetTimestampStr() << "[MAIN ALIGN] Turn complete -> Sending READY immediately (Server will wait 1s)" << std::endl;
                               
-                              auto start_wait = std::chrono::steady_clock::now();
-                              while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - start_wait).count() < 2500) {
-                                  robot_comm.SendSetSpeed(0, 0);
-                                  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                              }
-
                               net_manager.SendReady(active_op_index);
                           }
                       }
@@ -330,16 +324,9 @@ int main(int argc, char **argv) {
                           bool has_move_imu = g_use_imu_move && imu_manager.IsHealthy();
                           float imu_yaw = has_move_imu ? imu_manager.GetYaw() : 0.0f;
                           if (path_follower.UpdateMove(static_cast<int32_t>(status_snap.left_steps), static_cast<int32_t>(status_snap.right_steps), target_speed, imu_yaw)) {
-                              // Micro-move completed: Send stop & wait 2500ms before re-sending READY for same op
+                              // Micro-move completed: Send stop & immediately send READY (Server handles 1s camera settling)
                               robot_comm.SendSetSpeed(0, 0);
-                              std::cout << GetTimestampStr() << "[MAIN MORE] Move complete -> Waiting 2500ms for camera settling..." << std::endl;
-                              
-                              auto start_wait = std::chrono::steady_clock::now();
-                              while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - start_wait).count() < 2500) {
-                                  robot_comm.SendSetSpeed(0, 0);
-                                  std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                              }
+                              std::cout << GetTimestampStr() << "[MAIN MORE] Move complete -> Sending READY immediately (Server will wait 1s)" << std::endl;
 
                               net_manager.SendReady(active_op_index);
                           }
@@ -348,9 +335,16 @@ int main(int argc, char **argv) {
 
                   // Check for GO signal matching active_op_index
                   if (net_manager.CheckAndClearGoSignal(active_op_index)) {
-                      std::cout << GetTimestampStr() << "[MAIN] GO signal received for op " << active_op_index 
-                                << " (" << current_seg.op << ")" << std::endl;
                       waiting_for_go = false;
+                      std::cout << GetTimestampStr() << "[MAIN] GO signal received for op " << active_op_index << " (" << current_seg.op << ")" << std::endl;
+                      
+                      // Fix: Reset IMU Yaw exactly at the moment of the first GO signal to eliminate wait-time drift
+                      if (active_op_index == 0 || path_follower.GetCurrentSegmentIndex() == 0) {
+                          imu_manager.ResetYaw(0.0f);
+                          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                      }
+
+                      Msg_Status_t status_snap{};
                   }
               }
 
@@ -374,15 +368,50 @@ int main(int argc, char **argv) {
                               path_follower.StartMove(current_seg.dist_m, l_steps, r_steps);
                           }
 
-                          bool has_move_imu = g_use_imu_move && imu_manager.IsHealthy();
+                          std::string phase = net_manager.GetPathPhase();
+                          bool has_move_imu = g_use_imu_move && imu_manager.IsHealthy() && (phase != "calib");
                           float imu_yaw = has_move_imu ? imu_manager.GetYaw() : 0.0f;
                           if (path_follower.UpdateMove(l_steps, r_steps, target_speed, imu_yaw)) {
                               std::cout << GetTimestampStr() << "[MAIN MOVE] Op " << active_op_index << " complete." << std::endl;
+                              
+                              // User request: Recalibrate IMU after segment to guarantee stability (ONLY in calib phase)
+                              if ((g_use_imu_turn || g_use_imu_move) && phase == "calib") {
+                                  std::cout << GetTimestampStr() << "[MAIN MOVE] [CALIB PHASE] Waiting 3000ms for mechanical settling..." << std::endl;
+                                  robot_comm.SendSetSpeed(0, 0);
+                                  
+                                  // 1. Mechanical settling delay (3000ms)
+                                  auto start_mech = std::chrono::steady_clock::now();
+                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_mech).count() < 3000) {
+                                      robot_comm.SendSetSpeed(0, 0);
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                  }
+                                  
+                                  // 2. Dynamic IMU recalibration
+                                  imu_manager.Calibrate();
+                                  auto start_wait = std::chrono::steady_clock::now();
+                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - start_wait).count() < 2000) {
+                                      robot_comm.SendSetSpeed(0, 0);
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                  }
+                                  
+                                  // 3. Post-calibration breath delay (1000ms)
+                                  std::cout << GetTimestampStr() << "[MAIN MOVE] Calibration done. Waiting 1000ms before READY..." << std::endl;
+                                  auto start_breath = std::chrono::steady_clock::now();
+                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_breath).count() < 1000) {
+                                      robot_comm.SendSetSpeed(0, 0);
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                  }
+                              } else {
+                                  robot_comm.SendSetSpeed(0, 0); // draw/approach: stop instantly without 6s delay
+                              }
+
                               // R-4: Do NOT send SendReady here! AdvanceSegment() lets next loop iteration send READY(active_op_index + 1)
                               path_follower.AdvanceSegment();
                           }
                       } else if (current_seg.op == "turn") {
-                          bool has_turn_imu = g_use_imu_turn && imu_manager.IsHealthy();
+                          std::string phase = net_manager.GetPathPhase();
+                          bool has_turn_imu = g_use_imu_turn && imu_manager.IsHealthy() && (phase != "calib");
                           if (!path_follower.IsTurning()) {
                               // Protocol rule: positive angle = turn right (CW) -> StartTurn(-angle_deg)
                               float robot_turn_deg = -current_seg.angle_deg;
@@ -394,6 +423,39 @@ int main(int argc, char **argv) {
                           if (path_follower.UpdateTurn(l_steps, r_steps, target_speed, cur_yaw, has_turn_imu)) {
                               std::cout << GetTimestampStr() << "[MAIN TURN] Op " << active_op_index << " in-place turn (" 
                                         << current_seg.angle_deg << " deg) complete." << std::endl;
+                                        
+                              // User request: Recalibrate IMU after 90-degree turn to guarantee stability (ONLY in calib phase)
+                              if ((g_use_imu_turn || g_use_imu_move) && phase == "calib") {
+                                  std::cout << GetTimestampStr() << "[MAIN TURN] [CALIB PHASE] Waiting 3000ms for mechanical settling..." << std::endl;
+                                  robot_comm.SendSetSpeed(0, 0);
+                                  
+                                  // 1. Mechanical settling delay (3000ms)
+                                  auto start_mech = std::chrono::steady_clock::now();
+                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_mech).count() < 3000) {
+                                      robot_comm.SendSetSpeed(0, 0);
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                  }
+                                  
+                                  // 2. Dynamic IMU recalibration
+                                  imu_manager.Calibrate();
+                                  auto start_wait = std::chrono::steady_clock::now();
+                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - start_wait).count() < 2000) {
+                                      robot_comm.SendSetSpeed(0, 0);
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                  }
+                                  
+                                  // 3. Post-calibration breath delay (1000ms)
+                                  std::cout << GetTimestampStr() << "[MAIN TURN] Calibration done. Waiting 1000ms before READY..." << std::endl;
+                                  auto start_breath = std::chrono::steady_clock::now();
+                                  while (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_breath).count() < 1000) {
+                                      robot_comm.SendSetSpeed(0, 0);
+                                      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                  }
+                              } else {
+                                  robot_comm.SendSetSpeed(0, 0); // draw/approach: stop instantly without 6s delay
+                              }
+
                               // R-4: Do NOT send SendReady here! AdvanceSegment() lets next loop iteration send READY(active_op_index + 1)
                               path_follower.AdvanceSegment();
                           }
