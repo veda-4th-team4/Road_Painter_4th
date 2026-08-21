@@ -1,0 +1,21 @@
+[Unit]
+Description=Road Painter AMR Main Controller Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Requires root for wiringPi hardware access (I2C, UART, GPIO)
+User=root
+# The build directory where robot_exec is located
+WorkingDirectory=/home/user/Painter_Robot/build
+# Start the binary with the target Server IP (Change 192.168.0.8 if needed)
+ExecStart=/home/user/Painter_Robot/build/robot_exec 192.168.0.8
+# Automatically restart if the process crashes or network disconnects causes an exit
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

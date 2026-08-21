@@ -41,6 +41,8 @@ target_link_libraries(arc_test wiringPi pthread)
 set(CALIB_TEST_SOURCES
     src/calibration_test.cpp
     src/SerialManager.cpp
+    src/PathFollower.cpp
+    src/ImuManager.cpp
 )
 add_executable(calibration_test ${CALIB_TEST_SOURCES})
 target_link_libraries(calibration_test wiringPi pthread)

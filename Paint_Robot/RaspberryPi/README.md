@@ -62,7 +62,7 @@ RaspberryPi/
 * **바퀴 지름 (Wheel Diameter)**: $66\text{ mm}$ ($0.066\text{ m}$)
 * **차축 거리 (Wheelbase)**: $166\text{ mm}$ ($0.166\text{ m}$)
 * **1회전당 스텝 수**: $3,200\text{ steps/rev}$ (16 마이크로스텝)
-* **거리 보정 계수 (`DISTANCE_CALIB_FACTOR`)**: `1.010f` (+1% 실측 보정) $\rightarrow$ 약 $15,587\text{ steps/m}$ ($10\text{cm} = \mathbf{1,559\text{ 스텝}}$)
+* **거리 보정 계수 (`DISTANCE_CALIB_FACTOR`)**: `1.040f` (+4% 실측 보정) $\rightarrow$ 약 $16,050\text{ steps/m}$ ($10\text{cm} = \mathbf{1,605\text{ 스텝}}$)
 * **회전 보정 계수 (`TURN_ANGLE_CALIB_FACTOR`)**: `1.030f` (+3% 실측 보정) $\rightarrow$ 약 $2,073\text{ steps/90}^\circ$ ($1^\circ = \mathbf{23.03\text{ 스텝}}$)
 
 ---
@@ -72,7 +72,7 @@ RaspberryPi/
 * **바퀴 지름 (Wheel Diameter)**: $66\text{ mm}$ ($0.066\text{ m}$)
 * **차축 거리 (Wheelbase)**: $166\text{ mm}$ ($0.166\text{ m}$)
 * **1회전당 스텝 수**: $3,200\text{ steps/rev}$ (16 마이크로스텝)
-* **거리 보정 계수 (`DISTANCE_CALIB_FACTOR`)**: `1.010f` (+1% 실측 보정) $\rightarrow$ 약 $15,587\text{ steps/m}$ ($10\text{cm} = \mathbf{1,559\text{ 스텝}}$)
+* **거리 보정 계수 (`DISTANCE_CALIB_FACTOR`)**: `1.020f` (+2% 실측 보정) $\rightarrow$ 약 $15,741\text{ steps/m}$ ($10\text{cm} = \mathbf{1,574\text{ 스텝}}$)
 * **회전 보정 계수 (`TURN_ANGLE_CALIB_FACTOR`)**: `1.030f` (+3% 실측 보정) $\rightarrow$ 약 $2,073\text{ steps/90}^\circ$ ($1^\circ = \mathbf{23.03\text{ 스텝}}$)
 
 ---
