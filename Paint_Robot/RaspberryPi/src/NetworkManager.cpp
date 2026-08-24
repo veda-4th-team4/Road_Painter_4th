@@ -339,6 +339,10 @@ bool NetworkManager::GetLatestCommand(std::string& out_cmd) {
     return true;
 }
 
+bool NetworkManager::CheckAndClearZoneEnterEvent() {
+    return has_zone_enter_event.exchange(false);
+}
+
 void NetworkManager::rx_loop() {
     std::string rx_buffer;
     std::string line;
@@ -464,6 +468,16 @@ void NetworkManager::parse_incoming_data(const std::string& line) {
             std::string reason = payload.value("reason", "");
             std::cout << GetTimestampStr() << "[NetworkManager] Received HOLD: " << (hold ? "PAUSE" : "RESUME") << " (reason: " << reason << ")" << std::endl;
             is_hold_active.store(hold);
+
+        } else if (type == "ZONE_EVENT") {
+            const auto action = payload.find("action");
+            if (action != payload.end() && action->is_string() &&
+                action->get<std::string>() == "Enter") {
+                has_zone_enter_event.store(true);
+                std::cout << GetTimestampStr()
+                          << "[NetworkManager] Received ZONE_EVENT Enter from server."
+                          << std::endl;
+            }
 
         } else if (type == "ACK") {
             std::cout << GetTimestampStr() << "[NetworkManager] Received ACK from server: " << payload.value("msg", "") << std::endl;
