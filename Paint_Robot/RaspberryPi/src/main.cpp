@@ -3,6 +3,7 @@
 #include "SerialManager.h"
 #include "ImuManager.h"
 #include "LedStripManager.h"
+#include "AudioStripManager.h"
 #include <algorithm>
 #include <iostream>
 #include <string>
@@ -26,6 +27,14 @@ int main(int argc, char **argv) {
       std::cerr << "[MAIN] Warning: Tower lamp failed to open." << std::endl;
   }
   tower_lamp.SetState(LedState::IDLE);
+
+  AudioStripManager audio;
+  const bool audio_ready = audio.Open();
+  if (!audio_ready) {
+      std::cerr << "[MAIN] Warning: Audio strip failed to open." << std::endl;
+  } else {
+      audio.Play(SoundId::POWER_ON);
+  }
 
   // 2. Initialize serial communications
   if (!robot_comm.Init()) {
@@ -58,10 +67,12 @@ int main(int argc, char **argv) {
   // 4. Initialize network communications
   std::cout << "[MAIN] Starting TLS network link to " << server_ip << ":"
             << server_port << "..." << std::endl;
-  if (!net_manager.Init()) {
+  const bool network_initialized = net_manager.Init();
+  if (!network_initialized) {
     std::cerr << "[MAIN] Warning: Network link failed. Starting in local "
                  "test-only mode."
               << std::endl;
+    audio.Play(SoundId::SIGNAL_LOST);
   }
 
   std::cout << "[MAIN] Main Controller Sequence Active (v0.3 Protocol with IMU Support)." << std::endl;
@@ -81,10 +92,19 @@ int main(int argc, char **argv) {
   Msg_SetSpeed_t manual_speed = {0, 0};
   uint8_t manual_nozzle = 0;
   uint8_t auto_nozzle = 0;
+  bool hold_logged = false;
+  bool network_was_connected = network_initialized;
+  bool audio_path_active = false;
 
   while (true) {
       // 1. Run network loop to check sockets and reconnect if needed
       net_manager.Process();
+      const bool network_connected = net_manager.IsConnected();
+      if (network_was_connected && !network_connected)
+          audio.Play(SoundId::SIGNAL_LOST);
+      network_was_connected = network_connected;
+      if (net_manager.CheckAndClearZoneEnterEvent())
+          audio.Play(SoundId::PERSON_IN_ZONE);
 
       // 2. Handle incoming CMD (ESTOP / RESUME / ABORT_DRAW / Manual Controls) relay to STM32
       std::string cmd;
@@ -92,6 +112,7 @@ int main(int argc, char **argv) {
           std::cout << GetTimestampStr() << "[MAIN] Processing server CMD: " << cmd << std::endl;
           if (cmd == "ESTOP") {
               tower_lamp.SetState(LedState::ESTOP);
+              audio.Play(SoundId::EMERGENCY_STOP);
               robot_comm.SendEmergencyStop(0x01);
               manual_override = true;
               manual_speed = {0, 0};
@@ -113,6 +134,7 @@ int main(int argc, char **argv) {
               waiting_for_go = false;
               ready_seg_sent = 0xFFFFFFFF;
               path_done_sent = true; // A-3: Prevent false PATH_DONE reporting
+              audio_path_active = false;
               net_manager.ClearLatches();
           } else if (cmd == "STOP") { // A-4: STOP only clears manual speed
               if (tower_lamp.GetState() != LedState::ESTOP) tower_lamp.SetState(LedState::IDLE);
@@ -169,6 +191,7 @@ int main(int argc, char **argv) {
               waiting_for_go = false;
               ready_seg_sent = 0xFFFFFFFF;
               path_done_sent = true;
+              audio_path_active = false;
               net_manager.ClearLatches();
               // Settling delay: Ensure robot is fully still for 100ms before transmitting CALIB_STOPPED ACK
               std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -197,6 +220,8 @@ int main(int argc, char **argv) {
                has_pending_path = false;
                net_manager.ClearLatches(); // R-8: Clear any stale command latches from previous path
                tower_lamp.SetState(LedState::DRIVING);
+               audio.Play(SoundId::TASK_START);
+               audio_path_active = true;
                robot_comm.SendClearEStop(); // Clear startup/idle ESTOP latch when applying new autonomous path
                std::string phase = net_manager.GetPathPhase();
                std::cout << GetTimestampStr() << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2500ms for camera settling..." << std::endl;
@@ -217,13 +242,12 @@ int main(int argc, char **argv) {
       // 4. Check HOLD state and DRIFT feedback from server (~2.5Hz)
       bool hold_active = net_manager.IsHoldActive();
       if (hold_active) {
-          static bool hold_logged = false;
           if (!hold_logged) {
               std::cout << GetTimestampStr() << "[MAIN] HOLD active (pos lost). Pausing robot movement..." << std::endl;
+              audio.Play(SoundId::SYSTEM_ERROR);
               hold_logged = true;
           }
       } else {
-          static bool hold_logged = false;
           if (hold_logged) {
               std::cout << GetTimestampStr() << "[MAIN] HOLD released. Resuming autonomous path execution." << std::endl;
               hold_logged = false;
@@ -475,6 +499,9 @@ int main(int argc, char **argv) {
           }
       } else if (path_follower.IsPathFinished() && !path_done_sent) {
           tower_lamp.SetState(LedState::IDLE);
+          if (audio_path_active)
+              audio.Play(SoundId::TASK_COMPLETE);
+          audio_path_active = false;
           std::string phase = net_manager.GetPathPhase();
           net_manager.SendPathDone(phase);
           path_done_sent = true;

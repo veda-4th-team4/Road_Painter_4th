@@ -82,6 +82,7 @@ angle_robot = -angle_ccw
 | `MORE` | `{"op_index":n, "dist_m":±m}` | 현재 방향으로 전/후진 후 **같은 op_index로 READY 재전송** |
 | `DRIFT` | `{"op_index":n, "angle_deg":±d}` | 직진 주행 **중** 각도 보정 (READY 불필요) |
 | `HOLD` | `{"hold":true\|false, "reason":"pos_lost"}` | 즉시 정지 / 재개 |
+| `ZONE_EVENT` | `{"action":"Enter", "ch":n, ...}` | CCTV 구역 진입 경보. CMD와 별도 수신 래치로 음성 재생 |
 | `CMD` | `{"cmd":...}` | v1 그대로 (ESTOP/RESUME/수동조작/CALIB_START) |
 
 ### 2.2 로봇 → 서버
@@ -94,6 +95,11 @@ angle_robot = -angle_ccw
 | `PATH_DONE` | `{"phase":"approach"\|"draw"}` | 마지막 op까지 마쳤을 때 1회 |
 
 `READY` / `PATH_DONE` 외에 로봇이 자발적으로 보내는 것은 `STATUS`뿐이다.
+
+`ZONE_EVENT`는 CCTV가 기존 `role=CCTV` TLS 세션으로 서버에 전송하고, 서버가
+`action:"Enter"`만 기존 `role=ROBOT` TLS 세션으로 중계한다. 별도 UDP 포트는 없다.
+로봇은 이를 `CMD` 슬롯과 분리해 처리하므로 구역 경보가 `ESTOP`이나 수동 명령을
+덮어쓰지 않는다. 여러 Enter가 메인 루프 한 주기 안에 몰리면 한 번으로 합쳐진다.
 
 ---
 

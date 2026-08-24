@@ -15,6 +15,7 @@ file(COPY ${APP_DISPATCHER_SOURCE_DIR} DESTINATION ${APP_LIBS})
 file(MAKE_DIRECTORY ${APP_RES})
 file(MAKE_DIRECTORY ${APP_RES}/models)
 file(MAKE_DIRECTORY ${APP_RES}/settings)
+file(MAKE_DIRECTORY ${APP_RES}/cert)
 
 # Create storage, storage/settings
 file(MAKE_DIRECTORY ${APP_STORAGE})

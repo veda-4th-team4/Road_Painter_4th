@@ -10,7 +10,7 @@ RPi 내에서 SSL 암호화 소켓 연동, I2C IMU 제어 및 시리얼 통신 �
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y g++ make cmake libssl-dev wiringpi
+sudo apt-get install -y g++ make cmake libssl-dev wiringpi device-tree-compiler raspberrypi-kernel-headers
 ```
 
 ---
@@ -22,6 +22,8 @@ RaspberryPi/
 ├── CMakeLists.txt         # CMake 빌드 설정 파일
 ├── README.md              # 본 설명 문서
 ├── LED_STRIP_KR.md        # 타워램프(WS2812B) 설치 및 연동 가이드
+├── AUDIO_STRIP_KR.md      # MAX98357A 음성 알림 설치 및 연동 가이드
+├── audio/                 # WAV 카탈로그, 설치 및 수동 재생 스크립트
 │
 ├── include/
 │   ├── RobotTypes.h       # 공통 구조체, enum, Protocol v2 payload 및 ms 타임스탬프 헬퍼
@@ -30,12 +32,16 @@ RaspberryPi/
 │   ├── PathFollower.h     # 스텝 오도메트리 정밀 주행/회전 및 DRIFT 연속 차동 조향 클래스
 │   ├── ImuManager.h       # MPU6050 I2C 자이로 센서 필터링 및 적분 클래스
 │   ├── LedStripManager.h  # 타워램프 상태표시 API (SetState 한 줄로 제어)
+│   ├── AudioStripManager.h# 비동기 WAV 재생 및 우선순위 API
+│   ├── AudioStripDevice.h # /dev/audio_strip DRAIN/DROP 공용 계약
 │   └── nlohmann/          # JSON Parser 라이브러리 디렉토리 (nlohmann/json.hpp)
 │
 ├── driver/                # 커널 디바이스 드라이버 (모듈 + DT 오버레이)
 │   ├── mpu6050_driver.c   # MPU6050 I2C 드라이버
 │   ├── led_strip_driver.c # WS2812B 드라이버 (PWM 시리얼라이저 + DMA)
 │   ├── led_strip_regs.h   # BCM2711 PWM 레지스터 맵 / WS2812B 인코딩 상수
+│   ├── audio_strip_driver.c# MAX98357A raw I2S 큐 기반 DMA 드라이버
+│   ├── audio_strip_regs.h # BCM2711 PCM/I2S 레지스터 및 포맷 상수
 │   └── *_overlay.dts      # 디바이스 트리 오버레이 (LED는 GPIO12 = 물리 32번)
 │
 └── src/
@@ -45,15 +51,18 @@ RaspberryPi/
     ├── PathFollower.cpp   # 기구학 스텝 환산 및 후진/직진/턴 조향 알고리즘 구현
     ├── ImuManager.cpp     # MPU6050 I2C DLPF 필터링 및 Yaw 처리 구현
     ├── LedStripManager.cpp# 타워램프 렌더 스레드 및 상태별 애니메이션 구현
+    ├── AudioStripManager.cpp# 비동기 음성 재생 및 긴급 선점 구현
     ├── calibration_test.cpp# 🎯 하드웨어 캘리브레이션 (거리/각도 실측 보정) 대화형 CLI 툴
     ├── motor_test.cpp     # STM32 UART 모터/노즐 하드웨어 단독 검증 툴
     ├── arc_test.cpp       # 호(Arc) 주행 기구학 검증 툴
     ├── led_test.cpp       # 타워램프 점등 검증 전용 독립 테스트 툴
+    ├── audio_strip_test.cpp# 오디오 카탈로그 독립 재생 테스트 툴
     └── imu_test.cpp       # MPU6050 I2C 실시간 센서 검증 툴
 ```
 
 > 타워램프는 커널 모듈과 디바이스 트리 오버레이 설치가 선행되어야 합니다.
 > 배선·설치·연동 방법은 **[LED_STRIP_KR.md](LED_STRIP_KR.md)** 를 참고하세요.
+> 오디오 배선·설치·우선순위·테스트 방법은 **[AUDIO_STRIP_KR.md](AUDIO_STRIP_KR.md)** 를 참고하세요.
 
 ---
 
@@ -89,7 +98,7 @@ cd build
 cmake ..
 make
 ```
-* 빌드가 완료되면 `build` 폴더 내에 메인 제어 바이너리 **`robot_exec`** 및 캘리브레이션 툴 **`calibration_test`**가 생성됩니다.
+* 빌드가 완료되면 `build` 폴더 내에 메인 제어 바이너리 **`robot_exec`**, 캘리브레이션 툴 **`calibration_test`**, LED/오디오 독립 테스트 도구가 생성됩니다.
 
 ---
 

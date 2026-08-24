@@ -50,6 +50,11 @@ tap_dump: tools/tap_dump.cpp tools/tls_client.hpp
 cctv_pose: tools/cctv_pose.cpp tools/tls_client.hpp
 	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
 
+# CCTV 구역 진입 이벤트가 별도 UDP 없이 기존 TLS로 ROBOT까지 전달되는지 검증.
+# 실행 전 서버를 별도 포트에 띄울 것 (tools/zone_event_test.cpp 상단 참고).
+zone_event_test: tools/zone_event_test.cpp tools/tls_client.hpp
+	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
+
 # 채널별 캘리브레이션 저장 회귀 테스트 (프로토콜 v0.4).
 # 현장에 이미 배포된 users.json/calib_latest.json 의 예전 형식이 채널 1로 계속
 # 읽히는지, 채널 하나를 저장할 때 다른 채널이 날아가지 않는지 확인한다.
@@ -90,5 +95,5 @@ odo_calib_test: tools/odo_calib_test.cpp src/*.hpp
 	$(CXX) $(CXXFLAGS) $< -o tools/$@ $(LDLIBS)
 
 clean:
-	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose tools/calib_channel_test tools/calib_unit_test tools/offset_feedback_test tools/calib_session_test tools/odo_session_test tools/odo_calib_test
+	rm -f server tools/qt_sim tools/path_test tools/robot_sim tools/draw_test tools/drive_test tools/tap_dump tools/cctv_pose tools/zone_event_test tools/calib_channel_test tools/calib_unit_test tools/offset_feedback_test tools/calib_session_test tools/odo_session_test tools/odo_calib_test
 .PHONY: clean sim

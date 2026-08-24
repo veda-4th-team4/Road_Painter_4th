@@ -16,6 +16,7 @@ Module.symvers
 
 # Test binaries
 led_test
+audio_strip_test
 motor_test
 arc_test
 robot_exec

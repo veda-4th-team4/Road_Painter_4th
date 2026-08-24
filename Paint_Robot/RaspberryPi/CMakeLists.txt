@@ -17,8 +17,11 @@ set(SOURCES
     src/PathFollower.cpp
     src/ImuManager.cpp
     src/LedStripManager.cpp
+    src/AudioStripManager.cpp
 )
 add_executable(robot_exec ${SOURCES})
+target_compile_definitions(robot_exec PRIVATE
+    ROADPAINTER_AUDIO_DIR="${CMAKE_CURRENT_SOURCE_DIR}/audio/wav_files")
 target_link_libraries(robot_exec wiringPi OpenSSL::SSL OpenSSL::Crypto pthread)
 
 # 2) Stepper Motor Drive Test Tool
@@ -55,6 +58,16 @@ set(LED_TEST_SOURCES
 add_executable(led_test ${LED_TEST_SOURCES})
 target_link_libraries(led_test pthread)
 
+# 5b) Audio Strip (raw I2S / MAX98357A) Test Tool
+set(AUDIO_STRIP_TEST_SOURCES
+    src/audio_strip_test.cpp
+    src/AudioStripManager.cpp
+)
+add_executable(audio_strip_test ${AUDIO_STRIP_TEST_SOURCES})
+target_compile_definitions(audio_strip_test PRIVATE
+    ROADPAINTER_AUDIO_DIR="${CMAKE_CURRENT_SOURCE_DIR}/audio/wav_files")
+target_link_libraries(audio_strip_test pthread)
+
 # 6) Odometry Driving Homography Calibration Path Test Tool
 set(CALIB_PATH_TEST_SOURCES
     src/calib_path_test.cpp
@@ -64,5 +77,4 @@ set(CALIB_PATH_TEST_SOURCES
 )
 add_executable(calib_path_test ${CALIB_PATH_TEST_SOURCES})
 target_link_libraries(calib_path_test wiringPi pthread)
-
 

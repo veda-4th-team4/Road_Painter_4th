@@ -730,7 +730,24 @@ void Router::fromCctv(const json& msg) {
     std::string type = msg.value("type", "");
     json payload = msg.value("payload", json::object());
 
-    if (type == "POS") {
+    if (type == "ZONE_EVENT") {
+        // 카메라가 발끝 기준으로 확정한 구역 진입만 로봇 음성 이벤트로 중계한다.
+        // CMD와 별도 type을 사용해 경보가 ESTOP/수동 명령 슬롯을 덮지 않게 한다.
+        if (!payload.is_object()) {
+            logf("[WARN] CCTV ZONE_EVENT 무시 - payload 객체 아님");
+            return;
+        }
+        const auto action = payload.find("action");
+        if (action == payload.end() || !action->is_string()) {
+            logf("[WARN] CCTV ZONE_EVENT 무시 - payload.action 문자열 없음");
+            return;
+        }
+        if (action->get<std::string>() != "Enter") return;
+
+        const int ch = channelOf(payload);
+        logf("[INFO] ZONE_EVENT Enter ch%d -> ROBOT", ch);
+        srv_.sendTo("ROBOT", makeMsg("ZONE_EVENT", payload));
+    } else if (type == "POS") {
         // corners = CCTV 원본 픽셀 좌표. 좌표 변환(undistort -> H_marker)은
         // 여기(서버)서만 수행 - CCTV는 캘리브레이션 데이터를 가질 필요 없음.
         // 로봇에는 중계하지 않는다 - 로봇은 좌표를 모르며, 보정은 서버가

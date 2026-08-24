@@ -37,6 +37,9 @@ public:
      */
     void Process();
 
+    /** Thread-safe snapshot used for transition-only status notifications. */
+    bool IsConnected() const { return is_connected.load(); }
+
     /**
      * @brief Sends status packets back to the Vision Server.
      * @param status Struct containing steps count and flag state.
@@ -128,11 +131,14 @@ public:
      */
     bool GetLatestCommand(std::string& out_cmd);
 
+    /** Returns true once for each coalesced ZONE_EVENT Enter from the server. */
+    bool CheckAndClearZoneEnterEvent();
+
 private:
     std::string server_ip;
     uint16_t server_port;
     int client_fd;
-    bool is_connected;
+    std::atomic<bool> is_connected;
 
     // OpenSSL variables
     SSL_CTX* ssl_ctx;
@@ -158,6 +164,9 @@ private:
     std::mutex cmd_mutex;
     std::string latest_cmd;
     bool has_new_cmd;
+
+    // Kept separate from CMD so a zone alert can never overwrite ESTOP.
+    std::atomic<bool> has_zone_enter_event{false};
 
     // Protocol v2 state variables with op_index transaction locking
     std::mutex align_mutex;

@@ -92,26 +92,20 @@ static inline void CopyUtf8(char* dst, size_t dst_size, const char* src) {
 #define ENABLE_CENTRAL_TLS_STREAM 1
 #endif
 
-// Same RPi as POSE_SERVER_IP above, wired address (192.168.0.2) for the same
-// DHCP-stability reason, tried first. CENTRAL_TLS_SERVER_IP_FALLBACK below is
-// the Pi's Wi-Fi address (192.168.0.8) — wired first, wireless as a backup
-// path, not the other way round; see central_tls_sender_set_fallback().
+// The central server's currently deployed address/certificate is 192.168.0.8,
+// so that verified address is tried first. The wired 192.168.0.2 address stays
+// as a fallback candidate for deployments whose certificate SAN also includes
+// it; see central_tls_sender_set_fallback().
 //
 // CAUTION -- cert/IP mismatch, not a reachability problem: CENTRAL_TLS_CA_FILE's
 // current cert (copied from cctv_app, see below) has 127.0.0.1 and 192.168.0.8
-// in its Subject Alternative Name, NOT 192.168.0.2. central_tls_sender now
-// pins IP verification per-connection-attempt, so .2 will complete the TCP
-// connect but fail TLS verification EVERY time until the cert is reissued
-// with .2 in its SAN — this is expected to make every reconnect cycle fail
-// once on .2 before rotating to .8, not a bug to chase. Port 9000 was not
-// accepting connections on either address when this was checked (2026-08-10)
-// — no central-server process was listening at all; the link sits in
-// "offline"/rotates candidates and keeps retrying until one comes up.
+// in its Subject Alternative Name, NOT 192.168.0.2. The fallback therefore
+// fails closed until the cert is reissued with .2 in its SAN.
 #ifndef CENTRAL_TLS_SERVER_IP
-#define CENTRAL_TLS_SERVER_IP "192.168.0.2"
+#define CENTRAL_TLS_SERVER_IP "192.168.0.8"
 #endif
 #ifndef CENTRAL_TLS_SERVER_IP_FALLBACK
-#define CENTRAL_TLS_SERVER_IP_FALLBACK "192.168.0.8"
+#define CENTRAL_TLS_SERVER_IP_FALLBACK "192.168.0.2"
 #endif
 #ifndef CENTRAL_TLS_SERVER_PORT
 #define CENTRAL_TLS_SERVER_PORT 9000
