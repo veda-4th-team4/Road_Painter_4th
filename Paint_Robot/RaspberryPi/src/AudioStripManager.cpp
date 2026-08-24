@@ -185,6 +185,9 @@ bool AudioStripManager::Open()
     if (fd_ >= 0)
         return true;
 
+    // Ensure BCM2711 I2S pins (GPIO 18, 19, 21) are firmly set to ALT0 (PCM_CLK, PCM_FS, PCM_DOUT)
+    ::system("raspi-gpio set 18 a0 2>/dev/null; raspi-gpio set 19 a0 2>/dev/null; raspi-gpio set 21 a0 2>/dev/null; pinctrl set 18 a0 2>/dev/null; pinctrl set 19 a0 2>/dev/null; pinctrl set 21 a0 2>/dev/null");
+
     if (!IsDirectory(wav_dir_)) {
         std::cerr << "[Audio] WAV directory not found: " << wav_dir_ << std::endl;
         return false;

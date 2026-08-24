@@ -2,6 +2,10 @@
 
 set -u
 
+raspi-gpio set 18 a0 2>/dev/null || true
+raspi-gpio set 19 a0 2>/dev/null || true
+raspi-gpio set 21 a0 2>/dev/null || true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY="${ROADPAINTER_AUDIO_TEST_BIN:-$SCRIPT_DIR/../build/audio_strip_test}"
 
