@@ -18,38 +18,28 @@ sudo apt-get install -y g++ make cmake libssl-dev wiringpi
 ## 📂 프로젝트 구조
 
 ```text
-RaspberryPi/
-├── CMakeLists.txt         # CMake 빌드 설정 파일
-├── README.md              # 본 설명 문서
-├── LED_STRIP_KR.md        # 타워램프(WS2812B) 설치 및 연동 가이드
+Paint_Robot/RaspberryPi/
+├── driver/                         ➔ [리눅스 커널 공간: LKM & Device Tree]
+│   ├── led_strip_driver.c          • BCM2711 PWM Serializer + DMA 직결 커널 드라이버
+│   ├── led_strip_regs.h            • BCM2711 PWM/DMA 레지스터 맵 및 WS2812B 타이밍 상수
+│   ├── led_strip_overlay.dts       • GPIO 12(PWM0_0) 핀먹스 디바이스 트리 오버레이
+│   ├── mpu6050_driver.c            • kthread 기반 500 Hz I2C 폴링 & 고정소수점(mdeg) 적산 모듈
+│   ├── mpu6050_overlay.dts         • I2C-1 버스 디바이스 트리 오버레이
+│   └── Makefile                    • 커널 빌드 및 .ko 모듈 생성 스크립트
 │
-├── include/
-│   ├── RobotTypes.h       # 공통 구조체, enum, Protocol v2 payload 및 ms 타임스탬프 헬퍼
-│   ├── SerialManager.h    # RPi ↔ STM32 시리얼(UART 115200bps) 송수신 클래스
-│   ├── NetworkManager.h   # RPi ↔ 비전 서버 TCP/TLS 연결 및 Protocol v2 JSON 파서 클래스
-│   ├── PathFollower.h     # 스텝 오도메트리 정밀 주행/회전 및 DRIFT 연속 차동 조향 클래스
-│   ├── ImuManager.h       # MPU6050 I2C 자이로 센서 필터링 및 적분 클래스
-│   ├── LedStripManager.h  # 타워램프 상태표시 API (SetState 한 줄로 제어)
-│   └── nlohmann/          # JSON Parser 라이브러리 디렉토리 (nlohmann/json.hpp)
+├── include/ & src/                 ➔ [유저 공간: C++17 POSIX Core Application]
+│   ├── NetworkManager (.h/.cpp)    • 중앙 서버 TLS 1.2 소켓 통신 & JSON 명령 파싱
+│   ├── PathFollower (.h/.cpp)      • 차동 구동 역기구학 연산, 1단 감속(8%), 스텝 추종
+│   ├── SerialManager (.h/.cpp)     • termios 기반 Non-blocking UART 통신 (115200 bps)
+│   ├── LedStripManager (.h/.cpp)   • std::thread 백그라운드 30 fps 상태 렌더러 (/dev/led_strip)
+│   ├── ImuManager (.h/.cpp)        • /dev/mpu6050 캐릭터 디바이스 제어 및 동적 영점 리셋
+│   ├── RobotTypes.h                • 통신 프로토콜 바이너리 구조체(#pragma pack(1)) 및 전역 상수
+│   └── main.cpp                    • 메인 제어 루프, 50 Hz 상태 머신 스케줄링 및 Failsafe
 │
-├── driver/                # 커널 디바이스 드라이버 (모듈 + DT 오버레이)
-│   ├── mpu6050_driver.c   # MPU6050 I2C 드라이버
-│   ├── led_strip_driver.c # WS2812B 드라이버 (PWM 시리얼라이저 + DMA)
-│   ├── led_strip_regs.h   # BCM2711 PWM 레지스터 맵 / WS2812B 인코딩 상수
-│   └── *_overlay.dts      # 디바이스 트리 오버레이 (LED는 GPIO12 = 물리 32번)
-│
-└── src/
-    ├── main.cpp           # 메인 시퀀스 오케스트레이터 (Protocol v2 핸드셰이크 & 제어 루프)
-    ├── SerialManager.cpp  # UART 포트(/dev/serial0) 개방 및 CRC8 패킷 송수신 구현
-    ├── NetworkManager.cpp # TLS 소켓 세션 관리, op_index 매칭 및 HOLD 처리 구현
-    ├── PathFollower.cpp   # 기구학 스텝 환산 및 후진/직진/턴 조향 알고리즘 구현
-    ├── ImuManager.cpp     # MPU6050 I2C DLPF 필터링 및 Yaw 처리 구현
-    ├── LedStripManager.cpp# 타워램프 렌더 스레드 및 상태별 애니메이션 구현
-    ├── calibration_test.cpp# 🎯 하드웨어 캘리브레이션 (거리/각도 실측 보정) 대화형 CLI 툴
-    ├── motor_test.cpp     # STM32 UART 모터/노즐 하드웨어 단독 검증 툴
-    ├── arc_test.cpp       # 호(Arc) 주행 기구학 검증 툴
-    ├── led_test.cpp       # 타워램프 점등 검증 전용 독립 테스트 툴
-    └── imu_test.cpp       # MPU6050 I2C 실시간 센서 검증 툴
+└── daemon/                         ➔ [시스템 운영 및 자동화: systemd Service]
+    ├── robot_exec.service          • 부팅 시 자동 실행 및 장애 시 3초 내 자동 복구(Restart=always)
+    └── install_daemon.sh           • 원클릭 systemd 데몬 등록 및 권한 자동화 스크립트
+
 ```
 
 > 타워램프는 커널 모듈과 디바이스 트리 오버레이 설치가 선행되어야 합니다.
