@@ -1,6 +1,8 @@
 #include "motionprogram.h"
 #include "robottiming.h"
 #include "paintgeometry.h"
+#include "paintdimensions.h"
+#include "paintprogress.h"
 #include "routeplan.h"
 #include "strokefont.h"
 #include "camcalib.h"
@@ -1349,6 +1351,61 @@ void testRobotTimingEstimate()
           "program estimate must sum read-only operation timing");
 }
 
+void testPaintProgressUsesSeparatePaintPaths()
+{
+    const QList<QList<QPointF>> paths{
+        {QPointF(0.0, 0.0), QPointF(1.0, 0.0)},
+        {QPointF(10.0, 0.0), QPointF(11.0, 0.0)}
+    };
+    const QList<bool> closed{false, false};
+
+    check(near(paintprogress::progressAlongPaths(paths, closed, QPointF(0.5, 0.0)), 0.25),
+          "first painted path midpoint must be 25% of painted length");
+    check(near(paintprogress::progressAlongPaths(paths, closed, QPointF(10.5, 0.0)), 0.75),
+          "pen-up travel gap must not count toward painted progress");
+}
+
+void testPaintProgressUsesPenPosition()
+{
+    const QList<QList<QPointF>> paths{
+        {QPointF(0.0, 0.0), QPointF(1.0, 0.0)}
+    };
+    const QList<bool> closed{false};
+
+    check(near(paintprogress::progressAlongPaths(paths, closed, QPointF(0.2, 0.0)), 0.2),
+          "paint progress must follow the nozzle projection");
+}
+
+void testFinishedDimensionEditorKeepsWireGeometrySemantic()
+{
+    // 중심선 획(H/V/직선/화살표 등): 서버가 60mm 폭의 양끝을 30mm씩
+    // 연장하므로, 저장·전송 길이 40mm가 사용자에게는 완성 100mm로 보여야 한다.
+    check(near(paintdimensions::finishedSegmentMm(40.0, 60.0, false), 100.0),
+          "a 40mm centre stroke with a 60mm tip must display as 100mm finished paint");
+
+    double stored = 0.0;
+    check(paintdimensions::storedSegmentMm(100.0, 60.0, false, &stored)
+              && near(stored, 40.0),
+          "entering a 100mm finished H/V stroke must retain a 40mm centre path");
+
+    // 사각형·삼각형·닫힌 자유도형은 편집점 자체가 이미 완성 외곽선이다.
+    check(near(paintdimensions::finishedSegmentMm(100.0, 60.0, true), 100.0),
+          "an outer-contour edge must display its stored finished length unchanged");
+    check(paintdimensions::storedSegmentMm(100.0, 60.0, true, &stored)
+              && near(stored, 100.0),
+          "editing an outer-contour edge must not subtract the tip width twice");
+
+    // 펜 폭보다 짧은 완성 선은 양의 중심 경로를 만들 수 없다.
+    check(!paintdimensions::storedSegmentMm(60.0, 60.0, false, &stored),
+          "a finished centre stroke must be longer than the measured paint width");
+
+    // O와 일반 원호는 중심 반지름을 전송하되 UI에는 도색 바깥 반지름도 알려준다.
+    check(near(paintdimensions::finishedOuterRadiusMm(70.0, 60.0, false), 100.0),
+          "a centreline O arc must expose its finished outer radius");
+    check(near(paintdimensions::finishedOuterRadiusMm(100.0, 60.0, true), 100.0),
+          "an outer-contour circle already stores its finished outer radius");
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -1384,6 +1441,9 @@ int main(int argc, char **argv)
     testUndistortLensDataWarning();
     testMissingChannelResolution();
     testRobotTimingEstimate();
+    testPaintProgressUsesSeparatePaintPaths();
+    testPaintProgressUsesPenPosition();
+    testFinishedDimensionEditorKeepsWireGeometrySemantic();
     if (failures == 0) {
         std::cout << "motionprogram_tests: PASS\n";
         return 0;

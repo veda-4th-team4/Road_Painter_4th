@@ -6,6 +6,7 @@
 #include "serverclient.h"
 #include "routeplan.h"
 #include "paintgeometry.h"
+#include "paintprogress.h"
 #include "robottiming.h"
 
 #include <QTimer>
@@ -77,40 +78,13 @@ int pathsPointCount(const QList<QList<QPointF>> &paths)
     return n;
 }
 
-// Closest projection cumulative distance along path (0..L)
-double distanceAlongPolyline(const QList<QPointF> &pts, bool closed, const QPointF &pose)
-{
-    if (pts.size() < 2) return 0.0;
+// 표시 기하 기본값(펜 폭·펜 오프셋)의 세대 번호. loadSettings 가 이 값보다 낮은
+// 설정을 만나면 옛 기본값만 골라 현재 실측값으로 이관하고, saveSettings 가 같은
+// 값을 다시 기록한다.
+// 🔴 두 곳이 같은 상수를 봐야 한다 — 숫자를 직접 쓰면 다음에 세대를 올렸을 때
+//    save 가 옛 번호를 남겨 마이그레이션이 매 실행마다 다시 돈다.
+constexpr int kGeometryDefaultsVersion = 2;
 
-    QList<QPointF> segs = pts;
-    if (closed && pts.size() > 2)
-        segs.append(pts.first());
-
-    double bestDist2 = 1e300;
-    double bestAlong = 0.0;
-    double walked = 0.0;
-
-    for (int i = 1; i < segs.size(); ++i) {
-        const QPointF a = segs[i - 1];
-        const QPointF b = segs[i];
-        const QPointF ab = b - a;
-        const double len2 = QPointF::dotProduct(ab, ab);
-        double t = 0.0;
-        if (len2 > 1e-12) {
-            t = QPointF::dotProduct(pose - a, ab) / len2;
-            t = qBound(0.0, t, 1.0);
-        }
-        const QPointF proj = a + ab * t;
-        const QPointF d = pose - proj;
-        const double d2 = QPointF::dotProduct(d, d);
-        if (d2 < bestDist2) {
-            bestDist2 = d2;
-            bestAlong = walked + qSqrt(len2) * t;
-        }
-        walked += qSqrt(len2);
-    }
-    return bestAlong;
-}
 } // namespace
 
 Backend::Backend(QObject *parent)
@@ -1672,6 +1646,9 @@ void Backend::finishJob(const QString &reason)
     m_abortPending = false;
     m_paintingSeen = false;
     m_blueprintSent = false;   // 완료된 도면은 다시 그리려면 재전송이 필요하다
+    // STATUS.painting=false가 마지막 POSE보다 먼저 도착하면 표시 진행률이 잠시
+    // 마지막 투영값에 머물 수 있다. 완료의 유일한 권위인 DRAW_DONE이 이 함수로
+    // 들어오면 반드시 100%로 확정하므로 "완료인데 96%" 상태는 남지 않는다.
     setJobProgress(1.0);
     m_waypointIndex = qMax(0, m_waypointCount - 1);
     m_phase = "done";
@@ -2117,41 +2094,26 @@ void Backend::setJobProgress(double p)
     updatePhase();
 }
 
-// 미션 전체를 주행 순서대로 이어붙인 폴리라인 (닫힌 도형은 시작점 복귀 포함)
-QList<QPointF> Backend::missionTravelLine() const
+double Backend::progressAlongPath(const QPointF &pen) const
 {
-    QList<QPointF> travel;
-    for (int i = 0; i < m_missionPaths.size(); ++i) {
-        travel += m_missionPaths[i];
-        if (m_missionClosed.value(i, false) && m_missionPaths[i].size() > 2)
-            travel.append(m_missionPaths[i].first());
-    }
-    return travel;
-}
-
-double Backend::progressAlongPath(const QPointF &pose) const
-{
-    const QList<QPointF> travel = missionTravelLine();
-    const double L = polylineLength(travel, false);
-    if (L < 1e-6) return 0.0;
-    return qBound(0.0, distanceAlongPolyline(travel, false, pose) / L, 1.0);
+    return paintprogress::progressAlongPaths(m_missionPaths, m_missionClosed, pen);
 }
 
 // 서버가 주는 POSE(x, y)는 **ArUco 마커(ID 49)의 중심**이다. 로봇팀 제원(2026-07-30):
 //
-//      ArUco 마커 중심  ──── 155mm ────  노즐(= 펜 = 페인트가 나오는 곳)
+//      ArUco 마커 중심  ── 설정 거리(기본 172mm) ──  노즐(= 펜 = 페인트가 나오는 곳)
 //
-// 즉 **마커 = 로봇 기준점**이고, 펜은 거기서 155mm 떨어져 있다. 화면은 이렇게 나눈다:
+// 즉 **마커 = 로봇 기준점**이고, 펜은 설정된 거리만큼 떨어져 있다. 화면은 이렇게 나눈다:
 //   · setRobotPose  ← POSE 그대로            = 마커 = 로봇 기준점 (섀시를 여기 그린다)
-//   · setPenMarker  ← POSE − 155mm·heading   = 노즐 (실제로 칠하는 점)
+//   · setPenMarker  ← POSE − 설정거리·heading = 노즐 (실제로 칠하는 점)
 //
 // 방향이 **뒤**인 근거: 로봇은 "1m 직진"을 받으면 오프셋만큼 **더 가서** 1m 를 긋는다
 // (사용자 확인). 펜이 뒤에 달려 있어야 그 보정이 성립한다 — 중심이 d 만큼 더 나아가야
 // 뒤따라오는 펜이 시작점에 닿는다. 앞에 달렸다면 반대로 덜 가야 한다.
 // 방향이 틀린 것으로 밝혀지면 아래 부호 하나만 뒤집으면 된다.
 //
-// ⚠️ 진행률·시작점 도착 판정은 **보정 안 한 POSE(마커)** 를 그대로 쓴다. 서버가 이탈
-//    감시를 하는 기준도 같은 POSE 라, 여기서만 다른 점을 쓰면 두 판정이 어긋난다.
+// ⚠️ 서버의 시작점 도착·이탈 판정은 POSE(마커) 기준이다. 화면의 주황색 도색 진행선만
+//    실제 도포 지점과 맞추기 위해 아래 노즐 위치를 사용한다.
 // ⚠️ 표시 거리를 반영해서 로봇에 보내지 않는다. QT 는 도면 그대로만 낸다. 오프셋 보정은
 //    서버 v2/로봇 전담이다(`pen_offset_m`은 Qt 프로토콜에서 폐지).
 void Backend::pushPoseToView(bool valid)
@@ -2171,7 +2133,7 @@ void Backend::pushPoseToView(bool valid)
 //
 // 재생기는 시퀀스를 그대로 굴리므로 그 좌표가 곧 노즐이다(motionsim.h 참고).
 // 🔴 예전에는 재생기 좌표를 setRobotPose 에도 그대로 넣어서, **미리보기에서는
-//    섀시가 도면 선 위에** 있고 실주행에서는 155mm 옆에 있었다. 같은 도면인데
+//    섀시가 도면 선 위에** 있고 실주행에서는 설정 거리만큼 옆에 있었다. 같은 도면인데
 //    미리보기와 실주행의 로봇 자세가 달라 보이면 미리보기를 믿을 수 없게 된다.
 void Backend::pushSimPoseToView(const QPointF &nozzleM, double headingDeg, bool down)
 {
@@ -2210,11 +2172,15 @@ void Backend::onPose(double x, double y, double thetaDeg)
 
     pushPoseToView(true);
 
-    // 진행률은 "실제로 칠하기 시작한 뒤"부터만 의미가 있다.
-    // START_DRAW 직후에는 로봇이 시작점으로 접근하는 중이라, 그때 경로상 위치를
-    // 진행률로 환산하면 엉뚱한 값(예: 끝점 근처에서 출발)이 나온다.
-    if (m_jobActive && !m_testMode && m_paintingSeen)
-        setJobProgress(progressAlongPath(QPointF(x, y)));
+    // 흰색으로 채워진 펜 마커(m_painting=true)가 실제 경로 위를 지날 때만
+    // 주황색 도색 구간을 늘린다. 한 번 도색을 시작했다는 m_paintingSeen 으로
+    // 계속 갱신하면 펜을 든 도형 간 이동도 칠한 것처럼 보인다.
+    if (m_jobActive && !m_testMode && m_painting) {
+        const double displayOffsetM = m_penDisplayOffsetMm / 1000.0;
+        const QPointF pen = paintgeometry::penMarkerFromRobotCenter(
+            x, y, thetaDeg, displayOffsetM);
+        setJobProgress(progressAlongPath(pen));
+    }
 
     // ⚠️ 완료 판정은 하지 않는다. 끝은 서버의 DRAW_DONE 하나뿐이다.
     refreshLinkStatus();
@@ -3572,16 +3538,32 @@ void Backend::loadSettings()
     m_simSpeedFactor   = qBound(0.5,  s.value("ui/simSpeed",      4.0).toDouble(), 20.0);
     m_lensOn = s.value("camera/lensCorrection", false).toBool();
     m_robotVisible = s.value("ui/robotVisible", true).toBool();
-    const double savedPenDisplayOffset = s.value("ui/penDisplayOffsetMm", 155.0).toDouble();
+    double savedPenDisplayOffset = s.value("ui/penDisplayOffsetMm", 172.0).toDouble();
+    double savedStrokeWidth = s.value("paint/strokeWidthMm", 60.0).toDouble();
+
+    // v1의 기본값(50mm/155mm)이 QSettings에 저장된 PC에서는 단순히 C++ 기본값만
+    // 바꿔도 계속 옛 값이 살아난다. 사용자가 직접 넣은 다른 값은 보존하고,
+    // 정확히 옛 기본값인 경우에만 프로젝트 실측값 60mm/172mm로 한 번 이관한다.
+    const int savedGeometryVersion = s.value("paint/geometryDefaultsVersion", 1).toInt();
+    if (savedGeometryVersion < kGeometryDefaultsVersion) {
+        if (!s.contains("ui/penDisplayOffsetMm")
+            || std::abs(savedPenDisplayOffset - 155.0) < 0.01)
+            savedPenDisplayOffset = 172.0;
+        if (!s.contains("paint/strokeWidthMm")
+            || std::abs(savedStrokeWidth - 50.0) < 0.01)
+            savedStrokeWidth = 60.0;
+        s.setValue("ui/penDisplayOffsetMm", savedPenDisplayOffset);
+        s.setValue("paint/strokeWidthMm", savedStrokeWidth);
+        s.setValue("paint/geometryDefaultsVersion", kGeometryDefaultsVersion);
+    }
     m_penDisplayOffsetMm = std::isfinite(savedPenDisplayOffset)
-        ? qBound(0.0, savedPenDisplayOffset, 500.0) : 155.0;
+        ? qBound(0.0, savedPenDisplayOffset, 500.0) : 172.0;
     m_brightness = qBound(-100, s.value("video/brightness", 45).toInt(), 100);
     m_contrast = qBound(-100, s.value("video/contrast", 8).toInt(), 100);
     m_sharpen = qBound(0, s.value("video/sharpen", 0).toInt(), 100);
     m_saturation = qBound(-100, s.value("video/saturation", 0).toInt(), 100);
-    const double savedStrokeWidth = s.value("paint/strokeWidthMm", 50.0).toDouble();
     m_strokeWidthMm = std::isfinite(savedStrokeWidth)
-        ? qBound(1.0, savedStrokeWidth, 500.0) : 50.0;
+        ? qBound(1.0, savedStrokeWidth, 500.0) : 60.0;
 
     // 운영 카메라는 .13 PNM 한 대와 CH1~CH4로 고정한다. 과거 카메라 설정이나
     // 임의 RTSP 주소는 읽지 않고 현재 설정 키를 정상값으로 즉시 이관한다.
@@ -3617,6 +3599,7 @@ void Backend::saveSettings() const
     s.setValue("ui/robotVisible", m_robotVisible);
     s.setValue("ui/penDisplayOffsetMm", m_penDisplayOffsetMm);
     s.setValue("paint/strokeWidthMm", m_strokeWidthMm);
+    s.setValue("paint/geometryDefaultsVersion", kGeometryDefaultsVersion);
     s.setValue("video/brightness", m_brightness);
     s.setValue("video/contrast", m_contrast);
     s.setValue("video/sharpen", m_sharpen);

@@ -1,6 +1,7 @@
 #include "videoview.h"
 #include "motionprogram.h"
 #include "paintgeometry.h"
+#include "paintdimensions.h"
 
 #include <QPainter>
 #include <QPainterPath>
@@ -638,14 +639,17 @@ void VideoView::paint(QPainter *p)
                 const double outerRadiusMm = outerArc.ok
                     ? outerArc.radiusPx / std::max(1e-9, m_tvPxPerM) * 1000.0
                     : radiusMm;
+                const double finishedRadiusMm = paintdimensions::finishedOuterRadiusMm(
+                    radiusMm, m_strokeMm, m_outerContour);
                 const QString tag = arcTooTight
                     ? QStringLiteral("도색 불가 · 중심 R %1 · 최소 200 mm").arg(mmLabel(radiusMm))
                     : (m_outerContour
                        ? QStringLiteral("완성 R %1 · 중심 R %2 · %3°")
                              .arg(mmLabel(outerRadiusMm), mmLabel(radiusMm))
                              .arg(displayArc.sweepDeg, 0, 'f', 0)
-                       : QStringLiteral("ARC · R %1 · %2°")
-                             .arg(mmLabel(radiusMm)).arg(displayArc.sweepDeg, 0, 'f', 0));
+                       : QStringLiteral("도색 외곽 R %1 · 중심 R %2 · %3°")
+                             .arg(mmLabel(finishedRadiusMm), mmLabel(radiusMm))
+                             .arg(displayArc.sweepDeg, 0, 'f', 0));
                 p->setFont(QFont("Pretendard", 8));
                 const QFontMetrics fm(p->font());
                 QRectF pathBox;
@@ -1040,7 +1044,6 @@ void VideoView::paintEdgeLengths(QPainter *p, const QVector<QPointF> &pts, bool 
 {
     m_edgeLabelRects.clear();
     if (pts.size() < 2) return;
-    const double spm = (m_tvPxPerM > 0) ? m_tvPxPerM : 100.0;
     auto toW = [&](const QPointF &ip) {
         return QPointF(ip.x() * sx + ox, ip.y() * sy + oy);
     };
@@ -1056,12 +1059,17 @@ void VideoView::paintEdgeLengths(QPainter *p, const QVector<QPointF> &pts, bool 
         const QPointF wa = toW(a), wb = toW(b);
         // 화면에서 너무 짧은 변은 라벨 생략 — 겹쳐서 못 읽는 걸 방지
         if (QLineF(wa, wb).length() < 44.0) { m_edgeLabelRects[i] = QRectF(); continue; }
-        const double mm = QLineF(a, b).length() / spm * 1000.0;
+        // 치수 UI는 펜 중심선이 아니라 완성된 도색의 끝↔끝을 보여준다.
+        // 외곽 도형은 pts 자체가 완성 치수이고, 중심선 획은 서버가 양끝을
+        // 펜 폭의 절반씩 연장하므로 한 폭을 더해 표시한다.
+        const double storedMm = QLineF(topPxToWorldMm(a), topPxToWorldMm(b)).length();
+        const double mm = paintdimensions::finishedSegmentMm(
+            storedMm, m_strokeMm, m_outerContour);
         if (mm < 0.5) { m_edgeLabelRects[i] = QRectF(); continue; }
         const QPointF mid = (wa + wb) * 0.5;
         const QString label = m_outerContour
             ? QStringLiteral("외곽 %1").arg(mmLabel(mm))
-            : mmLabel(mm);
+            : QStringLiteral("도색 %1").arg(mmLabel(mm));
         const QRect br = fm.boundingRect(label);
         QRectF box(mid.x() - br.width() * 0.5 - 5, mid.y() - br.height() * 0.5 - 3,
                    br.width() + 10, br.height() + 6);
@@ -1251,7 +1259,7 @@ void VideoView::paintRobot(QPainter *p, double sx, double sy, double ox, double 
     //    뒤에 있다. 강조색은 전면 범퍼 하나로 충분하다.
 
     // ⑧ 기준점 십자 = **ArUco 마커(ID 49) 중심** = 서버가 준 POSE(x, y) 그 자체.
-    //    노즐은 여기가 아니라 155mm 뒤다 (Backend::pushPoseToView 참고).
+    //    노즐은 여기가 아니라 설정된 중심-펜 거리만큼 뒤다 (Backend::pushPoseToView 참고).
     //    점 하나보다 십자가 낫다: 도료 드럼 위에서도 축이 어디인지 정확히 짚힌다.
     if (L >= 30.0) {
         const double ct = std::max(2.6, L * 0.075);
@@ -1269,7 +1277,7 @@ void VideoView::paintRobot(QPainter *p, double sx, double sy, double ox, double 
     paintPenMarker(p, sx, sy, ox, oy);
 }
 
-// 노즐(펜) 끝 — 페인트가 실제로 나오는 점. 기준점(ArUco 마커) 뒤 155mm 라 로봇 몸통에
+// 노즐(펜) 끝 — 페인트가 실제로 나오는 점. 기준점(ArUco 마커) 뒤 설정 거리만큼 떨어져
 // 가려진다 → **아이콘 위에** 찍는다. 전장 265mm 의 절반(132mm)보다 멀어서 섀시 밖으로
 // 조금 나온다. 꼭짓점에서 후진·제자리회전할 때 어디를 칠하는지 이것만 보면 된다.
 // 내려간 상태 = 채운 점(칠하는 중), 올라간 상태 = 빈 원(이동/회전).
@@ -1279,7 +1287,7 @@ void VideoView::paintPenMarker(QPainter *p, double sx, double sy, double ox, dou
     const QPointF pw(m_penPx.x() * sx + ox, m_penPx.y() * sy + oy);
     const double r = qBound(5.0, 0.025 * m_tvPxPerM * sx, 11.0);
 
-    // 기준점 → 노즐 연결선. 실측 오프셋 155mm (ArUco 마커 중심 ↔ 노즐).
+    // 기준점 → 노즐 연결선. 설정 오프셋(기본 172mm, ArUco 마커 중심 ↔ 노즐).
     // 선이 없으면 꼭짓점에서 뒤로 물러났다 돌아오는 게 눈에 안 들어온다.
     if (m_robotValid) {
         const QPointF cw(m_robotPx.x() * sx + ox, m_robotPx.y() * sy + oy);
@@ -2519,13 +2527,13 @@ double VideoView::edgeLengthMm(int index) const
     if (n < 2 || index < 0) return 0.0;
     const int nSeg = (m_closed && n > 2) ? n : n - 1;
     if (index >= nSeg) return 0.0;
-    const double spm = (m_tvPxPerM > 0) ? m_tvPxPerM : 100.0;
-    return QLineF(m_points[index], m_points[(index + 1) % n]).length() / spm * 1000.0;
+    const double storedMm = QLineF(topPxToWorldMm(m_points[index]),
+                                   topPxToWorldMm(m_points[(index + 1) % n])).length();
+    return paintdimensions::finishedSegmentMm(storedMm, m_strokeMm, m_outerContour);
 }
 
 bool VideoView::setEdgeLengthMm(int index, double mm)
 {
-    pushUndo();
     const int n = m_points.size();
     if (n < 2 || index < 0 || mm <= 0.05) return false;
     const int nSeg = (m_closed && n > 2) ? n : n - 1;
@@ -2536,10 +2544,16 @@ bool VideoView::setEdgeLengthMm(int index, double mm)
     const double len = QLineF(a, b).length();
     if (len < 1e-6) return false;
 
-    const double spm = (m_tvPxPerM > 0) ? m_tvPxPerM : 100.0;
-    const double targetPx = mm / 1000.0 * spm;
+    double targetStoredMm = 0.0;
+    if (!paintdimensions::storedSegmentMm(
+            mm, m_strokeMm, m_outerContour, &targetStoredMm))
+        return false;
+    const double currentStoredMm = QLineF(topPxToWorldMm(a), topPxToWorldMm(b)).length();
+    if (currentStoredMm < 1e-9) return false;
+    const double targetPx = len * (targetStoredMm / currentStoredMm);
     if (std::abs(targetPx - len) < 1e-6) return true;
 
+    pushUndo();
     const QPointF u((b.x() - a.x()) / len, (b.y() - a.y()) / len);
     const QPointF delta = u * (targetPx - len);
 
@@ -2792,7 +2806,7 @@ QList<QVector<QPointF>> VideoView::textStrokePolylines(const QString &text,
     return out;
 }
 
-// 글자 도장. 기본은 획(중심선) — 붓 폭 50 mm 로 한 번에 칠해지는 형태.
+// 글자 도장. 기본은 획(중심선) — 설정된 붓 폭으로 한 번에 칠해지는 형태.
 void VideoView::addTextWorld(const QString &text, double heightMm, bool outline)
 {
     pushUndo();
