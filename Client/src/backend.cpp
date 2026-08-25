@@ -7,6 +7,7 @@
 #include "routeplan.h"
 #include "paintgeometry.h"
 #include "paintprogress.h"
+#include "paintdimensions.h"
 #include "robottiming.h"
 
 #include <QTimer>
@@ -3428,6 +3429,21 @@ void Backend::addTextWorldMm(const QString &text, double heightMm, bool outline)
     if (!m_topView || m_jobActive) return;
     const QString t = text.trimmed();
     if (t.isEmpty()) { appendLog(QStringLiteral("넣을 글자를 입력하세요.")); return; }
+
+    // 🔴 heightMm 은 **완성 도색 높이**다. 획 글자는 글리프가 펜 폭만큼 작아지므로
+    //    완성 높이가 펜 폭 이하이면 글리프가 0 이하가 된다 — 만들기 전에 막고
+    //    사유를 보여준다 (변 길이 입력창이 하는 것과 같은 처리).
+    //    외곽선(outline)은 닫힌 도형이라 이 보정 대상이 아니다.
+    if (!outline) {
+        double storedMm = 0.0;
+        if (!paintdimensions::storedSegmentMm(heightMm, m_strokeWidthMm,
+                                              /*outerContour=*/false, &storedMm)) {
+            setNotice(QStringLiteral("완성 도색 높이 %1 mm 는 붓 폭 %2 mm 보다 커야 합니다.")
+                          .arg(heightMm, 0, 'f', 0).arg(m_strokeWidthMm, 0, 'f', 0),
+                      QStringLiteral("warn"));
+            return;
+        }
+    }
     if (m_phase == QLatin1String("done"))
         clearMission();
 
@@ -3440,14 +3456,23 @@ void Backend::addTextWorldMm(const QString &text, double heightMm, bool outline)
                   .arg(t).arg(heightMm, 0, 'f', 0)
                   .arg(outline ? QStringLiteral("외곽선") : QStringLiteral("중심선(획)"))
                   .arg(std::max(0, made)));
+    // 작업 영역에 들어가는지 손으로 계산하지 않게 실제 도색 크기를 남긴다.
+    const QSizeF paintedMm = m_topView->lastTextPaintedMm();
+    if (!outline && paintedMm.isValid() && paintedMm.width() > 0.0)
+        appendLog(QStringLiteral("  실제 도색 크기 %1 x %2 mm (가로 x 세로)")
+                      .arg(paintedMm.width(), 0, 'f', 0)
+                      .arg(paintedMm.height(), 0, 'f', 0));
 
-    // 글자 높이가 붓 폭보다 너무 작으면 뭉개진다 — 미리 알려준다
-    if (heightMm < m_strokeWidthMm * 2.5) {
-        setNotice(QStringLiteral("글자 높이 %1 mm 는 붓 폭 %2 mm 에 비해 작아 뭉개질 수 있습니다. "
+    // 글자 높이가 붓 폭보다 너무 작으면 뭉개진다 — 미리 알려준다.
+    // ⚠️ 기준이 **완성 높이**로 바뀌었다. 예전 규칙은 '중심 높이 >= 붓폭 x 2.5' 였고,
+    //    완성 = 중심 + 붓폭 이므로 완성 기준으로는 x 3.5 다. 문구의 권장값도 같이 쓴다.
+    const double kMinRecommendedMm = m_strokeWidthMm * 3.5;
+    if (!outline && heightMm < kMinRecommendedMm) {
+        setNotice(QStringLiteral("완성 도색 높이 %1 mm 는 붓 폭 %2 mm 에 비해 작아 뭉개질 수 있습니다. "
                                  "%3 mm 이상을 권장합니다.")
                       .arg(heightMm, 0, 'f', 0)
                       .arg(m_strokeWidthMm, 0, 'f', 0)
-                      .arg(m_strokeWidthMm * 2.5, 0, 'f', 0),
+                      .arg(kMinRecommendedMm, 0, 'f', 0),
                   QStringLiteral("warn"));
     }
     updatePhase();

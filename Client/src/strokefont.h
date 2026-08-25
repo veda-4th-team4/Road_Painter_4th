@@ -23,6 +23,7 @@
 #include <QChar>
 #include <QList>
 #include <QPointF>
+#include <QVector>
 #include <QString>
 #include <QStringList>
 #include <QVector>
@@ -336,6 +337,59 @@ inline QList<Stroke> layout(const QString &text, double *outWidth)
     }
     if (outWidth) *outWidth = std::max(0.001, x - 0.12);
     return all;
+}
+
+// 레이아웃 결과의 **실제 잉크 세로 범위**(em 단위).
+//
+// 글리프가 전부 y 0~1 을 채우지는 않는다 — '-' 는 가운데 한 줄, '.' 는 바닥 점이고
+// 한글 'ㅗ ㅜ ㅡ' 도 마찬가지다. 글자 높이를 **완성 도색 높이** 기준으로 환산할 때
+// em 1.0 으로 나누면 그런 글자가 섞인 문자열에서 완성 높이가 요청값과 달라진다.
+// layout() 이 호를 이미 점으로 펼쳐 주므로 원호 글자도 이 방법이 정확하다.
+inline bool inkRangeEm(const QList<Stroke> &strokes, double *loOut, double *hiOut)
+{
+    bool seen = false;
+    double lo = 0.0, hi = 0.0;
+    for (const Stroke &st : strokes)
+        for (const QPointF &p : st) {
+            if (!seen) { lo = hi = p.y(); seen = true; }
+            else { lo = (p.y() < lo) ? p.y() : lo; hi = (p.y() > hi) ? p.y() : hi; }
+        }
+    if (!seen) return false;
+    if (loOut) *loOut = lo;
+    if (hiOut) *hiOut = hi;
+    return true;
+}
+
+// 위 범위의 높이. 잉크가 없으면 0.
+inline double inkHeightEm(const QList<Stroke> &strokes)
+{
+    double lo = 0.0, hi = 0.0;
+    return inkRangeEm(strokes, &lo, &hi) ? (hi - lo) : 0.0;
+}
+
+// 화면 좌표로 펼친 획 목록의 바운딩 박스. 실제 도색 바깥 크기를 재는 데 쓴다.
+//
+// 🔴 QRectF 로 하지 말 것. `QRectF(p, QSizeF(0,0))` 는 폭·높이가 0 이라
+//    isNull() 이 **항상 참**이다. `r = r.isNull() ? QRectF(p,{0,0}) : r.united(...)`
+//    같은 코드는 united() 가 한 번도 안 불려서 마지막 점의 0x0 사각형만 남는다.
+//    (실제로 그 함정을 밟았다 — 그래서 min/max 를 직접 돈다.)
+inline bool polylineBounds(const QList<QVector<QPointF>> &polys,
+                           double *x0, double *y0, double *x1, double *y1)
+{
+    bool seen = false;
+    double lx = 0.0, ly = 0.0, hx = 0.0, hy = 0.0;
+    for (const QVector<QPointF> &poly : polys)
+        for (const QPointF &p : poly) {
+            if (!seen) { lx = hx = p.x(); ly = hy = p.y(); seen = true; }
+            else {
+                lx = (p.x() < lx) ? p.x() : lx;  hx = (p.x() > hx) ? p.x() : hx;
+                ly = (p.y() < ly) ? p.y() : ly;  hy = (p.y() > hy) ? p.y() : hy;
+            }
+        }
+    if (!seen) return false;
+    if (x0) *x0 = lx;  if (y0) *y0 = ly;
+    if (x1) *x1 = hx;  if (y1) *y1 = hy;
+    return true;
 }
 
 } // namespace strokefont

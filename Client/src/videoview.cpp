@@ -753,7 +753,21 @@ void VideoView::paintBand(QPainter *p, const QVector<QPointF> &pts, bool closed,
     if (closed && pts.size() > 2)
         path.closeSubpath();
     p->setBrush(Qt::NoBrush);
-    p->setPen(QPen(c, wpx, Qt::SolidLine, Qt::FlatCap, Qt::MiterJoin));
+    // 🔴 캡은 **SquareCap** 이다 (FlatCap 아님).
+    //
+    // 서버는 도색 구간을 양끝으로 hw(= 펜 폭 / 2) 씩 늘려서 칠한다:
+    //   · 시작 — openPaint() 가 `lead = a - hw` 로 hw 앞에 펜을 내린다 (직선·호 공통)
+    //   · 끝   — MOVE 의 dist_m 에 `+ 2.0 * hw` (앞당긴 hw 를 포함한 값)
+    //   (Server/src/ops_builder.hpp)
+    // SquareCap 이 정확히 선폭의 절반만큼 끝을 연장하므로 그 값과 같아진다.
+    // FlatCap 이면 화면 띠가 실제 도색보다 양끝 hw 씩 짧게 그려져서,
+    // **같은 화면 안에서 길이 라벨과 그림이 다른 값을 말하게 된다**
+    // (라벨은 paintdimensions::finishedSegmentMm 로 이미 폭을 더해 표시 중).
+    //
+    // 닫힌 경로는 closeSubpath() 라 캡이 쓰이지 않는다 — 분기할 필요 없다.
+    // 호(ARC)도 같다 — 서버는 스윕 각도에 `2*(hw/rPaint)` 를 더한다
+    // (ops_builder.hpp travelGeom). 직선은 거리로, 호는 각도로 늘릴 뿐 양끝 hw 다.
+    p->setPen(QPen(c, wpx, Qt::SolidLine, Qt::SquareCap, Qt::MiterJoin));
     p->drawPath(path);
 }
 
@@ -2787,13 +2801,26 @@ QList<QVector<QPointF>> VideoView::textStrokePolylines(const QString &text,
     const QList<strokefont::Stroke> strokes = strokefont::layout(text, &emW);
     if (strokes.isEmpty()) return out;
 
-    // em 박스(가로 emW · 세로 1) → 목표 높이. y 는 폰트가 위로 +1 이고
-    // 이미지 좌표는 아래로 + 이므로 뒤집는다.
-    const double sc = targetHpx;
+    // 🔴 배율은 **실제 잉크 세로 범위**로 정한다 (em 박스 1.0 이 아니라).
+    //    strokefont 글리프가 전부 y 0~1 을 채우지는 않는다 — '-' 는 가운데 한 줄,
+    //    '.' 는 바닥 점이고 한글 'ㅗ ㅜ ㅡ' 도 마찬가지다. em 1.0 으로 나누면
+    //    그런 글자가 섞인 문자열에서 완성 높이가 요청값과 달라진다.
+    //    layout() 이 호를 이미 점으로 펼쳐 주므로 원호 글자도 이 방법이 정확하다.
+    // y 는 폰트가 위로 +1 이고 이미지 좌표는 아래로 + 이므로 뒤집는다.
+    double minY = 0.0, maxY = 0.0;
+    if (!strokefont::inkRangeEm(strokes, &minY, &maxY)) return out;
+    double ink = maxY - minY;
+    // ⚠️ 세로 두께가 0 인 문자열('-' 는 y=0.5 한 줄, '.' 는 y=0 점)이 있다.
+    //    그대로 나누면 글자가 아예 안 만들어진다 — 예전처럼 em 1.0 으로 되돌린다.
+    //    이런 글자는 실제 도색 세로가 어차피 펜 폭 하나라 높이 지정이 의미가 없다.
+    if (!(ink > 1e-6)) ink = 1.0;
+
+    const double sc = targetHpx / ink;
     const double cx = m_frame.isNull() ? 0.0 : m_frame.width() * 0.5;
     const double cy = m_frame.isNull() ? 0.0 : m_frame.height() * 0.5;
     const double ox = cx - emW * sc * 0.5;
-    const double oy = cy + sc * 0.5;
+    // 잉크 세로 **중앙**을 화면 중앙에 맞춘다 (em 중앙이 아니라).
+    const double oy = cy + (minY + maxY) * 0.5 * sc;
 
     for (const strokefont::Stroke &st : strokes) {
         if (st.size() < 2) continue;
@@ -2809,17 +2836,52 @@ QList<QVector<QPointF>> VideoView::textStrokePolylines(const QString &text,
 // 글자 도장. 기본은 획(중심선) — 설정된 붓 폭으로 한 번에 칠해지는 형태.
 void VideoView::addTextWorld(const QString &text, double heightMm, bool outline)
 {
-    pushUndo();
     if (!m_isTopView || text.trimmed().isEmpty() || m_frame.isNull()) return;
+
+    m_lastTextPaintedMm = QSizeF();   // 이번 호출이 실패하면 옛 값이 남지 않게
+
+    const double pxPerMm = m_tvPxPerM / 1000.0;
+
+    // 🔴 heightMm 은 **완성 도색 높이**다 — 변 길이 입력창과 같은 기준.
+    //    서버가 도색 구간 양끝을 hw(= 펜 폭 / 2) 씩 늘려 칠하므로, 글리프 자체는
+    //    펜 폭만큼 작아야 요청한 높이가 그대로 칠해진다.
+    //    ⚠️ 새 공식을 만들지 않는다 — 변 길이와 **같은 함수**를 써야 두 입력이
+    //       서로 어긋나지 않는다.
+    //    ⚠️ 외곽선(outline)은 닫힌 도형이라 이 보정을 하지 않는다 (이중 차감 방지).
+    double targetHmm = std::max(20.0, heightMm);
+    if (!outline) {
+        double storedMm = 0.0;
+        if (!paintdimensions::storedSegmentMm(heightMm, m_strokeMm,
+                                              /*outerContour=*/false, &storedMm))
+            return;   // 완성 높이가 펜 폭 이하 — 사유는 Backend 가 알린다
+        targetHmm = storedMm;
+    }
+    const double targetH = targetHmm * pxPerMm;
+
+    // 🔴 만들 것을 **먼저 만들어 보고**, 하나라도 나왔을 때만 상태를 건드린다.
+    //    글리프가 너무 작으면(완성 높이가 펜 폭보다 겨우 큰 경우) textStrokePolylines
+    //    가 빈 목록을 돌려주는데, 그전에 stashActive() 가 돌면 m_done 의 마지막
+    //    도형이 활성 경로로 끌려와 **엉뚱한 도형이 선택된 것처럼** 보인다.
+    QList<QVector<QPointF>> strokes;
+    if (!outline) {
+        strokes = textStrokePolylines(text.trimmed(), targetH);
+        if (strokes.isEmpty()) return;
+    }
+
+    // ⚠️ pushUndo 는 **실패 반환을 다 지난 뒤**에 — 헛 undo 가 쌓이면 Ctrl+Z 가 헛돈다.
+    pushUndo();
     stashActive();
     m_focused = true;              // 방금 넣은 것은 바로 편집할 수 있어야 한다
     m_drawing = false;
 
-    const double pxPerMm = m_tvPxPerM / 1000.0;
-    const double targetH = std::max(20.0, heightMm) * pxPerMm;
-
     if (!outline) {
-        const QList<QVector<QPointF>> strokes = textStrokePolylines(text.trimmed(), targetH);
+        // 실제 칠해지는 바깥 크기 = 획 점들의 바운딩 박스 + 펜 폭(양쪽 hw).
+        // ⚠️ QRectF::united 로 모으면 안 된다 — strokefont::polylineBounds 주석 참고.
+        double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+        m_lastTextPaintedMm = strokefont::polylineBounds(strokes, &x0, &y0, &x1, &y1)
+            ? QSizeF((x1 - x0) * mmPerPx() + m_strokeMm,
+                     (y1 - y0) * mmPerPx() + m_strokeMm)
+            : QSizeF();
         for (const QVector<QPointF> &s : strokes) {
             VVPath dp;
             dp.closed = false;          // 획은 열린 경로 = 직진/회전으로만 주행
