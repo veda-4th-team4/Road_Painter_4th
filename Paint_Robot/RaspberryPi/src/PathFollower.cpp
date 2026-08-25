@@ -178,8 +178,8 @@ bool PathFollower::TrimTurn(float target_yaw, float cur_imu_yaw, Msg_SetSpeed_t 
 }
 
 uint32_t PathFollower::CalculateMoveSteps(float dist_m) const {
-  // Straight move distance with 1.040f hardware calibration factor (updated for 1.195m -> 1.2m correction)
-  float abs_dist = std::fabs(dist_m) * 1.040f;
+  // Straight move distance calibration factor: 1.021f (calibrated from 15cm +2.8mm overshoot: 1.040 * 150.0 / 152.8 = 1.0209f)
+  float abs_dist = std::fabs(dist_m) * 1.021f;
   float steps = abs_dist * 15433.09f;
   return static_cast<uint32_t>(std::round(steps));
 }
