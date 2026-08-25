@@ -15,6 +15,7 @@
 #include "params.hpp"
 #include "path_planner.hpp"
 #include "protocol.hpp"
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -401,9 +402,27 @@ inline PlannedPath buildDrawOps(const json& program,
             // 도색 직선은 앞뒤로 hw 씩 늘린다 (진입에서 hw 앞당겼으므로 총 2hw).
             // 비도색 이동은 손대지 않는다 - 펜이 올라가 있어 늘릴 이유가 없다.
             const double distM = q.value("dist_m", 0.0) + (isPaint ? 2.0 * hw : 0.0);
+            // 일부러 덜 긋고 남은 만큼은 MORE가 채운다 (params paint_undershoot_m).
+            // 개루프 한 방보다 CCTV 실측 기반 보정이 정확하다는 전제.
+            //
+            // 🔴 아래 centerAheadM/tgt(= MORE 목표)는 줄이지 않는다. 목표를 같이
+            //   줄이면 메울 오차 자체가 사라져 그냥 짧은 선이 되고 끝난다.
+            //   명령 거리만 줄여야 그 차이가 MORE에 오차로 보인다.
+            // MORE 보정 시점에는 노즐이 아직 내려가 있다(nozzle up은 closePaint의
+            // 다음 op) - 그래서 남은 구간도 이어서 정상적으로 칠해진다.
+            //
+            // 적용 조건 둘: 도색 직선일 것(호는 접선 직선이 덧붙어 원이 깨진다),
+            // 그리고 도착 꼭짓점을 알 것(모르면 MORE가 안 걸려 영구 오차가 된다).
+            // min_move_m 밑으로는 안 깎는다 - 짧은 도색 구간에서 명령이 0이나
+            // 음수가 되면 펜을 내린 채 뒤로 가는 꼴이 된다.
+            double cmdM = distM;
+            if (isPaint && hasTgt && distM > 0.0) {
+                cmdM = std::max(params().min_move_m,
+                                distM - params().paint_undershoot_m);
+            }
             // 도색 move가 끝나는 시점의 마커 목표 = 꼭짓점 + (a + hw).
             // 펜이 꼭짓점을 hw 지나쳐 끝나기 때문이다.
-            seq.moveOp(distM, true, head, hasTgt, tgt,
+            seq.moveOp(cmdM, true, head, hasTgt, tgt,
                        /*centerAheadM=*/isPaint ? (a + hw) : 0.0);
         } else if (o == "TURN") {
             seq.turnOp(q.value("angle_deg", 0.0), true, head);

@@ -63,6 +63,13 @@ int main() {
              {"dist_m", 0.3}, {"paint", true}},
     });
 
+    // [1]~[4]는 "도면 기하가 명령값만으로 성립하는가"를 본다. 도색 언더슛
+    // (paint_undershoot_m)은 일부러 덜 명령하고 나머지를 MORE로 채우는 기능이라,
+    // 이 테스트는 MORE를 시뮬레이션하지 않으므로 여기서는 꺼 둔다. 언더슛 자체의
+    // 규약은 아래 [5]에서 따로 못박는다.
+    const double undershootDefault = params().paint_undershoot_m;
+    params().paint_undershoot_m = 0.0;
+
     PlannedPath p = buildDrawOps(program, points);
     CHECK(p.ok, "도면이 정상 생성됐다 (%s)", p.ok ? "ok" : p.failMsg.c_str());
     if (!p.ok) return 1;
@@ -251,6 +258,95 @@ int main() {
         CHECK(near(mx, 0.5) && near(my, 0.0),
               "turn 직전 마커 = (0.500, 0.000) = 꼭짓점 정확히 복귀 "
               "(실제 %.3f, %.3f)", mx, my);
+    }
+
+    // ---------------------------------------------------------------------
+    // [6] 도색 언더슛 (params paint_undershoot_m)
+    //
+    // "펜을 내리고 긋는 직선만 일부러 u 만큼 덜 명령하고, 남은 u 는 MORE가
+    // 채운다." 여기서 못박는 핵심은 **목표는 그대로 둔다**는 것이다 - 목표까지
+    // 같이 줄이면 MORE가 볼 오차가 사라져 그냥 짧은 선이 되고 끝난다.
+    // ---------------------------------------------------------------------
+    printf("\n[6] 도색 언더슛: 명령만 줄이고 목표는 그대로인가\n");
+    {
+        const double u = 0.02;
+        params().paint_undershoot_m = u;
+        PlannedPath q = buildDrawOps(program, points);
+        CHECK(q.ok, "언더슛 적용 도면이 정상 생성됐다");
+
+        int paintIdx = -1, offFwd = -1, offBack = -1;
+        for (size_t i = 0; i < q.meta.size(); ++i) {
+            const OpMeta& m = q.meta[i];
+            if (m.op != "move") continue;
+            const double d = q.ops[i].value("dist_m", 0.0);
+            if (m.isPath && paintIdx < 0) paintIdx = (int)i;
+            if (!m.isPath && d > 0 && offFwd < 0) offFwd = (int)i;
+            if (!m.isPath && d < 0 && offBack < 0) offBack = (int)i;
+        }
+
+        CHECK(paintIdx >= 0, "도색 move 를 찾았다 (op%d)", paintIdx);
+        if (paintIdx >= 0) {
+            const OpMeta& m = q.meta[(size_t)paintIdx];
+            const double cmd = q.ops[(size_t)paintIdx].value("dist_m", 0.0);
+            CHECK(near(cmd, 0.5 + 2.0 * hw - u),
+                  "도색 명령 거리 = %.3f (= L + w - u, 실제 %.3f)",
+                  0.5 + 2.0 * hw - u, cmd);
+            // 🔴 여기가 이 기능의 핵심 불변식이다.
+            CHECK(near(m.centerAheadM, a + hw),
+                  "목표 오프셋은 그대로 a + w/2 = %.3f (언더슛과 무관)", a + hw);
+            double tx, ty;
+            moreTarget(m, a, tx, ty);
+            CHECK(near(tx, 0.5 + a + hw) && near(ty, 0.0),
+                  "중심 목표도 그대로 (%.3f, 0.000) - MORE 가 %.3f 를 메운다",
+                  0.5 + a + hw, u);
+            CHECK(needsMore(q.meta, paintIdx + 1),
+                  "덜 간 도색 move 의 다음 boundary 에서 MORE 판정이 걸린다");
+        }
+
+        // 오프셋 다리는 손대지 않는다 - 펜이 올라가 있어 덜 갈 이유가 없고,
+        // 경로 맨 끝 후진 다리는 뒤에 READY 가 없어 MORE 로 메울 수도 없다.
+        if (offFwd >= 0)
+            CHECK(near(q.ops[(size_t)offFwd].value("dist_m", 0.0), a - hw),
+                  "오프셋 전진 다리는 언더슛 없음 (%.3f)", a - hw);
+        if (offBack >= 0)
+            CHECK(near(q.ops[(size_t)offBack].value("dist_m", 0.0), -(a + hw)),
+                  "오프셋 후진 다리는 언더슛 없음 (%.3f)", -(a + hw));
+
+        // 짧은 도색 구간: 언더슛을 그대로 빼면 0이나 음수가 된다(펜을 내린 채
+        // 후진). min_move_m 에서 잘라야 한다.
+        //
+        // ⚠️ 기본값에서는 이 분기에 닿지 않는다 - 도색 거리는 항상 L + w 라
+        //   w(0.05) 만으로도 기본 u(0.02)보다 크다. 클램프 자체를 검증하려면
+        //   u 를 도색 거리보다 크게 놓아야 해서 여기서만 크게 잡는다.
+        params().paint_undershoot_m = 0.2;
+        const json shortProg = json::array({
+            json{{"op", "MOVE"}, {"v", 0}, {"heading_deg", 0.0},
+                 {"dist_m", 0.005}, {"paint", true}},
+        });
+        const std::vector<Pt> shortPts = {{0.0, 0.0}, {0.005, 0.0}};
+        PlannedPath s = buildDrawOps(shortProg, shortPts);
+        if (s.ok) {
+            for (size_t i = 0; i < s.meta.size(); ++i) {
+                if (!(s.meta[i].op == "move" && s.meta[i].isPath)) continue;
+                const double d = s.ops[i].value("dist_m", 0.0);
+                CHECK(d >= params().min_move_m - 1e-9,
+                      "짧은 도색 구간도 min_move_m(%.3f) 이상 유지 (실제 %.3f)",
+                      params().min_move_m, d);
+                break;
+            }
+        }
+
+        // 0 이면 종전 동작 그대로여야 한다 (기능을 끌 수 있는가).
+        params().paint_undershoot_m = 0.0;
+        PlannedPath z = buildDrawOps(program, points);
+        for (size_t i = 0; i < z.meta.size(); ++i) {
+            if (!(z.meta[i].op == "move" && z.meta[i].isPath)) continue;
+            CHECK(near(z.ops[i].value("dist_m", 0.0), 0.5 + 2.0 * hw),
+                  "paint_undershoot_m=0 이면 종전대로 L + w = %.3f",
+                  0.5 + 2.0 * hw);
+            break;
+        }
+        params().paint_undershoot_m = undershootDefault;
     }
 
     printf("\n%s (%d fail)\n", fails ? "실패" : "전부 통과", fails);
