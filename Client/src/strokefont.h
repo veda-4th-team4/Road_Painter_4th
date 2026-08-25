@@ -338,4 +338,32 @@ inline QList<Stroke> layout(const QString &text, double *outWidth)
     return all;
 }
 
+// 레이아웃 결과의 **실제 잉크 세로 범위**(em 단위).
+//
+// 글리프가 전부 y 0~1 을 채우지는 않는다 — '-' 는 가운데 한 줄, '.' 는 바닥 점이고
+// 한글 'ㅗ ㅜ ㅡ' 도 마찬가지다. 글자 높이를 **완성 도색 높이** 기준으로 환산할 때
+// em 1.0 으로 나누면 그런 글자가 섞인 문자열에서 완성 높이가 요청값과 달라진다.
+// layout() 이 호를 이미 점으로 펼쳐 주므로 원호 글자도 이 방법이 정확하다.
+inline bool inkRangeEm(const QList<Stroke> &strokes, double *loOut, double *hiOut)
+{
+    bool seen = false;
+    double lo = 0.0, hi = 0.0;
+    for (const Stroke &st : strokes)
+        for (const QPointF &p : st) {
+            if (!seen) { lo = hi = p.y(); seen = true; }
+            else { lo = (p.y() < lo) ? p.y() : lo; hi = (p.y() > hi) ? p.y() : hi; }
+        }
+    if (!seen) return false;
+    if (loOut) *loOut = lo;
+    if (hiOut) *hiOut = hi;
+    return true;
+}
+
+// 위 범위의 높이. 잉크가 없으면 0.
+inline double inkHeightEm(const QList<Stroke> &strokes)
+{
+    double lo = 0.0, hi = 0.0;
+    return inkRangeEm(strokes, &lo, &hi) ? (hi - lo) : 0.0;
+}
+
 } // namespace strokefont

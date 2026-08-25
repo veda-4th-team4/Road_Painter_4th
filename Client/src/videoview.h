@@ -86,6 +86,10 @@ public:
     // ⚠️ pxPerMeter() 는 지웠다 — 호출부 0. 축척이 필요한 곳은 전부 mmPerPx() 를
     //    쓴다(화면 라벨·눈금자가 mm 단위라). m_tvPxPerM 은 클래스 안에서 직접 쓴다.
     double mmPerPx() const { return (m_tvPxPerM > 1e-9) ? 1000.0 / m_tvPxPerM : 0.0; }
+
+    // 방금 넣은 획 글자가 **실제로 칠해지는** 바깥 크기(mm). 펜 폭까지 포함한다.
+    // 작업 영역에 들어가는지 조작자가 손으로 계산하지 않게 하려고 남긴다.
+    QSizeF lastTextPaintedMm() const { return m_lastTextPaintedMm; }
     double screenPxPerMm() const;
     int zoomPercent() const;
     int selectionCount() const { return selectedPointCount(); }
@@ -346,6 +350,7 @@ private:
     QString m_calibUnitNote;
 
     double m_strokeMm = 60.0;   // 사용자가 선택한 직각 팁의 실제 도장 폭
+    QSizeF m_lastTextPaintedMm;   // 위 lastTextPaintedMm() 참고
 
     // 원본 뷰 오버레이 (원본 px)
     QList<VVPath> m_overlayPaths;

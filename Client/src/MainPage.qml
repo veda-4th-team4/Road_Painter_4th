@@ -1274,7 +1274,7 @@ Item {
                                 }
                             }
                             Text {
-                                text: "mm"
+                                text: "mm 완성"
                                 color: Theme.muted
                                 font.pixelSize: 10
                                 font.family: Theme.fontFamily
@@ -1285,9 +1285,14 @@ Item {
                                 text: "넣기"
                                 enabled: !Backend.jobActive
                                 ToolTip.visible: hovered
-                                ToolTip.text: "붓이 지나갈 획(중심선)으로 넣습니다.\n" +
-                                              "글자 높이는 붓 폭(" + Backend.strokeWidthMm.toFixed(0) +
-                                              "mm)의 2.5배 이상 권장"
+                                ToolTip.text: "붓이 지나갈 획(중심선)으로 넣습니다.
+" +
+                                              "입력값은 완성 도색 높이입니다 — 붓 폭까지 포함한,
+" +
+                                              "실제로 칠해지는 세로 크기.
+" +
+                                              "붓 폭(" + Backend.strokeWidthMm.toFixed(0) +
+                                              "mm)의 3.5배 이상 권장"
                                 onClicked: tsCol.putText()
                             }
                         }
@@ -1415,7 +1420,9 @@ Item {
 
                         function putText() {
                             const h = Number(textHeight.text)
-                            if (!textInput.text.length || !isFinite(h) || h < 20) return
+                            // 하한 판정은 C++ 이 한다 — 붓 폭 기준이라 여기서 막으면
+                            // 조작자가 사유를 못 본다 (변 길이 입력창과 같은 방식).
+                            if (!textInput.text.length || !isFinite(h) || h <= 0) return
                             Backend.addTextWorldMm(textInput.text, h, false)
                         }
                     }

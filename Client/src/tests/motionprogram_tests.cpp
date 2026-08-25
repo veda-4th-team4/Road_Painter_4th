@@ -1408,6 +1408,54 @@ void testFinishedDimensionEditorKeepsWireGeometrySemantic()
 
 } // namespace
 
+// 글자 높이 입력은 **완성 도색 높이**다 (변 길이 입력창과 같은 기준).
+// 서버가 도색 구간 양끝을 hw 씩 늘려 칠하므로 글리프는 펜 폭만큼 작아야 하고,
+// 배율은 em 1.0 이 아니라 **실제 잉크 세로 범위**로 나눠야 한다.
+void testTextHeightIsFinishedPaintHeight()
+{
+    const double penMm = 60.0, finishedMm = 340.0;
+
+    // (1) 완성 340 · 펜 60 -> 글리프 280. 변 길이와 같은 함수를 쓴다.
+    double glyphMm = 0.0;
+    check(paintdimensions::storedSegmentMm(finishedMm, penMm, false, &glyphMm),
+          "finished 340mm with a 60mm pen must be accepted");
+    check(near(glyphMm, 280.0), "finished 340 - pen 60 => glyph 280");
+
+    // (2) 완성 높이가 펜 폭 이하이면 글리프가 0 이하 -> 거부해야 한다.
+    double rejected = 0.0;
+    check(!paintdimensions::storedSegmentMm(penMm, penMm, false, &rejected),
+          "finished height equal to the pen width must be rejected");
+    check(!paintdimensions::storedSegmentMm(50.0, penMm, false, &rejected),
+          "finished height below the pen width must be rejected");
+
+    // (3) HANWHA 는 네 글자 다 em 세로를 채운다 -> 잉크 1.0.
+    double emW = 1.0;
+    const QList<strokefont::Stroke> hanwha =
+        strokefont::layout(QStringLiteral("HANWHA"), &emW);
+    check(!hanwha.isEmpty(), "HANWHA must lay out");
+    check(near(strokefont::inkHeightEm(hanwha), 1.0, 1e-9),
+          "HANWHA fills a full em vertically");
+
+    // (4) 세로 두께가 0 인 글자가 있다 — '-' 는 y=0.5 한 줄, '.' 는 y=0 점.
+    check(near(strokefont::inkHeightEm(
+                   strokefont::layout(QStringLiteral("-"), &emW)), 0.0, 1e-9),
+          "a lone dash has zero ink height");
+
+    // (5) 부분 높이 문자열("-." = y 0 ~ 0.5)에서 em 1.0 가정은 틀린다.
+    const QList<strokefont::Stroke> partial =
+        strokefont::layout(QStringLiteral("-."), &emW);
+    const double ink = strokefont::inkHeightEm(partial);
+    check(near(ink, 0.5, 1e-9), "dash+dot spans half an em");
+
+    const double paintedWithInk = ink * (glyphMm / ink) + penMm;   // 2-B (지금 방식)
+    const double paintedWithEm  = ink * (glyphMm / 1.0) + penMm;   // 2-A (em 1.0 가정)
+    check(near(paintedWithInk, finishedMm, 1e-9),
+          "ink-based scale paints exactly the requested finished height");
+    check(!near(paintedWithEm, finishedMm, 1.0),
+          "em-based scale would miss the requested height for partial-ink text");
+}
+
+
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
@@ -1444,6 +1492,7 @@ int main(int argc, char **argv)
     testPaintProgressUsesSeparatePaintPaths();
     testPaintProgressUsesPenPosition();
     testFinishedDimensionEditorKeepsWireGeometrySemantic();
+    testTextHeightIsFinishedPaintHeight();
     if (failures == 0) {
         std::cout << "motionprogram_tests: PASS\n";
         return 0;
