@@ -96,12 +96,6 @@ bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps,
   if (has_imu) {
     // IMU Closed-loop feedback termination
     float target_yaw = turn_start_imu_yaw + turn_target_angle_deg;
-    
-    // Fix: Snap large structural turns (90, 180, 270) to the absolute 90-degree grid 
-    // to eliminate cumulative drift from previous straight moves.
-    if (std::fabs(turn_target_angle_deg) >= 45.0f) {
-        target_yaw = std::round(target_yaw / 90.0f) * 90.0f;
-    }
 
     float yaw_error = std::fabs(cur_imu_yaw - target_yaw);
 
@@ -315,21 +309,9 @@ bool PathFollower::UpdateArc(int32_t cur_l_steps, int32_t cur_r_steps,
     return true;
   }
 
-  // 1-Step Deceleration: When 8% or less of target steps remains, step down speed instantly
-  uint32_t remaining_steps = outer_target - outer_progress;
-  uint32_t decel_threshold = (outer_target * 8) / 100; // 8% remaining threshold
-  float speed_factor = 1.0f;
-
-  if (decel_threshold > 0 && remaining_steps <= decel_threshold) {
-    float base_sps = std::max(std::abs((float)arc_sps_l), std::abs((float)arc_sps_r));
-    float min_factor = 300.0f / (base_sps > 0.1f ? base_sps : 0.1f); // Raised to 300 SPS floor speed
-    if (min_factor > 1.0f) min_factor = 1.0f; // Do not exceed max speed
-
-    speed_factor = min_factor; // Drop instantly to minimum speed
-  }
-
-  out_speed.left_sps = static_cast<int16_t>(arc_sps_l * speed_factor);
-  out_speed.right_sps = static_cast<int16_t>(arc_sps_r * speed_factor);
+  // Pure constant-speed Arc execution (no deceleration per user request)
+  out_speed.left_sps = arc_sps_l;
+  out_speed.right_sps = arc_sps_r;
   return false;
 }
 

@@ -20,24 +20,29 @@ sudo apt-get install -y g++ make cmake libssl-dev wiringpi
 ```text
 Paint_Robot/RaspberryPi/
 ├── driver/                         ➔ [리눅스 커널 공간: LKM & Device Tree]
-│   ├── led_strip_driver.c          • BCM2711 PWM Serializer + DMA 직결 커널 드라이버
-│   ├── led_strip_regs.h            • BCM2711 PWM/DMA 레지스터 맵 및 WS2812B 타이밍 상수
-│   ├── led_strip_overlay.dts       • GPIO 12(PWM0_0) 핀먹스 디바이스 트리 오버레이
-│   ├── mpu6050_driver.c            • kthread 기반 500 Hz I2C 폴링 & 고정소수점(mdeg) 적산 모듈
-│   ├── mpu6050_overlay.dts         • I2C-1 버스 디바이스 트리 오버레이
-│   └── Makefile                    • 커널 빌드 및 .ko 모듈 생성 스크립트
+│   ├── audio_strip_driver.c        • BCM2711 PCM/I2S + DMA 직결 오디오 커널 드라이버
+│   ├── audio_strip_regs.h          • PCM/I2S 레지스터 맵 및 ioctl(DRAIN/DROP) 정의
+│   ├── audio_strip_overlay.dts     • GPIO 18/19/21 I2S ALT0 핀먹스 오버레이 (/dev/audio_strip)
+│   ├── led_strip_driver.c          • BCM2711 PWM0 Serializer + DMA 직결 커널 드라이버
+│   ├── led_strip_regs.h / .dts     • GPIO 12(PWM0_0) 핀먹스 오버레이 (/dev/led_strip)
+│   ├── mpu6050_driver.c / .dts     • kthread 기반 500 Hz I2C 폴링 IMU 드라이버 (/dev/mpu6050)
+│   └── Makefile                    • 커널 모듈 통합 빌드 스크립트
+│
+├── audio/                          ➔ [현장 음성 알림 시스템]
+│   ├── install_audio.sh / play.sh  • I2S 오디오 시스템 자동 설치 및 단독 테스트 스크립트
+│   └── wav_files/*.wav             • 44.1kHz 16-bit stereo 표준 음원 카탈로그 10종
 │
 ├── include/ & src/                 ➔ [유저 공간: C++17 POSIX Core Application]
-│   ├── NetworkManager (.h/.cpp)    • 중앙 서버 TLS 1.2 소켓 통신 & JSON 명령 파싱
-│   ├── PathFollower (.h/.cpp)      • 차동 구동 역기구학 연산, 1단 감속(8%), 스텝 추종
-│   ├── SerialManager (.h/.cpp)     • termios 기반 Non-blocking UART 통신 (115200 bps)
+│   ├── AudioStripManager (.h/.cpp) • 비동기 WAV 스트리밍 & 우선순위 선점(Preemption) 오디오 매니저
 │   ├── LedStripManager (.h/.cpp)   • std::thread 백그라운드 30 fps 상태 렌더러 (/dev/led_strip)
+│   ├── NetworkManager (.h/.cpp)    • 중앙 서버 TLS 1.2 소켓 통신, JSON 파싱, 침입 경보 수신
+│   ├── PathFollower (.h/.cpp)      • 6WD 역기구학 연산, 1단 감속(8%), 스텝 오도메트리 추종
+│   ├── SerialManager (.h/.cpp)     • termios 기반 Non-blocking UART 통신 (115200 bps)
 │   ├── ImuManager (.h/.cpp)        • /dev/mpu6050 캐릭터 디바이스 제어 및 동적 영점 리셋
-│   ├── RobotTypes.h                • 통신 프로토콜 바이너리 구조체(#pragma pack(1)) 및 전역 상수
 │   └── main.cpp                    • 메인 제어 루프, 50 Hz 상태 머신 스케줄링 및 Failsafe
 │
 └── daemon/                         ➔ [시스템 운영 및 자동화: systemd Service]
-    ├── robot_exec.service          • 부팅 시 자동 실행 및 장애 시 3초 내 자동 복구(Restart=always)
+    ├── robot_exec.service          • 부팅 시 자동 실행 및 3초 이내 자동 재기동 (Restart=always)
     └── install_daemon.sh           • 원클릭 systemd 데몬 등록 및 권한 자동화 스크립트
 
 ```

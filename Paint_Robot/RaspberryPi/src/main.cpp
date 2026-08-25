@@ -3,6 +3,7 @@
 #include "SerialManager.h"
 #include "ImuManager.h"
 #include "LedStripManager.h"
+#include "AudioStripManager.h"
 #include <algorithm>
 #include <iostream>
 #include <string>
@@ -26,6 +27,14 @@ int main(int argc, char **argv) {
       std::cerr << "[MAIN] Warning: Tower lamp failed to open." << std::endl;
   }
   tower_lamp.SetState(LedState::IDLE);
+
+  AudioStripManager audio;
+  const bool audio_ready = audio.Open();
+  if (!audio_ready) {
+      std::cerr << "[MAIN] Warning: Audio strip failed to open." << std::endl;
+  } else {
+      audio.Play(SoundId::POWER_ON);
+  }
 
   // 2. Initialize serial communications
   if (!robot_comm.Init()) {
@@ -52,8 +61,8 @@ int main(int argc, char **argv) {
   // =========================================================================
   // IMU Closed-Loop Feature Flags (Toggle ON/OFF easily)
   // =========================================================================
-  bool g_use_imu_turn = true;  // Toggle IMU closed-loop for TURN & ALIGN (default: true, needed for phase: "calib")
-  bool g_use_imu_move = true; // Toggle IMU heading correction for MOVE & MORE (default: false, enable to test)
+  bool g_use_imu_turn = false; // Disabled per user request (pure step odometry)
+  bool g_use_imu_move = false; // Disabled per user request
 
   // 4. Initialize network communications
   std::cout << "[MAIN] Starting TLS network link to " << server_ip << ":"
@@ -62,6 +71,7 @@ int main(int argc, char **argv) {
     std::cerr << "[MAIN] Warning: Network link failed. Starting in local "
                  "test-only mode."
               << std::endl;
+    audio.Play(SoundId::SIGNAL_LOST);
   }
 
   std::cout << "[MAIN] Main Controller Sequence Active (v0.3 Protocol with IMU Support)." << std::endl;
@@ -86,12 +96,19 @@ int main(int argc, char **argv) {
       // 1. Run network loop to check sockets and reconnect if needed
       net_manager.Process();
 
+      // 1b. Check for intrusion alarm from CCTV zone enter event
+      if (net_manager.CheckAndClearZoneEnterEvent()) {
+          std::cout << GetTimestampStr() << "[MAIN] Zone enter event triggered -> Playing PERSON_IN_ZONE alarm." << std::endl;
+          audio.Play(SoundId::PERSON_IN_ZONE);
+      }
+
       // 2. Handle incoming CMD (ESTOP / RESUME / ABORT_DRAW / Manual Controls) relay to STM32
       std::string cmd;
       if (net_manager.GetLatestCommand(cmd)) {
           std::cout << GetTimestampStr() << "[MAIN] Processing server CMD: " << cmd << std::endl;
           if (cmd == "ESTOP") {
               tower_lamp.SetState(LedState::ESTOP);
+              audio.Play(SoundId::EMERGENCY_STOP);
               robot_comm.SendEmergencyStop(0x01);
               manual_override = true;
               manual_speed = {0, 0};
@@ -100,6 +117,7 @@ int main(int argc, char **argv) {
               robot_comm.SendControlNozzle(0);
           } else if (cmd == "ABORT_DRAW" || cmd == "CANCEL_DRAW") {
               tower_lamp.SetState(LedState::IDLE);
+              audio.Play(SoundId::SYSTEM_ERROR);
               std::cout << GetTimestampStr() << "[MAIN] [ABORT] Aborting active path execution and stopping robot." << std::endl;
               manual_override = false;
               manual_speed = {0, 0};
@@ -173,6 +191,10 @@ int main(int argc, char **argv) {
               // Settling delay: Ensure robot is fully still for 100ms before transmitting CALIB_STOPPED ACK
               std::this_thread::sleep_for(std::chrono::milliseconds(100));
               net_manager.SendCalibStopped();
+          } else if (cmd == "ALARM") {
+              // Server-triggered intrusion alarm: Play PERSON_IN_ZONE alarm without interrupting driving
+              std::cout << GetTimestampStr() << "[MAIN] [ALARM] Intrusion alarm received from server -> Playing PERSON_IN_ZONE." << std::endl;
+              audio.Play(SoundId::PERSON_IN_ZONE);
           }
       }
 
@@ -198,11 +220,9 @@ int main(int argc, char **argv) {
                net_manager.ClearLatches(); // R-8: Clear any stale command latches from previous path
                tower_lamp.SetState(LedState::DRIVING);
                robot_comm.SendClearEStop(); // Clear startup/idle ESTOP latch when applying new autonomous path
+               audio.Play(SoundId::TASK_START);
                std::string phase = net_manager.GetPathPhase();
                std::cout << GetTimestampStr() << "[MAIN] Applying new PATH (phase=" << phase << ") -> Waiting 2500ms for camera settling..." << std::endl;
-               if (phase == "draw" || phase == "calib") {
-                   imu_manager.Calibrate(); // Dynamically recalibrate IMU Gyro Z offset during the 2.5s settling time
-               }
 
                // Settling delay: Ensure robot is fully still for 2500ms (2.5s) before sending initial READY for op 0
                auto start_wait = std::chrono::steady_clock::now();
@@ -478,6 +498,7 @@ int main(int argc, char **argv) {
           std::string phase = net_manager.GetPathPhase();
           net_manager.SendPathDone(phase);
           path_done_sent = true;
+          audio.Play(SoundId::TASK_COMPLETE);
           std::cout << GetTimestampStr() << "[MAIN] All path segments completed! Transmitted PATH_DONE (phase=" << phase << ")" << std::endl;
       }
 

@@ -128,11 +128,15 @@ public:
      */
     bool GetLatestCommand(std::string& out_cmd);
 
+    /** Returns true once for each coalesced ZONE_EVENT Enter from the server. */
+    bool CheckAndClearZoneEnterEvent();
+
 private:
     std::string server_ip;
     uint16_t server_port;
     int client_fd;
     bool is_connected;
+    std::atomic<bool> has_zone_enter_event{false};
 
     // OpenSSL variables
     SSL_CTX* ssl_ctx;
