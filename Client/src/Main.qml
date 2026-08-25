@@ -4,6 +4,7 @@ import RoadPainter
 
 ApplicationWindow {
     id: win
+    property bool mainPageShown: false
     visible: true
     width: 1440
     height: 900
@@ -23,7 +24,15 @@ ApplicationWindow {
 
     Connections {
         target: Backend
-        function onLoginSucceeded() { stack.replace(mainComp) }
-        function onLoggedOut() { stack.replace(loginComp) }
+        function onLoginSucceeded() {
+            if (win.mainPageShown) return
+            win.mainPageShown = true
+            stack.replace(mainComp)
+        }
+        function onLoggedOut() {
+            if (!win.mainPageShown) return
+            win.mainPageShown = false
+            stack.replace(loginComp)
+        }
     }
 }

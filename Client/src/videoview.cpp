@@ -1,5 +1,7 @@
 #include "videoview.h"
 #include "motionprogram.h"
+#include "paintgeometry.h"
+#include "paintdimensions.h"
 
 #include <QPainter>
 #include <QPainterPath>
@@ -54,7 +56,9 @@ struct DisplayArc {
 
 // 화면의 샘플 점이 실제 전송 단계에서 ARC 하나가 되는지 같은 판정기로 확인한다.
 // 이 경우 각 현의 길이와 꼭짓점 회전각은 로봇 명령이 아니므로 편집 라벨로 보이면 안 된다.
-DisplayArc displayArcFor(const QVector<QPointF> &pts, bool closed)
+// pxPerM: 이 점들의 단위(px/m). 판정기가 미터 기준 상수를 픽셀로 환산해 쓰도록
+// 반드시 넘긴다 — 안 넘기면 화면과 전송이 서로 다른 임계값으로 판정한다.
+DisplayArc displayArcFor(const QVector<QPointF> &pts, bool closed, double pxPerM)
 {
     DisplayArc out;
     if (pts.size() < 5) return out;
@@ -65,7 +69,7 @@ DisplayArc displayArcFor(const QVector<QPointF> &pts, bool closed)
 
     motionprogram::detail::Circle fit;
     if (!motionprogram::detail::arcFits(run, 0, run.size() - 1,
-                                        fit, out.sweepDeg, out.left))
+                                        fit, out.sweepDeg, out.left, pxPerM))
         return out;
     out.ok = true;
     out.center = fit.c;
@@ -118,8 +122,39 @@ QVector<QPointF> rdpSimplify(const QVector<QPointF> &pts, double eps)
     return out;
 }
 
-// 곡선 구간은 각도 간격만 지켜 남기고, 나머지만 RDP 로 줄인다.
-// eps: 직선 구간 허용오차(px) · arcTol: 원호 잔차 허용(px) · stepDeg: 곡선 샘플 간격
+// 곡선 구간의 점은 지우지 않고, 직선 구간만 RDP 로 줄인다.
+// "직선 정리" 버튼이 원·부분호·직선+반원의 곡선 샘플을 지워버리면 같은 도형이
+// ARC 하나에서 MOVE/TURN 무더기로 바뀐다 — 사용자가 그린 기하가 파괴된다.
+// 곡선이 없으면 rdpSimplify 와 완전히 같은 결과다(직선 도형 동작 불변).
+QVector<QPointF> rdpSimplifyPreservingCurves(const QVector<QPointF> &pts, double eps,
+                                             double pxPerM)
+{
+    if (pts.size() < 3 || eps <= 0.0) return pts;
+    QList<QPointF> asList(pts.begin(), pts.end());
+    const QList<motionprogram::detail::CurveRun> runs =
+        motionprogram::detail::curveRuns(asList, pxPerM);
+    if (runs.isEmpty()) return rdpSimplify(pts, eps);
+
+    QVector<bool> protect(pts.size(), false);
+    for (const motionprogram::detail::CurveRun &r : runs)
+        for (int i = r.a; i <= r.b && i < pts.size(); ++i)
+            protect[i] = true;
+
+    QVector<QPointF> out;
+    int spanStart = 0;
+    for (int i = 1; i < pts.size(); ++i) {
+        if (!protect[i] && i + 1 < pts.size()) continue;
+        // spanStart..i 구간만 줄인다 (양 끝은 보존된다)
+        QVector<QPointF> span(pts.begin() + spanStart, pts.begin() + i + 1);
+        const QVector<QPointF> simp = (i > spanStart + 1 && !protect[spanStart + 1])
+                                    ? rdpSimplify(span, eps) : span;
+        for (int k = (out.isEmpty() ? 0 : 1); k < simp.size(); ++k)
+            out.append(simp[k]);
+        spanStart = i;
+    }
+    return out;
+}
+
 } // namespace
 
 VideoView::VideoView(QQuickItem *parent)
@@ -141,27 +176,28 @@ VideoView::VideoView(QQuickItem *parent)
 void VideoView::setTopView(bool v)   { if (m_isTopView != v)   { m_isTopView = v;   emit topViewChanged(); update(); } }
 void VideoView::setInteractive(bool v){ if (m_interactive != v) { m_interactive = v; emit interactiveChanged(); } }
 
-void VideoView::setShowLabels(bool v)
-{
-    if (m_showLabels == v) return;
-    m_showLabels = v;
-    if (!v) {
-        // 다시 그리기 전의 짧은 순간에도 숨긴 배지가 클릭되지 않게 한다.
-        m_edgeLabelRects.clear();
-        m_turnBadgeRects.clear();
-        m_hoverEdge = -1;
-    }
-    emit showLabelsChanged();
-    update();
-}
-
 void VideoView::setStrokeWidthMm(double mm)
 {
+    if (!std::isfinite(mm)) return;
     const double v = qBound(1.0, mm, 500.0);
     if (qFuzzyCompare(m_strokeMm, v)) return;
     m_strokeMm = v;
     emit strokeWidthChanged();
     update();
+}
+
+QVector<QPointF> VideoView::centerlineFor(const VVPath &path, QString *errorOut) const
+{
+    const paintgeometry::Result result = paintgeometry::centerlineFor(
+        path.pts, path.closed, path.outerContour, strokePx(), m_tvPxPerM);
+    if (errorOut) {
+        *errorOut = result.ok
+            ? QString()
+            : QStringLiteral("%1 (현재 펜촉 폭 %2 mm)")
+                  .arg(result.error)
+                  .arg(m_strokeMm, 0, 'f', 0);
+    }
+    return result.ok ? result.points : QVector<QPointF>();
 }
 
 // ── 표시 변환 / 좌표 매핑 ─────────────────────────────────────────────
@@ -338,6 +374,16 @@ double VideoView::strokePx() const
 }
 
 // ── 프레임 수신 ───────────────────────────────────────────────────────
+void VideoView::clearFrame()
+{
+    const bool had = !m_frame.isNull();
+    m_frame = QImage();
+    m_arucoIds.clear();
+    m_arucoPolys.clear();
+    if (had) emit scaleChanged();
+    update();
+}
+
 void VideoView::onFrame(const QImage &original)
 {
     const QSize before = m_frame.size();
@@ -437,7 +483,11 @@ void VideoView::paint(QPainter *p)
 
         if (!m_points.isEmpty()) {
             const bool dense = m_points.size() > kDenseLimit;
-            const DisplayArc displayArc = displayArcFor(m_points, m_closed);
+            const VVPath activePath{m_points, m_closed, m_outerContour};
+            QString geometryError;
+            const QVector<QPointF> centerPoints = centerlineFor(activePath, &geometryError);
+            const DisplayArc displayArc = displayArcFor(centerPoints, m_closed, m_tvPxPerM);
+            const DisplayArc outerArc = displayArcFor(m_points, m_closed, m_tvPxPerM);
 
             const double arcRadiusM = displayArc.ok
                                     ? displayArc.radiusPx / std::max(1e-9, m_tvPxPerM)
@@ -445,30 +495,52 @@ void VideoView::paint(QPainter *p)
             const bool arcTooTight = displayArc.ok
                                   && arcRadiusM + 1e-9
                                      < motionprogram::kServerConfirmedMinPaintRadiusM;
+            const bool geometryInvalid = centerPoints.isEmpty();
 
-            // 실제 도포 폭(50 mm) — 불가능한 ARC는 도면에서 바로 빨간색으로 보인다.
-            paintBand(p, m_points, m_closed, sx, sy, ox, oy,
-                      arcTooTight ? QColor(229, 107, 107, 95)
-                                  : QColor(255, 255, 255, 80));
+            // Keep the full physical paint footprint visible. The dashed cyan
+            // outline is the requested finished edge; this translucent band is
+            // the actual rectangular-tip coverage and must not be replaced by
+            // the thin center path.
+            paintBand(p, centerPoints, m_closed, sx, sy, ox, oy,
+                      (arcTooTight || geometryInvalid) ? QColor(229, 107, 107, 95)
+                                  : QColor(255, 255, 255, 112));
 
-            p->setPen(QPen(arcTooTight ? QColor(229, 107, 107) : kActive,
-                           2.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            // The requested finished outer contour is the primary editing
+            // geometry. The thinner dashed line is only a preview of the
+            // marker-tip center path that is serialized to the server.
+            if (m_outerContour) {
+                QPen outline(geometryInvalid ? QColor(229, 107, 107) : kSel,
+                             2.0, Qt::SolidLine, Qt::FlatCap, Qt::MiterJoin);
+                p->setPen(outline);
+                p->setBrush(Qt::NoBrush);
+                QPainterPath outerPath;
+                outerPath.moveTo(toW(m_points.first()));
+                for (int i = 1; i < m_points.size(); ++i) outerPath.lineTo(toW(m_points[i]));
+                if (m_closed) outerPath.closeSubpath();
+                p->drawPath(outerPath);
+            }
+
+            QPen centerPen((arcTooTight || geometryInvalid) ? QColor(229, 107, 107)
+                                                            : QColor(255, 255, 255, 205),
+                           1.2, Qt::DashLine, Qt::FlatCap, Qt::MiterJoin);
+            centerPen.setDashPattern({4, 4});
+            p->setPen(centerPen);
             p->setBrush(Qt::NoBrush);
-            for (int i = 1; i < m_points.size(); ++i)
-                p->drawLine(toW(m_points[i - 1]), toW(m_points[i]));
-            if (m_closed && m_points.size() > 2)
-                p->drawLine(toW(m_points.last()), toW(m_points.first()));
+            for (int i = 1; i < centerPoints.size(); ++i)
+                p->drawLine(toW(centerPoints[i - 1]), toW(centerPoints[i]));
+            if (m_closed && centerPoints.size() > 2)
+                p->drawLine(toW(centerPoints.last()), toW(centerPoints.first()));
 
             // 편집 표시가 꺼져 있으면(빈 곳 클릭) 완성 도형과 똑같이 그린다.
             const bool edit = m_focused || m_drawing;
-            if (edit && m_showLabels && !dense && !displayArc.ok) {
+            if (edit && !dense && !displayArc.ok) {
                 paintEdgeLengths(p, m_points, m_closed, sx, sy, ox, oy);
             } else {
                 m_edgeLabelRects.clear();
                 m_turnBadgeRects.clear();
             }
             paintPathGuides(p, m_points, m_closed, sx, sy, ox, oy,
-                            edit && m_showLabels && !dense && !displayArc.ok);
+                            edit && !dense && !displayArc.ok);
 
             // 작도 중 첫 점은 "여기 클릭하면 닫힘" 표시
             if (m_drawing && m_points.size() >= 3 && !m_closed) {
@@ -535,7 +607,7 @@ void VideoView::paint(QPainter *p)
                 const double wpx = strokePx() * sx;
                 if (wpx >= 2.0) {
                     p->setPen(QPen(QColor(255, 255, 255, 55), wpx, Qt::SolidLine,
-                                   Qt::RoundCap, Qt::RoundJoin));
+                                   Qt::FlatCap, Qt::MiterJoin));
                     p->drawLine(toW(last), toW(cur));
                 }
                 QPen preview(QColor(255, 255, 255, 190), 1.5, Qt::DashLine, Qt::RoundCap);
@@ -558,13 +630,26 @@ void VideoView::paint(QPainter *p)
             // 마커가 가장 많이 겹치는 자리이므로 쓰지 않는다. 변형 안내가 선택
             // 박스 아래·왼쪽에 있으니 ARC 요약은 도형 위·오른쪽에 둔다. 점과
             // 번호를 다 그린 뒤 덮어 그려 배경 영상이 복잡해도 읽히게 한다.
-            if (edit && m_showLabels && !dense && displayArc.ok) {
+            // ARC summary is the primary dimension for circles and curves. Do
+            // not hide it with dense point labels: circles intentionally keep
+            // enough samples for stable ARC fitting.
+            if (edit && displayArc.ok) {
                 const double radiusMm = displayArc.radiusPx
                                       / std::max(1e-9, m_tvPxPerM) * 1000.0;
+                const double outerRadiusMm = outerArc.ok
+                    ? outerArc.radiusPx / std::max(1e-9, m_tvPxPerM) * 1000.0
+                    : radiusMm;
+                const double finishedRadiusMm = paintdimensions::finishedOuterRadiusMm(
+                    radiusMm, m_strokeMm, m_outerContour);
                 const QString tag = arcTooTight
-                    ? QStringLiteral("도색 불가 · R %1 · 최소 200 mm").arg(mmLabel(radiusMm))
-                    : QStringLiteral("ARC · R %1 · %2°")
-                          .arg(mmLabel(radiusMm)).arg(displayArc.sweepDeg, 0, 'f', 0);
+                    ? QStringLiteral("도색 불가 · 중심 R %1 · 최소 200 mm").arg(mmLabel(radiusMm))
+                    : (m_outerContour
+                       ? QStringLiteral("완성 R %1 · 중심 R %2 · %3°")
+                             .arg(mmLabel(outerRadiusMm), mmLabel(radiusMm))
+                             .arg(displayArc.sweepDeg, 0, 'f', 0)
+                       : QStringLiteral("도색 외곽 R %1 · 중심 R %2 · %3°")
+                             .arg(mmLabel(finishedRadiusMm), mmLabel(radiusMm))
+                             .arg(displayArc.sweepDeg, 0, 'f', 0));
                 p->setFont(QFont("Pretendard", 8));
                 const QFontMetrics fm(p->font());
                 QRectF pathBox;
@@ -575,7 +660,7 @@ void VideoView::paint(QPainter *p)
                 const double boxWidth = fm.horizontalAdvance(tag) + 12.0;
                 const double boxHeight = fm.height() + 6.0;
                 double boxX = pathBox.right() - boxWidth;
-                double boxY = pathBox.top() - boxHeight - 7.0;
+                double boxY = pathBox.top() - boxHeight - 15.0;
                 if (boxY < 2.0) boxY = pathBox.top() + 7.0;
                 QRectF box(boxX, boxY, boxWidth, boxHeight);
                 box.moveLeft(qBound(2.0, box.left(),
@@ -589,6 +674,15 @@ void VideoView::paint(QPainter *p)
                 p->setPen(arcTooTight ? QColor(255, 190, 190)
                                       : QColor(kSel.red(), kSel.green(), kSel.blue(), 235));
                 p->drawText(box, Qt::AlignCenter, tag);
+            }
+            if (edit && geometryInvalid) {
+                const double warningWidth = std::max(1.0, width() - 16.0);
+                const QRectF warning(8, 8, warningWidth, 26);
+                p->setPen(QColor(255, 190, 190));
+                p->setBrush(QColor(92, 24, 24, 225));
+                p->drawRoundedRect(warning, 3, 3);
+                p->drawText(warning.adjusted(8, 0, -8, 0),
+                            Qt::AlignVCenter | Qt::AlignLeft, geometryError);
             }
         }
 
@@ -659,7 +753,21 @@ void VideoView::paintBand(QPainter *p, const QVector<QPointF> &pts, bool closed,
     if (closed && pts.size() > 2)
         path.closeSubpath();
     p->setBrush(Qt::NoBrush);
-    p->setPen(QPen(c, wpx, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    // 🔴 캡은 **SquareCap** 이다 (FlatCap 아님).
+    //
+    // 서버는 도색 구간을 양끝으로 hw(= 펜 폭 / 2) 씩 늘려서 칠한다:
+    //   · 시작 — openPaint() 가 `lead = a - hw` 로 hw 앞에 펜을 내린다 (직선·호 공통)
+    //   · 끝   — MOVE 의 dist_m 에 `+ 2.0 * hw` (앞당긴 hw 를 포함한 값)
+    //   (Server/src/ops_builder.hpp)
+    // SquareCap 이 정확히 선폭의 절반만큼 끝을 연장하므로 그 값과 같아진다.
+    // FlatCap 이면 화면 띠가 실제 도색보다 양끝 hw 씩 짧게 그려져서,
+    // **같은 화면 안에서 길이 라벨과 그림이 다른 값을 말하게 된다**
+    // (라벨은 paintdimensions::finishedSegmentMm 로 이미 폭을 더해 표시 중).
+    //
+    // 닫힌 경로는 closeSubpath() 라 캡이 쓰이지 않는다 — 분기할 필요 없다.
+    // 호(ARC)도 같다 — 서버는 스윕 각도에 `2*(hw/rPaint)` 를 더한다
+    // (ops_builder.hpp travelGeom). 직선은 거리로, 호는 각도로 늘릴 뿐 양끝 hw 다.
+    p->setPen(QPen(c, wpx, Qt::SolidLine, Qt::SquareCap, Qt::MiterJoin));
     p->drawPath(path);
 }
 
@@ -672,9 +780,11 @@ void VideoView::paintDonePaths(QPainter *p, double sx, double sy, double ox, dou
     };
     for (const VVPath &dp : std::as_const(m_done)) {
         if (dp.pts.size() < 2) continue;
-        paintBand(p, dp.pts, dp.closed, sx, sy, ox, oy, QColor(255, 255, 255, 45));
+        const QVector<QPointF> center = centerlineFor(dp);
+        paintBand(p, center, dp.closed, sx, sy, ox, oy, QColor(255, 255, 255, 70));
 
-        p->setPen(QPen(kDone, 2.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p->setPen(QPen(kDone, 2.0, dp.outerContour ? Qt::DashLine : Qt::SolidLine,
+                       Qt::FlatCap, Qt::MiterJoin));
         p->setBrush(Qt::NoBrush);
         for (int i = 1; i < dp.pts.size(); ++i)
             p->drawLine(toW(dp.pts[i - 1]), toW(dp.pts[i]));
@@ -948,7 +1058,6 @@ void VideoView::paintEdgeLengths(QPainter *p, const QVector<QPointF> &pts, bool 
 {
     m_edgeLabelRects.clear();
     if (pts.size() < 2) return;
-    const double spm = (m_tvPxPerM > 0) ? m_tvPxPerM : 100.0;
     auto toW = [&](const QPointF &ip) {
         return QPointF(ip.x() * sx + ox, ip.y() * sy + oy);
     };
@@ -964,10 +1073,17 @@ void VideoView::paintEdgeLengths(QPainter *p, const QVector<QPointF> &pts, bool 
         const QPointF wa = toW(a), wb = toW(b);
         // 화면에서 너무 짧은 변은 라벨 생략 — 겹쳐서 못 읽는 걸 방지
         if (QLineF(wa, wb).length() < 44.0) { m_edgeLabelRects[i] = QRectF(); continue; }
-        const double mm = QLineF(a, b).length() / spm * 1000.0;
+        // 치수 UI는 펜 중심선이 아니라 완성된 도색의 끝↔끝을 보여준다.
+        // 외곽 도형은 pts 자체가 완성 치수이고, 중심선 획은 서버가 양끝을
+        // 펜 폭의 절반씩 연장하므로 한 폭을 더해 표시한다.
+        const double storedMm = QLineF(topPxToWorldMm(a), topPxToWorldMm(b)).length();
+        const double mm = paintdimensions::finishedSegmentMm(
+            storedMm, m_strokeMm, m_outerContour);
         if (mm < 0.5) { m_edgeLabelRects[i] = QRectF(); continue; }
         const QPointF mid = (wa + wb) * 0.5;
-        const QString label = mmLabel(mm);
+        const QString label = m_outerContour
+            ? QStringLiteral("외곽 %1").arg(mmLabel(mm))
+            : QStringLiteral("도색 %1").arg(mmLabel(mm));
         const QRect br = fm.boundingRect(label);
         QRectF box(mid.x() - br.width() * 0.5 - 5, mid.y() - br.height() * 0.5 - 3,
                    br.width() + 10, br.height() + 6);
@@ -1157,7 +1273,7 @@ void VideoView::paintRobot(QPainter *p, double sx, double sy, double ox, double 
     //    뒤에 있다. 강조색은 전면 범퍼 하나로 충분하다.
 
     // ⑧ 기준점 십자 = **ArUco 마커(ID 49) 중심** = 서버가 준 POSE(x, y) 그 자체.
-    //    노즐은 여기가 아니라 155mm 뒤다 (Backend::pushPoseToView 참고).
+    //    노즐은 여기가 아니라 설정된 중심-펜 거리만큼 뒤다 (Backend::pushPoseToView 참고).
     //    점 하나보다 십자가 낫다: 도료 드럼 위에서도 축이 어디인지 정확히 짚힌다.
     if (L >= 30.0) {
         const double ct = std::max(2.6, L * 0.075);
@@ -1175,7 +1291,7 @@ void VideoView::paintRobot(QPainter *p, double sx, double sy, double ox, double 
     paintPenMarker(p, sx, sy, ox, oy);
 }
 
-// 노즐(펜) 끝 — 페인트가 실제로 나오는 점. 기준점(ArUco 마커) 뒤 155mm 라 로봇 몸통에
+// 노즐(펜) 끝 — 페인트가 실제로 나오는 점. 기준점(ArUco 마커) 뒤 설정 거리만큼 떨어져
 // 가려진다 → **아이콘 위에** 찍는다. 전장 265mm 의 절반(132mm)보다 멀어서 섀시 밖으로
 // 조금 나온다. 꼭짓점에서 후진·제자리회전할 때 어디를 칠하는지 이것만 보면 된다.
 // 내려간 상태 = 채운 점(칠하는 중), 올라간 상태 = 빈 원(이동/회전).
@@ -1185,7 +1301,7 @@ void VideoView::paintPenMarker(QPainter *p, double sx, double sy, double ox, dou
     const QPointF pw(m_penPx.x() * sx + ox, m_penPx.y() * sy + oy);
     const double r = qBound(5.0, 0.025 * m_tvPxPerM * sx, 11.0);
 
-    // 기준점 → 노즐 연결선. 실측 오프셋 155mm (ArUco 마커 중심 ↔ 노즐).
+    // 기준점 → 노즐 연결선. 설정 오프셋(기본 172mm, ArUco 마커 중심 ↔ 노즐).
     // 선이 없으면 꼭짓점에서 뒤로 물러났다 돌아오는 게 눈에 안 들어온다.
     if (m_robotValid) {
         const QPointF cw(m_robotPx.x() * sx + ox, m_robotPx.y() * sy + oy);
@@ -1272,9 +1388,10 @@ void VideoView::clearMission()
 void VideoView::stashActive()
 {
     if (m_points.size() >= 2)
-        m_done.append({ m_points, m_closed });
+        m_done.append({ m_points, m_closed, m_outerContour });
     m_points.clear();
     m_closed = false;
+    m_outerContour = false;
     resetSelection();
 }
 
@@ -1306,9 +1423,10 @@ bool VideoView::activateDoneAt(const QPointF &img, double thr)
         }
         if (!hit) continue;
 
-        VVPath cur{ m_points, m_closed };
+        VVPath cur{ m_points, m_closed, m_outerContour };
         m_points = m_done[i].pts;
         m_closed = m_done[i].closed;
+        m_outerContour = m_done[i].outerContour;
         m_done.removeAt(i);
         if (cur.pts.size() >= 2)
             m_done.append(cur);
@@ -1400,14 +1518,17 @@ void VideoView::applyToSelection(const std::function<QPointF(const QPointF &)> &
     }
 }
 
-double VideoView::selectedArcRadiusPx(const QList<VVPath> &snapshot) const
+double VideoView::selectedArcRadiusPx(const QList<VVPath> &snapshot, bool *outerOut) const
 {
     if (snapshot.isEmpty()) return 0.0;
     double minimum = std::numeric_limits<double>::infinity();
     auto consider = [&](const VVPath &path, bool fullySelected) {
         if (!fullySelected) return;
-        const DisplayArc arc = displayArcFor(path.pts, path.closed);
-        if (arc.ok) minimum = std::min(minimum, arc.radiusPx);
+        const DisplayArc arc = displayArcFor(path.pts, path.closed, m_tvPxPerM);
+        if (arc.ok && arc.radiusPx < minimum) {
+            minimum = arc.radiusPx;
+            if (outerOut) *outerOut = path.outerContour;
+        }
     };
 
     if (selectedPointCount() == 0) {
@@ -1454,6 +1575,7 @@ void VideoView::pushUndo()
     s.done = m_done;
     s.pts = m_points;
     s.closed = m_closed;
+    s.outerContour = m_outerContour;
     s.drawing = m_drawing;
     m_undo.append(s);
     if (m_undo.size() > 60) m_undo.removeFirst();
@@ -1464,6 +1586,7 @@ void VideoView::beginPendingUndo()
     m_pendingUndo.done = m_done;
     m_pendingUndo.pts = m_points;
     m_pendingUndo.closed = m_closed;
+    m_pendingUndo.outerContour = m_outerContour;
     m_pendingUndo.drawing = m_drawing;
     m_pendingUndoValid = true;
 }
@@ -1595,8 +1718,12 @@ void VideoView::applyHandleDrag(const QPointF &img)
     // 스냅샷을 되돌려놓고 변환을 새로 얹는다 (드래그 중 계속 호출되므로)
     m_points = m_handleStartAll.first().pts;
     m_closed = m_handleStartAll.first().closed;
-    for (int s = 0; s + 1 < m_handleStartAll.size() && s < m_done.size(); ++s)
+    m_outerContour = m_handleStartAll.first().outerContour;
+    for (int s = 0; s + 1 < m_handleStartAll.size() && s < m_done.size(); ++s) {
         m_done[s].pts = m_handleStartAll[s + 1].pts;
+        m_done[s].closed = m_handleStartAll[s + 1].closed;
+        m_done[s].outerContour = m_handleStartAll[s + 1].outerContour;
+    }
 
     // 회전 손잡이 — Shift 로 15° 스냅
     if (m_handleIdx == 8) {
@@ -1639,11 +1766,15 @@ void VideoView::applyHandleDrag(const QPointF &img)
         fx = (fx < 0 ? -f : f);
         fy = (fy < 0 ? -f : f);
 
-        const double radiusPx = selectedArcRadiusPx(m_handleStartAll);
+        bool outerArc = false;
+        const double radiusPx = selectedArcRadiusPx(m_handleStartAll, &outerArc);
         if (radiusPx > 0.0 && m_tvPxPerM > 1e-9) {
             const double requested = std::min(std::abs(fx), std::abs(fy));
-            const double constrained = motionprogram::constrainPaintArcScale(
-                radiusPx / m_tvPxPerM, requested);
+            const double constrained = outerArc
+                ? paintgeometry::constrainOuterArcScale(
+                      radiusPx / m_tvPxPerM, m_strokeMm / 1000.0,
+                      motionprogram::kServerConfirmedMinPaintRadiusM, requested)
+                : motionprogram::constrainPaintArcScale(radiusPx / m_tvPxPerM, requested);
             if (constrained > requested + 1e-9) m_radiusConstraintHit = true;
             fx = std::copysign(constrained, fx);
             fy = std::copysign(constrained, fy);
@@ -1706,12 +1837,16 @@ void VideoView::scaleActive(double factor)
     const QRectF b = selectionBoundsImg();
     if (b.isNull()) return;
     QList<VVPath> snapshot;
-    snapshot.append(VVPath{m_points, m_closed});
+    snapshot.append(VVPath{m_points, m_closed, m_outerContour});
     for (const VVPath &path : std::as_const(m_done)) snapshot.append(path);
-    const double radiusPx = selectedArcRadiusPx(snapshot);
+    bool outerArc = false;
+    const double radiusPx = selectedArcRadiusPx(snapshot, &outerArc);
     if (radiusPx > 0.0 && m_tvPxPerM > 1e-9) {
-        const double constrained = motionprogram::constrainPaintArcScale(
-            radiusPx / m_tvPxPerM, factor);
+        const double constrained = outerArc
+            ? paintgeometry::constrainOuterArcScale(
+                  radiusPx / m_tvPxPerM, m_strokeMm / 1000.0,
+                  motionprogram::kServerConfirmedMinPaintRadiusM, factor)
+            : motionprogram::constrainPaintArcScale(radiusPx / m_tvPxPerM, factor);
         m_radiusConstraintHit = constrained > factor + 1e-9;
         factor = constrained;
     } else {
@@ -1752,7 +1887,7 @@ void VideoView::deleteSelection()
         for (int i = 0; i < m_points.size(); ++i)
             if (!m_selection.contains(i)) keep.append(m_points[i]);
         m_points = keep;
-        if (m_points.size() < 3) m_closed = false;
+        if (m_points.size() < 3) { m_closed = false; m_outerContour = false; }
         m_selection.clear();
     }
 
@@ -1766,7 +1901,10 @@ void VideoView::deleteSelection()
             m_doneSel.removeAt(s);
         } else {
             m_done[s].pts = keep;
-            if (keep.size() < 3) m_done[s].closed = false;
+            if (keep.size() < 3) {
+                m_done[s].closed = false;
+                m_done[s].outerContour = false;
+            }
             m_doneSel[s].clear();
         }
     }
@@ -1775,6 +1913,7 @@ void VideoView::deleteSelection()
     if (m_points.isEmpty() && !m_done.isEmpty()) {
         m_points = m_done.last().pts;
         m_closed = m_done.last().closed;
+        m_outerContour = m_done.last().outerContour;
         m_done.removeLast();
         if (!m_doneSel.isEmpty()) m_doneSel.removeLast();
     }
@@ -1810,7 +1949,7 @@ int VideoView::mergeClosePoints()
     const int removed = m_points.size() - out.size();
     if (removed > 0 && out.size() >= 1) {
         m_points = out;
-        if (m_points.size() < 3) m_closed = false;
+        if (m_points.size() < 3) { m_closed = false; m_outerContour = false; }
         resetSelection();
         emitPath();
         update();
@@ -1844,6 +1983,7 @@ void VideoView::commitDrawPoint(QPointF img)
         }
         if (bi == 0 && m_points.size() >= 3) {
             m_closed = true;
+            m_outerContour = true;
             emitPath();
             emit pathClosed();
             finishFreeDraw();
@@ -1864,6 +2004,11 @@ void VideoView::finishFreeDraw()
     if (!m_drawing) return;
     m_drawing = false;
     mergeClosePoints();
+    // A newly drawn open curve becomes an outer contour only when the same
+    // fitter used by the wire protocol proves that it is one ARC. Straight and
+    // arbitrary open paths keep their historical centerline meaning.
+    if (!m_closed && displayArcFor(m_points, false, m_tvPxPerM).ok)
+        m_outerContour = true;
     emitPath();
     emit freeDrawEnded();
     update();
@@ -1951,7 +2096,10 @@ void VideoView::mousePressEvent(QMouseEvent *e)
                 m_handleIdx = h;
                 // 드래그 시작 시점의 모든 도형 좌표를 보관 (0=활성, 1..=완성)
                 m_handleStartAll.clear();
-                VVPath act; act.pts = m_points; act.closed = m_closed;
+                VVPath act;
+                act.pts = m_points;
+                act.closed = m_closed;
+                act.outerContour = m_outerContour;
                 m_handleStartAll.append(act);
                 for (const VVPath &d : std::as_const(m_done)) m_handleStartAll.append(d);
                 m_rotStartImg = img;
@@ -2320,7 +2468,7 @@ void VideoView::hoverMoveEvent(QHoverEvent *e)
 // ── 꼭짓점 회전각 (프로토콜 TURN: 양수 = 좌회전) ─────────────────────
 int VideoView::turnBadgeAtView(qreal viewX, qreal viewY) const
 {
-    if (!m_isTopView || !m_showLabels || !m_focused || m_points.size() > kDenseLimit)
+    if (!m_isTopView || !m_focused || m_points.size() > kDenseLimit)
         return -1;
     const QPointF v(viewX, viewY);
     for (int i = 0; i < m_turnBadgeRects.size(); ++i) {
@@ -2376,7 +2524,7 @@ bool VideoView::setTurnAngleAt(int index, double deg)
 // ── 변 길이(mm) 수치 편집 ─────────────────────────────────────────────
 int VideoView::edgeAtView(qreal viewX, qreal viewY) const
 {
-    if (!m_isTopView || !m_showLabels || !m_focused || m_points.size() > kDenseLimit)
+    if (!m_isTopView || !m_focused || m_points.size() > kDenseLimit)
         return -1;
     const QPointF v(viewX, viewY);
     for (int i = 0; i < m_edgeLabelRects.size(); ++i) {
@@ -2393,13 +2541,13 @@ double VideoView::edgeLengthMm(int index) const
     if (n < 2 || index < 0) return 0.0;
     const int nSeg = (m_closed && n > 2) ? n : n - 1;
     if (index >= nSeg) return 0.0;
-    const double spm = (m_tvPxPerM > 0) ? m_tvPxPerM : 100.0;
-    return QLineF(m_points[index], m_points[(index + 1) % n]).length() / spm * 1000.0;
+    const double storedMm = QLineF(topPxToWorldMm(m_points[index]),
+                                   topPxToWorldMm(m_points[(index + 1) % n])).length();
+    return paintdimensions::finishedSegmentMm(storedMm, m_strokeMm, m_outerContour);
 }
 
 bool VideoView::setEdgeLengthMm(int index, double mm)
 {
-    pushUndo();
     const int n = m_points.size();
     if (n < 2 || index < 0 || mm <= 0.05) return false;
     const int nSeg = (m_closed && n > 2) ? n : n - 1;
@@ -2410,10 +2558,16 @@ bool VideoView::setEdgeLengthMm(int index, double mm)
     const double len = QLineF(a, b).length();
     if (len < 1e-6) return false;
 
-    const double spm = (m_tvPxPerM > 0) ? m_tvPxPerM : 100.0;
-    const double targetPx = mm / 1000.0 * spm;
+    double targetStoredMm = 0.0;
+    if (!paintdimensions::storedSegmentMm(
+            mm, m_strokeMm, m_outerContour, &targetStoredMm))
+        return false;
+    const double currentStoredMm = QLineF(topPxToWorldMm(a), topPxToWorldMm(b)).length();
+    if (currentStoredMm < 1e-9) return false;
+    const double targetPx = len * (targetStoredMm / currentStoredMm);
     if (std::abs(targetPx - len) < 1e-6) return true;
 
+    pushUndo();
     const QPointF u((b.x() - a.x()) / len, (b.y() - a.y()) / len);
     const QPointF delta = u * (targetPx - len);
 
@@ -2454,6 +2608,7 @@ void VideoView::clearPath()
     m_pendingClick = false;
     m_points.clear();
     m_closed = false;
+    m_outerContour = false;
     m_done.clear();
     m_drawing = false;
     m_hoverEdge = -1;
@@ -2476,6 +2631,7 @@ void VideoView::undo()
     m_done = s.done;
     m_points = s.pts;
     m_closed = s.closed;
+    m_outerContour = s.outerContour;
     m_drawing = s.drawing;
 
     m_focused = true;              // 되돌린 결과를 바로 손볼 수 있게
@@ -2530,10 +2686,12 @@ void VideoView::buildPreset(const QString &type, double cx, double cy)
 
     if (type == "RECT") {
         m_closed = true;
+        m_outerContour = true;
         m_points << QPointF(cx - s, cy - s) << QPointF(cx + s, cy - s)
                  << QPointF(cx + s, cy + s) << QPointF(cx - s, cy + s);
     } else if (type == "TRIANGLE") {
         m_closed = true;
+        m_outerContour = true;
         m_points << QPointF(cx, cy - s) << QPointF(cx + s, cy + s) << QPointF(cx - s, cy + s);
     } else if (type == "CIRCLE") {
         // ⚠️ 예전엔 6점(60° 간격) 육각형이었다. 화면에서도 각져 보였고, 무엇보다
@@ -2543,9 +2701,12 @@ void VideoView::buildPreset(const QString &type, double cx, double cy)
         //    점 개수는 병합 임계값에 맞춰 정한다. 촘촘하게 깔면 예쁘지만, 점 하나를
         //    끌자마자 mergeClosePoints() 가 이웃을 통째로 지워 원이 무너진다.
         m_closed = true;
+        m_outerContour = true;
         // 새 원을 만든 직후부터 서버가 거부하는 상태가 되면 안 된다. 캔버스의
         // 실제 축척을 기준으로 최소 도색 반지름에서 시작한다.
-        s = std::max(s, motionprogram::kServerConfirmedMinPaintRadiusM * m_tvPxPerM);
+        const double minimumOuterRadiusM = paintgeometry::minimumOuterArcRadius(
+            m_strokeMm / 1000.0, motionprogram::kServerConfirmedMinPaintRadiusM);
+        s = std::max(s, minimumOuterRadiusM * m_tvPxPerM);
         const double minStep = std::max(mergeThresholdPx() * 1.3, 6.0);
         const int nPt = qBound(16, int(std::floor(2.0 * M_PI * s / minStep)), 36);
         for (int i = 0; i < nPt; ++i) {
@@ -2640,13 +2801,26 @@ QList<QVector<QPointF>> VideoView::textStrokePolylines(const QString &text,
     const QList<strokefont::Stroke> strokes = strokefont::layout(text, &emW);
     if (strokes.isEmpty()) return out;
 
-    // em 박스(가로 emW · 세로 1) → 목표 높이. y 는 폰트가 위로 +1 이고
-    // 이미지 좌표는 아래로 + 이므로 뒤집는다.
-    const double sc = targetHpx;
+    // 🔴 배율은 **실제 잉크 세로 범위**로 정한다 (em 박스 1.0 이 아니라).
+    //    strokefont 글리프가 전부 y 0~1 을 채우지는 않는다 — '-' 는 가운데 한 줄,
+    //    '.' 는 바닥 점이고 한글 'ㅗ ㅜ ㅡ' 도 마찬가지다. em 1.0 으로 나누면
+    //    그런 글자가 섞인 문자열에서 완성 높이가 요청값과 달라진다.
+    //    layout() 이 호를 이미 점으로 펼쳐 주므로 원호 글자도 이 방법이 정확하다.
+    // y 는 폰트가 위로 +1 이고 이미지 좌표는 아래로 + 이므로 뒤집는다.
+    double minY = 0.0, maxY = 0.0;
+    if (!strokefont::inkRangeEm(strokes, &minY, &maxY)) return out;
+    double ink = maxY - minY;
+    // ⚠️ 세로 두께가 0 인 문자열('-' 는 y=0.5 한 줄, '.' 는 y=0 점)이 있다.
+    //    그대로 나누면 글자가 아예 안 만들어진다 — 예전처럼 em 1.0 으로 되돌린다.
+    //    이런 글자는 실제 도색 세로가 어차피 펜 폭 하나라 높이 지정이 의미가 없다.
+    if (!(ink > 1e-6)) ink = 1.0;
+
+    const double sc = targetHpx / ink;
     const double cx = m_frame.isNull() ? 0.0 : m_frame.width() * 0.5;
     const double cy = m_frame.isNull() ? 0.0 : m_frame.height() * 0.5;
     const double ox = cx - emW * sc * 0.5;
-    const double oy = cy + sc * 0.5;
+    // 잉크 세로 **중앙**을 화면 중앙에 맞춘다 (em 중앙이 아니라).
+    const double oy = cy + (minY + maxY) * 0.5 * sc;
 
     for (const strokefont::Stroke &st : strokes) {
         if (st.size() < 2) continue;
@@ -2659,20 +2833,55 @@ QList<QVector<QPointF>> VideoView::textStrokePolylines(const QString &text,
     return out;
 }
 
-// 글자 도장. 기본은 획(중심선) — 붓 폭 50 mm 로 한 번에 칠해지는 형태.
+// 글자 도장. 기본은 획(중심선) — 설정된 붓 폭으로 한 번에 칠해지는 형태.
 void VideoView::addTextWorld(const QString &text, double heightMm, bool outline)
 {
-    pushUndo();
     if (!m_isTopView || text.trimmed().isEmpty() || m_frame.isNull()) return;
+
+    m_lastTextPaintedMm = QSizeF();   // 이번 호출이 실패하면 옛 값이 남지 않게
+
+    const double pxPerMm = m_tvPxPerM / 1000.0;
+
+    // 🔴 heightMm 은 **완성 도색 높이**다 — 변 길이 입력창과 같은 기준.
+    //    서버가 도색 구간 양끝을 hw(= 펜 폭 / 2) 씩 늘려 칠하므로, 글리프 자체는
+    //    펜 폭만큼 작아야 요청한 높이가 그대로 칠해진다.
+    //    ⚠️ 새 공식을 만들지 않는다 — 변 길이와 **같은 함수**를 써야 두 입력이
+    //       서로 어긋나지 않는다.
+    //    ⚠️ 외곽선(outline)은 닫힌 도형이라 이 보정을 하지 않는다 (이중 차감 방지).
+    double targetHmm = std::max(20.0, heightMm);
+    if (!outline) {
+        double storedMm = 0.0;
+        if (!paintdimensions::storedSegmentMm(heightMm, m_strokeMm,
+                                              /*outerContour=*/false, &storedMm))
+            return;   // 완성 높이가 펜 폭 이하 — 사유는 Backend 가 알린다
+        targetHmm = storedMm;
+    }
+    const double targetH = targetHmm * pxPerMm;
+
+    // 🔴 만들 것을 **먼저 만들어 보고**, 하나라도 나왔을 때만 상태를 건드린다.
+    //    글리프가 너무 작으면(완성 높이가 펜 폭보다 겨우 큰 경우) textStrokePolylines
+    //    가 빈 목록을 돌려주는데, 그전에 stashActive() 가 돌면 m_done 의 마지막
+    //    도형이 활성 경로로 끌려와 **엉뚱한 도형이 선택된 것처럼** 보인다.
+    QList<QVector<QPointF>> strokes;
+    if (!outline) {
+        strokes = textStrokePolylines(text.trimmed(), targetH);
+        if (strokes.isEmpty()) return;
+    }
+
+    // ⚠️ pushUndo 는 **실패 반환을 다 지난 뒤**에 — 헛 undo 가 쌓이면 Ctrl+Z 가 헛돈다.
+    pushUndo();
     stashActive();
     m_focused = true;              // 방금 넣은 것은 바로 편집할 수 있어야 한다
     m_drawing = false;
 
-    const double pxPerMm = m_tvPxPerM / 1000.0;
-    const double targetH = std::max(20.0, heightMm) * pxPerMm;
-
     if (!outline) {
-        const QList<QVector<QPointF>> strokes = textStrokePolylines(text.trimmed(), targetH);
+        // 실제 칠해지는 바깥 크기 = 획 점들의 바운딩 박스 + 펜 폭(양쪽 hw).
+        // ⚠️ QRectF::united 로 모으면 안 된다 — strokefont::polylineBounds 주석 참고.
+        double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+        m_lastTextPaintedMm = strokefont::polylineBounds(strokes, &x0, &y0, &x1, &y1)
+            ? QSizeF((x1 - x0) * mmPerPx() + m_strokeMm,
+                     (y1 - y0) * mmPerPx() + m_strokeMm)
+            : QSizeF();
         for (const QVector<QPointF> &s : strokes) {
             VVPath dp;
             dp.closed = false;          // 획은 열린 경로 = 직진/회전으로만 주행
@@ -2683,6 +2892,7 @@ void VideoView::addTextWorld(const QString &text, double heightMm, bool outline)
             const VVPath last = m_done.takeLast();
             m_points = last.pts;
             m_closed = last.closed;
+            m_outerContour = last.outerContour;
         }
     } else {
         QFont f(QStringLiteral("Pretendard"));
@@ -2703,7 +2913,7 @@ void VideoView::addTextWorld(const QString &text, double heightMm, bool outline)
                                    cy + (pt.y() - br.center().y()) * sc));
             const QVector<QPointF> simp = rdpSimplify(pts, eps);
             if (simp.size() >= 3)
-                m_done.append({ simp, true });
+                m_done.append({ simp, true, false });
         }
     }
     resetSelection();
@@ -2720,8 +2930,8 @@ int VideoView::simplifyActive(double toleranceMm)
     if (m_points.size() < 3) return 0;
     const double eps = std::max(0.5, toleranceMm / 1000.0 * m_tvPxPerM);
     const int before = m_points.size();
-    m_points = rdpSimplify(m_points, eps);
-    if (m_points.size() < 3) m_closed = false;
+    m_points = rdpSimplifyPreservingCurves(m_points, eps, m_tvPxPerM);
+    if (m_points.size() < 3) { m_closed = false; m_outerContour = false; }
     resetSelection();
     emitPath();
     update();
@@ -2736,7 +2946,7 @@ int VideoView::simplifyAll(double toleranceMm)
     for (VVPath &dp : m_done) {
         if (dp.pts.size() < 3) continue;
         const int before = dp.pts.size();
-        dp.pts = rdpSimplify(dp.pts, eps);
+        dp.pts = rdpSimplifyPreservingCurves(dp.pts, eps, m_tvPxPerM);
         if (dp.pts.size() < 3) dp.closed = false;
         removed += before - dp.pts.size();
     }
@@ -3205,6 +3415,7 @@ void VideoView::addRectWorldMm(double widthMm, double heightMm)
     }
     const double hx = widthMm * 0.5, hy = heightMm * 0.5;
     m_closed = true;
+    m_outerContour = true;
     m_drawing = false;
     m_points << worldMmToTopPx(cxMm - hx, cyMm - hy)
              << worldMmToTopPx(cxMm + hx, cyMm - hy)
@@ -3368,12 +3579,18 @@ QList<QList<QPointF>> VideoView::overlayPathsForOriginal(QList<bool> *closedOut)
     // 닫는 변까지 이미 점으로 펼쳐 넣으므로 closed 는 항상 false 로 넘긴다.
     // (true 로 주면 받는 쪽이 마지막↔첫 점을 곧은 직선으로 한 번 더 그어 휘지 않는다)
     for (const VVPath &dp : m_done) {
-        out.append(topViewToOriginal(dp.pts, dp.closed && dp.pts.size() > 2));
+        const QVector<QPointF> center = centerlineFor(dp);
+        if (center.size() < 2) continue;
+        out.append(topViewToOriginal(center, dp.closed && center.size() > 2));
         if (closedOut) closedOut->append(false);
     }
     if (m_points.size() >= 2) {
-        out.append(topViewToOriginal(m_points, m_closed && m_points.size() > 2));
-        if (closedOut) closedOut->append(false);
+        const VVPath active{m_points, m_closed, m_outerContour};
+        const QVector<QPointF> center = centerlineFor(active);
+        if (center.size() >= 2) {
+            out.append(topViewToOriginal(center, m_closed && center.size() > 2));
+            if (closedOut) closedOut->append(false);
+        }
     }
     return out;
 }
@@ -3397,8 +3614,8 @@ QList<QPolygonF> VideoView::overlayBandsForOriginal() const
 
         QPainterPathStroker st;
         st.setWidth(w);
-        st.setCapStyle(Qt::RoundCap);
-        st.setJoinStyle(Qt::RoundJoin);
+        st.setCapStyle(Qt::FlatCap);
+        st.setJoinStyle(Qt::MiterJoin);
         const QList<QPolygonF> rings = st.createStroke(src).toSubpathPolygons();
         for (const QPolygonF &ring : rings) {
             if (ring.size() < 3) continue;
@@ -3407,8 +3624,9 @@ QList<QPolygonF> VideoView::overlayBandsForOriginal() const
         }
     };
 
-    for (const VVPath &dp : m_done) bandOf(dp.pts, dp.closed);
-    if (m_points.size() >= 2) bandOf(m_points, m_closed);
+    for (const VVPath &dp : m_done) bandOf(centerlineFor(dp), dp.closed);
+    if (m_points.size() >= 2)
+        bandOf(centerlineFor({m_points, m_closed, m_outerContour}), m_closed);
     return out;
 }
 
@@ -3427,10 +3645,12 @@ QList<QPointF> VideoView::metersToOriginal(const QList<QPointF> &meters) const
     return topViewToOriginal(tv);
 }
 
-QList<QList<QPointF>> VideoView::pathsToMeters(QList<bool> *closedOut) const
+QList<QList<QPointF>> VideoView::pathsToMeters(QList<bool> *closedOut,
+                                               QString *errorOut) const
 {
     QList<QList<QPointF>> out;
     if (closedOut) closedOut->clear();
+    if (errorOut) errorOut->clear();
 
     cv::Mat inv;
     const bool useMat = (m_hasMmToTv && !m_mmToTv.empty());
@@ -3456,22 +3676,76 @@ QList<QList<QPointF>> VideoView::pathsToMeters(QList<bool> *closedOut) const
 
     for (const VVPath &dp : m_done) {
         if (dp.pts.size() < 2) continue;
-        out.append(convert(dp.pts));
+        QString geometryError;
+        const QVector<QPointF> center = centerlineFor(dp, &geometryError);
+        if (center.size() < 2) {
+            if (errorOut) *errorOut = geometryError;
+            return {};
+        }
+        out.append(convert(center));
         if (closedOut) closedOut->append(dp.closed);
     }
     if (m_points.size() >= 2) {
-        out.append(convert(m_points));
+        QString geometryError;
+        const QVector<QPointF> center = centerlineFor(
+            {m_points, m_closed, m_outerContour}, &geometryError);
+        if (center.size() < 2) {
+            if (errorOut) *errorOut = geometryError;
+            return {};
+        }
+        out.append(convert(center));
         if (closedOut) closedOut->append(m_closed);
     }
     return out;
 }
 
+QList<QList<QPointF>> VideoView::editablePathsToMeters(QList<bool> *closedOut,
+                                                       QList<bool> *outerOut) const
+{
+    QList<QList<QPointF>> out;
+    if (closedOut) closedOut->clear();
+    if (outerOut) outerOut->clear();
+
+    cv::Mat inv;
+    const bool useMat = (m_hasMmToTv && !m_mmToTv.empty());
+    if (useMat) inv = m_mmToTv.inv();
+
+    auto convert = [&](const QVector<QPointF> &pts) {
+        QList<QPointF> res;
+        if (useMat) {
+            std::vector<cv::Point2f> in, mm;
+            for (const QPointF &point : pts)
+                in.emplace_back(float(point.x()), float(point.y()));
+            cv::perspectiveTransform(in, mm, inv);
+            for (const cv::Point2f &point : mm)
+                res.append(QPointF(point.x / 1000.0, point.y / 1000.0));
+        } else {
+            const double scale = (m_tvPxPerM > 0) ? m_tvPxPerM : 1.0;
+            for (const QPointF &point : pts)
+                res.append(QPointF(point.x() / scale, (m_tvOutH - point.y()) / scale));
+        }
+        return res;
+    };
+
+    auto append = [&](const VVPath &path) {
+        if (path.pts.size() < 2) return;
+        out.append(convert(path.pts));
+        if (closedOut) closedOut->append(path.closed);
+        if (outerOut) outerOut->append(path.outerContour);
+    };
+    for (const VVPath &path : m_done) append(path);
+    append({m_points, m_closed, m_outerContour});
+    return out;
+}
+
 void VideoView::setEditPathsMeters(const QList<QList<QPointF>> &metersPaths,
-                                   const QList<bool> &closed)
+                                   const QList<bool> &closed,
+                                   const QList<bool> &outer)
 {
     if (!m_isTopView) return;
     m_points.clear();
     m_closed = false;
+    m_outerContour = false;
     m_done.clear();
     m_drawing = false;
     m_hoverEdge = -1;
@@ -3481,6 +3755,7 @@ void VideoView::setEditPathsMeters(const QList<QList<QPointF>> &metersPaths,
     for (int k = 0; k < metersPaths.size(); ++k) {
         VVPath dp;
         dp.closed = closed.value(k, false) && metersPaths[k].size() > 2;
+        dp.outerContour = outer.value(k, false);
         for (const QPointF &m : metersPaths[k])
             dp.pts.append(worldMmToTopPx(m.x() * 1000.0, m.y() * 1000.0));
         if (dp.pts.size() >= 2)
@@ -3490,6 +3765,7 @@ void VideoView::setEditPathsMeters(const QList<QList<QPointF>> &metersPaths,
         const VVPath dp = m_done.takeLast();
         m_points = dp.pts;
         m_closed = dp.closed;
+        m_outerContour = dp.outerContour;
     }
     syncDoneSelSize();
     emit selectionChanged();

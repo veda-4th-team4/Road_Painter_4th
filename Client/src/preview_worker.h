@@ -51,6 +51,9 @@ public:
     // retrieve(색변환) · QImage 변환 · 시그널은 건너뛴다.
     void setPaused(bool on) { m_paused.store(on, std::memory_order_relaxed); }
 
+    // 메인 작업 화면과 같은 표시 보정. 원자값만 바꾸므로 캡처 중에도 안전하다.
+    void setVideoFilters(int brightness, int contrast, int sharpen, int saturation);
+
     // GUI 가 프레임 하나를 소비했다고 알린다 (Backend 가 연결해 준다).
     void frameConsumed() { m_queued.fetch_sub(1, std::memory_order_relaxed); }
 
@@ -74,6 +77,10 @@ private:
     std::atomic<bool> m_stopRequested{false};
     std::atomic<bool> m_paused{false};   // 위 setPaused 참고
     std::atomic<int> m_queued{0};   // GUI 이벤트 큐에 떠 있는 프레임 수
+    std::atomic<int> m_brightness{0};
+    std::atomic<int> m_contrast{0};
+    std::atomic<int> m_sharpen{0};
+    std::atomic<int> m_saturation{0};
 };
 
 #endif // PREVIEW_WORKER_H

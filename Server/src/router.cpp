@@ -25,6 +25,12 @@ void Router::sweep() {
     // 캘리 세션도 같은 방식으로 회수한다. 종결 응답이 안 오는 세션을 서버가
     // 먼저 접지 않으면 calibActive_가 켜진 채 남아 이후 요청이 전부 busy가 된다.
     checkCalibTimeout();
+    // 오도메트리 캡처 ack 개별 타임아웃 - 세션 전체 타임아웃(위)보다 훨씬
+    // 짧게 걸려서 CCTV가 침묵하는 순간 3m 주행을 계속 돌리지 않는다.
+    checkOdoCaptureTimeout();
+    // 채널 간 정합 수집 - 주기적으로 REGISTER_CAPTURE를 다시 쏘고, 세션
+    // 데드라인/종료 ack 타임아웃을 본다 (router_registration.cpp).
+    checkRegistrationTick();
 }
 
 // 주기 호출 (main의 tick 스레드).
@@ -44,12 +50,31 @@ void Router::tick() {
 void Router::onPeerChange(const std::string& role, bool connected) {
     std::lock_guard<std::mutex> lk(mtx_);
     if (role == "QT") {
-        if (connected) sendPeers();  // 막 접속한 QT에 현재 스냅샷 1회 전송
+        if (connected) {
+            sendPeers();  // 막 접속한 QT에 현재 스냅샷 1회 전송
+            return;
+        }
+        // 🔴 QT가 소유한 캘리 세션은 주인이 사라졌다. 예전에는 여기서 그냥
+        //   return이라 세션이 그대로 남았는데, 정적 앵커 방식에서는 로봇이
+        //   움직이지 않아 "타임아웃까지 busy"로 끝났다. 오도메트리 방식은
+        //   다르다 - **주인 없는 로봇이 계속 사각형을 그린다.** 조작자는 Qt
+        //   화면이 죽은 것을 보고 자리를 뜨거나 로봇 쪽으로 걸어간다.
+        if (calibActive_ && calibOwner_ == CalibOwner::QT) {
+            if (calibIsOdo_)
+                abortOdoCalib("qt_offline",
+                              "Qt 연결이 끊겨 주행을 중단했습니다.");
+            else
+                failCalib("qt_offline",
+                          "Qt 연결이 끊겨 캘리브레이션을 중단했습니다.");
+        }
         return;
     }
     if (role != "ROBOT" && role != "CCTV") return;  // QT 관심사만 (ADMIN 등 무시)
     sendPeers();
     logf("[INFO] PEERS 통지 - %s %s", role.c_str(), connected ? "접속" : "해제");
+    // 로봇이 빠지면 STATUS 로그 억제 상태를 비운다 - 재접속 후 첫 STATUS가
+    // 이전과 같은 값이어도 한 줄 남아야 "다시 붙었고 이 상태다"가 보인다.
+    if (role == "ROBOT" && !connected) clearStatusLog();
     // 로봇이 빠지면 진행 중이던 경로는 의미가 없다. 상태를 접지 않으면
     // planActive_가 켜진 채로 남아 재접속 후 START_DRAW가 "busy"로 거절된다.
     if (role == "ROBOT" && !connected && (planActive_ || awaitingArrival_)) {
@@ -60,10 +85,24 @@ void Router::onPeerChange(const std::string& role, bool connected) {
     // 캘리 세션도 마찬가지다. 여기서 접지 않으면 결과를 만들어줄 상대가 사라진
     // 채로 타임아웃(기본 3분)까지 Qt가 대기 화면에 갇힌다 - 원인을 이미 아는데
     // 3분을 기다리게 할 이유가 없다.
-    if (!connected && calibActive_)
-        failCalib(role == "ROBOT" ? "robot_offline" : "cctv_offline",
-                  std::string(role == "ROBOT" ? "로봇" : "카메라") +
-                      " 연결이 끊겨 캘리브레이션을 계속할 수 없습니다.");
+    if (!connected && calibActive_) {
+        const char* reason = role == "ROBOT" ? "robot_offline" : "cctv_offline";
+        const std::string m = std::string(role == "ROBOT" ? "로봇" : "카메라") +
+                              " 연결이 끊겨 캘리브레이션을 계속할 수 없습니다.";
+        // 🔴 카메라만 빠지고 로봇은 살아 있는 오도메트리 주행에서는 failCalib이
+        //   위험하다. 그건 서버 상태만 정리할 뿐 로봇을 세우지 않으므로, 아무도
+        //   보고 있지 않은 로봇이 사각형을 마저 그린다. 로봇이 아직 붙어 있으면
+        //   정지 핸드셰이크로 세운다.
+        if (calibIsOdo_ && role == "CCTV" && !odoAwaitingResult_) {
+            abortOdoCalib(reason, m);
+            // 떠난 카메라의 CALIB_STOPPED는 영영 오지 않는다. 그걸 기다리다
+            // cancel_failed로 닫으면 "로봇 상태를 직접 확인하세요"라는 엉뚱한
+            // 경고가 뜬다 - 정작 확인이 필요한 로봇은 ack를 보내올 것이다.
+            cancelAckCctv_ = true;
+        } else {
+            failCalib(reason, m);
+        }
+    }
 }
 
 // 현재 ROBOT/CCTV 접속 여부를 조회해 QT로 전송. QT 미접속이면 다른 중계와
@@ -98,8 +137,26 @@ void Router::fromAdmin(const json& msg) {
             startCalib(payload, msg, "ADMIN");
             return;
         }
+        // 관리자 창은 자기 세션만 취소할 수 있다. 단 {"force":true}면 QT 세션도
+        // 강제로 회수한다 - 로봇이 굴러가는 중인데 Qt 단말 앞에 사람이 없을 수
+        // 있고, 그때 관리자가 로봇을 세울 방법이 없으면 안 된다 (§3-3).
         if (cmd == "CALIB_CANCEL") {
-            cancelCalib(payload, msg);
+            cancelCalib(payload, msg, "ADMIN");
+            return;
+        }
+        // 채널 간 정합(registration) 수집 - ADMIN 전용, router_registration.cpp.
+        // 로봇에는 아무것도 안 보낸다 - 이 세션은 조이스틱 수동 조작을 전제로
+        // 하므로(자동 경로 없음), 로봇 쪽에 새로 알려야 할 상태가 없다.
+        if (cmd == "REGISTER_COLLECT_START") {
+            startRegistrationCollect(payload);
+            return;
+        }
+        if (cmd == "REGISTER_COLLECT_STOP") {
+            stopRegistrationCollect(false, "operator_stop");
+            return;
+        }
+        if (cmd == "REGISTER_COLLECT_CANCEL") {
+            stopRegistrationCollect(true, "operator_cancel");
             return;
         }
         // 요약 INFO를 sendTo보다 먼저 (미접속 [WARN]이 뒤따르도록 - fromQt 참고)
@@ -214,7 +271,7 @@ void Router::fromQt(const json& msg) {
             return;
         }
         if (cmd == "CALIB_CANCEL") {
-            cancelCalib(payload, msg);
+            cancelCalib(payload, msg, "QT");
             return;
         }
         // 로봇을 움직이는 수동 조작 (조이스틱).
@@ -341,9 +398,20 @@ void Router::fromRobot(const json& msg) {
     if (type == "STATUS") {
         lastStatus_ = payload;
         srv_.sendTo("QT", msg);  // Qt로 상태 중계 (지속 모니터링)
-        logf("[INFO] STATUS: state=%s painting=%s",
-             payload.value("state", "?").c_str(),
-             payload.value("painting", false) ? "true" : "false");
+        // 로그는 값이 바뀐 순간만 남긴다 (2026-08-18). STATUS는 2Hz 하트비트라
+        // 그대로 찍으면 초당 두 줄씩 다른 로그를 밀어내는데, 정작 알고 싶은
+        // "언제 바뀌었나"는 같은 줄 수백 개 사이에 묻힌다. 중계와 lastStatus_
+        // 갱신은 그대로이므로 Qt 화면과 서버 판단에는 아무 영향이 없다.
+        std::string state = payload.value("state", "?");
+        bool painting = payload.value("painting", false);
+        if (!lastStatusSeen_ || state != lastStatusState_ ||
+            painting != lastStatusPainting_) {
+            logf("[INFO] STATUS: state=%s painting=%s",
+                 state.c_str(), painting ? "true" : "false");
+            lastStatusState_ = state;
+            lastStatusPainting_ = painting;
+            lastStatusSeen_ = true;
+        }
     } else if (type == "READY") {
         if (!payload.contains("op_index")) {
             // v1 로봇은 READY{"seg":n}을 MOVE 앞에서만 보냈다. 그 로봇을 v2
@@ -358,7 +426,11 @@ void Router::fromRobot(const json& msg) {
         // 판단하고, payload.phase는 어긋났을 때 경고를 남기는 용도로만 쓴다
         // (로봇이 phase를 안 실어도 동작하게 - 서버가 단계의 주인).
         std::string phase = payload.value("phase", "");
-        if (awaitingArrival_) {
+        if (activePhase_ == "calib") {
+            // 로봇 코드(main.cpp R-4)는 마지막 op 완료 후 READY 없이 곧장
+            // PATH_DONE을 보낸다 - 9번째(복귀) 캡처는 그래서 여기서 트리거한다.
+            onCalibPathDone();
+        } else if (awaitingArrival_) {
             if (!phase.empty() && phase != "approach")
                 logf("[WARN] PATH_DONE phase=%s - 서버는 접근 대기 중이라 접근 완료로 처리",
                      phase.c_str());
@@ -393,6 +465,15 @@ void Router::fromRobot(const json& msg) {
 //   빠뜨리면 로봇은 영원히 그 자리에 선다.
 void Router::onReady(int k) {
     runningOp_ = -1;  // READY = 직전 op 실행이 끝났다는 뜻 (DRIFT 중단)
+
+    // 오도메트리 캘리 경로는 별도 핸드셰이크를 탄다 (CALIB_CAPTURE ack까지
+    // GO를 미룸) - 아래 도색용 판정 로직(ALIGN/MORE 대기 창)과는 무관하다.
+    // planActive_는 sendPath()가 이미 세워뒀으므로 이 분기는 그 체크보다
+    // 먼저 와야 한다 (docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §3).
+    if (activePhase_ == "calib") {
+        onCalibReady(k);
+        return;
+    }
 
     if (!planActive_ || activeMeta_.empty()) {
         sendGo(k, "진행 중인 경로 없음");
@@ -435,6 +516,7 @@ void Router::sendGo(int k, const char* why) {
     srv_.sendTo("ROBOT", makeMsg("GO", {{"op_index", k}}));
     runningOp_ = k;
     lastDriftMs_ = 0;  // 새 op 시작 - 첫 DRIFT를 기다리게 하지 않는다
+    clearDriftAvg();   // 이전 op의 heading 표본이 새 구간에 섞이면 안 된다
     if (why) logf("[INFO] GO(op %d) - %s", k, why);
     else logf("[INFO] GO(op %d)", k);
 }
@@ -455,23 +537,40 @@ void Router::clearBoundary() {
 //   꼭짓점마다 ±a(150mm)를 슬립계수 하나만 믿고 개루프로 찍고, 틀려도 아무도
 //   고치지 않았다 - 펜 오프셋 설정값과 실측값이 5mm만 어긋나도 그 오차가 보정
 //   없이 꼭짓점마다 그대로 쌓였다(2026-08-11 삼각형 시험에서 관측).
+// 🔴 arc는 대상이 아니다 (2026-08-13 실기 시험에서 "원을 망침"으로 관측).
+//   MORE는 exitHeadingDeg 방향으로 **직선 이동**을 시키는 보정이다. 직진에는
+//   맞지만 호에서는 틀린다 - 원 위의 점에서 접선으로 나가면 원을 벗어나므로,
+//   호 끝마다 접선 직선이 덧붙는다. 그것도 more_max_tries(4회)까지 반복한다.
+//   설계 의도와도 어긋났다: needsAlign 주석대로 호는 개루프 구간이고 진입
+//   pose가 원의 위치를 100% 결정한다 - 진입만 맞추고 끝까지 두는 게 규약이다.
+//   호의 거리 오차를 정말 잡으려면 직선이 아니라 추가 호(Δθ)여야 하고, 그건
+//   로봇 쪽 op이 하나 더 필요한 별도 작업이다.
 bool Router::needsMore(int k) const {
     if (k <= 0 || k > (int)activeMeta_.size()) return false;
     const OpMeta& m = activeMeta_[(size_t)k - 1];
-    return (m.op == "move" || m.op == "arc") && m.hasTarget &&
-           hasHeading(m.exitHeadingDeg);
+    return m.op == "move" && m.hasTarget && hasHeading(m.exitHeadingDeg);
 }
 
 // ALIGN 판정이 가능한 boundary인지. 목표 방위(CCW 절대각)를 targetCcw에 채운다.
-//   ① 직전 op이 role=path인 turn      -> 그 turn이 만들어야 할 방위
+//   ① 직전 op이 turn (role 무관)       -> 그 turn이 만들어야 할 방위
 //   ② k==0 이고 phase=="draw"          -> 첫 주행 op의 방위 (도색 시작 직전)
 //   ③ 다음 op이 role=path인 arc        -> 진입 접선 방향
 // ③이 별도 항인 이유: arc는 개루프 구간이라(DRIFT 없음) 진입 pose가 원의 위치를
 // 100% 결정한다. 진입 각도가 5도 틀어지면 원 전체가 통째로 어긋난다 (§4.4).
+//
+// 🔴 ①에서 role=path 요구를 걷어냈다 (2026-08-14 실기 시험).
+//   호를 빠져나온 뒤 각도를 맞추는 자리가 통째로 없었다. 호는 개루프라 스윕만큼
+//   오차가 그대로 남는데, 그 뒤에 오는 것은 closePaint가 넣는 위상 복원
+//   turn(role=offset) 하나뿐이라 ①에 걸리지 않았다. 그래서 호 다음 직선이
+//   기울어진 채로 시작했다("호 뒤에 이어 그은 선이 삐뚤어짐").
+//
+//   이 자리는 노즐이 이미 올라간 뒤라(closePaint가 먼저 올린다) 제자리 회전을
+//   시켜도 도료를 문지르지 않는다. 캘리 사각형 경로의 turn은 목표 방위를
+//   kNoHeading으로 실어 보내므로 hasHeading 검사에서 그대로 걸러진다.
 bool Router::needsAlign(int k, double& targetCcw) const {
     if (k > 0 && k <= (int)activeMeta_.size()) {
         const OpMeta& m = activeMeta_[(size_t)k - 1];
-        if (m.isPath && m.op == "turn" && hasHeading(m.exitHeadingDeg)) {
+        if (m.op == "turn" && hasHeading(m.exitHeadingDeg)) {
             targetCcw = m.exitHeadingDeg;
             return true;
         }
@@ -540,11 +639,16 @@ void Router::resolveBoundary() {
         const double head = m.exitHeadingDeg;
         const double ux = std::cos(head * M_PI / 180.0);
         const double uy = std::sin(head * M_PI / 180.0);
-        // 🔴 노즐이 내려간 상태로 끝나는 op이면 마커 중심의 목표는 꼭짓점보다
-        //   a 앞이다 (§5.2). 이 항을 빠뜨리면 도색 구간마다 15cm 전진 오차를
-        //   잡고 있다고 착각해 매번 MORE{-0.150}를 쏜다.
-        //   오프셋 전진 다리(+a)도 곧 노즐을 내리므로 같은 목표를 쓴다.
-        const double off = m.centerAheadByA ? P.pen_offset_m : 0.0;
+        // 🔴 마커 중심의 목표는 꼭짓점보다 진행방향으로 centerAheadM 앞이다.
+        //   이 항을 빠뜨리면 도색 구간마다 15cm 전진 오차를 잡고 있다고 착각해
+        //   매번 MORE{-0.150}를 쏜다 (§5.2).
+        //
+        //   값은 op마다 다르다 (ops_builder.hpp OpMeta::centerAheadM 참고).
+        //   예전에는 bool이라 "참이면 pen_offset_m"으로 여기서 상수를 꺼내 썼는데,
+        //   펜 두께 보정(2026-08-13)이 들어오며 진입(a-w/2)/도색(a+w/2)/이탈(0)로
+        //   갈려서 경로를 만든 쪽이 값을 실어 보내는 구조로 바꿨다. 여기서 다시
+        //   상수를 쓰면 MORE가 그 두께 보정을 매 boundary마다 되돌린다.
+        const double off = m.centerAheadM;
         const double tx = m.penTarget[0] + off * ux;
         const double ty = m.penTarget[1] + off * uy;
         const double dist = (tx - cx) * ux + (ty - cy) * uy;
@@ -750,20 +854,39 @@ void Router::fromCctv(const json& msg) {
         //   15.5cm짜리라 보정할 값이 없다.
         if (runningOp_ >= 0 && runningOp_ < (int)activeMeta_.size()) {
             const OpMeta& m = activeMeta_[(size_t)runningOp_];
-            if (m.isPath && m.op == "move" && hasHeading(m.headingDeg) &&
-                nowMs() - lastDriftMs_ >= P.drift_period_ms) {
-                double err = normDeg(m.headingDeg - p.theta * 180.0 / M_PI);
-                if (std::fabs(err) >= P.drift_deadband_deg) {
-                    srv_.sendTo("ROBOT", makeMsg("DRIFT",
-                        {{"op_index", runningOp_},
-                         {"angle_deg", round1(toRobotDeg(err))}}));
-                    lastDriftMs_ = nowMs();
-                    // v1은 DRIFT를 로그에 남기지 않아 "보냈는지"를 tap_dump로만
-                    // 확인할 수 있었다. 전송률이 drift_period_ms로 제한돼 있어
-                    // (기본 2.5Hz) 로그가 뒤덮이지 않으므로 남긴다.
-                    logf("[INFO] DRIFT(op %d) %.1f도 (목표 %.1f, 현재 %.1f)",
-                         runningOp_, toRobotDeg(err), m.headingDeg,
-                         p.theta * 180.0 / M_PI);
+            if (!(m.isPath && m.op == "move")) {
+                clearDriftAvg();  // 직진 도색 구간이 아니면 표본을 섞지 않는다
+            } else if (hasHeading(m.headingDeg)) {
+                // 최근 kDriftAvgN개의 평균 heading으로 판정한다. 표본이 아직 덜
+                // 찼으면 있는 것만으로 평균한다 - 구간 첫머리에 보정을 통째로
+                // 쉬는 것보다는 낫다(그때가 제일 많이 틀어져 있다).
+                driftSin_[driftPos_] = std::sin(p.theta);
+                driftCos_[driftPos_] = std::cos(p.theta);
+                driftPos_ = (driftPos_ + 1) % kDriftAvgN;
+                if (driftN_ < kDriftAvgN) ++driftN_;
+                double ss = 0, cc = 0;
+                for (int i = 0; i < driftN_; ++i) {
+                    ss += driftSin_[i];
+                    cc += driftCos_[i];
+                }
+                const double thetaAvg = std::atan2(ss, cc) * 180.0 / M_PI;
+                if (nowMs() - lastDriftMs_ >= P.drift_period_ms) {
+                    const double err = normDeg(m.headingDeg - thetaAvg);
+                    if (std::fabs(err) >= P.drift_deadband_deg) {
+                        srv_.sendTo("ROBOT", makeMsg("DRIFT",
+                            {{"op_index", runningOp_},
+                             {"angle_deg", round1(toRobotDeg(err))}}));
+                        lastDriftMs_ = nowMs();
+                        // v1은 DRIFT를 로그에 남기지 않아 "보냈는지"를 tap_dump로만
+                        // 확인할 수 있었다. 전송률이 drift_period_ms로 제한돼 있어
+                        // (기본 2.5Hz) 로그가 뒤덮이지 않으므로 남긴다.
+                        // 평균값과 방금 들어온 값을 같이 남긴다 - 둘이 크게
+                        // 벌어져 있으면 그 구간 POS가 튀고 있다는 뜻이다.
+                        logf("[INFO] DRIFT(op %d) %.1f도 (목표 %.1f, 평균 %.1f "
+                             "/ 최근 %.1f, 표본 %d)",
+                             runningOp_, toRobotDeg(err), m.headingDeg, thetaAvg,
+                             p.theta * 180.0 / M_PI, driftN_);
+                    }
                 }
             }
         }
@@ -776,6 +899,22 @@ void Router::fromCctv(const json& msg) {
         relayCalibFail(payload);
     } else if (type == "CALIB_STOPPED") {
         onCalibStopped("CCTV");
+    } else if (type == "CALIB_CAPTURE_OK") {
+        // 오도메트리 캘리 캡처 ack (2026-08-12 신설, router_odocalib.cpp).
+        // 정적 앵커 세션과는 다른 메시지 타입이라 여기서 갈릴 필요 없이
+        // onCalibCaptureAck 내부에서 calibIsOdo_를 확인한다.
+        onCalibCaptureAck(payload, true, "");
+    } else if (type == "CALIB_CAPTURE_FAIL") {
+        onCalibCaptureAck(payload, false, payload.value("reason", "unknown"));
+    } else if (type == "REGISTER_CAPTURE_OK") {
+        // 채널 간 정합 캡처 ack (2026-08-15 신설, router_registration.cpp).
+        onRegisterCaptureAck(payload, true, "");
+    } else if (type == "REGISTER_CAPTURE_FAIL") {
+        onRegisterCaptureAck(payload, false, payload.value("reason", "unknown"));
+    } else if (type == "REGISTER_FAIL") {
+        onRegisterFail(payload);
+    } else if (type == "REGISTER_STOPPED") {
+        onRegisterStopped(payload);
     } else {
         logf("[WARN] CCTV로부터 알 수 없는 type: %s", type.c_str());
     }
@@ -881,6 +1020,15 @@ static void warnCalibSpec(int ch, const json& bundle) {
         logf("[WARN] 캘리브레이션(채널 %d) image_size=%s - 이번 운용 규격은 [%d,%d]다. "
              "Qt가 디코딩하는 영상 크기와 다르면 좌표가 그만큼 틀어진다",
              ch, sz.is_null() ? "(없음)" : sz.dump().c_str(), kSpecW, kSpecH);
+    // coord_mode=undistort인데 K/D가 없으면 서버는 Calib::hasKD 게이트 때문에
+    // 왜곡 보정을 조용히 건너뛰고 H를 raw 픽셀에 그대로 적용한다 - 에러 없이
+    // 좌표만 틀어진다. 이 프로젝트에서 실제로 겪은 사고 부류다
+    // (admin_console/cctv.py 주석: "K·D·H_marker를 버렸다 - 에러 없이 보정만
+    // 꺼졌다"). 거부하지 않는다(레거시 번들 호환) - 눈에 보이게만 남긴다.
+    if (mode == "undistort" && !(bundle.contains("K") && bundle.contains("D")))
+        logf("[WARN] 캘리브레이션(채널 %d) coord_mode=undistort인데 K/D가 없음 - "
+             "서버가 왜곡 보정을 건너뛰고 H를 raw 픽셀에 그대로 적용한다 "
+             "(에러 없이 좌표만 렌즈 왜곡만큼 틀어짐)", ch);
 }
 
 // 캘리브레이션 번들 수신 (CCTV 직접 or 관리자 창 ADMIN 경유 공용). 세 형태를 받는다:
@@ -925,6 +1073,32 @@ void Router::handleHMatrix(const json& msg) {
              ch, payload.dump().c_str());
         return;
     }
+    // 🔴 격하 감시 (2026-08-13). 이미 들고 있는 것보다 **빈약한** 번들이 덮어쓰는
+    //   상황을 크게 남긴다. 값이 그럴듯하고 에러도 안 나서, 실기 시험에서
+    //   오도메트리 결과(H_marker+K/D 포함)가 관리자 창의 floor 번들에 덮이는 걸
+    //   아무도 눈치채지 못했다 - 서버는 H_marker가 없으면 바닥 H로 대신 쓰므로
+    //   (calib.hpp) 두 평면이 조용히 하나로 붕괴하고 로봇 pose가 시차만큼 틀어진다.
+    //
+    //   막지는 않는다. "최신 번들이 이긴다"가 규약이고, 바닥 재캘리처럼 H_marker가
+    //   원래 없는 정당한 갱신도 이 모양이기 때문이다. 판단은 사람이 하되,
+    //   그러려면 보여야 한다.
+    {
+        auto prev = calibs_.find(ch);
+        if (prev != calibs_.end() && prev->second.valid) {
+            const Calib& p = prev->second;
+            std::string lost;
+            if (p.hasMarker && !c.hasMarker) lost += "H_marker ";
+            if (p.hasKD && !c.hasKD) lost += "K/D ";
+            const bool prevId = p.raw.contains("calib_id");
+            if (prevId && !bundle.contains("calib_id")) lost += "calib_id ";
+            if (!lost.empty())
+                logf("[WARN] 캘리브레이션(채널 %d) 격하 - 기존 번들에 있던 [%s]이(가) "
+                     "새 번들에 없다. 덮어쓴다(규약)지만 의도한 것인지 확인할 것 "
+                     "(기존 calib_id=%s)",
+                     ch, lost.c_str(),
+                     prevId ? p.raw["calib_id"].dump().c_str() : "(없음)");
+        }
+    }
     calibs_[ch] = c;
     // mm 번들 그대로 다시 싸서 QT에 중계 + 영속 저장 - QT는 mm H_floor로 top-view.
     json outMsg = msg;
@@ -941,6 +1115,11 @@ void Router::handleHMatrix(const json& msg) {
     //   통째로 갈아치우므로 CCTV가 실어 보낸 필드가 여기서 사라진다.
     // 채널이 어긋나면 세션을 닫지 않는다 - 계약 §6 "다른 요청의 늦은 결과가 현재
     // 대기를 풀면 안 된다"와 같은 이유다. 번들 자체는 정상이므로 저장은 한다.
+    //
+    // ⚠️ 오도메트리 세션도 이 판정을 그대로 탄다. QT 개시면 CALIB_DONE 이후에도
+    //    calibActive_가 켜져 있으므로(odoAwaitingResult_) 여기서 정상적으로
+    //    종결 처리된다. ADMIN 개시면 이미 꺼져 있어 저장·중계만 하고 지나간다 -
+    //    기다리는 Qt가 없으니 그게 맞다.
     const bool closesSession = calibActive_ && ch == calibCh_;
     if (closesSession && !calibReqId_.empty())
         outMsg["payload"]["request_id"] = calibReqId_;
@@ -952,6 +1131,25 @@ void Router::handleHMatrix(const json& msg) {
         logf("[INFO] 캘리 세션 성공 종료 [채널 %d] request_id=%s", ch,
              calibReqId_.empty() ? "(없음)" : calibReqId_.c_str());
         clearCalib();  // 종결 응답(H_MATRIX)을 이미 보낸 뒤라 안전하다
+    }
+    // ----- 채널 간 정합(registration) 세션의 종결 (2026-08-15 신설) -----
+    // REGISTER_COLLECT_STOP -> REGISTER_DONE 을 보낸 뒤 카메라가 성공하면
+    // (실패는 REGISTER_FAIL, onRegisterFail()이 따로 접는다) 이 번들로 알려온다
+    // - reg_* 필드는 위에서 이미 bundle 그대로 실려 나갔다(손대지 않는다).
+    // 여기서는 세션 로컬 상태(regActive_)를 접는 것만 한다. calib* 세션과는
+    // 완전히 별개 상태라 위 closesSession 판정과 겹치지 않는다 - 같은
+    // H_MATRIX 하나가 두 세션을 동시에 닫을 수도 있다(오도메트리 결과 대기 중에
+    // 그 채널을 ch_b로 정합까지 걸어놨다면).
+    if (regActive_ && regStopping_ && ch == regChB_) {
+        const double regScale = bundle.value("reg_scale", 0.0);
+        logf("[INFO] 정합 세션 성공 종료 [ch_a=%d ch_b=%d] request_id=%s "
+             "reg_scale=%.4f reg_rmse_mm=%.1f reg_n=%d%s",
+             regChA_, regChB_, regReqId_.c_str(), regScale,
+             bundle.value("reg_rmse_mm", -1.0), bundle.value("reg_n", 0),
+             (regScale > 0.0 && std::fabs(regScale - 1.0) > 0.05)
+                 ? " - ⚠️ 스케일이 1.0에서 크게 벗어남, 두 채널 중 한쪽 오도메트리 캘리를 의심할 것"
+                 : "");
+        clearRegistration();
     }
     // 어느 스키마로 읽혔는지 남긴다 - 평면 번들을 보냈는데 "레거시"로 찍히면
     // K/D가 빠졌다는 뜻이라, 로그만 보고 바로 알 수 있어야 한다.

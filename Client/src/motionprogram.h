@@ -41,6 +41,14 @@ constexpr double kDegToRad = kPi / 180.0;
 // 추후 LOGIN_OK가 min_paint_radius_m을 제공하면 이 상수 대신 서버 값을 사용한다.
 constexpr double kServerConfirmedMinPaintRadiusM = 0.200;
 
+// 원호 판정 상수. 값은 **미터 기준**이며, 픽셀 좌표로 판정할 때는 arcFits 의
+// unitsPerMeter 인자로 같은 배율을 넘겨 화면/전송이 같은 물리 임계값을 쓰게 한다.
+constexpr double kMinArcFitRadiusM = 0.02;        // 이보다 작은 피팅 반지름은 호로 보지 않는다
+constexpr double kArcFitResidualFloorM = 0.001;   // 잔차 허용 하한 (1mm)
+constexpr double kArcFitResidualRatio = 0.005;    // 잔차 허용 비율 (반지름의 0.5%)
+constexpr double kMaxArcStepDeg = 30.0;           // 한 세그먼트가 먹을 수 있는 최대 중심각
+constexpr double kMinArcSweepDeg = 30.0;          // 이보다 작은 스윕은 직선으로 본다
+
 // 균일 축소 중 도색 ARC가 서버·로봇 하한 아래로 내려가지 않게 한다.
 // 이미 하한보다 작은 옛 도면은 갑자기 200mm로 튀지 않도록 추가 축소만 막고,
 // 확대는 사용자가 자연스럽게 경계까지 키울 수 있게 그대로 허용한다.
@@ -163,20 +171,28 @@ inline Circle fitCircle(const QList<QPointF> &pts, int a, int b)
 }
 
 // 세그먼트 a..b (점 index) 가 하나의 원호로 볼 만한가
+//
+// ⚠️ unitsPerMeter — 입력 점의 단위를 명시한다. 미터 좌표(전송 경로)면 1.0,
+//    TopView 픽셀(화면 표시)이면 px/m 값을 넘긴다. 예전에는 인자가 없어서
+//    최소 반지름 0.02(=20mm)와 잔차 하한 0.001(=1mm)이 픽셀 입력에도 그대로
+//    쓰였다 — 화면 판정과 전송 판정이 다른 임계값으로 돌아 "화면은 도색 불가인데
+//    전송은 통과"하는 어긋남의 원인이었다.
 inline bool arcFits(const QList<QPointF> &pts, int a, int b, Circle &fit, double &sweepDeg,
-                    bool &left)
+                    bool &left, double unitsPerMeter = 1.0)
 {
+    const double unit = (std::isfinite(unitsPerMeter) && unitsPerMeter > 0.0)
+                      ? unitsPerMeter : 1.0;
     fit = fitCircle(pts, a, b);
     if (!fit.ok) return false;
     // 글자 획의 곡선은 생각보다 작다 — 높이 300mm 짜리 'D' 의 배는 반지름 40~80mm 다.
     // 예전 하한 50mm 는 그걸 통째로 걸러내서 'D' 가 MOVE 무더기로 나갔다.
     // 5m 상한은 작업장/로봇의 제한이 아니라 임의의 피팅 제한이었다. 반지름이
     // 5.00m에서 5.01m가 되는 순간 ARC 1개가 모든 MOVE로 바뀌므로 제거한다.
-    if (!std::isfinite(fit.r) || fit.r < 0.02) return false;
+    if (!std::isfinite(fit.r) || fit.r < kMinArcFitRadiusM * unit) return false;
 
     // 반지름 잔차 — 1mm 또는 반지름의 0.5% 중 큰 값. 이전 2%는 완만한 타원도
     // 원 하나로 흡수해 도면과 실행 경로가 달라졌다. ARC 감소보다 기하 보존이 우선이다.
-    const double tol = std::max(0.001, fit.r * 0.005);
+    const double tol = std::max(kArcFitResidualFloorM * unit, fit.r * kArcFitResidualRatio);
     for (int i = a; i <= b; ++i)
         if (std::abs(QLineF(fit.c, pts[i]).length() - fit.r) > tol) return false;
 
@@ -193,7 +209,7 @@ inline bool arcFits(const QList<QPointF> &pts, int a, int b, Circle &fit, double
         //    'D' 처럼 곧은 변의 두 끝점이 우연히 원 위에 있으면(지름이면 항상 그렇다)
         //    중간 샘플이 없어 잔차 검사를 그냥 통과해 버린다. 실측: D 자 세로변이
         //    215도짜리 가짜 ARC 로 흡수됐다. 스텝 각을 제한해 그 경로를 막는다.
-        if (std::abs(da) > 30.0) return false;
+        if (std::abs(da) > kMaxArcStepDeg) return false;
         const int s = (da > 0) ? 1 : -1;
         if (sign == 0) sign = s;
         else if (s != sign) return false;
@@ -204,9 +220,99 @@ inline bool arcFits(const QList<QPointF> &pts, int a, int b, Circle &fit, double
     // 30° 미만은 직선으로 보낸다. 세선화 잡음이 남긴 "반지름 0.67m 짜리 15° 호"
     // 같은 게 'ㅁ' 같은 직선 도형에 끼어드는 걸 막는다 (실측으로 잡은 값).
     // 360° 초과는 같은 자리를 되밟는 것 — 원호 하나일 수 없다.
-    if (sweepDeg < 30.0 || sweepDeg > 360.0 + 1e-6) return false;
+    if (sweepDeg < kMinArcSweepDeg || sweepDeg > 360.0 + 1e-6) return false;
     left = (sign > 0);                                       // +Y 위 · CCW = 좌회전
     return true;
+}
+
+// ── 곡선 구간 검출 ────────────────────────────────────────────────────────
+// arcFits 로 "ARC 하나"가 되지 못한 곡선도 물리적으로는 곡선이다. 최소 도색
+// 반지름 검사와 단순화 보호가 ARC 분류 성공 여부에 따라 갈리면
+//   · 화면은 "도색 불가"인데 전송은 통과하거나(24각형 R=15mm),
+//   · 직선 정리 한 번에 원이 MOVE 무더기로 바뀐다.
+// 그래서 분류와 별개로 "완만한 회전이 한 방향으로 이어지는 구간"을 찾는다.
+// 다각형(삼각형 120°, 사각형 90°)의 꼭짓점은 kMaxArcStepDeg 를 넘으므로 걸리지
+// 않는다 — 기존 직선 도형 동작은 그대로다.
+struct CurveRun {
+    int a = 0;              // 시작 점 index
+    int b = 0;              // 끝 점 index
+    double radius = 0.0;    // 입력 단위 기준 반지름 — ok=true 일 때만 의미가 있다
+    double sweepDeg = 0.0;
+    // ok = "이 구간은 잔차 검사를 통과한 **실제 원호**이고 radius 를 물리값으로
+    //       써도 된다". 타원·나선·잡음 있는 곡선은 ok=false 이며, 그때 radius 는
+    //       0 이고 최소 도색 반지름 판정에 쓰이지 않는다(구간 보존에만 쓴다).
+    bool ok = false;
+};
+
+inline QList<CurveRun> curveRuns(const QList<QPointF> &pts, double unitsPerMeter = 1.0)
+{
+    const double unit = (std::isfinite(unitsPerMeter) && unitsPerMeter > 0.0)
+                      ? unitsPerMeter : 1.0;
+    const double minSeg = 1e-6 * unit;
+    QList<CurveRun> out;
+    const int n = pts.size();
+    if (n < 4) return out;
+
+    auto headingAt = [&](int i) {            // pts[i-1] → pts[i]
+        const QPointF v = pts[i] - pts[i - 1];
+        return std::atan2(v.y(), v.x()) * kRadToDeg;
+    };
+
+    int runStart = -1;      // 곡선 구간의 첫 점 index
+    int sign = 0;
+    double sweep = 0.0;
+    auto flush = [&](int endIdx) {
+        if (runStart >= 0 && std::abs(sweep) >= kMinArcSweepDeg && endIdx > runStart + 1) {
+            CurveRun r;
+            r.a = runStart;
+            r.b = endIdx;
+            r.sweepDeg = std::abs(sweep);
+            // 🔴 원 피팅 결과를 그대로 "물리 반지름"으로 쓰면 안 된다. 타원·나선처럼
+            //    한 방향으로만 도는 곡선도 fitCircle 은 아무 원이나 하나 돌려준다.
+            //    arcFits 와 **같은 잔차 기준**을 통과했을 때만 반지름을 신뢰한다
+            //    (ok=true). 통과 못 하면 구간은 남기되(단순화 보호용) 반지름은
+            //    보고하지 않는다 — 지어낸 반지름으로 도형을 거절하지 않기 위함이다.
+            const Circle c = fitCircle(pts, r.a, r.b);
+            // ⚠️ 여기서는 kMinArcFitRadiusM(20mm) 하한을 쓰지 않는다. 그 상수는 잡음을
+            //    ARC 로 오인하지 않기 위한 **분류용**이고, 여기서 걸러야 하는 대상은
+            //    바로 그 작은 원(R=15mm)이기 때문이다. 대신 잔차 허용치를 반지름에
+            //    비례해 조이므로 작은 잡음 덩어리가 원으로 인정되지는 않는다.
+            bool radiusTrusted = c.ok && std::isfinite(c.r) && c.r > 0.0;
+            if (radiusTrusted) {
+                const double tol = std::max(c.r * kArcFitResidualRatio,
+                                            std::min(kArcFitResidualFloorM * unit,
+                                                     c.r * 0.05));
+                for (int i = r.a; i <= r.b; ++i) {
+                    if (std::abs(QLineF(c.c, pts[i]).length() - c.r) > tol) {
+                        radiusTrusted = false;
+                        break;
+                    }
+                }
+            }
+            r.ok = radiusTrusted;
+            r.radius = radiusTrusted ? c.r : 0.0;
+            out.append(r);
+        }
+        runStart = -1; sign = 0; sweep = 0.0;
+    };
+
+    for (int i = 1; i + 1 < n; ++i) {
+        const double l0 = QLineF(pts[i - 1], pts[i]).length();
+        const double l1 = QLineF(pts[i], pts[i + 1]).length();
+        double da = 0.0;
+        bool smooth = (l0 > minSeg && l1 > minSeg);
+        if (smooth) {
+            da = normDeg(headingAt(i + 1) - headingAt(i));
+            if (std::abs(da) < 1e-9 || std::abs(da) > kMaxArcStepDeg) smooth = false;
+        }
+        if (!smooth) { flush(i); continue; }
+        const int s = (da > 0) ? 1 : -1;
+        if (runStart < 0) { runStart = i - 1; sign = s; sweep = 0.0; }
+        else if (s != sign) { flush(i); runStart = i - 1; sign = s; sweep = 0.0; }
+        sweep += da;
+    }
+    flush(n - 1);
+    return out;
 }
 
 // 원 위 점에서의 접선 방위(도). left=CCW 진행 기준.
@@ -384,6 +490,31 @@ inline int firstTooTightPaintArc(const QList<Op> &ops, double *radiusM = nullptr
         if (o.kind == Op::Arc && o.paint && wireRadiusM < minRadiusM) {
             if (radiusM) *radiusM = o.radius;
             return i;
+        }
+    }
+    return -1;
+}
+
+// ARC 로 분류되지 못한 도색 곡선까지 포함해 최소 도색 반지름을 검사한다.
+// (firstTooTightPaintArc 는 Op::Arc 만 보므로, 24각형 R=15mm 처럼 ARC 분류에
+//  실패한 곡선은 그 검사를 통째로 비켜 간다 — 화면 경고와 전송 판정이 어긋난다)
+// pts/paint 는 BLUEPRINT 와 같은 미터 좌표. 반환값은 위반 구간의 시작 점 index.
+inline int firstTooTightPaintCurve(const QList<QPointF> &pts, const QList<bool> &paint,
+                                   double *radiusM = nullptr,
+                                   double minRadiusM = kServerConfirmedMinPaintRadiusM)
+{
+    const QList<detail::CurveRun> runs = detail::curveRuns(pts, 1.0);
+    for (const detail::CurveRun &r : runs) {
+        if (!r.ok) continue;
+        bool painted = true;
+        for (int i = r.a + 1; i <= r.b; ++i)
+            if (!paint.value(i, true)) { painted = false; break; }
+        if (!painted) continue;
+        // serverclient 가 radius_m 을 0.1mm 단위로 반올림해 보내므로 같은 값으로 본다.
+        const double wireRadiusM = std::round(r.radius * 10000.0) / 10000.0;
+        if (wireRadiusM < minRadiusM) {
+            if (radiusM) *radiusM = r.radius;
+            return r.a;
         }
     }
     return -1;

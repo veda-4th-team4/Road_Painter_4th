@@ -91,21 +91,45 @@ private:
     //   갇힌다 - clearCalib()를 단독으로 부르지 말고 항상 전송과 짝지을 것.
     // origin = "QT" | "ADMIN". 개시자가 둘이라 회신 대상과 검증 강도가 다르다.
     void startCalib(const json& payload, const json& msg, const char* origin);
-    void cancelCalib(const json& payload, const json& msg);
-    // ROBOT/CCTV의 CALIB_STOPPED 수신. 둘 다 모이면 CALIB_CANCELLED를 보낸다.
+    // origin이 필요하다: 소유자가 아닌 쪽의 취소를 걸러야 하고, 회신도 요청한
+    // 쪽에만 가야 한다 (예전엔 인자가 없어 ADMIN이 눌러도 QT에 회신이 갔다).
+    void cancelCalib(const json& payload, const json& msg, const char* origin);
+    // ROBOT/CCTV의 CALIB_STOPPED 수신. 둘 다 모이면 종결 응답을 보낸다
+    // (순수 취소면 CALIB_CANCELLED, 중단 사유가 있으면 CALIB_FAIL - §3-3).
     void onCalibStopped(const std::string& role);
+    // 세션을 시작하지 못했을 때의 거절 회신. 아직 calibActive_가 아니라
+    // failCalib()을 쓸 수 없는 자리에서 쓴다 (startCalib/startOdoCalib 공용).
+    // extra는 payload에 덧붙일 필드 (busy일 때의 owner 등). toQt=false면
+    // 로그만 남긴다 - 관리자 창은 TAP으로 서버 로그를 이미 받고 있다.
+    void rejectCalib(bool toQt, int ch, const std::string& reqId,
+                     const char* origin, const char* reason, const std::string& m,
+                     const json& extra = json::object());
     // CCTV가 올린 CALIB_PROGRESS/CALIB_FAIL을 ch/request_id를 채워 QT로 넘긴다.
     void relayCalibProgress(const json& msg);
     void relayCalibFail(const json& payload);
     // 세션이 도는 중이면 CALIB_FAIL을 QT에 보내고 상태를 접는다 (개시자가 ADMIN
-    // 이면 QT는 기다리는 게 없으므로 로그만 남긴다).
+    // 이면 QT는 기다리는 게 없으므로 로그만 남긴다). calibIsOdo_ 세션이면
+    // 대신 abortOdoCalib()으로 넘긴다 - 로봇이 실제로 굴러가고 있기 때문.
     void failCalib(const char* reason, const std::string& m);
     // 종결 응답 없이 늘어지는 세션을 서버가 먼저 접는다 (Qt 5분 한도보다 짧게).
     void checkCalibTimeout();
     void clearCalib();
 
+    // ----- 세션 소유권 (2026-08-13) -----
+    // 🔴 잠금 자체는 mtx_가 이미 한다 - onMessage() 전체가 직렬화되므로 두
+    //   CALIB_START가 동시에 통과하는 경합은 구조적으로 불가능하다. 여기서
+    //   추가하는 것은 "누가 쥐고 있는가"다. 예전에는 calibFromQt_(bool) 하나로
+    //   회신 대상만 구분했는데, 그것만으로는 취소 권한을 판정할 수 없다 -
+    //   ADMIN이 request_id 없이 CALIB_CANCEL을 보내면 QT 세션이 그냥 죽었다.
+    enum class CalibOwner { NONE, QT, ADMIN };
+    CalibOwner calibOwner_ = CalibOwner::NONE;
+    // 종결 응답을 QT로 보내야 하는가. calibFromQt_를 대체한다.
+    bool calibToQt() const { return calibOwner_ == CalibOwner::QT; }
+    static const char* ownerName(CalibOwner o) {
+        return o == CalibOwner::QT ? "QT" : o == CalibOwner::ADMIN ? "ADMIN" : "NONE";
+    }
+
     bool calibActive_ = false;     // 세션이 도는 중인가 (busy 판정의 단일 근거)
-    bool calibFromQt_ = false;     // QT가 개시했나 (아니면 ADMIN - QT에 회신 안 함)
     std::string calibReqId_;       // Qt가 준 상관관계 ID (ADMIN 개시면 빈 문자열)
     int calibCh_ = 0;              // 이 세션이 캘리 중인 채널
     long calibStartMs_ = 0;        // 수락 시각 (calib_timeout_ms 기준점)
@@ -113,6 +137,141 @@ private:
     long calibCancelMs_ = 0;         // 중계 시각 (calib_cancel_ack_ms 기준점)
     bool cancelAckRobot_ = false;    // ROBOT의 CALIB_STOPPED를 받았나
     bool cancelAckCctv_ = false;     // CCTV의 CALIB_STOPPED를 받았나
+    // 정지 핸드셰이크가 "실패로 인한 중단"인가. 비어 있으면 순수 취소다.
+    // 🔴 이게 없으면 capture_timeout/no_intrinsics 같은 실패가 Qt 화면에
+    //   CALIB_CANCELLED("안전하게 중단했습니다")로 떠서, 조작자는 자기가
+    //   누르지도 않은 취소가 성공한 줄 안다. 실제로는 캘리가 실패한 것이다.
+    std::string calibAbortReason_;
+    std::string calibAbortMsg_;
+
+    // ----- 로봇 오도메트리 주행 캘리 (2026-08-12, router_odocalib.cpp) -----
+    // calibActive_/calibReqId_/calibCh_/calibStartMs_/calibOwner_ 등 위 필드를
+    // 그대로 공유해서 쓴다 (busy 판정이 method 무관하게 걸리도록).
+    // calibIsOdo_만으로 "지금 도는 세션이 어느 방식인가"를 구분한다.
+    //
+    // ⚠️ 2026-08-13부터 QT도 이 방식을 개시할 수 있다. 예전 주석의 "calibFromQt_는
+    //    이 방식에서 항상 false"는 더 이상 사실이 아니다 - 그 전제 위에 서 있던
+    //    것들(세션이 CALIB_DONE에서 끝난다, 타임아웃에 Qt 제약이 없다)이 전부
+    //    바뀌었다. docs/ROBOT_ODOMETRY_HOMOGRAPHY_REQUEST_QT_20260813.md 참고.
+    //
+    // QT/ADMIN이 CALIB_START{method:"robot_motion", m_cm, n_cm, start_corner}를
+    // 보내면 여기로 분기한다 (startCalib() 내부에서 method를 보고 갈라짐).
+    // m_cm/n_cm/start_corner 검증은 startCalib()이 이미 마쳤다 - 거기서 해야
+    // reject() 하나로 QT 회신과 ADMIN 로그가 같이 처리된다.
+    void startOdoCalib(const json& payload, const json& msg,
+                       const std::string& reqId, int ch, bool fromQt);
+    // 이 세션의 주행 데드라인(CALIB_START -> CALIB_DONE). QT 개시면 Qt 대기
+    // 예산에서 결과 대기 몫을 뺀 값으로 깎는다 (params.hpp 주석 참고).
+    long odoDriveBudgetMs() const;
+    // 주행 진행률을 QT에 합성해 보낸다. 카메라는 이 방식에서 CALIB_PROGRESS를
+    // 올리지 않으므로(정적 앵커 방식과 다름) 서버가 정지점 진행으로 만든다.
+    // 주행이 2~4분이라 이게 없으면 Qt 대기 화면이 그동안 통째로 비어 있다.
+    void sendOdoProgress(const char* phase, int pointIdx);
+    // READY(k) 수신, activePhase_=="calib"일 때 onReady()가 위임한다.
+    // 캡처 대상 boundary면 CALIB_CAPTURE를 보내고 ack까지 GO를 미룬다.
+    void onCalibReady(int k);
+    // PATH_DONE(calib) 수신. 9번째(복귀) 캡처 요청 후 CALIB_DONE으로 마감한다.
+    void onCalibPathDone();
+    // CCTV의 CALIB_CAPTURE_OK/CALIB_CAPTURE_FAIL 수신.
+    void onCalibCaptureAck(const json& payload, bool ok, const std::string& reason);
+    // 캡처 1건에 대해 CALIB_CAPTURE를 보내고 대기 상태를 연다.
+    void sendCalibCapture(int pointIdx);
+    // 캡처 ack가 calib_capture_timeout_ms 안에 안 오면 호출 (sweep()에서).
+    void checkOdoCaptureTimeout();
+    // 폐합오차(idx0과 idx8은 같은 물리 지점이므로 두 픽셀은 같아야 한다)를
+    // 로그 한 줄로 남긴다. 🔴 진단 전용 - 판정도 통지도 하지 않는다.
+    void logOdoClosure();
+    // 안전 정지: 로봇은 fire-and-forget ABORT_DRAW, CCTV는 CALIB_CANCEL 후
+    // CALIB_STOPPED 대기. 정적 앵커 방식의 cancelCalib()/failCalib()과 다른
+    // 경로다 - 로봇이 실제로 주행 중이라 CALIB_CANCEL이 로봇에 안 먹는다
+    // (로봇 펌웨어에 CALIB_* 핸들러가 없음). 상세는 위 계획서 §7.
+    void abortOdoCalib(const char* reason, const std::string& msg);
+
+    bool calibIsOdo_ = false;       // 지금 세션이 robot_motion 방식인가
+    // CALIB_DONE을 보내고 카메라의 H_MATRIX/CALIB_FAIL을 기다리는 중인가.
+    // 🔴 QT 개시 세션에서만 켜진다. 예전에는 CALIB_DONE 자리에서 그냥
+    //   clearCalib()을 불러 세션이 끝났는데, 그러면 뒤늦게 오는 H_MATRIX가
+    //   request_id 없이 중계되고(종결로 안 잡힘) 카메라의
+    //   CALIB_FAIL{too_few_points}은 "진행 중인 세션 없음"으로 버려진다 -
+    //   둘 다 Qt를 타임아웃까지 대기 화면에 가둔다. ADMIN 개시는 기다리는
+    //   쪽이 없으므로 예전대로 CALIB_DONE에서 끝낸다.
+    bool odoAwaitingResult_ = false;
+    long odoResultWaitMs_ = 0;      // 결과 대기 시작 시각 (calib_odo_result_wait_ms 기준점)
+    double odoMmm_ = 0, odoNmm_ = 0;  // 사각형 치수 (mm)
+    bool odoCcw_ = true;             // start_corner=="bottom_left"
+    int odoPointIdx_ = -1;           // 지금 CCTV 응답을 기다리는 point_index (-1=없음)
+    // ack를 받으면 이 op_index에 GO를 보낸다. -2 = 아직 캡처 요청 전.
+    // -1 = 이번 캡처가 PATH_DONE 트리거였다는 뜻 - ack 후 GO 대신 CALIB_DONE.
+    int odoPendingGoOp_ = -2;
+    long odoCaptureMs_ = 0;          // CALIB_CAPTURE 전송 시각 (캡처 타임아웃 기준)
+    int odoValidCount_ = 0;          // 유효 캡처 개수 (idx 0~7 중 OK, findHomography 입력)
+    // 정지점 9곳의 raw 픽셀. 폐합오차(idx0 vs idx8)와 그 mm 환산에 쓴다 -
+    // 환산 스케일을 네 변의 실측 픽셀 길이에서 뽑기 때문에 코너 픽셀이 필요하다.
+    // 진단 로그 전용이다. 서버는 이 값으로 아무 판정도 하지 않는다 (H 산출과
+    // 유효점 판정은 전부 카메라 몫, wire 스펙 §7).
+    double odoPixU_[9] = {0}, odoPixV_[9] = {0};
+    bool odoPixOk_[9] = {false};
+
+    // ----- 채널 간 정합 (registration, 2026-08-15 신설, router_registration.cpp) -----
+    //
+    // 오도메트리(위)로 구한 H_marker는 채널마다 world 원점이 다르다(그 세션
+    // 로봇 출발점) - 겹치는 FOV 구역에서 두 채널이 "같은 순간, 같은 로봇 위치"를
+    // 본 correspondence 점들로, ch_b의 좌표를 ch_a 기준 좌표계로 옮기는
+    // 닮음변환을 계산하는 건 **카메라 앱**이 한다(ArucoPosePNM HomographyMapper::
+    // FinishRegistration). 서버가 하는 일은 그 계산에 필요한 REGISTER_CAPTURE를
+    // 주기적으로 보내는 것과, 세션 하나를 관리하는 것뿐 - 계산도 저장도 안 한다.
+    //
+    // 🔴 로봇 경로가 없다. FOV 겹침 구역이 아직 실측되지 않아 자동 사각형 경로를
+    //   (오도메트리처럼) 짤 수 없다 - 그래서 조작자가 조이스틱(수동 조작, §QT CMD
+    //   FORWARD/TURN_*)으로 로봇을 겹침 구역에 직접 몬다. 그동안 이 세션은
+    //   REGISTER_CAPTURE를 일정 주기로 반복 발사한다 - 로봇이 실제로 두 채널
+    //   시야 안에 있을 때만 카메라가 OK로 답하고, 아닐 때는 그냥 FAIL(not_both_seen)
+    //   이라 조용히 넘어간다(오도메트리의 READY/GO 핸드셰이크와 달리 실패해도
+    //   세션을 접지 않는다 - 다음 주기에 다시 시도).
+    //
+    // 오도메트리 세션(calibActive_ 등)과 완전히 분리된 상태를 쓴다 - 이유는
+    // calibCh_가 채널 하나뿐인데, 정합은 항상 두 채널(ch_a/ch_b)이 동시에
+    // 필요하기 때문이다. 대신 startRegistrationCollect()가 calibActive_ 를
+    // 검사해서, 관련 채널의 오도메트리/앵커 세션이 도는 중이면 거절한다 -
+    // 그 채널의 hmm_이 지금 바뀌는 중인데 그 위에서 정합을 모으면 의미가 없다.
+    //
+    // ADMIN(관리자 창) 전용이다 - QT 소유권/대기 budget 개념이 없다. 관리자
+    // 창은 서버 로그를 TAP으로 이미 받고 있으므로, 거절/진행 상황은 회신
+    // 메시지 없이 로그(logf)로만 남긴다 (rejectCalib()의 toQt=false 분기와
+    // 같은 판단).
+    //
+    // CMD REGISTER_COLLECT_START{ch_a, ch_b} 로 연다 (fromAdmin()).
+    void startRegistrationCollect(const json& payload);
+    // CMD REGISTER_COLLECT_STOP(정상 종료, REGISTER_DONE) /
+    //     REGISTER_COLLECT_CANCEL(중단, REGISTER_CANCEL) 로 닫는다.
+    void stopRegistrationCollect(bool cancel, const char* why);
+    // sweep()에서 매 tick 호출. 주기가 찼으면 REGISTER_CAPTURE를 새로 보내고,
+    // 세션 전체 타임아웃(reg_session_timeout_ms)이 지났으면 안전하게 접는다 -
+    // 켜둔 채 잊어버렸을 때의 워치독(오도메트리의 checkCalibTimeout()과 같은 자리).
+    void checkRegistrationTick();
+    void sendRegisterCapture();
+    // CCTV의 REGISTER_CAPTURE_OK/FAIL 수신. 오도메트리와 달리 이 ack는 다음
+    // 캡처 발사를 막지 않는다 - 그냥 통계(regOkCount_/regFailCount_)에 반영하고
+    // 로그만 남긴다. 로봇 경로가 없어 "이 캡처가 끝나야 다음으로 넘어간다"는
+    // 동기화 자체가 필요 없기 때문이다.
+    void onRegisterCaptureAck(const json& payload, bool ok, const std::string& reason);
+    // CCTV의 REGISTER_FAIL(세션 수준 실패, 예: fit_failed) 수신 - 세션을 접는다.
+    void onRegisterFail(const json& payload);
+    // CCTV의 REGISTER_STOPPED(REGISTER_CANCEL/DONE에 대한 ack) 수신.
+    void onRegisterStopped(const json& payload);
+    void clearRegistration();
+
+    bool regActive_ = false;        // 수집 세션이 도는 중인가
+    int regChA_ = 0, regChB_ = 0;   // 참여 채널 (1-based, wire 그대로 - 카메라와 규약 통일)
+    std::string regReqId_;          // 이 세션의 상관관계 ID (서버가 발급)
+    long regStartMs_ = 0;           // 세션 시작 시각 (reg_session_timeout_ms 기준점)
+    long regLastCaptureMs_ = 0;     // 마지막 REGISTER_CAPTURE 전송 시각 (주기 기준점)
+    int regPointIdx_ = 0;           // 다음 캡처에 실을 point_index (0부터 순증 - 상한 없음,
+                                     // AddCorrespondencePoint가 kMaxAnchors=24로 알아서 막는다)
+    int regOkCount_ = 0, regFailCount_ = 0;  // 진행 통계 (로그/대시보드 표시용)
+    bool regStopping_ = false;      // REGISTER_DONE/CANCEL 전송 후 REGISTER_STOPPED 대기 중
+                                     // (그 동안은 checkRegistrationTick이 새 캡처를 안 쏜다)
+    long regStopMs_ = 0;            // 그 전송 시각 (ack 타임아웃 기준점 - 못 받아도 그냥 접는다)
 
     // ----- 로봇 핸드셰이크 (§3, §6) -----
     // READY 수신. 판정이 필요 없는 boundary면 즉시 GO, 필요하면 대기 창을 연다.
@@ -200,6 +359,33 @@ private:
     double pendingSin_ = 0, pendingCos_ = 0, pendingX_ = 0, pendingY_ = 0;
     int pendingPoseN_ = 0;
     long lastDriftMs_ = 0;     // 마지막 DRIFT 전송 시각 (전송률 제한용)
+
+    // ----- 주행 중 각도의 이동평균 (2026-08-14) -----
+    // 꼭짓점 판정(ALIGN/MORE)은 1초간 모은 POS의 평균을 쓰는데, 주행 중
+    // DRIFT는 방금 들어온 값 하나로 바로 계산해 쏘고 있었다. 이상치 게이트를
+    // 통과할 만큼 작게 튀는 잡음(몇 도)은 그대로 실려 로봇을 틀어버린다.
+    // 직진 중 목표 heading은 상수이므로 평균이 정당하다 - 지연 대신 잡음을
+    // 1/sqrt(N)로 줄인다. 도 단위로 더하면 ±180도 경계에서 깨지므로 sin/cos.
+    static constexpr int kDriftAvgN = 3;
+    double driftSin_[kDriftAvgN] = {0}, driftCos_[kDriftAvgN] = {0};
+    int driftN_ = 0, driftPos_ = 0;   // 채워진 개수, 다음에 덮어쓸 자리
+    void clearDriftAvg() { driftN_ = 0; driftPos_ = 0; }
+
+    // ----- STATUS 로그 억제 (2026-08-18) -----
+    // 로봇 STATUS는 2Hz 하트비트라 그대로 찍으면 초당 두 줄씩 로그를 덮는다.
+    // 값이 바뀐 순간만 남긴다 - Qt 중계(sendTo)와 lastStatus_ 갱신은 그대로다.
+    // 로봇이 살아있다는 것은 [접속]/[해제]와 POS 요약이 이미 보여주므로,
+    // 같은 값의 반복은 정보가 아니라 소음이다.
+    // 로봇이 빠지면 비운다 - 재접속 후 첫 STATUS는 값이 같아도 한 줄 남아야
+    // "다시 붙어서 이 상태였다"가 로그에 보인다.
+    std::string lastStatusState_;
+    bool lastStatusPainting_ = false;
+    bool lastStatusSeen_ = false;   // 한 번이라도 찍었나 (첫 STATUS는 무조건 남김)
+    void clearStatusLog() {
+        lastStatusState_.clear();
+        lastStatusPainting_ = false;
+        lastStatusSeen_ = false;
+    }
 
     // ----- POS 두절 (§7) -----
     bool holdActive_ = false;  // HOLD{true}를 보내 로봇을 세워둔 상태

@@ -1,0 +1,19 @@
+version: '3.3'
+
+services:
+  opensdk:
+    image: opensdk:${SDK_VER}
+    container_name : ${APP_NAME}
+    volumes:
+      - ./:/opt/${APP_NAME}
+    working_dir: /opt/${APP_NAME}
+    command: >
+      /bin/bash -c "
+      cd /opt/${APP_NAME}/app/ &&
+      mkdir -p build &&
+      cd build &&
+      cmake -DSOC=${SOC} .. &&
+      make clean && make && make install &&
+      cd /opt/${APP_NAME} &&
+      opensdk_packager -s ${SOC}
+      "

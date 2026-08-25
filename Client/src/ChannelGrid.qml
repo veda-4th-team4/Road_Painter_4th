@@ -105,6 +105,10 @@ Rectangle {
                     //    나중에 들어와도 화면이 "없음"인 채로 남는다.
                     readonly property bool hasCalib:
                         Backend.calibratedChannels.indexOf(cell.ch) >= 0
+                    // 번들은 받았지만 coord_mode=undistort 인데 K/D 가 없는 채널.
+                    // 배너는 다른 통지에 덮이므로 채널 타일에 계속 남겨 둔다.
+                    readonly property bool lensDataMissing:
+                        Backend.lensDataMissingChannels.indexOf(cell.ch) >= 0
 
                     width: (tileGrid.width - tileGrid.spacing * (grid.cols - 1)) / grid.cols
                     height: (tileGrid.height - tileGrid.spacing * (grid.rows - 1)) / grid.rows
@@ -185,6 +189,40 @@ Rectangle {
                             color: Theme.warn
                             font.pixelSize: 11
                             font.family: Theme.fontFamily
+                        }
+                    }
+
+                    // 캘리브레이션은 있지만 렌즈 왜곡 보정 데이터(K/D)가 없는 채널.
+                    // 좌표는 나오지만 오차가 커진다 — 채널별로 계속 보이게 둔다.
+                    Rectangle {
+                        visible: cell.hasCalib && cell.lensDataMissing
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 8
+                        z: 2
+                        radius: 4
+                        color: Theme.warnSoft
+                        border.color: Theme.warn
+                        border.width: 1
+                        width: lensWarnLabel.implicitWidth + 14
+                        height: 24
+                        Text {
+                            id: lensWarnLabel
+                            anchors.centerIn: parent
+                            text: "왜곡보정 데이터 없음"
+                            color: Theme.warn
+                            font.pixelSize: 11
+                            font.family: Theme.fontFamily
+                        }
+                        ToolTip.visible: lensWarnArea.containsMouse
+                        ToolTip.text: "CH" + cell.ch + " 번들은 undistort 기준이라고 하는데 "
+                                    + "K/D 가 없습니다.\n좌표 오차가 커질 수 있으니 카메라 "
+                                    + "내부 보정을 다시 받으세요."
+                        MouseArea {
+                            id: lensWarnArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            acceptedButtons: Qt.NoButton
                         }
                     }
 
@@ -271,80 +309,204 @@ Rectangle {
             border.width: 1
             border.color: Theme.stroke
 
+            // 대기 화면 오른쪽 패널. 위에서 아래로 "무엇을/어디까지/안전/다음 행동"
+            // 순서로 읽히게 두고, 값이 늘고 줄어도 레이아웃이 흔들리지 않도록
+            // 진행 영역 높이를 고정한다.
             Column {
+                id: waitPanel
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.margins: 24
-                spacing: 18
+                anchors.top: parent.top
+                anchors.bottom: parent.bottom
+                anchors.margins: 18
+                spacing: 12
 
-                BusyIndicator {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    running: Backend.homographyPending
-                    width: 48
-                    height: 48
-                }
-                Text {
+                // 서버 응답을 기다리는 단계 이름. 화면 문구를 한 곳에서 만든다.
+                readonly property string phase: !Backend.homographyPending ? ""
+                    : (Backend.homographyCancelPending ? "cancelling"
+                    : (Backend.homographyCancelUnconfirmed ? "cancel_unconfirmed"
+                    : (Backend.homographyOdometry
+                        ? (Backend.homographyPhase === "" ? "requesting" : Backend.homographyPhase)
+                        : "solving")))
+                readonly property bool driving: phase === "driving"
+
+                // ── 헤더: 채널 + 방식 ─────────────────────────────────────
+                Row {
                     width: parent.width
-                    text: "CH" + Backend.homographyChannel + " 호모그래피 계산 중"
-                    horizontalAlignment: Text.AlignHCenter
-                    color: Theme.text
-                    font.pixelSize: 20
-                    font.bold: true
-                    font.family: Theme.fontFamily
-                    wrapMode: Text.WordWrap
+                    spacing: 8
+                    Text {
+                        text: "CH" + Backend.homographyChannel
+                        color: Theme.text
+                        font.pixelSize: 20
+                        font.bold: true
+                        font.family: Theme.fontFamily
+                    }
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: methodLabel.implicitWidth + 14
+                        height: 22
+                        radius: 4
+                        color: Backend.homographyOdometry ? Theme.warnSoft : Theme.mutedSoft
+                        border.width: 1
+                        border.color: Backend.homographyOdometry ? Theme.warn : Theme.stroke
+                        Text {
+                            id: methodLabel
+                            anchors.centerIn: parent
+                            text: Backend.homographyOdometry ? "주행 캘리브레이션" : "정적 앵커 캘리브레이션"
+                            color: Theme.text
+                            font.pixelSize: 11
+                            font.bold: true
+                            font.family: Theme.fontFamily
+                        }
+                    }
                 }
-                Text {
+
+                // ── 현재 단계 ─────────────────────────────────────────────
+                Row {
                     width: parent.width
-                    text: Backend.homographyStatus
-                    horizontalAlignment: Text.AlignHCenter
-                    color: Theme.sub
-                    font.pixelSize: 12
-                    font.family: Theme.fontFamily
-                    wrapMode: Text.WordWrap
+                    spacing: 10
+                    BusyIndicator {
+                        anchors.verticalCenter: parent.verticalCenter
+                        running: Backend.homographyPending
+                        width: 24
+                        height: 24
+                    }
+                    Column {
+                        width: parent.width - 34
+                        spacing: 2
+                        Text {
+                            width: parent.width
+                            text: waitPanel.phase === "requesting" ? "서버 응답을 기다리는 중"
+                                : waitPanel.phase === "driving" ? "로봇이 사각형을 주행하며 촬영 중"
+                                : waitPanel.phase === "solving" ? "카메라가 호모그래피를 계산 중"
+                                : waitPanel.phase === "cancelling" ? "중단 요청 — 정지 확인 대기"
+                                : waitPanel.phase === "cancel_unconfirmed" ? "정지 확인을 받지 못함"
+                                : "진행 중"
+                            color: waitPanel.phase === "cancel_unconfirmed" ? Theme.warn : Theme.text
+                            font.pixelSize: 13
+                            font.bold: true
+                            font.family: Theme.fontFamily
+                            wrapMode: Text.WordWrap
+                        }
+                        Text {
+                            width: parent.width
+                            text: Backend.homographyStatus
+                            color: Theme.sub
+                            font.pixelSize: 11
+                            font.family: Theme.fontFamily
+                            wrapMode: Text.WordWrap
+                            maximumLineCount: 3
+                            elide: Text.ElideRight
+                        }
+                    }
                 }
+
+                // ── 정지점 진행 (주행 방식 전용) ──────────────────────────
+                // 서버가 값을 주기 전에는 점만 비워 둔다 — 가짜 진행률은 만들지 않는다.
+                Column {
+                    width: parent.width
+                    spacing: 6
+                    visible: Backend.homographyOdometry
+                    Row {
+                        width: parent.width
+                        spacing: 4
+                        Repeater {
+                            model: Math.max(Backend.homographyPointTotal, 9)
+                            delegate: Rectangle {
+                                required property int index
+                                width: (waitPanel.width - 4 * (Math.max(Backend.homographyPointTotal, 9) - 1))
+                                       / Math.max(Backend.homographyPointTotal, 9)
+                                height: 6
+                                radius: 3
+                                color: index <= Backend.homographyPointIndex ? Theme.accent : Theme.stroke
+                            }
+                        }
+                    }
+                    Text {
+                        width: parent.width
+                        text: Backend.homographyPointIndex < 0
+                            ? "정지점 0 / " + Math.max(Backend.homographyPointTotal, 9) + " 완료"
+                            : ("정지점 " + (Backend.homographyPointIndex + 1) + " / "
+                               + Math.max(Backend.homographyPointTotal, 9) + " 완료   ·   유효 "
+                               + Math.max(0, Backend.homographyValidPoints) + "개")
+                        color: Backend.homographyCaptureLag ? Theme.warn : Theme.sub
+                        font.pixelSize: 11
+                        font.family: Theme.fontFamily
+                    }
+                    Text {
+                        width: parent.width
+                        visible: Backend.homographyCaptureLag
+                        text: "카메라가 로봇을 놓치고 있습니다. 유효 대응점이 6개 미만이면 실패합니다."
+                        color: Theme.warn
+                        font.pixelSize: 11
+                        font.family: Theme.fontFamily
+                        wrapMode: Text.WordWrap
+                    }
+                }
+
+                // 정적 앵커는 서버 진행률이 있을 때만 막대를 보여준다.
                 ProgressBar {
                     width: parent.width
-                    visible: Backend.homographyProgress >= 0
+                    visible: !Backend.homographyOdometry && Backend.homographyProgress >= 0
                     from: 0
                     to: 1
                     value: Math.max(0, Backend.homographyProgress)
                 }
+
+                // ── 안전 / 다음 행동 ──────────────────────────────────────
                 Rectangle {
                     width: parent.width
-                    height: safetyText.implicitHeight + 24
+                    height: safetyText.implicitHeight + 20
                     radius: 6
-                    color: Theme.warnSoft
+                    color: Backend.homographyOdometry ? Theme.warnSoft : Theme.mutedSoft
                     border.width: 1
-                    border.color: Theme.warn
+                    border.color: Backend.homographyOdometry ? Theme.warn : Theme.stroke
                     Text {
                         id: safetyText
-                        anchors.fill: parent
-                        anchors.margins: 12
-                        text: "로봇이 자동으로 이동할 수 있습니다.\n작업 영역에 들어가지 마세요."
-                        horizontalAlignment: Text.AlignHCenter
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.margins: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: Backend.homographyOdometry
+                            ? "로봇이 지금 사각형을 주행합니다 (약 2~4분). 작업 영역과 사각형 안으로 들어가지 마세요."
+                            : "로봇은 움직이지 않습니다. 카메라가 정지 상태에서 계산합니다."
                         color: Theme.text
-                        font.pixelSize: 12
-                        font.bold: true
+                        font.pixelSize: 11
+                        font.bold: Backend.homographyOdometry
                         font.family: Theme.fontFamily
                         wrapMode: Text.WordWrap
                     }
                 }
                 Text {
                     width: parent.width
-                    text: "완료되면 새 보정값을 적용하고 이 채널의 작업 화면으로 자동 전환합니다."
-                    horizontalAlignment: Text.AlignHCenter
+                    text: "완료되면 새 보정값을 적용하고 이 채널의 작업 화면으로 전환합니다."
                     color: Theme.muted
                     font.pixelSize: 11
                     font.family: Theme.fontFamily
                     wrapMode: Text.WordWrap
                 }
+
+                // ── 중단 ──────────────────────────────────────────────────
+                // 취소는 서버가 로봇 정지를 확인한 뒤에야 확정된다. 확인이 오지
+                // 않으면 "취소됨"이 아니라 확인 실패로 알리고 재시도를 허용한다.
                 AppButton {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    text: Backend.homographyCancelPending ? "중단 확인 대기 중" : "호모그래피 중단"
+                    width: parent.width
+                    text: Backend.homographyCancelPending ? "정지 확인 대기 중…"
+                        : (Backend.homographyCancelUnconfirmed ? "중단 다시 요청" : "캘리브레이션 중단")
                     enabled: !Backend.homographyCancelPending
                     danger: true
                     onClicked: Backend.cancelHomography()
+                }
+                Text {
+                    width: parent.width
+                    visible: Backend.homographyCancelPending || Backend.homographyCancelUnconfirmed
+                    text: Backend.homographyCancelPending
+                        ? "로봇이 실제로 섰다는 서버 확인을 기다립니다."
+                        : "서버 확인이 없습니다. 로봇 정지를 직접 확인하고, 필요하면 비상정지를 사용하세요."
+                    color: Backend.homographyCancelUnconfirmed ? Theme.warn : Theme.muted
+                    font.pixelSize: 10
+                    font.family: Theme.fontFamily
+                    wrapMode: Text.WordWrap
                 }
             }
         }

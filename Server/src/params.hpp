@@ -23,11 +23,36 @@
 
 using json = nlohmann::json;
 
+// Qt가 캘리 종결 응답(H_MATRIX|CALIB_FAIL|CALIB_CANCELLED)을 기다리는 한도.
+// Qt 클라이언트 쪽 상수라 서버가 바꿀 수 없다 - params.json으로 덮어쓸 수 있게
+// 두면 "현장에서 늘렸는데 Qt는 그대로"라는 어긋남만 만든다. 그래서 코드 상수다.
+// 🔴 Qt팀이 이 값을 바꾸면 여기도 같이 바꿔야 한다
+// (docs/ROBOT_ODOMETRY_HOMOGRAPHY_REQUEST_QT_20260813.md §4).
+inline constexpr long kQtCalibWaitMs = 300000L;
+// 서버가 쓸 수 있는 실효 예산. Qt가 스스로 포기하기 전에 서버가 먼저 종결
+// 응답을 보내야 하므로 한 뼘 짧게 잡는다.
+inline constexpr long kQtCalibWaitCapMs = 290000L;
+
+// 🔴 robot_motion 은 Qt 대기 한도가 다르다 - 10분이다
+// (2026-08-13 Qt팀 회신 §6, 요청서 §4의 선택지 A 채택).
+//
+// 위의 5분을 그대로 쓰면 서버가 주행을 3분 50초(290s - 결과대기 60s)에 끊는다.
+// Qt는 6분을 더 기다릴 준비가 돼 있는데 서버가 먼저 죽이는 꼴이고, 하필 첫
+// 실기 주행이 제일 느린 조건이다 - 정지점 9개 × 카메라 정지판정 최대 10초에
+// IMU 폐루프 회전 재시도가 얹힌다. 방식별로 상수를 나눈다.
+inline constexpr long kQtOdoWaitMs = 600000L;
+inline constexpr long kQtOdoWaitCapMs = 590000L;
+
 // X(타입, 이름, 기본값, 설명)
 #define RP_PARAM_LIST(X)                                                       \
     /* ---- 기하 (로봇 하드웨어 실측값) ---- */                                \
     X(double, pen_offset_m, 0.150,                                             \
       "펜(노즐)이 마커 중심 뒤로 떨어진 거리 a. 로봇 PathFollower.h와 같아야 함")\
+    X(double, pen_width_m, 0.05,                                               \
+      "펜이 실제로 칠하는 폭 w (마커 사양 5cm). 도색 구간을 앞뒤로 w/2씩 늘려 "\
+      "꼭짓점 귀퉁이가 비지 않게 한다 - docs/PEN_WIDTH_COMPENSATION_20260813.md. "\
+      "0으로 두면 보정이 통째로 꺼진다(예전 동작). 실측값을 넣을 것 - 마커 "   \
+      "사양보다 압력·속도에 따라 달라진다")                                    \
     X(double, wheel_base_m, 0.166,                                             \
       "좌우 바퀴 축간거리 W(로봇팀 실측). arc 안쪽바퀴 역회전 경고 판정에만 사용")\
     X(double, min_paint_radius_m, 0.200,                                       \
@@ -45,6 +70,19 @@ using json = nlohmann::json;
       "이보다 큰 보정량은 물리적으로 말이 안 되므로 판정 폐기 + GO")           \
     X(int, more_max_tries, 4,                                                  \
       "한 boundary에서 MORE 최대 반복. 소진하면 포기하고 GO")                  \
+    X(double, paint_undershoot_m, 0.02,                                        \
+      "펜을 내리고 그리는 직선(도색 move)을 '일부러 이만큼 덜' 명령하고, 남은 "\
+      "만큼은 MORE 피드백이 채우게 한다. 예: 펜 두께 보정까지 끝난 도색 거리가 "\
+      "0.05m면 0.03m만 명령하고 남은 0.02m를 MORE가 메운다. 개루프 주행의 "    \
+      "오버슛보다 CCTV 실측 기반 MORE가 정확하다는 전제. "                     \
+      "0으로 두면 종전대로 계산값을 그대로 한 번에 명령한다. "                 \
+      "🔴 목표 지점(OpMeta::centerAheadM/penTarget)은 건드리지 않는다 - 명령 "\
+      "거리만 줄이므로 MORE가 그 차이를 그대로 오차로 보고 메운다. "           \
+      "MORE 보정은 노즐을 올리기 전에 일어나므로 남은 구간도 정상적으로 "      \
+      "칠해진다. 적용 대상은 도색 **직선**뿐이다 - 호(arc)는 MORE가 접선 "     \
+      "직선을 덧붙이는 방식이라 덜 그으면 원이 찌그러진다(§6.3). "             \
+      "도착 꼭짓점을 모르는 구간(MORE 불가)과 min_move_m 미만이 되는 짧은 "    \
+      "구간에는 적용되지 않는다")                                              \
     /* ---- 피드백 판정 대기 창 ---- */                                        \
     X(long, feedback_wait_ms, 1000,                                            \
       "READY 수신 후 판정까지 고정 대기. 이 동안 POS를 모아 평균낸다")         \
@@ -67,7 +105,43 @@ using json = nlohmann::json;
       "🔴 Qt 자체 타임아웃(5분)보다 반드시 짧아야 한다 - 아래 주석 참조")      \
     X(long, calib_cancel_ack_ms, 5000,                                         \
       "CALIB_CANCEL 후 ROBOT/CCTV의 CALIB_STOPPED를 기다리는 한도. "           \
-      "넘으면 CALIB_FAIL{cancel_failed} (정지를 추정으로 확인하지 않는다)")
+      "넘으면 CALIB_FAIL{cancel_failed} (정지를 추정으로 확인하지 않는다)")     \
+    /* ---- 로봇 오도메트리 주행 캘리 (2026-08-12) ---- */                     \
+    X(long, calib_odo_timeout_ms, 300000,                                      \
+      "오도메트리 주행 세션(method=robot_motion)의 **주행** 데드라인 "         \
+      "(CALIB_START -> CALIB_DONE). calib_timeout_ms와 별개 값이다. 목적은 "   \
+      "주행 시간을 조이는 게 아니라 로봇/카메라가 죽었을 때 세션을 접는 "      \
+      "워치독. ⚠️ ADMIN 개시일 때의 값이다 - QT 개시 세션은 Qt 대기 한도에 "   \
+      "맞춰 kQtOdoWaitCapMs - calib_odo_result_wait_ms 로 깎인다")             \
+    X(long, calib_odo_result_wait_ms, 60000,                                   \
+      "CALIB_DONE 전송 후 카메라의 H_MATRIX/CALIB_FAIL을 기다리는 한도. "      \
+      "주행이 끝난 뒤 카메라가 findHomography + LOO를 도는 구간이다 - 이 "     \
+      "동안 로봇은 이미 서 있으므로 만료 시 abortOdoCalib이 아니라 "          \
+      "failCalib(timeout)으로 접는다 (세울 로봇이 없다)")                      \
+    X(long, calib_capture_timeout_ms, 15000,                                   \
+      "CALIB_CAPTURE 전송 후 CCTV의 ack(OK/FAIL) 한도. 카메라 자체 정지판정 "  \
+      "한도(10초)보다 여유 있게 잡는다. 넘으면 세션 중단(abortOdoCalib)")      \
+    X(double, calib_odo_max_side_m, 10.0,                                      \
+      "오도메트리 캘리 사각형 한 변의 상한. 이 값을 넘는 m_cm/n_cm은 "         \
+      "invalid_param으로 거절한다. 하한(min_move_m)과 달리 기하가 아니라 "     \
+      "**현장 안전** 값이다 - 90을 900으로 잘못 치면 로봇이 9m를 그대로 "      \
+      "달린다. Qt는 하한만 검증하고 상한이 없으므로(2026-08-13 회신 §2) "      \
+      "여기가 유일한 방어선이다. 바닥이 넓으면 올려도 된다")                    \
+    X(double, marker_offset_m, 0.0,                                            \
+      "마커 중심이 로봇 회전 중심에서 진행방향으로 떨어진 거리. 오도메트리 "    \
+      "캘리의 world_xy_mm 계산에만 쓴다. 0이면 보정 없음 (로봇팀 실측 전 기본)")\
+    /* ---- 채널 간 정합 (registration, 2026-08-15) ---- */                     \
+    X(long, reg_capture_interval_ms, 800,                                       \
+      "REGISTER_CAPTURE 자동 반복 주기. 로봇 경로가 없어(FOV 겹침 미실측) "      \
+      "조이스틱으로 겹침 구역을 지나가는 동안 여러 지점을 모으려면 계속 "        \
+      "쏴야 한다 - 오도메트리의 READY/GO 같은 동기화 지점이 없다")               \
+    X(long, reg_capture_ack_timeout_ms, 3000,                                   \
+      "REGISTER_DONE/CANCEL 전송 후 CCTV의 응답(H_MATRIX|REGISTER_FAIL|"        \
+      "REGISTER_STOPPED)을 기다리는 한도의 1/3 단위 (실제 한도는 이 값의 "       \
+      "3배 - checkRegistrationTick() 참고). 링크가 끊긴 채로 굳는 것을 막는다")  \
+    X(long, reg_session_timeout_ms, 600000,                                     \
+      "정합 수집 세션 전체 데드라인. 켜둔 채 잊어버렸을 때의 워치독 - "          \
+      "calib_odo_timeout_ms와 같은 역할")
 
 struct Params {
 #define RP_DECL(T, N, D, C) T N = D;
@@ -133,12 +207,38 @@ inline void sanitize(Params& p) {
         }
     };
     floorAt("pen_offset_m", p.pen_offset_m, 0.0);
+    floorAt("pen_width_m", p.pen_width_m, 0.0);
+    // 🔴 w/2 가 a 를 넘으면 도색 진입 오프셋(a - w/2)이 음수가 된다 - 펜을 내리기
+    // 전에 뒤로 물러나는 꼴이라 기하가 성립하지 않는다. 물리적으로도 "펜 반폭이
+    // 마커~펜 거리보다 크다"는 뜻이라 현장 오입력으로 보고 잘라낸다.
+    if (p.pen_width_m / 2.0 > p.pen_offset_m) {
+        logf("[WARN] params 'pen_width_m'=%g 의 절반이 pen_offset_m(%g)을 넘음 "
+             "- 도색 진입 오프셋이 음수가 되므로 %g 로 내림",
+             p.pen_width_m, p.pen_offset_m, p.pen_offset_m * 2.0);
+        p.pen_width_m = p.pen_offset_m * 2.0;
+    }
     floorAt("wheel_base_m", p.wheel_base_m, 0.001);
     floorAt("align_max_tries", p.align_max_tries, 0);
     floorAt("more_max_tries", p.more_max_tries, 0);
     floorAt("align_threshold_deg", p.align_threshold_deg, 0.0);
     floorAt("more_deadband_m", p.more_deadband_m, 0.0);
     floorAt("more_max_m", p.more_max_m, 0.0);
+    floorAt("paint_undershoot_m", p.paint_undershoot_m, 0.0);
+    // 🔴 more_deadband_m 이하로 덜 가면 MORE가 "보정 불필요"로 판정해 그대로
+    // GO한다 - 덜 간 만큼이 메워지지 않고 그냥 짧게 그어진 선으로 남는다.
+    // 껐다는 뜻(0)이 아니면 경고한다.
+    if (p.paint_undershoot_m > 0.0 && p.paint_undershoot_m <= p.more_deadband_m) {
+        logf("[WARN] params 'paint_undershoot_m'=%g 가 more_deadband_m(%g) 이하 "
+             "- MORE가 보정 불필요로 판정해 덜 그은 만큼이 그대로 남는다",
+             p.paint_undershoot_m, p.more_deadband_m);
+    }
+    // MORE 한 번의 상한을 넘으면 판정 자체가 폐기되고(GO) 보정이 아예 안 걸린다.
+    if (p.paint_undershoot_m > p.more_max_m) {
+        logf("[WARN] params 'paint_undershoot_m'=%g 가 more_max_m(%g) 초과 "
+             "- MORE가 판정을 폐기해 보정이 걸리지 않으므로 %g 로 내림",
+             p.paint_undershoot_m, p.more_max_m, p.more_max_m);
+        p.paint_undershoot_m = p.more_max_m;
+    }
     floorAt("feedback_wait_ms", p.feedback_wait_ms, 0L);
     floorAt("drift_period_ms", p.drift_period_ms, 0L);
     floorAt("pos_lost_ms", p.pos_lost_ms, 0L);
@@ -152,11 +252,39 @@ inline void sanitize(Params& p) {
     // 🔴 Qt는 종결 응답이 5분(300s) 없으면 스스로 대기를 푼다. 서버 타임아웃이
     // 그보다 길면 Qt는 이미 포기했는데 서버만 busy로 남아, 다음 요청이 전부
     // busy로 거절된다 (사람 눈에는 "캘리가 영영 안 되는" 상태로 보인다).
-    if (p.calib_timeout_ms >= 300000L) {
-        logf("[WARN] params 'calib_timeout_ms'=%ld 은(는) Qt 대기 한도(300000)"
-             " 이상 - 290000으로 내림", p.calib_timeout_ms);
-        p.calib_timeout_ms = 290000L;
+    if (p.calib_timeout_ms >= kQtCalibWaitMs) {
+        logf("[WARN] params 'calib_timeout_ms'=%ld 은(는) Qt 대기 한도(%ld)"
+             " 이상 - %ld으로 내림", p.calib_timeout_ms, kQtCalibWaitMs,
+             kQtCalibWaitCapMs);
+        p.calib_timeout_ms = kQtCalibWaitCapMs;
     }
+    // ⚠️ calib_odo_timeout_ms에는 여기서 상한 클램프를 걸지 않는다. 예전에는
+    // "오도메트리는 ADMIN 전용이라 Qt 제약이 없다"가 이유였는데, 2026-08-13에
+    // Qt 개시를 열면서 그 전제가 깨졌다. 그렇다고 값 자체를 깎으면 ADMIN 개시
+    // 세션까지 같이 짧아진다 - 그쪽은 Qt가 기다리지 않으므로 깎을 이유가 없다.
+    // 그래서 클램프를 **세션 단위**로 옮겼다: Router::odoDriveBudgetMs()가
+    // QT 개시일 때만 kQtOdoWaitCapMs - calib_odo_result_wait_ms 로 깎는다.
+    floorAt("calib_odo_timeout_ms", p.calib_odo_timeout_ms, 5000L);
+    floorAt("calib_odo_result_wait_ms", p.calib_odo_result_wait_ms, 1000L);
+    // 결과 대기가 Qt 예산을 통째로 먹으면 주행 데드라인이 0 이하가 된다 -
+    // QT 개시 세션이 시작하자마자 타임아웃으로 죽는다. 예산의 절반으로 자른다.
+    // 🔴 이 구간은 오도메트리에만 있으므로 기준은 kQtOdoWaitCapMs(10분)다.
+    if (p.calib_odo_result_wait_ms > kQtOdoWaitCapMs / 2) {
+        logf("[WARN] params 'calib_odo_result_wait_ms'=%ld 은(는) Qt 예산(%ld)의 "
+             "절반을 넘음 - %ld으로 내림 (QT 개시 세션의 주행 시간이 남지 않는다)",
+             p.calib_odo_result_wait_ms, kQtOdoWaitCapMs, kQtOdoWaitCapMs / 2);
+        p.calib_odo_result_wait_ms = kQtOdoWaitCapMs / 2;
+    }
+    // 0을 넣으면 checkRegistrationTick()이 매 tick(200ms)마다 REGISTER_CAPTURE를
+    // 쏜다 - 카메라가 감당 못 할 정도는 아니지만 의도한 값은 아닐 가능성이 높다.
+    floorAt("reg_capture_interval_ms", p.reg_capture_interval_ms, 100L);
+    floorAt("reg_capture_ack_timeout_ms", p.reg_capture_ack_timeout_ms, 500L);
+    floorAt("reg_session_timeout_ms", p.reg_session_timeout_ms, 10000L);
+    floorAt("calib_capture_timeout_ms", p.calib_capture_timeout_ms, 1000L);
+    // 상한이 하한(min_move_m*2)보다 작으면 어떤 값도 통과하지 못한다 - 캘리가
+    // 통째로 막히고, 조작자는 무슨 값을 넣어도 invalid_param만 본다.
+    floorAt("calib_odo_max_side_m", p.calib_odo_max_side_m, p.min_move_m * 2.0);
+    floorAt("marker_offset_m", p.marker_offset_m, 0.0);
     // min_paint_radius_m 기본값 0.200은 기하가 아니라 모터가 정한 값이다.
     // 호에서는 바깥 바퀴가 base_sps × (R_robot + W/2) / R_robot 으로 돌고,
     // 이 값이 1/R_robot 로 발산한다. 로봇팀 회신(2026-08-07): NEMA 17 기준

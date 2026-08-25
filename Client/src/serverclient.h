@@ -41,6 +41,8 @@ public:
 
     // 서버에 접속(암호화)한다. 이미 연결돼 있으면 무시.
     void connectToServer();
+    // 사용자가 요청한 강제 재연결. 진행 중인 DNS/TCP/TLS 상태도 먼저 정리한다.
+    void reconnectToServer();
     void disconnectFromServer();
     void setServer(const QString &host, quint16 port);
     QString host() const { return m_host; }
@@ -72,7 +74,14 @@ public:
     void sendSelectChannel(int ch);
     // 선택 채널의 로봇 주행 호모그래피 시작/취소. requestId는 늦게 도착한
     // 이전 결과를 현재 요청으로 오인하지 않기 위한 상관관계 키다.
-    void sendCalibStart(int ch, const QString &requestId);
+    // method="robot_motion" 이면 오도메트리 주행 캘리브레이션이다 (서버 요청서
+    // 20260813 §1). m_cm/n_cm 은 사각형 가로·세로(cm), startCorner 는
+    // "bottom_left"(반시계) | "top_left"(시계). 🔴 필드 이름을 바꾸면 서버가
+    // CALIB_START 원본을 ROBOT/CCTV 로 그대로 중계하므로 양쪽이 못 읽는다.
+    void sendCalibStart(int ch, const QString &requestId,
+                        const QString &method = QString(),
+                        double mCm = 0.0, double nCm = 0.0,
+                        const QString &startCorner = QString());
     void sendCalibCancel(int ch, const QString &requestId);
     // ⚠️ sendSpeeds 는 없앴다 — 프로토콜에 속도 CMD 가 없고(2026-07-28 확정),
     //    로봇에도 SET_SPEED 분기가 없어 보내봐야 버려진다.
@@ -94,18 +103,19 @@ signals:
     void poseReceived(double x, double y, double thetaDeg);
     void statusReceived(const QString &state, bool painting);
     void peersReceived(bool robot, bool cctv);
-    // 캘리브레이션 갱신 → top-view 재생성. ch 는 이 번들이 어느 채널의 것인지
-    // (단일 채널 카메라·v0.3 서버는 ch 를 안 실으므로 1로 온다).
+    // 캘리브레이션 갱신 → top-view 재생성. ch는 반드시 1..4여야 한다.
     void hMatrixReceived(int ch, const QJsonObject &calib, const QString &requestId);
     void calibStarted(int ch, const QString &requestId, const QString &message);
+    // phase="driving"|"solving", pointIndex 0~8, total=9, valid=유효 대응점 수.
+    // 구형 서버는 이 필드들을 안 보내므로 -1 / 빈 문자열로 온다.
     void calibProgress(int ch, const QString &requestId, double progress,
-                       const QString &stage, const QString &message);
+                       const QString &stage, const QString &message,
+                       const QString &phase, int pointIndex, int total, int valid);
+    // owner="QT"|"ADMIN" 은 busy 거절의 주체다 (없으면 도색 작업 중).
     void calibFailed(int ch, const QString &requestId, const QString &reason,
-                     const QString &message);
+                     const QString &message, const QString &owner);
     void calibCancelled(int ch, const QString &requestId, const QString &message);
-    // LOGIN_OK 의 채널별 번들 맵 + 서버가 기억하는 활성 채널 (프로토콜 v0.4).
-    // loginResult 와 따로 두는 이유: 단일 채널 경로는 calib 하나만 보면 되고,
-    // 그 시그니처를 건드리면 4채널과 무관한 코드까지 다 바뀐다.
+    // LOGIN_OK의 채널별 번들 맵 + 서버가 기억하는 활성 채널.
     void calibChannelsReceived(const QJsonObject &calibs, int activeCh);
     // LOGIN_OK 의 선택 stream 오브젝트. 필드 자체가 없으면 signal도 내지 않아 기존
     // QSettings를 유지한다. 명시적 enabled=false는 저장된 중계를 해제하라는 계약이다.

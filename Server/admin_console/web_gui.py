@@ -683,6 +683,108 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ok = server_send("CMD", {"cmd": cmd})
             self.send_response(200 if ok else 503)
             self.end_headers()
+        elif self.path in ("/odo/start", "/odo/cancel"):
+            # 주행 캘리(오도메트리) 세션 개시/취소. ADMIN 연결로 서버에 CMD 를
+            # 보내면 서버가 로봇 경로(PATH)를 만들고 CCTV 에 CALIB_CAPTURE 를
+            # 물린다 (wire 규격 §1).
+            #
+            # /robot/cmd 를 재사용하지 않는 이유: 그쪽은 문자열 하나를 그대로
+            # {"cmd": <문자열>} 로 감싸 보내는 통로라 ch·m_cm·start_corner 같은
+            # 필드를 실을 수 없다. 그리고 이 명령은 **로봇을 실제로 주행시킨다** —
+            # 값 검증을 브라우저에만 맡길 자리가 아니다(아래에서 다시 본다).
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(raw)
+            except (ValueError, json.JSONDecodeError):
+                self._send_json({"ok": False, "reason": "잘못된 요청 형식"}, 400)
+                return
+            try:
+                ch = int(data.get("ch", 0))
+            except (TypeError, ValueError):
+                ch = 0
+            if not 1 <= ch <= rp_core.CAM_CHANNELS:
+                self._send_json({"ok": False, "reason": f"채널 범위 밖: {ch}"}, 400)
+                return
+            # request_id 는 브라우저가 만들어 보낸다. 서버가 세션 내내 이 값을
+            # 정본으로 쓰고(wire §1), 진행도 표도 이 값으로 자기 세션을 가려낸다.
+            rid = str(data.get("request_id") or "")[:64]
+            if not rid:
+                self._send_json({"ok": False, "reason": "request_id 없음"}, 400)
+                return
+            if self.path == "/odo/cancel":
+                ok = server_send("CMD", {"cmd": "CALIB_CANCEL", "ch": ch,
+                                         "request_id": rid})
+                self._send_json({"ok": ok} if ok else
+                                {"ok": False, "reason": "서버(9000) 미연결"},
+                                200 if ok else 503)
+                return
+            try:
+                m_cm = float(data.get("m_cm", 0))
+                n_cm = float(data.get("n_cm", 0))
+            except (TypeError, ValueError):
+                m_cm = n_cm = 0.0
+            # 상한/하한을 서버 쪽에서도 본다. 이 값이 그대로 로봇 주행 거리가
+            # 되므로, 브라우저 input 의 min/max 만 믿으면 개발자도구로 고친 값이
+            # 그대로 바닥을 가로지른다.
+            if not (20 <= m_cm <= 1000 and 20 <= n_cm <= 1000):
+                self._send_json({"ok": False,
+                                 "reason": f"사각형 크기 범위 밖: {m_cm}x{n_cm} cm"}, 400)
+                return
+            corner = data.get("start_corner", "")
+            if corner not in ("bottom_left", "top_left"):
+                self._send_json({"ok": False,
+                                 "reason": f"출발 코너가 올바르지 않습니다: {corner}"}, 400)
+                return
+            ok = server_send("CMD", {"cmd": "CALIB_START", "ch": ch,
+                                     "request_id": rid, "method": "robot_motion",
+                                     "m_cm": m_cm, "n_cm": n_cm,
+                                     "start_corner": corner})
+            self._send_json({"ok": ok} if ok else
+                            {"ok": False, "reason": "서버(9000) 미연결"},
+                            200 if ok else 503)
+        elif self.path in ("/register/start", "/register/stop", "/register/cancel"):
+            # 채널 간 정합(registration) 수집 세션 (2026-08-15 신설,
+            # router_registration.cpp). /odo/start 와 같은 이유로 별도
+            # 엔드포인트를 쓴다 - ch_a/ch_b 두 채널을 실어야 하고, 이 명령도
+            # (조작자가 조이스틱으로) 로봇을 실제로 움직이는 세션을 여닫으므로
+            # 값 검증을 브라우저에만 맡길 자리가 아니다.
+            #
+            # /odo/start 와 달리 request_id 는 브라우저가 만들지 않는다 - 이
+            # 세션은 ADMIN 전용이라 Qt처럼 종결 응답을 미리 알 필요가 없고,
+            # 서버(router_registration.cpp regReqId_)가 직접 발급한다. 진행
+            # 상황은 오도메트리 진행도표와 같은 방식으로 TAP 로그에서 본다
+            # (REGISTER_CAPTURE_OK/FAIL 이벤트).
+            if self.path == "/register/start":
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    data = json.loads(raw)
+                except (ValueError, json.JSONDecodeError):
+                    self._send_json({"ok": False, "reason": "잘못된 요청 형식"}, 400)
+                    return
+                try:
+                    ch_a = int(data.get("ch_a", 0))
+                    ch_b = int(data.get("ch_b", 0))
+                except (TypeError, ValueError):
+                    ch_a = ch_b = 0
+                if not (1 <= ch_a <= rp_core.CAM_CHANNELS and
+                        1 <= ch_b <= rp_core.CAM_CHANNELS):
+                    self._send_json({"ok": False,
+                                     "reason": f"채널 범위 밖: ch_a={ch_a} ch_b={ch_b}"}, 400)
+                    return
+                if ch_a == ch_b:
+                    self._send_json({"ok": False, "reason": "ch_a와 ch_b가 같습니다"}, 400)
+                    return
+                ok = server_send("CMD", {"cmd": "REGISTER_COLLECT_START",
+                                         "ch_a": ch_a, "ch_b": ch_b})
+            else:
+                cmd = ("REGISTER_COLLECT_CANCEL" if self.path == "/register/cancel"
+                       else "REGISTER_COLLECT_STOP")
+                ok = server_send("CMD", {"cmd": cmd})
+            self._send_json({"ok": ok} if ok else
+                            {"ok": False, "reason": "서버(9000) 미연결"},
+                            200 if ok else 503)
         elif self.path == "/server/login":
             # 사용자 로그인을 ADMIN 연결로 서버에 전달하고 응답까지 기다린다.
             # 서버는 이 role에 LOGIN_OK/LOGIN_FAIL을 돌려주고, 성공 시 캘리브레이션
@@ -773,6 +875,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/iva_push":
+            # Body: the IVA_SYNC reply the browser already has, verbatim
+            # ({"ch":..,"points":[{"x":..,"y":..},...]}) plus the operator's
+            # enable/name choice -- nothing here is trusted beyond shape
+            # checks, since it is what cctv.push_iva_area() puts on the wire
+            # to the camera unmodified (WiseAI does its own range validation).
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length) if length else b"{}"
+                data = json.loads(raw)
+                ch = int(data["ch"])
+                pts = [(float(p["x"]), float(p["y"])) for p in data["points"]]
+                enable = bool(data.get("enable", True))
+                name = str(data.get("name") or "ArucoPose_calib")
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError) as e:
+                self._send_json({"ok": False, "detail": str(e)}, 400)
+                return
+            with cctv.conn_lock:
+                cam_ip = cctv.current_cam_ip
+            ok, detail = cctv.push_iva_area(cam_ip, ch, pts, enable, name)
+            cctv.broadcast(f"[iva] push ch={ch} n={len(pts)} -> "
+                           f"{'OK' if ok else 'FAILED'}: {detail}")
+            self._send_json({"ok": ok, "detail": detail}, 200 if ok else 400)
         else:
             self.send_response(404)
             self.end_headers()

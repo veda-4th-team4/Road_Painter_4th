@@ -15,6 +15,7 @@
 #include "params.hpp"
 #include "path_planner.hpp"
 #include "protocol.hpp"
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -63,6 +64,10 @@ struct TravelGeom {
     double bodyExit = kNoHeading;   // 마쳤을 때 바라보는 방위
     double phase = 0.0;             // 접선 대비 차체 위상 (도색 호만 0이 아니다)
     double rRobot = 0.0;            // 로봇에 실어 보낼 반지름 (arc 전용)
+    // 로봇에 실어 보낼 스윕 각도 크기 (arc 전용). 도면 값이 아니라 **펜 두께
+    // 보정이 반영된 값**이다 - 도색 호는 양끝을 hw 씩 늘리므로 도면보다 크다.
+    // bodyExit도 이 값으로 계산된다 (로봇이 실제로 그만큼 더 돌기 때문).
+    double sweepDeg = 0.0;
 };
 
 // 🔴 ARC의 heading_deg는 "호에 **진입할 때**의 접선"이다 (2026-08-07 Qt팀과 확정).
@@ -78,7 +83,8 @@ struct TravelGeom {
 //   ⚠️ Qt의 해당 수정이 저장소에 push되기 전까지는 저장소 코드(출구)와 이
 //   구현(진입)이 어긋난다. 부분호에서 스윕만큼 틀어지므로, 호 도색 통합 시험은
 //   Qt push 확인 후에 잡을 것.
-inline TravelGeom travelGeom(const json& q, bool isPaint, double aM) {
+inline TravelGeom travelGeom(const json& q, bool isPaint, double aM,
+                             double hwM = 0.0) {
     TravelGeom g;
     const double head = q.value("heading_deg", kNoHeading);
     if (q.value("op", "") != "ARC") {  // 직진: 방향이 안 바뀐다
@@ -86,7 +92,7 @@ inline TravelGeom travelGeom(const json& q, bool isPaint, double aM) {
         return g;
     }
     const double rPaint = q.value("radius_m", 0.0);
-    const double sweep = std::fabs(q.value("angle_deg", 0.0));
+    double sweep = std::fabs(q.value("angle_deg", 0.0));
     const bool left = (q.value("direction", "left") != "right");
     // 도색하지 않는 호는 펜이 올라가 있어 마커 중심이 곧 도면 자취다 - 반지름도
     // 위상도 보정하지 않는다 (§5.2 불변식의 나머지 절반).
@@ -94,11 +100,26 @@ inline TravelGeom travelGeom(const json& q, bool isPaint, double aM) {
         const double inner = rPaint * rPaint - aM * aM;
         g.rRobot = inner > 0 ? std::sqrt(inner) : 0.0;
         g.phase = arcPhaseDeg(g.rRobot, aM, left);
+        // 펜 두께 보정 (2026-08-13 실기 시험에서 "호가 끝까지 안 닫힘"으로 관측).
+        //
+        // 직선은 거리를 앞뒤로 hw 씩 늘려 이음매를 겹치게 하는데(buildDrawOps의
+        // MOVE 가지), 호는 거리가 아니라 **스윕 각도**를 늘려야 한다. 펜이 그리는
+        // 원의 반지름이 rPaint 이므로 호 길이 hw 에 해당하는 각도는 hw/rPaint 다.
+        // 양끝이므로 2배 - R=0.2m, w=0.05m 이면 약 7.2도가 붙는다.
+        //
+        // 🔴 rRobot 이 아니라 rPaint 로 나눈다. 늘리려는 것은 로봇의 자취가 아니라
+        //   **펜이 실제로 칠하는 자취**다. 두 원은 반지름이 다르지만 ICR을 공유해
+        //   스윕 각도는 같으므로, 각도만 맞추면 로봇 쪽은 자동으로 따라온다.
+        if (hwM > 0.0 && rPaint > 0.0)
+            sweep += 2.0 * (hwM / rPaint) * 180.0 / M_PI;
     } else {
         g.rRobot = rPaint;
     }
+    g.sweepDeg = sweep;
     if (!hasHeading(head)) return g;
     const double tanEntry = head;
+    // 🔴 늘어난 스윕으로 출구 접선을 잡는다. 로봇이 실제로 그만큼 더 돌기
+    //   때문이다 - 도면 각도로 잡으면 호 뒤에 이어지는 op이 전부 그만큼 기운다.
     const double tanExit = normDeg(head + (left ? sweep : -sweep));
     g.bodyEntry = normDeg(tanEntry + g.phase);
     g.bodyExit = normDeg(tanExit + g.phase);
@@ -115,12 +136,20 @@ struct OpMeta {
     double exitHeadingDeg = kNoHeading;
     bool hasTarget = false;   // MORE 판정이 가능한가 (도착 꼭짓점을 아는가)
     Pt penTarget{0, 0};       // 도착 꼭짓점 = 펜이 있어야 할 자리 (도면 좌표)
-    // 이 op을 마쳤을 때 마커 중심이 꼭짓점보다 진행방향으로 a 앞에 있어야 하는가.
-    // 즉 §5.2 불변식 중 "노즐 down" 쪽 상태로 끝나는 op인가 (MORE 목표 보정항).
-    //   도색 move/arc  : true  - 노즐을 내린 채 끝나므로 중심이 a 앞
-    //   오프셋 move(+a): true  - 곧 노즐을 내리려고 a 앞으로 나간 참이다
-    //   오프셋 move(-a): false - 노즐을 올리고 물러났으므로 중심이 꼭짓점 위
-    bool centerAheadByA = false;
+    // 이 op을 마쳤을 때 마커 중심이 꼭짓점보다 진행방향으로 **얼마나** 앞에
+    // 있어야 하는가 (미터). MORE 목표 = penTarget + centerAheadM * 진행방향.
+    //
+    // 예전에는 bool(centerAheadByA)이었고 참이면 무조건 a(pen_offset_m)였다.
+    // 펜 두께 보정(2026-08-13)이 들어오면서 값이 셋으로 갈려 bool로는 표현할
+    // 수 없게 됐다 - docs/PEN_WIDTH_COMPENSATION_20260813.md §4:
+    //   오프셋 전진(a - w/2) : a - w/2  - 펜이 꼭짓점보다 w/2 앞(=전)에 내려앉는다
+    //   도색 move (L + w)    : a + w/2  - 펜이 꼭짓점보다 w/2 더 지나쳐 끝난다
+    //   오프셋 후진(a + w/2) : 0        - 노즐을 올리고 꼭짓점 위로 되돌아왔다
+    //   도색 arc             : a        - 호는 아직 두께 보정을 안 한다(§6-2)
+    //
+    // 🔴 이 값이 실제 경로와 어긋나면 MORE가 매 boundary마다 그 차이만큼
+    //   로봇을 밀어 보정을 무효화한다. 경로 거리를 고치면 여기도 같이 고칠 것.
+    double centerAheadM = 0.0;
 };
 
 struct PlannedPath {
@@ -136,14 +165,14 @@ struct PlannedPath {
 class OpSeq {
 public:
     void moveOp(double distM, bool isPath, double headCcw, bool hasTgt = false,
-                Pt tgt = {0, 0}, bool centerAheadByA = false) {
+                Pt tgt = {0, 0}, double centerAheadM = 0.0) {
         OpMeta m;
         m.op = "move";
         m.isPath = isPath;
         m.headingDeg = m.exitHeadingDeg = headCcw;  // 직진은 방향이 안 바뀐다
         m.hasTarget = hasTgt;
         m.penTarget = tgt;
-        m.centerAheadByA = centerAheadByA;
+        m.centerAheadM = centerAheadM;
         push(json{{"op", "move"}, {"dist_m", round3(distM)}}, m);
     }
     // angCcw = CCW 양수 (서버 내부 규약). 전선에는 부호를 뒤집어 내보낸다.
@@ -164,7 +193,7 @@ public:
     // angleMagDeg = 회전량 크기(항상 양수), dir = "left"/"right".
     void arcOp(double radiusRobotM, double angleMagDeg, const std::string& dir,
                double radiusDrawM, double entryHeadCcw, double exitHeadCcw,
-               bool hasTgt, Pt tgt, bool centerAheadByA) {
+               bool hasTgt, Pt tgt, double centerAheadM) {
         OpMeta m;
         m.op = "arc";
         m.isPath = true;
@@ -172,7 +201,7 @@ public:
         m.exitHeadingDeg = exitHeadCcw;
         m.hasTarget = hasTgt;
         m.penTarget = tgt;
-        m.centerAheadByA = centerAheadByA;
+        m.centerAheadM = centerAheadM;
         push(json{{"op", "arc"},
                   {"radius_m", round3(radiusRobotM)},
                   {"angle_deg", round1(angleMagDeg)},
@@ -248,6 +277,20 @@ inline bool validateProgram(const json& program, std::string& reason,
 inline PlannedPath buildDrawOps(const json& program,
                                 const std::vector<Pt>& points) {
     const double a = params().pen_offset_m;
+    // 펜 두께 보정 반폭 (2026-08-13, docs/PEN_WIDTH_COMPENSATION_20260813.md).
+    // 도색 구간을 앞뒤로 hw 씩 늘려 꼭짓점 귀퉁이(hw × hw 정사각형)를 메운다.
+    //   진입 오프셋 a - hw  -> 펜이 시작 꼭짓점보다 hw 앞(전)에 내려앉는다
+    //   도색 move  L + 2hw  -> 펜이 [V0 - hw, V1 + hw] 를 지난다
+    //   이탈 오프셋 a + hw  -> 늘어난 만큼 되돌려 마커를 꼭짓점 위로 정확히 복귀
+    // 호(arc)도 2026-08-13부터 같은 규칙을 탄다. 늘리는 대상이 거리가 아니라
+    // 스윕 각도(Δθ = hw / R_paint, travelGeom)일 뿐, 진입/이탈 다리는 직선과
+    // 완전히 동일하다 - 그래서 여기서 호를 따로 가르지 않는다.
+    //
+    // ⚠️ 진입 다리는 접선 방향 직선이라 호를 현(chord)으로 근사한다. 오차는
+    //   O(hw²/R) 로 R=0.2m, hw=0.025m 에서 약 3mm - 펜 폭 50mm 앞에서 무시할
+    //   수준이다. 정확히 하려면 진입 자체를 호로 만들어야 하는데, 그러면 접근
+    //   경로가 세워둔 진입 자세가 깨진다.
+    const double hw = params().pen_width_m / 2.0;
     OpSeq seq;
     bool penDown = false;
     // 노즐을 올릴 때 뒤로 물러날 방향 = 직전 도색 op의 **차체** 종료 방위.
@@ -266,14 +309,16 @@ inline PlannedPath buildDrawOps(const json& program,
     //
     // startTgt = 이 도색이 시작될 꼭짓점(= 펜이 내려앉아야 할 자리). 전진 다리에
     // 실어 보내면 그 다리가 끝난 boundary에서 MORE가 걸린다 - 목표는 "중심이
-    // 꼭짓점보다 a 앞"(centerAheadByA=true)이라 곧 내려올 펜이 꼭짓점에 맞는다.
+    // 꼭짓점보다 (a - w/2) 앞"이라 곧 내려올 펜이 꼭짓점보다 w/2 앞에 앉는다.
     // 🔴 이 보정은 노즐이 아직 올라가 있을 때 실행된다 (nozzle down은 다음 op).
     //   젖은 도료를 문지를 여지가 없다.
     auto openPaint = [&](const TravelGeom& g, bool hasStart, Pt startTgt) {
         if (g.phase != 0.0 && hasHeading(g.bodyEntry))
             seq.turnOp(g.phase, false, g.bodyEntry);  // 접선 -> 차체 방위
-        seq.moveOp(+a, false, g.bodyEntry, hasStart, startTgt,
-                   /*centerAheadByA=*/true);
+        // hw 만큼 덜 나가서 펜이 꼭짓점보다 hw 앞에 내려앉게 한다 (직선·호 공통).
+        const double lead = a - hw;
+        seq.moveOp(lead, false, g.bodyEntry, hasStart, startTgt,
+                   /*centerAheadM=*/lead);
         seq.nozzleOp(true);
         penDown = true;
         penPhase = g.phase;
@@ -282,13 +327,17 @@ inline PlannedPath buildDrawOps(const json& program,
     // op이 접선 기준으로 이어진다 (안 하면 이후 경로 전체가 φ만큼 기운다).
     //
     // 후진 다리도 직전 도색의 종료 꼭짓점을 목표로 물고 간다. 노즐을 이미 올린
-    // 뒤라 목표는 꼭짓점 그대로다(centerAheadByA=false).
+    // 뒤라 목표는 꼭짓점 그대로다(centerAheadM=0).
     // ⚠️ 경로 맨 끝의 closePaint는 뒤에 op이 없어 로봇이 READY 대신 PATH_DONE을
     //   보낸다 - 그 한 번만 보정이 걸리지 않는다. 도색은 이미 끝난 뒤라 무해하다.
     auto closePaint = [&]() {
         seq.nozzleOp(false);
-        seq.moveOp(-a, false, penBodyHeading, penEndHasTgt, penEndTgt,
-                   /*centerAheadByA=*/false);
+        // 도색 구간이 끝에서 hw 만큼 더 나갔으므로(직선은 거리, 호는 스윕으로)
+        // 그만큼 더 물러나야 마커가 꼭짓점 위로 정확히 돌아온다.
+        // 목표는 꼭짓점 그대로(0)다.
+        const double back = a + hw;
+        seq.moveOp(-back, false, penBodyHeading, penEndHasTgt, penEndTgt,
+                   /*centerAheadM=*/0.0);
         if (penPhase != 0.0 && hasHeading(penBodyHeading))
             seq.turnOp(-penPhase, false, normDeg(penBodyHeading - penPhase));
         penDown = false;
@@ -303,7 +352,7 @@ inline PlannedPath buildDrawOps(const json& program,
         const bool isTravel = (o == "MOVE" || o == "ARC");
         const bool isPaint = isTravel && q.value("paint", false);
         const double head = q.value("heading_deg", kNoHeading);  // CCW 절대 방위
-        const TravelGeom g = travelGeom(q, isPaint, a);
+        const TravelGeom g = travelGeom(q, isPaint, a, hw);
 
         // 도착 꼭짓점 = 그다음 Qt op의 v. 없으면 폴리라인 마지막 점 (§6.5).
         // 추측항법으로 누적하지 않고 Qt가 준 좌표만 쓴다 - 오차가 쌓이지 않는다.
@@ -350,12 +399,35 @@ inline PlannedPath buildDrawOps(const json& program,
         }
 
         if (o == "MOVE") {
-            seq.moveOp(q.value("dist_m", 0.0), true, head, hasTgt, tgt, isPaint);
+            // 도색 직선은 앞뒤로 hw 씩 늘린다 (진입에서 hw 앞당겼으므로 총 2hw).
+            // 비도색 이동은 손대지 않는다 - 펜이 올라가 있어 늘릴 이유가 없다.
+            const double distM = q.value("dist_m", 0.0) + (isPaint ? 2.0 * hw : 0.0);
+            // 일부러 덜 긋고 남은 만큼은 MORE가 채운다 (params paint_undershoot_m).
+            // 개루프 한 방보다 CCTV 실측 기반 보정이 정확하다는 전제.
+            //
+            // 🔴 아래 centerAheadM/tgt(= MORE 목표)는 줄이지 않는다. 목표를 같이
+            //   줄이면 메울 오차 자체가 사라져 그냥 짧은 선이 되고 끝난다.
+            //   명령 거리만 줄여야 그 차이가 MORE에 오차로 보인다.
+            // MORE 보정 시점에는 노즐이 아직 내려가 있다(nozzle up은 closePaint의
+            // 다음 op) - 그래서 남은 구간도 이어서 정상적으로 칠해진다.
+            //
+            // 적용 조건 둘: 도색 직선일 것(호는 접선 직선이 덧붙어 원이 깨진다),
+            // 그리고 도착 꼭짓점을 알 것(모르면 MORE가 안 걸려 영구 오차가 된다).
+            // min_move_m 밑으로는 안 깎는다 - 짧은 도색 구간에서 명령이 0이나
+            // 음수가 되면 펜을 내린 채 뒤로 가는 꼴이 된다.
+            double cmdM = distM;
+            if (isPaint && hasTgt && distM > 0.0) {
+                cmdM = std::max(params().min_move_m,
+                                distM - params().paint_undershoot_m);
+            }
+            // 도색 move가 끝나는 시점의 마커 목표 = 꼭짓점 + (a + hw).
+            // 펜이 꼭짓점을 hw 지나쳐 끝나기 때문이다.
+            seq.moveOp(cmdM, true, head, hasTgt, tgt,
+                       /*centerAheadM=*/isPaint ? (a + hw) : 0.0);
         } else if (o == "TURN") {
             seq.turnOp(q.value("angle_deg", 0.0), true, head);
         } else if (o == "ARC") {
             const double rPaint = q.value("radius_m", 0.0);
-            const double angMag = std::fabs(q.value("angle_deg", 0.0));
             std::string dir = q.value("direction", "left");
             if (dir != "left" && dir != "right") dir = "left";
             // 🔴 R_robot = sqrt(R_paint² - d²) (§5.4). ICR은 반드시 좌우 바퀴
@@ -380,10 +452,12 @@ inline PlannedPath buildDrawOps(const json& program,
                 return bad;
             }
             // 🔴 arcOp에 넘기는 진입/출구 방위는 접선이 아니라 **차체 방위**다
-            //   (도색 호면 접선 + φ). ALIGN 목표와 MORE 투영축이 전부 이 값을
-            //   쓰는데, 로봇이 실제로 바라보는 방향은 차체 방위이기 때문이다.
-            seq.arcOp(g.rRobot, angMag, dir, rPaint, g.bodyEntry, g.bodyExit,
-                      hasTgt, tgt, isPaint);
+            //   (도색 호면 접선 + φ). ALIGN 목표가 이 값을 쓰는데, 로봇이 실제로
+            //   바라보는 방향은 차체 방위이기 때문이다.
+            // 스윕은 도면의 angMag 가 아니라 g.sweepDeg 다 - 도색 호는 펜 두께
+            // 보정으로 양끝이 hw 씩 늘어나 있다(travelGeom).
+            seq.arcOp(g.rRobot, g.sweepDeg, dir, rPaint, g.bodyEntry, g.bodyExit,
+                      hasTgt, tgt, /*centerAheadM=*/isPaint ? (a + hw) : 0.0);
         }
         // 다음 closePaint가 쓸 "직전 도색의 끝" 상태를 갱신한다. 방위는 후진
         // 방향, 꼭짓점은 후진 다리의 MORE 목표가 된다.
@@ -431,7 +505,7 @@ inline PlannedPath buildApproachOps(const Pose& start, const Pt& target,
         double turn = normDeg(desired - th);
         if (std::fabs(turn) > P.min_turn_deg) seq.turnOp(turn, true, desired);
         seq.moveOp(dist, true, desired, /*hasTgt=*/true, target,
-                   /*centerAheadByA=*/false);
+                   /*centerAheadM=*/0.0);
         th = desired;
     }
     if (hasHeading(firstHeadingDeg)) {
@@ -440,6 +514,80 @@ inline PlannedPath buildApproachOps(const Pose& start, const Pt& target,
             seq.turnOp(turn, true, round1(firstHeadingDeg));
     }
     return seq.take();
+}
+
+// ===== 로봇 오도메트리 주행 캘리 경로 (2026-08-12) =====
+// 규격: docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §3.
+//
+// 닫힌 직사각형을 4변으로, 각 변을 반으로 쪼개 11개 op으로 돈다:
+//   MOVE(m/2) MOVE(m/2) TURN(±90) MOVE(n/2) MOVE(n/2) TURN(±90)
+//   MOVE(m/2) MOVE(m/2) TURN(±90) MOVE(n/2) MOVE(n/2)
+// ccw=true(start_corner=="bottom_left")면 TURN(+90), false(top_left)면 TURN(-90).
+//
+// 🔴 전부 hasTarget=false, headingDeg=kNoHeading, centerAheadM=0으로
+//   나간다 - MORE/ALIGN/DRIFT가 op 자체에서부터 차단된다 (isPath=false라
+//   needsAlign의 role 검사, needsMore의 hasTarget 검사, DRIFT의 isPath 검사에
+//   전부 걸린다). phase=="calib" 가드(onCalibReady)는 이중 방어다.
+// 노즐 op은 넣지 않는다 - 도색하지 않는다.
+inline PlannedPath buildCalibRectOps(double mM, double nM, bool ccw) {
+    OpSeq seq;
+    const double turnDeg = ccw ? 90.0 : -90.0;
+    for (int leg = 0; leg < 4; ++leg) {
+        const double half = (leg % 2 == 0 ? mM : nM) / 2.0;
+        seq.moveOp(half, false, kNoHeading);
+        seq.moveOp(half, false, kNoHeading);
+        if (leg < 3) seq.turnOp(turnDeg, false, kNoHeading);
+    }
+    return seq.take();
+}
+
+// READY(op_index) -> point_index (0..7, 8은 PATH_DONE에서 별도 처리).
+// -1 = 직전 op이 TURN이라 같은 물리 위치 (캡처 스킵, 즉시 GO).
+// buildCalibRectOps()의 고정 11-op 구조(op 2/5/8이 TURN)에서 나온 표라
+// m/n 값과 무관하다. docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §4.
+inline int odoReadyToPoint(int k) {
+    static constexpr int kTable[11] = {0, 1, 2, -1, 3, 4, -1, 5, 6, -1, 7};
+    return (k >= 0 && k < 11) ? kTable[k] : -2;  // -2 = 범위 밖 (호출측 방어 처리용)
+}
+
+// point_index(0~8) -> "그 지점에서 로봇이 걷고 있(었)던 변" 번호(0~3).
+// sendCalibCapture()의 마커 오프셋 보정에서 헤딩을 정하는 데 쓴다.
+inline int odoLegOfPoint(int pointIdx) {
+    static constexpr int kLeg[9] = {0, 0, 0, 1, 1, 2, 2, 3, 3};
+    return kLeg[pointIdx >= 0 && pointIdx <= 8 ? pointIdx : 0];
+}
+
+// point_index(0~8)의 물리좌표(mm) - 마커 중심 기준, 오프셋 보정 포함.
+// wire 스펙 §4 좌표표를 y0/ySign 하나의 공식으로 통일한다:
+//   bottom_left(ccw=true) : y0=0,   ySign=+1  (0,0)에서 시작해 위로 올라간다
+//   top_left   (ccw=false): y0=n,   ySign=-1  (0,n)에서 시작해 아래로 내려간다
+// markerOffsetM이 0이 아니면 그 지점의 헤딩 방향으로 오프셋만큼 이동시킨다
+// (§3-0 - 마커 중심 ≠ 회전 중심인 경우의 보정. 기본 0이면 좌표가 그대로 나간다).
+inline std::array<double, 2> odoPointWorldMm(int pointIdx, double mMm, double nMm,
+                                             bool ccw, double markerOffsetM = 0.0) {
+    const double y0 = ccw ? 0.0 : nMm;
+    const double ySign = ccw ? 1.0 : -1.0;
+    double x = 0.0, y = y0;
+    switch (pointIdx) {
+        case 0: x = 0.0;       y = y0;                     break;
+        case 1: x = mMm / 2.0; y = y0;                     break;
+        case 2: x = mMm;       y = y0;                     break;
+        case 3: x = mMm;       y = y0 + ySign * nMm / 2.0;  break;
+        case 4: x = mMm;       y = y0 + ySign * nMm;        break;
+        case 5: x = mMm / 2.0; y = y0 + ySign * nMm;        break;
+        case 6: x = 0.0;       y = y0 + ySign * nMm;        break;
+        case 7: x = 0.0;       y = y0 + ySign * nMm / 2.0;  break;
+        default: x = 0.0;      y = y0;                      break;  // 8 = 복귀(진단용)
+    }
+    const double offsetMm = markerOffsetM * 1000.0;
+    if (offsetMm != 0.0) {
+        const int leg = odoLegOfPoint(pointIdx);
+        const double headingDeg = normDeg(ccw ? 90.0 * leg : -90.0 * leg);
+        const double rad = headingDeg * M_PI / 180.0;
+        x += offsetMm * std::cos(rad);
+        y += offsetMm * std::sin(rad);
+    }
+    return {x, y};
 }
 
 // ===== 하위호환: Qt가 program 없이 points만 보낸 경우 =====

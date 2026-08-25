@@ -23,6 +23,10 @@ config/camera.json
 # (users.json 단독 패턴은 .bak-* 변형을 안 잡아서 실제로 새 나갈 뻔한 적 있음)
 config/users.json*
 
+# 카메라 관리자 계정 (WiseAI IVA push용, admin_console/cctv.py가 env로 읽음)
+# - 평문 비번이 그대로 들어있어 절대 커밋 금지
+admin_console/cam_creds.sh
+
 # 파이썬
 __pycache__/
 calib_frames/
@@ -54,9 +58,24 @@ offset_feedback_test
 #로봇 주행 호모그래피 세션 회귀 테스트 (2026-08-10 계약 §6)
 calib_session_test
 
+#로봇 오도메트리 주행 캘리 회귀 테스트 (2026-08-12)
+odo_calib_test
+
+#오도메트리 주행 캘리 세션 회귀 테스트 (2026-08-13, Qt 개시 지원)
+odo_session_test
+
 start.log
 
 server.out.log
 
 # start.sh 가 남기는 기동 로그
 server_start.log
+server_run.log
+
+#작업 중 만든 소스 백업본 (2026-08-13 실수로 커밋된 적 있음)
+*.bak.*
+
+# 실행 부산물 (수동 기동 로그 / 바이너리 사본)
+server.running
+start_manual_*.log
+config/calib_latest.json.*

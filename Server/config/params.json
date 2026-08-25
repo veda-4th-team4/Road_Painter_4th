@@ -2,14 +2,17 @@
   "_readme": "서버 튜닝 파라미터. 값을 고치고 서버만 재시작하면 적용된다(재컴파일 불필요). 항목 설명과 기본값은 src/params.hpp, 근거는 docs/PROTOCOL_v2_ROBOT.md §10. '_'로 시작하는 키는 주석 취급하고 무시한다. 지우거나 항목을 빼도 되며, 빠진 항목은 코드의 기본값을 쓴다.",
 
   "_1_기하": "로봇 하드웨어 실측값. pen_offset_m은 로봇 PathFollower.h NOZZLE_OFFSET_M과 반드시 같아야 한다 - 자동 동기화되지 않는다. wheel_base_m은 로봇팀 실측 확정값 0.166 (calibration_test.cpp WHEELBASE_M)",
-  "pen_offset_m": 0.150,
+  "pen_offset_m": 0.172,
   "wheel_base_m": 0.166,
+
+  "_1a_펜두께": "펜이 실제로 칠하는 폭. 도색 구간을 앞뒤로 w/2씩 늘려 꼭짓점 귀퉁이가 비지 않게 한다(docs/PEN_WIDTH_COMPENSATION_20260813.md). 0으로 두면 보정이 통째로 꺼진다(2026-08-13 이전 동작). 🔴 마커 사양(5cm)이 아니라 직선 한 줄 긋고 자로 잰 실측값을 넣을 것 - 압력·속도·노면에 따라 달라진다",
+  "pen_width_m": 0.06,
 
   "_1b_최소반지름": "0.200은 기하가 아니라 모터 한계다. 호에서 바깥 바퀴 SPS = 771.65 * (R_robot + W/2) / R_robot 이 1/R_robot로 발산한다. 로봇팀 회신(2026-08-07): NEMA 17 기준 2000 SPS 초과 시 탈조 위험. 0.200 -> 1278 SPS(권장), 0.180 -> 약 1450 SPS(마진 하한선). 로봇 호 주행속도(0.05 m/s)가 바뀌면 이 값도 재계산해야 한다",
   "min_paint_radius_m": 0.200,
 
   "_2_ALIGN": "turn 직후 각도 정렬. 임계값 2.0은 v1 현장 튜닝값(로봇 1틱 오버슛 1.42도 + 마커 코너 노이즈 0.7도). 로봇이 감속 접근으로 오버슛을 줄이면 내릴 것",
-  "align_threshold_deg": 2.0,
+  "align_threshold_deg": 1.0,
   "align_max_tries": 6,
 
   "_3_MORE": "move/arc 직후 거리 보정. more_max_m를 넘는 값은 pose가 틀렸다고 보고 판정을 폐기한다",
@@ -17,12 +20,15 @@
   "more_max_m": 0.5,
   "more_max_tries": 4,
 
+  "_3a_도색언더슛": "펜을 내리고 긋는 직선을 일부러 이만큼 덜 명령하고, 남은 만큼은 MORE가 채운다. 예: 계산된 도색 거리 0.05m면 0.03m만 명령하고 0.02m는 MORE가 메운다. 개루프 한 방보다 CCTV 실측 기반 보정이 정확하다는 전제. 0이면 종전대로 한 번에 명령한다. 🔴 more_deadband_m(0.005)보다 커야 한다 - 이하면 MORE가 '보정 불필요'로 판정해 덜 그은 채로 끝난다. 호(arc)와 비도색 이동에는 적용되지 않는다",
+  "paint_undershoot_m": 0.02,
+
   "_4_판정대기": "READY 수신 후 이만큼 기다렸다가 그동안 모은 POS 평균으로 판정한다. 로봇의 미세회전(0.1~0.3초)이 CCTV->pose 반영보다 빨라서 필요. 줄이면 회전 전 각도로 판정해 같은 ALIGN이 반복된다",
   "feedback_wait_ms": 1000,
 
   "_5_DRIFT": "직진 주행 중 각도 피드백. 현장 POS 실측이 1~2Hz라 400ms(2.5Hz)보다 촘촘하게 해도 의미가 없다",
   "drift_period_ms": 400,
-  "drift_deadband_deg": 1.0,
+  "drift_deadband_deg": 10.0,
 
   "_6_POS": "두절 감시와 이상치 게이트. 허용 각도변화 = pose_gate_base_deg + pose_gate_rate_dps * 경과초. 상한을 두지 말 것 - POS가 느린 현장에서 정상 회전을 잘라낸다",
   "pos_lost_ms": 2000,
@@ -36,7 +42,17 @@
   "min_turn_deg": 2.0,
   "min_move_m": 0.01,
 
-  "_8_캘리세션": "로봇 주행 호모그래피 세션(2026-08-10 계약). calib_timeout_ms는 Qt 자체 타임아웃(5분=300000)보다 반드시 짧아야 한다 - 서버가 먼저 접어야 Qt가 이유를 안 채 5분을 기다리지 않는다",
+  "_8_캘리세션": "로봇 주행 호모그래피 세션(2026-08-10 계약, 정적 앵커·Qt 트리거). calib_timeout_ms는 Qt 자체 타임아웃(5분=300000)보다 반드시 짧아야 한다 - 서버가 먼저 접어야 Qt가 이유를 안 채 5분을 기다리지 않는다",
   "calib_timeout_ms": 180000,
-  "calib_cancel_ack_ms": 5000
+  "calib_cancel_ack_ms": 5000,
+
+  "_9_오도메트리캘리": "로봇 오도메트리 주행 캘리(2026-08-12, ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md). 🔴 2026-08-13부터 Qt도 개시할 수 있다 - 예전 주석의 'ADMIN 전용이라 Qt 5분 제약이 없다'는 더 이상 사실이 아니다. calib_odo_timeout_ms는 ADMIN 개시 세션에만 그대로 적용되고, QT 개시 세션은 Qt 대기 한도에 맞춰 (590000 - calib_odo_result_wait_ms)로 서버가 알아서 깎는다(Router::odoDriveBudgetMs). 🔴 이 방식의 Qt 대기 한도는 10분이다 - 정적 앵커(5분)와 다르다(2026-08-13 Qt팀 회신 §6). marker_offset_m은 로봇팀 실측 전까지 0.0(보정 없음)",
+  "calib_odo_timeout_ms": 300000,
+  "calib_odo_result_wait_ms": 60000,
+  "calib_capture_timeout_ms": 15000,
+
+  "_9a_사각형상한": "🔴 안전 장치. 이 값이 그대로 로봇의 실제 주행 거리가 된다 - 90을 900으로 잘못 치면 로봇이 9m 사각형을 그린다. Qt는 하한(2cm)만 검증하고 상한이 없으며(2026-08-13 회신 §2) 관리자 창의 브라우저 검증은 개발자도구로 우회되므로, 서버의 이 값이 두 개시 경로 공통의 유일한 방어선이다. 현장 바닥이 넓으면 올려도 된다",
+  "calib_odo_max_side_m": 10.0,
+
+  "marker_offset_m": 0.0
 }

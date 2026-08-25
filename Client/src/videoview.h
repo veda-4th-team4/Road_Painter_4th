@@ -22,6 +22,7 @@
 struct VVPath {
     QVector<QPointF> pts;   // 표시 프레임 px (TopView) 또는 원본 px (CCTV 오버레이)
     bool closed = false;
+    bool outerContour = false; // true: 완성 외곽선, 전송 시 펜 중심 경로로 변환
 };
 
 // 💡 [QML판] 영상 표시 + 작도 표면.
@@ -33,7 +34,7 @@ struct VVPath {
 //       좌클릭        = 점/도형 선택·이동 (편집이 최우선 — 확대 때문에 막히지 않음)
 //       빈 곳 좌드래그 = 올가미(사각) 다중 선택
 //       Ctrl/Shift+클릭 = 선택 토글
-//   - 도장 폭(기본 50 mm)을 실제 두께로 그려 도포 면적을 그대로 보여준다.
+//   - 도장 폭(기본 60 mm)을 실제 두께로 그려 도포 면적을 그대로 보여준다.
 class VideoView : public QQuickPaintedItem {
     Q_OBJECT
     QML_ELEMENT
@@ -46,7 +47,6 @@ class VideoView : public QQuickPaintedItem {
     Q_PROPERTY(int selectionCount READ selectionCount NOTIFY selectionChanged)
     Q_PROPERTY(int undoDepth READ undoDepth NOTIFY pathChanged)
     Q_PROPERTY(bool hasActiveShape READ hasActiveShape NOTIFY selectionChanged)
-    Q_PROPERTY(bool showLabels READ showLabels WRITE setShowLabels NOTIFY showLabelsChanged)
     Q_PROPERTY(double strokeWidthMm READ strokeWidthMm WRITE setStrokeWidthMm NOTIFY strokeWidthChanged)
     // 영역 확대 도구: 켜면 좌드래그가 "그 사각형에 맞춰 확대"가 된다
     Q_PROPERTY(bool zoomTool READ zoomTool WRITE setZoomTool NOTIFY zoomToolChanged)
@@ -72,7 +72,10 @@ public:
     bool isClosed() const { return m_closed; }
     int totalPointCount() const;
     int shapeCount() const;
-    QList<QList<QPointF>> pathsToMeters(QList<bool> *closedOut = nullptr) const;
+    QList<QList<QPointF>> pathsToMeters(QList<bool> *closedOut = nullptr,
+                                        QString *errorOut = nullptr) const;
+    QList<QList<QPointF>> editablePathsToMeters(QList<bool> *closedOut = nullptr,
+                                                QList<bool> *outerOut = nullptr) const;
     QList<QList<QPointF>> overlayPathsForOriginal(QList<bool> *closedOut = nullptr) const;
     // 원본(왜곡) 뷰에 얹을 도포 폭 밴드. 원본에서는 폭이 위치마다 달라서 그쪽에서
     // 계산할 수 없다 → TopView 축척에서 폴리곤을 만든 뒤 원근+렌즈 왜곡을 태워 보낸다.
@@ -83,13 +86,15 @@ public:
     // ⚠️ pxPerMeter() 는 지웠다 — 호출부 0. 축척이 필요한 곳은 전부 mmPerPx() 를
     //    쓴다(화면 라벨·눈금자가 mm 단위라). m_tvPxPerM 은 클래스 안에서 직접 쓴다.
     double mmPerPx() const { return (m_tvPxPerM > 1e-9) ? 1000.0 / m_tvPxPerM : 0.0; }
+
+    // 방금 넣은 획 글자가 **실제로 칠해지는** 바깥 크기(mm). 펜 폭까지 포함한다.
+    // 작업 영역에 들어가는지 조작자가 손으로 계산하지 않게 하려고 남긴다.
+    QSizeF lastTextPaintedMm() const { return m_lastTextPaintedMm; }
     double screenPxPerMm() const;
     int zoomPercent() const;
     int selectionCount() const { return selectedPointCount(); }
     int undoDepth() const;
     bool hasActiveShape() const { return m_points.size() >= 2; }
-    bool showLabels() const { return m_showLabels; }
-    void setShowLabels(bool v);
     double strokeWidthMm() const { return m_strokeMm; }
     void setStrokeWidthMm(double mm);
     bool zoomTool() const { return m_zoomTool; }
@@ -98,7 +103,13 @@ public:
     // H 출력 단위 검산 결과 한 줄. 선언값과 실제가 다르면 경고 문구가 담긴다.
     QString calibUnitNote() const { return m_calibUnitNote; }
 
-    void setEditPathsMeters(const QList<QList<QPointF>> &metersPaths, const QList<bool> &closed);
+    void setEditPathsMeters(const QList<QList<QPointF>> &metersPaths,
+                           const QList<bool> &closed,
+                           const QList<bool> &outer = QList<bool>());
+    // 채널 전환용: 이전 채널의 마지막 프레임/오버레이를 즉시 버린다.
+    // 안 버리면 새 스트림 첫 프레임이 올 때까지(RTSP 개시 1~2초) 이전 채널 영상이
+    // 선택한 채널인 것처럼 화면에 남는다.
+    void clearFrame();
     void setArucoMarkers(const QList<int> &ids, const QList<QPolygonF> &cornersPx);
     void setArucoVisible(bool on);
     // 로봇 아이콘 표시 on/off. 끄면 섀시·펜 점·연결선이 모두 사라진다 (위치 수신은 계속).
@@ -167,7 +178,6 @@ signals:
     void interactiveChanged();
     void scaleChanged();
     void selectionChanged();
-    void showLabelsChanged();
     void strokeWidthChanged();
     void zoomToolChanged();
     void pathChanged();
@@ -202,6 +212,7 @@ private:
     double strokePx() const;                        // 도장 폭(이미지 px)
     void paintBand(QPainter *p, const QVector<QPointF> &pts, bool closed,
                    double sx, double sy, double ox, double oy, const QColor &c);
+    QVector<QPointF> centerlineFor(const VVPath &path, QString *errorOut = nullptr) const;
     void paintMission(QPainter *p, double sx, double sy, double ox, double oy);
     void paintRobot(QPainter *p, double sx, double sy, double ox, double oy);
     void paintPenMarker(QPainter *p, double sx, double sy, double ox, double oy);
@@ -248,7 +259,7 @@ private:
     void applyToSelection(const std::function<QPointF(const QPointF &)> &fn);
     // 현재 변환 대상 전체가 포함하는 원호 중 가장 작은 반지름(px).
     // 부분 선택으로 원호를 찌그러뜨리는 경우는 균일 ARC 제약 대상이 아니다.
-    double selectedArcRadiusPx(const QList<VVPath> &snapshot) const;
+    double selectedArcRadiusPx(const QList<VVPath> &snapshot, bool *outerOut = nullptr) const;
     QRectF selectionBoundsImg() const;
 
     // ── 되돌리기 (동작 단위 스냅샷) ──────────────────────────────────
@@ -256,6 +267,7 @@ private:
         QList<VVPath> done;
         QVector<QPointF> pts;
         bool closed = false;
+        bool outerContour = false;
         bool drawing = false;
     };
     void pushUndo();
@@ -290,6 +302,7 @@ private:
     bool m_drawing = false;
     QVector<QPointF> m_points;
     bool m_closed = false;
+    bool m_outerContour = false;
     QList<VVPath> m_done;
     QPointF m_mouse;
     bool m_hover = false;
@@ -336,9 +349,8 @@ private:
     // H 출력 단위 검산 결과 (사람이 읽는 한 줄). 선언값과 실제가 다르면 경고가 담긴다.
     QString m_calibUnitNote;
 
-    // 표시 옵션
-    bool m_showLabels = true;
-    double m_strokeMm = 50.0;   // 로봇 도장 폭 — 고정값
+    double m_strokeMm = 60.0;   // 사용자가 선택한 직각 팁의 실제 도장 폭
+    QSizeF m_lastTextPaintedMm;   // 위 lastTextPaintedMm() 참고
 
     // 원본 뷰 오버레이 (원본 px)
     QList<VVPath> m_overlayPaths;
