@@ -23,6 +23,7 @@
 #include <QChar>
 #include <QList>
 #include <QPointF>
+#include <QVector>
 #include <QString>
 #include <QStringList>
 #include <QVector>
@@ -364,6 +365,31 @@ inline double inkHeightEm(const QList<Stroke> &strokes)
 {
     double lo = 0.0, hi = 0.0;
     return inkRangeEm(strokes, &lo, &hi) ? (hi - lo) : 0.0;
+}
+
+// 화면 좌표로 펼친 획 목록의 바운딩 박스. 실제 도색 바깥 크기를 재는 데 쓴다.
+//
+// 🔴 QRectF 로 하지 말 것. `QRectF(p, QSizeF(0,0))` 는 폭·높이가 0 이라
+//    isNull() 이 **항상 참**이다. `r = r.isNull() ? QRectF(p,{0,0}) : r.united(...)`
+//    같은 코드는 united() 가 한 번도 안 불려서 마지막 점의 0x0 사각형만 남는다.
+//    (실제로 그 함정을 밟았다 — 그래서 min/max 를 직접 돈다.)
+inline bool polylineBounds(const QList<QVector<QPointF>> &polys,
+                           double *x0, double *y0, double *x1, double *y1)
+{
+    bool seen = false;
+    double lx = 0.0, ly = 0.0, hx = 0.0, hy = 0.0;
+    for (const QVector<QPointF> &poly : polys)
+        for (const QPointF &p : poly) {
+            if (!seen) { lx = hx = p.x(); ly = hy = p.y(); seen = true; }
+            else {
+                lx = (p.x() < lx) ? p.x() : lx;  hx = (p.x() > hx) ? p.x() : hx;
+                ly = (p.y() < ly) ? p.y() : ly;  hy = (p.y() > hy) ? p.y() : hy;
+            }
+        }
+    if (!seen) return false;
+    if (x0) *x0 = lx;  if (y0) *y0 = ly;
+    if (x1) *x1 = hx;  if (y1) *y1 = hy;
+    return true;
 }
 
 } // namespace strokefont

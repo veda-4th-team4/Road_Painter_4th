@@ -1285,12 +1285,9 @@ Item {
                                 text: "넣기"
                                 enabled: !Backend.jobActive
                                 ToolTip.visible: hovered
-                                ToolTip.text: "붓이 지나갈 획(중심선)으로 넣습니다.
-" +
-                                              "입력값은 완성 도색 높이입니다 — 붓 폭까지 포함한,
-" +
-                                              "실제로 칠해지는 세로 크기.
-" +
+                                ToolTip.text: "붓이 지나갈 획(중심선)으로 넣습니다.\n" +
+                                              "입력값은 완성 도색 높이입니다 — 붓 폭까지 포함한,\n" +
+                                              "실제로 칠해지는 세로 크기.\n" +
                                               "붓 폭(" + Backend.strokeWidthMm.toFixed(0) +
                                               "mm)의 3.5배 이상 권장"
                                 onClicked: tsCol.putText()

@@ -2838,6 +2838,8 @@ void VideoView::addTextWorld(const QString &text, double heightMm, bool outline)
 {
     if (!m_isTopView || text.trimmed().isEmpty() || m_frame.isNull()) return;
 
+    m_lastTextPaintedMm = QSizeF();   // 이번 호출이 실패하면 옛 값이 남지 않게
+
     const double pxPerMm = m_tvPxPerM / 1000.0;
 
     // 🔴 heightMm 은 **완성 도색 높이**다 — 변 길이 입력창과 같은 기준.
@@ -2856,6 +2858,16 @@ void VideoView::addTextWorld(const QString &text, double heightMm, bool outline)
     }
     const double targetH = targetHmm * pxPerMm;
 
+    // 🔴 만들 것을 **먼저 만들어 보고**, 하나라도 나왔을 때만 상태를 건드린다.
+    //    글리프가 너무 작으면(완성 높이가 펜 폭보다 겨우 큰 경우) textStrokePolylines
+    //    가 빈 목록을 돌려주는데, 그전에 stashActive() 가 돌면 m_done 의 마지막
+    //    도형이 활성 경로로 끌려와 **엉뚱한 도형이 선택된 것처럼** 보인다.
+    QList<QVector<QPointF>> strokes;
+    if (!outline) {
+        strokes = textStrokePolylines(text.trimmed(), targetH);
+        if (strokes.isEmpty()) return;
+    }
+
     // ⚠️ pushUndo 는 **실패 반환을 다 지난 뒤**에 — 헛 undo 가 쌓이면 Ctrl+Z 가 헛돈다.
     pushUndo();
     stashActive();
@@ -2863,16 +2875,13 @@ void VideoView::addTextWorld(const QString &text, double heightMm, bool outline)
     m_drawing = false;
 
     if (!outline) {
-        const QList<QVector<QPointF>> strokes = textStrokePolylines(text.trimmed(), targetH);
         // 실제 칠해지는 바깥 크기 = 획 점들의 바운딩 박스 + 펜 폭(양쪽 hw).
-        QRectF ink;
-        for (const QVector<QPointF> &s : strokes)
-            for (const QPointF &q : s)
-                ink = ink.isNull() ? QRectF(q, QSizeF(0, 0)) : ink.united(QRectF(q, QSizeF(0, 0)));
-        const double mmPer = mmPerPx();
-        m_lastTextPaintedMm = ink.isNull()
-            ? QSizeF()
-            : QSizeF(ink.width() * mmPer + m_strokeMm, ink.height() * mmPer + m_strokeMm);
+        // ⚠️ QRectF::united 로 모으면 안 된다 — strokefont::polylineBounds 주석 참고.
+        double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+        m_lastTextPaintedMm = strokefont::polylineBounds(strokes, &x0, &y0, &x1, &y1)
+            ? QSizeF((x1 - x0) * mmPerPx() + m_strokeMm,
+                     (y1 - y0) * mmPerPx() + m_strokeMm)
+            : QSizeF();
         for (const QVector<QPointF> &s : strokes) {
             VVPath dp;
             dp.closed = false;          // 획은 열린 경로 = 직진/회전으로만 주행
