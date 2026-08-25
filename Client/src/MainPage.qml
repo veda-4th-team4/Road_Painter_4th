@@ -2876,7 +2876,7 @@ Item {
                         accent: Math.abs(Backend.strokeWidthMm - 60) < 0.01
                         onClicked: Backend.strokeWidthMm = 60
                         ToolTip.visible: hovered
-                        ToolTip.text: "60 mm 직각 팁"
+                        ToolTip.text: "60 mm 실측 도장 폭 (기본)"
                     }
                     Text {
                         text: "직접"
@@ -2992,6 +2992,18 @@ Item {
                                 penDisplayOffsetField.text = Backend.penDisplayOffsetMm.toFixed(0)
                         }
                     }
+                }
+
+                Text {
+                    width: parent.width
+                    text: "프로젝트 서버 기준값: 도장 폭 60 mm · 중심-펜 거리 172 mm. "
+                          + "Qt와 서버는 이 값을 자동 동기화하지 않으므로 서버 설정을 바꾸면 여기에도 같은 값을 입력하세요."
+                    color: (Math.abs(Backend.strokeWidthMm - 60) < 0.01
+                            && Math.abs(Backend.penDisplayOffsetMm - 172) < 0.01)
+                           ? Theme.muted : Theme.warn
+                    font.pixelSize: 10
+                    font.family: Theme.fontFamily
+                    wrapMode: Text.WordWrap
                 }
 
                 // ── 로봇 속도 ──────────────────────────────────────────

@@ -34,7 +34,7 @@ struct VVPath {
 //       좌클릭        = 점/도형 선택·이동 (편집이 최우선 — 확대 때문에 막히지 않음)
 //       빈 곳 좌드래그 = 올가미(사각) 다중 선택
 //       Ctrl/Shift+클릭 = 선택 토글
-//   - 도장 폭(기본 50 mm)을 실제 두께로 그려 도포 면적을 그대로 보여준다.
+//   - 도장 폭(기본 60 mm)을 실제 두께로 그려 도포 면적을 그대로 보여준다.
 class VideoView : public QQuickPaintedItem {
     Q_OBJECT
     QML_ELEMENT
@@ -345,7 +345,7 @@ private:
     // H 출력 단위 검산 결과 (사람이 읽는 한 줄). 선언값과 실제가 다르면 경고가 담긴다.
     QString m_calibUnitNote;
 
-    double m_strokeMm = 50.0;   // 사용자가 선택한 직각 팁의 실제 도장 폭
+    double m_strokeMm = 60.0;   // 사용자가 선택한 직각 팁의 실제 도장 폭
 
     // 원본 뷰 오버레이 (원본 px)
     QList<VVPath> m_overlayPaths;
