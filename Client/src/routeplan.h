@@ -6,8 +6,8 @@
 //   ① 로봇이 도형 사이를 가로질러 다니느라 현장을 활보하고 (횡단보도 5줄을 1→2→3 이
 //      아니라 그린 순서대로 왔다갔다),
 //   ② 그 이동 구간까지 전부 도색 구간으로 나가 바닥에 없는 선이 그려진다.
-// 여기서 도형 순서·진행 방향을 다시 잡고, 도형 사이 구간에 pen-up(paint=false) 표시를
-// 붙인다.
+// 일반 도형은 순서·진행 방향을 다시 잡고, 글자처럼 필순이 중요한 입력은 순서를
+// 잠근다. 두 경우 모두 도형 사이 구간에 pen-up(paint=false) 표시를 붙인다.
 //
 // 좌표계: 바닥 평면 미터. (BLUEPRINT 와 동일 — 서버는 재변환하지 않는다)
 #include <QLineF>
@@ -207,9 +207,11 @@ inline double naiveTravel(const QList<QList<QPointF>> &paths, const QList<bool> 
 // 도형들을 재배열·뒤집어 이동거리를 줄인 뒤 폴리라인 하나로 잇는다.
 //   start/hasStart : 로봇의 현재 위치 (모르면 hasStart=false — 첫 도형은 작도 순서 유지)
 //   tolM           : 경로 단순화 허용 오차 (기본 1cm = 서버가 버리는 최소 이동거리)
+//   preserveInputOrder : 입력 순서와 각 경로 방향을 그대로 유지 (글자 도장용)
 inline Route plan(const QList<QList<QPointF>> &paths, const QList<bool> &closed,
                   QPointF start, bool hasStart, double tolM = 0.01,
-                  const QList<bool> &preservePoints = {})
+                  const QList<bool> &preservePoints = {},
+                  bool preserveInputOrder = false)
 {
     Route r;
 
@@ -241,7 +243,19 @@ inline Route plan(const QList<QList<QPointF>> &paths, const QList<bool> &closed,
         detail::Cand bestC{0, false};
         double bestD = 0.0;
 
-        if (!have) {
+        if (preserveInputOrder) {
+            // 글자 획처럼 순서 자체가 의미인 도면은 현재 위치가 가깝다는 이유로
+            // 다른 글자/획을 먼저 고르면 안 된다. 입력 순서와 진행 방향을 모두
+            // 그대로 유지한다. 일반 도형은 아래의 기존 최단 이동 계획을 계속 쓴다.
+            for (int i = 0; i < shape.size(); ++i) {
+                if (!used[i]) {
+                    best = i;
+                    bestC = {0, false};
+                    bestD = have ? QLineF(cur, shape[i].first()).length() : 0.0;
+                    break;
+                }
+            }
+        } else if (!have) {
             // 로봇 위치를 모르면 첫 도형은 작도 순서·방향을 그대로 존중한다.
             // (사용자가 의도한 시작점을 임의로 바꾸지 않기 위함)
             best = 0;

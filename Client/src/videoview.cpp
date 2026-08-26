@@ -1028,12 +1028,21 @@ void VideoView::paintMission(QPainter *p, double sx, double sy, double ox, doubl
 
     if (total < 1e-6) return;
 
-    // 칠해진 구간 — 실제 도포 폭으로
-    double remain = total * qBound(0.0, m_missionProgress, 1.0);
+    // 칠해진 구간 — 실제 도포 폭으로. 도형별 진행률이 있으면 각 획을 독립적으로
+    // 채운다. 예전의 단일 전체 진행률은 뒤쪽 획 가까이 지나가기만 해도 그 앞의
+    // 모든 글자가 주황색으로 바뀌는 원인이었다.
     QPen fillPen(kProgress, std::max(6.0, wpx), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
     p->setPen(fillPen);
     p->setBrush(Qt::NoBrush);
-    for (const QVector<QPointF> &segs : std::as_const(segsList)) {
+    for (int pathIndex = 0; pathIndex < segsList.size(); ++pathIndex) {
+        const QVector<QPointF> &segs = segsList[pathIndex];
+        double pathLengthPx = 0.0;
+        for (int i = 1; i < segs.size(); ++i)
+            pathLengthPx += QLineF(segs[i - 1], segs[i]).length();
+        const double pathProgress = m_missionPathProgress.size() == segsList.size()
+            ? m_missionPathProgress.value(pathIndex, 0.0)
+            : m_missionProgress;
+        double remain = pathLengthPx * qBound(0.0, pathProgress, 1.0);
         for (int i = 1; i < segs.size() && remain > 1e-9; ++i) {
             const QPointF a = segs[i - 1];
             const QPointF b = segs[i];
@@ -1048,7 +1057,6 @@ void VideoView::paintMission(QPainter *p, double sx, double sy, double ox, doubl
                 remain = 0;
             }
         }
-        if (remain <= 1e-9) break;
     }
 }
 
@@ -1336,6 +1344,7 @@ void VideoView::setMissionPathsMeters(const QList<QList<QPointF>> &metersPaths,
         m_missionPaths.append(mp);
     }
     m_missionProgress = 0.0;
+    m_missionPathProgress = QList<double>(m_missionPaths.size(), 0.0);
     update();
 }
 
@@ -1350,12 +1359,22 @@ void VideoView::setMissionPathsPixels(const QList<QList<QPointF>> &imagePx,
         m_missionPaths.append(mp);
     }
     m_missionProgress = 0.0;
+    m_missionPathProgress = QList<double>(m_missionPaths.size(), 0.0);
     update();
 }
 
 void VideoView::setMissionProgress(double progress01)
 {
     m_missionProgress = qBound(0.0, progress01, 1.0);
+    update();
+}
+
+void VideoView::setMissionPathProgress(const QList<double> &progress01)
+{
+    m_missionPathProgress.clear();
+    m_missionPathProgress.reserve(m_missionPaths.size());
+    for (int i = 0; i < m_missionPaths.size(); ++i)
+        m_missionPathProgress.append(qBound(0.0, progress01.value(i, 0.0), 1.0));
     update();
 }
 
@@ -1379,6 +1398,7 @@ void VideoView::clearMission()
 {
     m_missionPaths.clear();
     m_missionProgress = 0.0;
+    m_missionPathProgress.clear();
     m_robotValid = false;
     m_penValid = false;
     update();
@@ -1577,6 +1597,7 @@ void VideoView::pushUndo()
     s.closed = m_closed;
     s.outerContour = m_outerContour;
     s.drawing = m_drawing;
+    s.preservePathOrder = m_preservePathOrder;
     m_undo.append(s);
     if (m_undo.size() > 60) m_undo.removeFirst();
 }
@@ -1588,6 +1609,7 @@ void VideoView::beginPendingUndo()
     m_pendingUndo.closed = m_closed;
     m_pendingUndo.outerContour = m_outerContour;
     m_pendingUndo.drawing = m_drawing;
+    m_pendingUndo.preservePathOrder = m_preservePathOrder;
     m_pendingUndoValid = true;
 }
 
@@ -2610,6 +2632,7 @@ void VideoView::clearPath()
     m_closed = false;
     m_outerContour = false;
     m_done.clear();
+    m_preservePathOrder = false;
     m_drawing = false;
     m_hoverEdge = -1;
     m_hoverVertex = -1;
@@ -2633,6 +2656,7 @@ void VideoView::undo()
     m_closed = s.closed;
     m_outerContour = s.outerContour;
     m_drawing = s.drawing;
+    m_preservePathOrder = s.preservePathOrder;
 
     m_focused = true;              // 되돌린 결과를 바로 손볼 수 있게
     m_selection.clear();
@@ -2870,6 +2894,7 @@ void VideoView::addTextWorld(const QString &text, double heightMm, bool outline)
 
     // ⚠️ pushUndo 는 **실패 반환을 다 지난 뒤**에 — 헛 undo 가 쌓이면 Ctrl+Z 가 헛돈다.
     pushUndo();
+    m_preservePathOrder = true;
     stashActive();
     m_focused = true;              // 방금 넣은 것은 바로 편집할 수 있어야 한다
     m_drawing = false;
@@ -3747,6 +3772,9 @@ void VideoView::setEditPathsMeters(const QList<QList<QPointF>> &metersPaths,
     m_closed = false;
     m_outerContour = false;
     m_done.clear();
+    // 이력에서 불러온 여러 획도 저장 당시 순서를 유지한다. 일반 단일 도형에는
+    // 영향이 없고, 글자 이력이 다시 최적화되어 섞이는 회귀를 막는다.
+    m_preservePathOrder = metersPaths.size() > 1;
     m_drawing = false;
     m_hoverEdge = -1;
     m_focused = true;

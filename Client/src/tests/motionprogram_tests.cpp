@@ -1376,6 +1376,46 @@ void testPaintProgressUsesPenPosition()
           "paint progress must follow the nozzle projection");
 }
 
+void testOrderedTextPathsAreNeverRearranged()
+{
+    // H의 가운데 획 바로 옆에서 시작하면 기존 greedy 계획은 가운데 획을 먼저
+    // 골랐고, 그 다음에는 더 가까운 A 획로 건너갔다. 글자 도장은 입력 필순을
+    // 잠그므로 현재 로봇 위치와 무관하게 H 세 획 -> A 두 획 순서여야 한다.
+    const QList<QList<QPointF>> paths{
+        {QPointF(0.0, 0.0), QPointF(0.0, 0.24)},
+        {QPointF(0.13, 0.0), QPointF(0.13, 0.24)},
+        {QPointF(0.0, 0.12), QPointF(0.13, 0.12)},
+        {QPointF(0.20, 0.0), QPointF(0.27, 0.24), QPointF(0.34, 0.0)},
+        {QPointF(0.22, 0.12), QPointF(0.32, 0.12)}
+    };
+    const QList<bool> closed(paths.size(), false);
+    const routeplan::Route route = routeplan::plan(
+        paths, closed, QPointF(-0.005, 0.12), true, 0.01, {}, true);
+    check(route.order == QList<int>({0, 1, 2, 3, 4}),
+          "ordered text must keep H strokes before A strokes");
+    check(route.flipped == QList<bool>({false, false, false, false, false}),
+          "ordered text must keep every stroke direction");
+}
+
+void testPerPathProgressDoesNotPaintPassedLaterStroke()
+{
+    const QList<QList<QPointF>> paths{
+        {QPointF(0.0, 0.0), QPointF(1.0, 0.0)},
+        {QPointF(10.0, 0.0), QPointF(11.0, 0.0)}
+    };
+    const QList<bool> closed{false, false};
+
+    const paintprogress::PathProjection expected =
+        paintprogress::projectOnPath(paths[0], false, QPointF(10.5, 0.0));
+    check(expected.valid && expected.distanceM > 9.0,
+          "passing a later stroke must not count as contact with the current stroke");
+    check(near(paintprogress::weightedProgress(paths, closed, {0.0, 0.5}), 0.25),
+          "only the explicitly contacted path may contribute orange progress");
+    check(paintprogress::prefixPathProgress(paths, closed, 0.25)
+              == QList<double>({0.5, 0.0}),
+          "test-mode scalar progress must still map to the planned prefix");
+}
+
 void testFinishedDimensionEditorKeepsWireGeometrySemantic()
 {
     // 중심선 획(H/V/직선/화살표 등): 서버가 60mm 폭의 양끝을 30mm씩
@@ -1517,6 +1557,8 @@ int main(int argc, char **argv)
     testRobotTimingEstimate();
     testPaintProgressUsesSeparatePaintPaths();
     testPaintProgressUsesPenPosition();
+    testOrderedTextPathsAreNeverRearranged();
+    testPerPathProgressDoesNotPaintPassedLaterStroke();
     testFinishedDimensionEditorKeepsWireGeometrySemantic();
     testTextHeightIsFinishedPaintHeight();
     testPolylineBoundsDoesNotFallForNullRect();
