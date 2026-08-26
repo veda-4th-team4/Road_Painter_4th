@@ -484,9 +484,8 @@ bool SampleComponent::Initialize() {
   try {
     if (central_tls_sender_init(CENTRAL_TLS_SERVER_IP, CENTRAL_TLS_SERVER_PORT,
                                 CENTRAL_TLS_CA_FILE) == 0) {
-      // Wired first, Wi-Fi as the fallback candidate -- see app_config.h's
-      // CENTRAL_TLS_SERVER_IP_FALLBACK comment for why (DHCP-stability,
-      // AND the current cert only verifying against the Wi-Fi address).
+      // The deployed/certificate-verified .8 address is primary. The wired .2
+      // candidate remains available after its SAN is added to the certificate.
       central_tls_sender_set_fallback(CENTRAL_TLS_SERVER_IP_FALLBACK);
       printf("[ArucoPosePNM] init: central TLS -> %s:%d (fallback %s)\n",
              CENTRAL_TLS_SERVER_IP, CENTRAL_TLS_SERVER_PORT, CENTRAL_TLS_SERVER_IP_FALLBACK);
@@ -2099,45 +2098,55 @@ void SampleComponent::ProcessWiseAiMetadata(Event* event) {
       double fwx = 0.0, fwy = 0.0;
       const bool have_world =
           homography_.PixelToWorld(channel, d.foot_u, d.foot_v, &fwx, &fwy, NULL);
-      char zjson[512];
-      int w = snprintf(zjson, sizeof(zjson),
-                       "{\"type\":\"ZONE_EVENT\",\"ch\":%d,\"object_id\":\"%.32s\","
+      char zpayload[512];
+      int w = snprintf(zpayload, sizeof(zpayload),
+                       "{\"ch\":%d,\"object_id\":\"%.32s\","
                        "\"action\":\"%s\",\"foot_u\":%.1f,\"foot_v\":%.1f,"
                        "\"left\":%.1f,\"top\":%.1f,\"right\":%.1f,\"bottom\":%.1f",
                        channel, d.object_id.c_str(),
                        (edge == kZoneEntered) ? "Enter" : "Exit",
                        d.foot_u, d.foot_v, d.left, d.top, d.right, d.bottom);
-      if (have_world && w > 0 && w < (int)sizeof(zjson)) {
-        w += snprintf(zjson + w, sizeof(zjson) - w,
+      if (have_world && w > 0 && w < (int)sizeof(zpayload)) {
+        w += snprintf(zpayload + w, sizeof(zpayload) - w,
                       ",\"foot_wx\":%.0f,\"foot_wy\":%.0f", fwx, fwy);
       }
       // When the camera SAW this crossing, not when we are sending it. Absent
       // rather than 0 if the frame carried no parseable stamp -- 0 is a real
       // epoch millisecond (1970) and would read as a wildly stale event.
-      if (d.utc_ms != 0 && w > 0 && w < (int)sizeof(zjson)) {
-        w += snprintf(zjson + w, sizeof(zjson) - w, ",\"t_ms\":%ld", d.utc_ms);
+      if (d.utc_ms != 0 && w > 0 && w < (int)sizeof(zpayload)) {
+        w += snprintf(zpayload + w, sizeof(zpayload) - w, ",\"t_ms\":%ld", d.utc_ms);
       }
       // The disc that made this call, so the decision can be second-guessed
       // downstream without re-deriving it: radius used, and how far the foot
       // actually was from the zone (0 = the point itself was inside).
-      if (w > 0 && w < (int)sizeof(zjson)) {
-        w += snprintf(zjson + w, sizeof(zjson) - w,
+      if (w > 0 && w < (int)sizeof(zpayload)) {
+        w += snprintf(zpayload + w, sizeof(zpayload) - w,
                       ",\"foot_r\":%.1f,\"zone_d\":%.1f", foot_r, zone_d);
       }
-      if (have_mm && w > 0 && w < (int)sizeof(zjson)) {
-        w += snprintf(zjson + w, sizeof(zjson) - w, ",\"zone_mm\":%.0f", zone_mm);
+      if (have_mm && w > 0 && w < (int)sizeof(zpayload)) {
+        w += snprintf(zpayload + w, sizeof(zpayload) - w, ",\"zone_mm\":%.0f", zone_mm);
       }
       // 어느 단계를 넘어서 난 이벤트인지 -- 받는 쪽이 "접근금지였나 존 내부였나"를
       // 구분해 다른 소리를 낼 수 있게 한다.
-      if (zone_level >= 0 && w > 0 && w < (int)sizeof(zjson)) {
-        w += snprintf(zjson + w, sizeof(zjson) - w,
+      if (zone_level >= 0 && w > 0 && w < (int)sizeof(zpayload)) {
+        w += snprintf(zpayload + w, sizeof(zpayload) - w,
                       ",\"level\":%d,\"alarm_level\":%d", zone_level, zone_alarm_level_);
       }
-      if (w > 0 && w < (int)sizeof(zjson)) snprintf(zjson + w, sizeof(zjson) - w, "}");
+      if (w <= 0 || w >= (int)sizeof(zpayload) - 1) continue;
+      zpayload[w++] = '}';
+      zpayload[w] = '\0';
+
+      char zjson[544];
+      const int zw = snprintf(zjson, sizeof(zjson),
+                              "{\"type\":\"ZONE_EVENT\",%s", zpayload + 1);
+      if (zw <= 0 || zw >= (int)sizeof(zjson)) continue;
+
       printf("[ArucoPosePNM] %s\n", zjson);
+      // 운영 경로: 카메라의 기존 role=CCTV TLS 세션으로 중앙 서버에 전달한다.
+      // 연결이 내려가 있으면 send_typed가 즉시 실패하고 영상 처리는 계속된다.
+      central_tls_sender_send_typed("ZONE_EVENT", zpayload);
       // Control line, not the realtime one, for the same reason IVA_EVENT uses
-      // it: this is the event an alarm hangs off, and a dropped Enter is not
-      // superseded by the next frame the way a dropped pose sample is.
+      // it: 관리자 화면 표시와 RP_CCTV_BRIDGE=1 과도기 경로도 유지한다.
       pose_sender_send_control_line(zjson);
     }
 

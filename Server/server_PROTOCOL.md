@@ -70,6 +70,7 @@
 |---|---|---|
 | `H_MATRIX.payload.ch` | CCTV/ADMIN → 서버 | 이 캘리브레이션 번들이 **어느 채널의 것인지** |
 | `POS.payload.ch` | CCTV → 서버 | 이 마커를 **어느 채널에서 봤는지** |
+| `ZONE_EVENT.payload.ch` | CCTV → 서버 → ROBOT | 사람 진입이 **어느 채널에서 검출됐는지** |
 | `CMD{"cmd":"SELECT_CHANNEL","ch":n}` | QT/ADMIN → 서버 → CCTV | 작업 채널 전환 |
 | `CHANNEL_OK.payload.ch` | 서버 → QT | 전환 결과 + 그 채널의 캘리브레이션 |
 | `LOGIN_OK.payload.calibs` | 서버 → QT | **채널별** 번들 맵 |
@@ -457,6 +458,18 @@
   - `STOP`은 수동 이동의 일반 정지 — 긴급정지(`ESTOP`, RESUME 필요)와는 별개.
 - ACK 응답 불필요 (fire-and-forget)
 
+### 수신: ZONE_EVENT (서버 → 로봇)
+
+```json
+{"type":"ZONE_EVENT","seq":8,"payload":{"action":"Enter","ch":1,"object_id":"42"}}
+```
+
+- CCTV가 기존 TLS 세션으로 보낸 사람 진입 이벤트를 서버가 검증해 중계한다.
+- 서버는 `payload.action`이 문자열 `"Enter"`인 메시지만 로봇으로 보낸다.
+- 로봇은 `CMD`와 별도 latch로 처리한다. 따라서 이 이벤트는 ESTOP, RESUME,
+  수동 조작 명령을 덮어쓰지 않는다.
+- 전송은 기존 `role=ROBOT` TLS JSON Lines를 사용하며 별도 UDP 포트는 없다.
+
 > ⚠️ **안전**: 조이스틱 방식은 "떼면 STOP"에 의존한다. TCP라 정상 연결 중엔 순서·전달이 보장되지만, **버튼을 누른 채 연결이 끊기면 STOP이 못 가서 로봇이 계속 움직일 수 있다.** 로봇 펌웨어에 데드맨(예: 300ms 내 다음 명령/하트비트 없으면 자동 정지)을 두는 것을 권장.
 
 ### 송신: STATUS (로봇 → 서버) — 주기 전송 필수
@@ -761,6 +774,22 @@ Qt 입력값 그대로, 서버는 손대지 않고 중계한다. **로봇이 그
 ### 수신: CMD (서버 → CCTV)
 
 `{"cmd":"CALIB_START"}` — 캘리브레이션 시작
+
+### 송신: ZONE_EVENT (CCTV → 서버)
+
+```json
+{"type":"ZONE_EVENT","seq":11,"payload":{
+  "ch":1,"object_id":"42","action":"Enter",
+  "foot_u":1200.5,"foot_v":810.0,"zone_d":0.0
+}}
+```
+
+- 카메라 앱이 이미 사용하는 `role=CCTV` 중앙 TLS 연결로 보낸다.
+- `action`은 `"Enter"` 또는 `"Exit"`이며, 서버는 음성 경보용으로 `Enter`만
+  `role=ROBOT` 세션에 중계한다.
+- 관리자 콘솔의 `RP_CCTV_BRIDGE=1` 과도기 모드도 같은 CCTV role 메시지로 올린다.
+  직결 운영 모드에서는 카메라 앱이 직접 보내므로 브리지는 꺼 둔다.
+- 별도 UDP 전송, `ZONE_FORWARD`, 9999 포트는 사용하지 않는다.
 
 ### 송신: H_MATRIX (CCTV → 서버) — 캘리브레이션 완료 후 1회
 

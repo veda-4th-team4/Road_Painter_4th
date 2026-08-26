@@ -27,6 +27,7 @@
 //               + 주행 중이면 DRIFT. POS 원본은 QT에 중계하지 않는다 (POSE만 사용)
 //   CCTV  -> H_MATRIX  -> 캘리브레이션 번들(K,D,H_floor,H_marker) 수신,
 //               로그인 사용자에 영속 저장 + QT 중계
+//   CCTV  -> ZONE_EVENT Enter -> ROBOT TLS 세션으로 중계 (사람 진입 음성 경보)
 //   ROBOT/CCTV 접속·해제 -> QT에 PEERS{"robot":bool,"cctv":bool} 통지
 //               (QT 접속 시에도 현재 스냅샷 1회 전송)
 //

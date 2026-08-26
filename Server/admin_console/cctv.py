@@ -17,7 +17,6 @@ import os
 import socket
 import ssl
 import struct
-import sys      # forward_event() 진단 출력
 import threading
 import time
 import urllib.error
@@ -60,43 +59,6 @@ HG_EXPERIMENT_DIR = f"{SNAPSHOT_DIR}/homography_experiments"
 # which read the same two names from the operator's shell rather than a
 # checked-in file). Read once at import so a typo shows up immediately in
 # push_iva_area()'s "not set" branch rather than failing silently mid-session.
-# ── 이벤트 UDP 중계 (테스트용) ────────────────────────────────────────────
-# ZONE_FORWARD="host:port" 가 있으면 ZONE_EVENT/IVA_EVENT 를 그 주소로 그대로
-# 한 줄씩 흘린다. 형식은 서버가 브라우저에 보내는 것과 같은 JSON.
-#
-# UDP인 이유: 이 전송이 print_msg 안, 즉 카메라 메시지 루프 위에서 일어난다.
-# TCP였다면 상대가 꺼져 있을 때 connect 타임아웃만큼 루프가 멈추고 그 뒤의
-# 카메라 메시지가 전부 밀린다 -- 테스트용 수신기 하나 때문에 본 기능이 서는 건
-# 말이 안 된다. UDP는 받는 쪽이 없으면 그냥 버려지고, 테스트 탭으로는 그게
-# 올바른 실패 방식이다.
-_FWD_ADDR = None
-_fwd_sock = None
-_fwd_fail_logged = False
-_fwd = os.environ.get("ZONE_FORWARD", "").strip()
-if _fwd:
-    try:
-        _h, _p = _fwd.rsplit(":", 1)
-        _FWD_ADDR = (_h, int(_p))
-        _fwd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    except (ValueError, OSError) as _e:
-        print(f"[iva] ZONE_FORWARD={_fwd!r} 해석 실패: {_e}", file=sys.stderr)
-        _FWD_ADDR = None
-
-
-def forward_event(line):
-    """Best-effort UDP tap. Never raises -- a test tap must not be able to
-    break the message loop it is spliced into."""
-    global _fwd_fail_logged
-    if not (_fwd_sock and _FWD_ADDR):
-        return
-    try:
-        _fwd_sock.sendto(line.encode("utf-8"), _FWD_ADDR)
-    except OSError as e:
-        if not _fwd_fail_logged:      # 한 번만 -- 매 이벤트마다 찍으면 로그가 잠긴다
-            _fwd_fail_logged = True
-            print(f"[iva] forward 실패 ({_FWD_ADDR}): {e}", file=sys.stderr)
-
-
 CAMERA_USER = os.environ.get("CAMERA_USER", "")
 CAMERA_PASS = os.environ.get("CAMERA_PASS", "")
 # The AppID WiseAI.html's Servers block documents as the default -- override
@@ -1068,7 +1030,6 @@ def print_msg(msg, last_seq):
         # 링크(재시도 큐 포함)가 실제로 얼마나 밀렸는지가 나온다. 브라우저에서
         # 재면 뷰어 PC 시계가 섞여 들어가 측정이 안 된다.
         msg["rx_ms"] = int(now_ms)
-        forward_event(json.dumps(msg, ensure_ascii=False))
         broadcast("[iva] EVENT " + json.dumps(msg, ensure_ascii=False))
         return last_seq
     if mtype == "ZONE_EVENT":
@@ -1083,7 +1044,10 @@ def print_msg(msg, last_seq):
         # IVA_EVENT를 지우지 않고 나란히 두는 건 교차 검증용이다 -- 둘이 갈리는
         # 지점이 곧 위 오차이고, 화면에서 바로 보이는 편이 낫다.
         msg["rx_ms"] = int(now_ms)  # PY1과 같은 이유 -- 위 주석 참고
-        forward_event(json.dumps(msg, ensure_ascii=False))
+        # 과도기 bridge 모드에서만 이 프로세스가 CCTV role을 소유한다. 운영
+        # 직결 모드에서는 카메라 앱이 같은 ZONE_EVENT를 중앙 TLS로 직접 보낸다.
+        if CCTV_BRIDGE_ENABLED:
+            cctv_send("ZONE_EVENT", {k: v for k, v in msg.items() if k != "type"})
         broadcast("[iva] ZONE " + json.dumps(msg, ensure_ascii=False))
         return last_seq
     if mtype == "IVA_ZONE_SET":

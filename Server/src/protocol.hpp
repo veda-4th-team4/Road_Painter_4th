@@ -81,6 +81,9 @@
 //     - true: 실행 중인 op 도중이라도 즉시 정지 (op을 포기하지는 않는다)
 //       false: 멈춘 지점에서 같은 op을 남은 거리/각도부터 이어서 수행
 //     - HOLD 중에는 서버가 GO/ALIGN/MORE/DRIFT를 일절 보내지 않는다.
+//   ZONE_EVENT payload: {"action":"Enter", "ch":1, "object_id":"...", ...}
+//     - CCTV가 발끝 기준으로 판정한 사람 진입을 서버가 검증해 중계한다.
+//     - 로봇은 CMD와 별도 latch로 받아 PERSON_IN_ZONE 음성을 재생한다.
 //   CMD    payload: {"cmd": ...}  (응답 불필요, fire-and-forget)
 //     - 이벤트: "ESTOP" | "RESUME" | "CALIB_START"
 //     - 수동 조작(조이스틱, 누르는 동안 이동 / STOP=뗌, 이동량 없음):
@@ -298,6 +301,9 @@
 // ============================================================================
 //
 // [CCTV -> 서버]
+//   ZONE_EVENT payload: {"action":"Enter"|"Exit", "ch":1,
+//                        "object_id":"...", "foot_u":..., "foot_v":..., ...}
+//     - 서버는 Enter만 ROBOT의 ZONE_EVENT로 중계한다. UDP 우회 경로는 사용하지 않는다.
 //   H_MATRIX payload: {"ch":2, "request_id":"qt-...", "calib":{ …번들… }}
 //     번들(2026-08-11 정규형) = {"calib_id","created_at","image_size":[2592,1520],
 //       "coord_mode":"undistort","unit":"mm","K":[[...]x3],"D":[k1,k2,p1,p2,k3],
