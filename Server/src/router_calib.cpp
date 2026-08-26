@@ -1,7 +1,7 @@
 // 로봇 주행 호모그래피 세션 (2026-08-10 신설).
 //
 // 규격: QT_HOMOGRAPHY_SERVER_CONTRACT_2026-08-10.md (Qt팀 제안),
-//       회신 docs/QT_HOMOGRAPHY_REPLY_20260810_SERVER.md.
+//       회신 docs/CALIBRATION.md.
 //       메시지 목록은 protocol.hpp의 [로봇 주행 호모그래피 세션] 절에 있다.
 //
 // 역할 경계: Qt는 "CH n 시작/중단"만 보낸다. 로봇 경로·샘플링 위치·계산 알고리즘은
@@ -29,7 +29,7 @@
 //    (CALIB_CANCEL{force:true})는 예외로 둔다. 로봇이 실제로 바닥을 굴러다니는
 //    중인데 Qt 단말 앞에 사람이 없을 수 있고, 그때 관리자가 로봇을 못 세우면
 //    안 되기 때문이다. 상세는
-//    docs/ROBOT_ODOMETRY_HOMOGRAPHY_REQUEST_QT_20260813.md §3.
+//    docs/CALIBRATION.md '공통 계약'.
 #include "router.hpp"
 #include "log.hpp"
 
@@ -213,11 +213,11 @@ void Router::startCalib(const json& payload, const json& msg, const char* origin
     // 통과시켰다. 다른 건 "무엇을 로봇/CCTV에 보내는가"뿐이다 - 정적 앵커는
     // 원본 CALIB_START를 그대로 중계하고(아래), 오도메트리는 서버가 만든
     // 사각형 op을 PATH{phase:"calib"}로 보낸다
-    // (docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §1, §3).
+    // (docs/CALIBRATION.md '공통 계약').
     //
     // 🔴 method로 가르지 않는다. 두 규격이 같은 값을 쓰기 때문이다:
     //     - 2026-08-10 Qt 계약: Qt가 **정적 앵커** 요청에 method:"robot_motion"을
-    //       실어 보낸다 (protocol.hpp:259, QT_HOMOGRAPHY_REPLY_20260810_SERVER.md
+    //       실어 보낸다 (protocol.hpp:259, docs/CALIBRATION.md
     //       §225 표. "로봇 주행 호모그래피"라는 기능 이름에서 온 값이다)
     //     - 2026-08-12 오도메트리 wire 스펙: 같은 값을 **오도메트리** 방식의
     //       판별자로 다시 썼다

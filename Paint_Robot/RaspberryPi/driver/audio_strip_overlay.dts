@@ -1,0 +1,60 @@
+/*
+ * Device tree overlay for the raw I2S audio_strip driver.
+ *
+ * Repurposes the Pi's I2S/PCM block (normally driven by bcm2835-i2s
+ * through ALSA/ASoC, e.g. via the "hifiberry-dac" overlay) and binds it to
+ * this driver instead. Routes GPIO18/19/21 to the PCM function (BCLK/
+ * LRCLK/DOUT) and wires up the TX DMA request line so the FIFO can be fed
+ * without CPU involvement - same shape as led_strip_overlay.dts, applied
+ * to &i2s instead of &pwm.
+ *
+ * GPIO20 (PCM_DIN, microphone input) is deliberately left alone: this
+ * driver is playback-only, and mpu6050_overlay.dts / led_strip_overlay.dts
+ * already account for what else is on this Pi's header - GPIO18 in
+ * particular is why the LED strip lives on GPIO12 instead (see that
+ * overlay's own header comment).
+ *
+ * CANNOT be active at the same time as "hifiberry-dac" (or any other
+ * overlay claiming &i2s) - only one compatible string can bind to a given
+ * device tree node, and both want the same physical GPIO18/19/21 pins.
+ * Pick one in config.txt. AUDIO_STRIP_KR.md documents the switch and rollback.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2711";
+
+	/* GPIO18/19/21 (header pins 12/35/40) -> ALT0 = PCM_CLK/PCM_FS/PCM_DOUT */
+	fragment@0 {
+		target = <&gpio>;
+		__overlay__ {
+			audio_strip_pins: audio_strip_pins {
+				brcm,pins = <18 19 21>;
+				brcm,function = <4>;	/* 4 = ALT0 */
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&i2s>;
+		frag1: __overlay__ {
+			compatible = "roadpainter,audio-strip";
+			pinctrl-names = "default";
+			pinctrl-0 = <&audio_strip_pins>;
+
+			/* cell is the DREQ line; 2 = PCM TX (see PCM_DREQ_LINE
+			 * in audio_strip_regs.h). No "rx" entry - TX only. */
+			dmas = <&dma 2>;
+			dma-names = "tx";
+
+			status = "okay";
+		};
+	};
+
+	__overrides__ {
+		pin  = <&audio_strip_pins>,"brcm,pins:0";
+		func = <&audio_strip_pins>,"brcm,function:0";
+	};
+};

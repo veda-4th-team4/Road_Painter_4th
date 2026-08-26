@@ -10,7 +10,7 @@
 //   - 현장에서: config/params.json 편집 후 서버 재시작
 //   - 파일이 없으면 아래 기본값 그대로 동작한다 (파일은 선택 사항)
 //
-// 값의 근거는 docs/PROTOCOL_v2_ROBOT.md §10 상수표에 정리되어 있다.
+// 항목별 설명과 근거는 docs/TUNING.md 에 정리되어 있다.
 // 새 상수를 추가할 때는 아래 RP_PARAM_LIST에 한 줄 넣기만 하면
 // 구조체 필드 / JSON 로딩 / 시작 로그 덤프 / 오타 검출이 전부 따라온다.
 #include "log.hpp"
@@ -27,7 +27,7 @@ using json = nlohmann::json;
 // Qt 클라이언트 쪽 상수라 서버가 바꿀 수 없다 - params.json으로 덮어쓸 수 있게
 // 두면 "현장에서 늘렸는데 Qt는 그대로"라는 어긋남만 만든다. 그래서 코드 상수다.
 // 🔴 Qt팀이 이 값을 바꾸면 여기도 같이 바꿔야 한다
-// (docs/ROBOT_ODOMETRY_HOMOGRAPHY_REQUEST_QT_20260813.md §4).
+// (docs/CALIBRATION.md '타임아웃').
 inline constexpr long kQtCalibWaitMs = 300000L;
 // 서버가 쓸 수 있는 실효 예산. Qt가 스스로 포기하기 전에 서버가 먼저 종결
 // 응답을 보내야 하므로 한 뼘 짧게 잡는다.
@@ -50,7 +50,7 @@ inline constexpr long kQtOdoWaitCapMs = 590000L;
       "펜(노즐)이 마커 중심 뒤로 떨어진 거리 a. 로봇 PathFollower.h와 같아야 함")\
     X(double, pen_width_m, 0.05,                                               \
       "펜이 실제로 칠하는 폭 w (마커 사양 5cm). 도색 구간을 앞뒤로 w/2씩 늘려 "\
-      "꼭짓점 귀퉁이가 비지 않게 한다 - docs/PEN_WIDTH_COMPENSATION_20260813.md. "\
+      "꼭짓점 귀퉁이가 비지 않게 한다 - docs/PATH_GEOMETRY.md. "\
       "0으로 두면 보정이 통째로 꺼진다(예전 동작). 실측값을 넣을 것 - 마커 "   \
       "사양보다 압력·속도에 따라 달라진다")                                    \
     X(double, wheel_base_m, 0.166,                                             \
@@ -70,6 +70,19 @@ inline constexpr long kQtOdoWaitCapMs = 590000L;
       "이보다 큰 보정량은 물리적으로 말이 안 되므로 판정 폐기 + GO")           \
     X(int, more_max_tries, 4,                                                  \
       "한 boundary에서 MORE 최대 반복. 소진하면 포기하고 GO")                  \
+    X(double, paint_undershoot_m, 0.02,                                        \
+      "펜을 내리고 그리는 직선(도색 move)을 '일부러 이만큼 덜' 명령하고, 남은 "\
+      "만큼은 MORE 피드백이 채우게 한다. 예: 펜 두께 보정까지 끝난 도색 거리가 "\
+      "0.05m면 0.03m만 명령하고 남은 0.02m를 MORE가 메운다. 개루프 주행의 "    \
+      "오버슛보다 CCTV 실측 기반 MORE가 정확하다는 전제. "                     \
+      "0으로 두면 종전대로 계산값을 그대로 한 번에 명령한다. "                 \
+      "🔴 목표 지점(OpMeta::centerAheadM/penTarget)은 건드리지 않는다 - 명령 "\
+      "거리만 줄이므로 MORE가 그 차이를 그대로 오차로 보고 메운다. "           \
+      "MORE 보정은 노즐을 올리기 전에 일어나므로 남은 구간도 정상적으로 "      \
+      "칠해진다. 적용 대상은 도색 **직선**뿐이다 - 호(arc)는 MORE가 접선 "     \
+      "직선을 덧붙이는 방식이라 덜 그으면 원이 찌그러진다(§6.3). "             \
+      "도착 꼭짓점을 모르는 구간(MORE 불가)과 min_move_m 미만이 되는 짧은 "    \
+      "구간에는 적용되지 않는다")                                              \
     /* ---- 피드백 판정 대기 창 ---- */                                        \
     X(long, feedback_wait_ms, 1000,                                            \
       "READY 수신 후 판정까지 고정 대기. 이 동안 POS를 모아 평균낸다")         \
@@ -210,6 +223,22 @@ inline void sanitize(Params& p) {
     floorAt("align_threshold_deg", p.align_threshold_deg, 0.0);
     floorAt("more_deadband_m", p.more_deadband_m, 0.0);
     floorAt("more_max_m", p.more_max_m, 0.0);
+    floorAt("paint_undershoot_m", p.paint_undershoot_m, 0.0);
+    // 🔴 more_deadband_m 이하로 덜 가면 MORE가 "보정 불필요"로 판정해 그대로
+    // GO한다 - 덜 간 만큼이 메워지지 않고 그냥 짧게 그어진 선으로 남는다.
+    // 껐다는 뜻(0)이 아니면 경고한다.
+    if (p.paint_undershoot_m > 0.0 && p.paint_undershoot_m <= p.more_deadband_m) {
+        logf("[WARN] params 'paint_undershoot_m'=%g 가 more_deadband_m(%g) 이하 "
+             "- MORE가 보정 불필요로 판정해 덜 그은 만큼이 그대로 남는다",
+             p.paint_undershoot_m, p.more_deadband_m);
+    }
+    // MORE 한 번의 상한을 넘으면 판정 자체가 폐기되고(GO) 보정이 아예 안 걸린다.
+    if (p.paint_undershoot_m > p.more_max_m) {
+        logf("[WARN] params 'paint_undershoot_m'=%g 가 more_max_m(%g) 초과 "
+             "- MORE가 판정을 폐기해 보정이 걸리지 않으므로 %g 로 내림",
+             p.paint_undershoot_m, p.more_max_m, p.more_max_m);
+        p.paint_undershoot_m = p.more_max_m;
+    }
     floorAt("feedback_wait_ms", p.feedback_wait_ms, 0L);
     floorAt("drift_period_ms", p.drift_period_ms, 0L);
     floorAt("pos_lost_ms", p.pos_lost_ms, 0L);
@@ -267,7 +296,7 @@ inline void sanitize(Params& p) {
     //   이 하한도 같이 올려야 한다. 속도를 바꿀 때 반드시 재계산할 것.
     //
     // 아래 검사는 그와 별개인 기하학적 하한이다. 펜이 중심 뒤 a에 달려 있는 이상
-    // 노즐이 그릴 수 있는 반지름은 a 미만이 될 수 없다 (PROTOCOL_v2_ROBOT.md §5.5).
+    // 노즐이 그릴 수 있는 반지름은 a 미만이 될 수 없다 (docs/PATH_GEOMETRY.md '최소 도색 반지름').
     if (p.min_paint_radius_m < p.pen_offset_m) {
         logf("[WARN] params 'min_paint_radius_m'=%g < 'pen_offset_m'=%g - "
              "물리 하한인 %g로 올림 (§5.5)",

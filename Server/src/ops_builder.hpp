@@ -1,6 +1,6 @@
 #pragma once
 // ===== Qt 도면/동작 시퀀스 -> 로봇 op 시퀀스 (프로토콜 v2) =====
-// 규격: docs/PROTOCOL_v2_ROBOT.md (이 파일은 그 문서의 §4·§5 구현체다)
+// 규격: docs/PROTOCOL.md (op 사양) + docs/PATH_GEOMETRY.md (펜 오프셋·펜 두께·호 기하)
 //
 // 이 파일이 책임지는 것 네 가지:
 //   1. 부호 반전  - 서버 내부는 CCW 양수, 로봇 대면은 "양수 = 오른쪽" (§1.3)
@@ -15,6 +15,7 @@
 #include "params.hpp"
 #include "path_planner.hpp"
 #include "protocol.hpp"
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -140,7 +141,7 @@ struct OpMeta {
     //
     // 예전에는 bool(centerAheadByA)이었고 참이면 무조건 a(pen_offset_m)였다.
     // 펜 두께 보정(2026-08-13)이 들어오면서 값이 셋으로 갈려 bool로는 표현할
-    // 수 없게 됐다 - docs/PEN_WIDTH_COMPENSATION_20260813.md §4:
+    // 수 없게 됐다 - docs/PATH_GEOMETRY.md '펜 두께':
     //   오프셋 전진(a - w/2) : a - w/2  - 펜이 꼭짓점보다 w/2 앞(=전)에 내려앉는다
     //   도색 move (L + w)    : a + w/2  - 펜이 꼭짓점보다 w/2 더 지나쳐 끝난다
     //   오프셋 후진(a + w/2) : 0        - 노즐을 올리고 꼭짓점 위로 되돌아왔다
@@ -276,7 +277,7 @@ inline bool validateProgram(const json& program, std::string& reason,
 inline PlannedPath buildDrawOps(const json& program,
                                 const std::vector<Pt>& points) {
     const double a = params().pen_offset_m;
-    // 펜 두께 보정 반폭 (2026-08-13, docs/PEN_WIDTH_COMPENSATION_20260813.md).
+    // 펜 두께 보정 반폭 (docs/PATH_GEOMETRY.md '펜 두께').
     // 도색 구간을 앞뒤로 hw 씩 늘려 꼭짓점 귀퉁이(hw × hw 정사각형)를 메운다.
     //   진입 오프셋 a - hw  -> 펜이 시작 꼭짓점보다 hw 앞(전)에 내려앉는다
     //   도색 move  L + 2hw  -> 펜이 [V0 - hw, V1 + hw] 를 지난다
@@ -401,9 +402,27 @@ inline PlannedPath buildDrawOps(const json& program,
             // 도색 직선은 앞뒤로 hw 씩 늘린다 (진입에서 hw 앞당겼으므로 총 2hw).
             // 비도색 이동은 손대지 않는다 - 펜이 올라가 있어 늘릴 이유가 없다.
             const double distM = q.value("dist_m", 0.0) + (isPaint ? 2.0 * hw : 0.0);
+            // 일부러 덜 긋고 남은 만큼은 MORE가 채운다 (params paint_undershoot_m).
+            // 개루프 한 방보다 CCTV 실측 기반 보정이 정확하다는 전제.
+            //
+            // 🔴 아래 centerAheadM/tgt(= MORE 목표)는 줄이지 않는다. 목표를 같이
+            //   줄이면 메울 오차 자체가 사라져 그냥 짧은 선이 되고 끝난다.
+            //   명령 거리만 줄여야 그 차이가 MORE에 오차로 보인다.
+            // MORE 보정 시점에는 노즐이 아직 내려가 있다(nozzle up은 closePaint의
+            // 다음 op) - 그래서 남은 구간도 이어서 정상적으로 칠해진다.
+            //
+            // 적용 조건 둘: 도색 직선일 것(호는 접선 직선이 덧붙어 원이 깨진다),
+            // 그리고 도착 꼭짓점을 알 것(모르면 MORE가 안 걸려 영구 오차가 된다).
+            // min_move_m 밑으로는 안 깎는다 - 짧은 도색 구간에서 명령이 0이나
+            // 음수가 되면 펜을 내린 채 뒤로 가는 꼴이 된다.
+            double cmdM = distM;
+            if (isPaint && hasTgt && distM > 0.0) {
+                cmdM = std::max(params().min_move_m,
+                                distM - params().paint_undershoot_m);
+            }
             // 도색 move가 끝나는 시점의 마커 목표 = 꼭짓점 + (a + hw).
             // 펜이 꼭짓점을 hw 지나쳐 끝나기 때문이다.
-            seq.moveOp(distM, true, head, hasTgt, tgt,
+            seq.moveOp(cmdM, true, head, hasTgt, tgt,
                        /*centerAheadM=*/isPaint ? (a + hw) : 0.0);
         } else if (o == "TURN") {
             seq.turnOp(q.value("angle_deg", 0.0), true, head);
@@ -498,7 +517,7 @@ inline PlannedPath buildApproachOps(const Pose& start, const Pt& target,
 }
 
 // ===== 로봇 오도메트리 주행 캘리 경로 (2026-08-12) =====
-// 규격: docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §3.
+// 규격: docs/CALIBRATION.md '오도메트리 주행 방식'.
 //
 // 닫힌 직사각형을 4변으로, 각 변을 반으로 쪼개 11개 op으로 돈다:
 //   MOVE(m/2) MOVE(m/2) TURN(±90) MOVE(n/2) MOVE(n/2) TURN(±90)
@@ -525,7 +544,7 @@ inline PlannedPath buildCalibRectOps(double mM, double nM, bool ccw) {
 // READY(op_index) -> point_index (0..7, 8은 PATH_DONE에서 별도 처리).
 // -1 = 직전 op이 TURN이라 같은 물리 위치 (캡처 스킵, 즉시 GO).
 // buildCalibRectOps()의 고정 11-op 구조(op 2/5/8이 TURN)에서 나온 표라
-// m/n 값과 무관하다. docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §4.
+// m/n 값과 무관하다. docs/CALIBRATION.md '정지점 9개'.
 inline int odoReadyToPoint(int k) {
     static constexpr int kTable[11] = {0, 1, 2, -1, 3, 4, -1, 5, 6, -1, 7};
     return (k >= 0 && k < 11) ? kTable[k] : -2;  // -2 = 범위 밖 (호출측 방어 처리용)

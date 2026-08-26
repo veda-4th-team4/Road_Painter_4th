@@ -477,9 +477,8 @@ private:
     // 테스트 재생용 — 위와 거울 관계(재생기 좌표가 노즐이라 섀시를 앞으로 민다).
     void pushSimPoseToView(const QPointF &nozzleM, double headingDeg, bool down);
     void onStatus(const QString &state, bool painting);
-    double progressAlongPath(const QPointF &pose) const;
-    // 미션 전체를 주행 순서대로 이어붙인 폴리라인 (닫힌 도형은 시작점 복귀 포함)
-    QList<QPointF> missionTravelLine() const;
+    // 실제 노즐 위치를 도색 경로에 투영한 진행률. 펜을 든 이동 거리는 제외한다.
+    double progressAlongPath(const QPointF &pen) const;
     void pushMissionToView();
     void pushOverlayToOriginal();
     void onAruco(const QList<int> &ids, const QList<QPolygonF> &corners);
@@ -667,8 +666,8 @@ private:
     QString m_noticeKey;          // 상황이 풀리면 그 통지만 골라 내리기 위한 태그
     QString m_arucoSummary;
     bool m_arucoOverlay = true;
-    double m_strokeWidthMm = 50.0;   // 로봇이 그리는 선 두께 (5 cm)
-    double m_penDisplayOffsetMm = 155.0; // TopView 표시 전용, 서버 전송에는 미사용
+    double m_strokeWidthMm = 60.0;   // 실측 도색 폭 (서버 pen_width_m=0.06과 일치)
+    double m_penDisplayOffsetMm = 172.0; // 표시 전용 (서버 pen_offset_m=0.172와 일치)
     motionprogram::Speeds m_speeds;
     // CCTV 가 준 정식 내부 파라미터 (K + plumb-bob 5계수). 왜곡 보정의 **유일한** 출처다.
     // ⚠️ 여기 있던 m_lensK1/m_lensK2(옛 2계수 경로)는 지웠다 — 같은 일을 하는 길이

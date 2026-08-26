@@ -315,7 +315,7 @@ qputenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000");
 - **서버가 중계 주소를 내려주기**: `LOGIN_OK` 에 선택적 `stream` 필드
   (`{base, channels}`) 를 더한다. 있으면 쓰고 없으면 QSettings 로 폴백.
   `cam_ip` 의 의미는 **바꾸지 말 것** — 바꾸면 PNO 경로가 깨진다.
-  서버 쪽 파일: `Server/src/router.cpp:87`, `Server/server_PROTOCOL.md:257`
+  서버 쪽 파일: `Server/src/router.cpp:87`, `Server/docs/PROTOCOL.md:257`
 - **채널별 캘리브레이션**: 채널마다 렌즈·각도가 다르므로 캘리브 번들도 채널별로
   가져야 한다. 지금은 채널 1개만 제대로 쓴다는 전제로 진행한다.
 - **4채널 동시 마커 검출**: 하지 말 것. 로봇은 한 채널에만 보인다.

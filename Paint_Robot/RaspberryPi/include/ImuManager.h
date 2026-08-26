@@ -31,6 +31,11 @@ public:
     void ResetYaw(float new_yaw = 0.0f);
 
     /**
+     * @brief Triggers a dynamic gyro Z offset recalibration in the background thread.
+     */
+    void Calibrate();
+
+    /**
      * @brief Gets current integrated Yaw heading angle in degrees.
      */
     float GetYaw();
@@ -45,6 +50,7 @@ private:
     int fd;
     std::atomic<bool> is_initialized;
     std::atomic<bool> rx_alive;
+    std::atomic<bool> trigger_calibration;
     std::thread worker_thread;
     std::mutex yaw_mutex;
 

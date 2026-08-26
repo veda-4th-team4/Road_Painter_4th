@@ -50,3 +50,6 @@ V-\[HW\] UART 통신-130726-071752.pdf
 # Scratch / temporary simulation scripts
 scratch/
 **/scratch/
+
+# Ignore etc directory containing presentation materials
+etc/

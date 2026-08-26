@@ -1,6 +1,8 @@
 #include "motionprogram.h"
 #include "robottiming.h"
 #include "paintgeometry.h"
+#include "paintdimensions.h"
+#include "paintprogress.h"
 #include "routeplan.h"
 #include "strokefont.h"
 #include "camcalib.h"
@@ -1349,7 +1351,136 @@ void testRobotTimingEstimate()
           "program estimate must sum read-only operation timing");
 }
 
+void testPaintProgressUsesSeparatePaintPaths()
+{
+    const QList<QList<QPointF>> paths{
+        {QPointF(0.0, 0.0), QPointF(1.0, 0.0)},
+        {QPointF(10.0, 0.0), QPointF(11.0, 0.0)}
+    };
+    const QList<bool> closed{false, false};
+
+    check(near(paintprogress::progressAlongPaths(paths, closed, QPointF(0.5, 0.0)), 0.25),
+          "first painted path midpoint must be 25% of painted length");
+    check(near(paintprogress::progressAlongPaths(paths, closed, QPointF(10.5, 0.0)), 0.75),
+          "pen-up travel gap must not count toward painted progress");
+}
+
+void testPaintProgressUsesPenPosition()
+{
+    const QList<QList<QPointF>> paths{
+        {QPointF(0.0, 0.0), QPointF(1.0, 0.0)}
+    };
+    const QList<bool> closed{false};
+
+    check(near(paintprogress::progressAlongPaths(paths, closed, QPointF(0.2, 0.0)), 0.2),
+          "paint progress must follow the nozzle projection");
+}
+
+void testFinishedDimensionEditorKeepsWireGeometrySemantic()
+{
+    // 중심선 획(H/V/직선/화살표 등): 서버가 60mm 폭의 양끝을 30mm씩
+    // 연장하므로, 저장·전송 길이 40mm가 사용자에게는 완성 100mm로 보여야 한다.
+    check(near(paintdimensions::finishedSegmentMm(40.0, 60.0, false), 100.0),
+          "a 40mm centre stroke with a 60mm tip must display as 100mm finished paint");
+
+    double stored = 0.0;
+    check(paintdimensions::storedSegmentMm(100.0, 60.0, false, &stored)
+              && near(stored, 40.0),
+          "entering a 100mm finished H/V stroke must retain a 40mm centre path");
+
+    // 사각형·삼각형·닫힌 자유도형은 편집점 자체가 이미 완성 외곽선이다.
+    check(near(paintdimensions::finishedSegmentMm(100.0, 60.0, true), 100.0),
+          "an outer-contour edge must display its stored finished length unchanged");
+    check(paintdimensions::storedSegmentMm(100.0, 60.0, true, &stored)
+              && near(stored, 100.0),
+          "editing an outer-contour edge must not subtract the tip width twice");
+
+    // 펜 폭보다 짧은 완성 선은 양의 중심 경로를 만들 수 없다.
+    check(!paintdimensions::storedSegmentMm(60.0, 60.0, false, &stored),
+          "a finished centre stroke must be longer than the measured paint width");
+
+    // O와 일반 원호는 중심 반지름을 전송하되 UI에는 도색 바깥 반지름도 알려준다.
+    check(near(paintdimensions::finishedOuterRadiusMm(70.0, 60.0, false), 100.0),
+          "a centreline O arc must expose its finished outer radius");
+    check(near(paintdimensions::finishedOuterRadiusMm(100.0, 60.0, true), 100.0),
+          "an outer-contour circle already stores its finished outer radius");
+}
+
 } // namespace
+
+// 실제 도색 바깥 크기를 재는 바운딩 박스.
+// 🔴 QRectF 로 모으면 조용히 0x0 이 된다 — QRectF(p, QSizeF(0,0)) 는 isNull() 이
+//    항상 참이라 united() 가 한 번도 안 불린다. 그 함정을 실제로 밟았어서,
+//    다시 QRectF 로 되돌리면 이 테스트가 잡도록 반례를 그대로 남긴다.
+void testPolylineBoundsDoesNotFallForNullRect()
+{
+    QList<QVector<QPointF>> polys;
+    polys.append(QVector<QPointF>{ QPointF(10, 20), QPointF(50, 20),
+                                   QPointF(50, 90), QPointF(10, 90) });
+    double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+    check(strokefont::polylineBounds(polys, &x0, &y0, &x1, &y1),
+          "polylineBounds must report success for a non-empty polyline");
+    check(near(x1 - x0, 40.0), "bounds width is 40 (QRectF::isNull trap)");
+    check(near(y1 - y0, 70.0), "bounds height is 70 (QRectF::isNull trap)");
+
+    // 점이 하나뿐이면 크기는 0 이지만 **성공**이어야 한다 (칠은 펜 폭만큼 된다).
+    QList<QVector<QPointF>> dot;
+    dot.append(QVector<QPointF>{ QPointF(7, 7) });
+    check(strokefont::polylineBounds(dot, &x0, &y0, &x1, &y1),
+          "a single point is still valid bounds");
+    check(near(x1 - x0, 0.0) && near(y1 - y0, 0.0), "single point spans zero");
+
+    check(!strokefont::polylineBounds(QList<QVector<QPointF>>(), &x0, &y0, &x1, &y1),
+          "empty input must report failure");
+}
+
+// 글자 높이 입력은 **완성 도색 높이**다 (변 길이 입력창과 같은 기준).
+// 서버가 도색 구간 양끝을 hw 씩 늘려 칠하므로 글리프는 펜 폭만큼 작아야 하고,
+// 배율은 em 1.0 이 아니라 **실제 잉크 세로 범위**로 나눠야 한다.
+void testTextHeightIsFinishedPaintHeight()
+{
+    const double penMm = 60.0, finishedMm = 340.0;
+
+    // (1) 완성 340 · 펜 60 -> 글리프 280. 변 길이와 같은 함수를 쓴다.
+    double glyphMm = 0.0;
+    check(paintdimensions::storedSegmentMm(finishedMm, penMm, false, &glyphMm),
+          "finished 340mm with a 60mm pen must be accepted");
+    check(near(glyphMm, 280.0), "finished 340 - pen 60 => glyph 280");
+
+    // (2) 완성 높이가 펜 폭 이하이면 글리프가 0 이하 -> 거부해야 한다.
+    double rejected = 0.0;
+    check(!paintdimensions::storedSegmentMm(penMm, penMm, false, &rejected),
+          "finished height equal to the pen width must be rejected");
+    check(!paintdimensions::storedSegmentMm(50.0, penMm, false, &rejected),
+          "finished height below the pen width must be rejected");
+
+    // (3) HANWHA 는 네 글자 다 em 세로를 채운다 -> 잉크 1.0.
+    double emW = 1.0;
+    const QList<strokefont::Stroke> hanwha =
+        strokefont::layout(QStringLiteral("HANWHA"), &emW);
+    check(!hanwha.isEmpty(), "HANWHA must lay out");
+    check(near(strokefont::inkHeightEm(hanwha), 1.0, 1e-9),
+          "HANWHA fills a full em vertically");
+
+    // (4) 세로 두께가 0 인 글자가 있다 — '-' 는 y=0.5 한 줄, '.' 는 y=0 점.
+    check(near(strokefont::inkHeightEm(
+                   strokefont::layout(QStringLiteral("-"), &emW)), 0.0, 1e-9),
+          "a lone dash has zero ink height");
+
+    // (5) 부분 높이 문자열("-." = y 0 ~ 0.5)에서 em 1.0 가정은 틀린다.
+    const QList<strokefont::Stroke> partial =
+        strokefont::layout(QStringLiteral("-."), &emW);
+    const double ink = strokefont::inkHeightEm(partial);
+    check(near(ink, 0.5, 1e-9), "dash+dot spans half an em");
+
+    const double paintedWithInk = ink * (glyphMm / ink) + penMm;   // 2-B (지금 방식)
+    const double paintedWithEm  = ink * (glyphMm / 1.0) + penMm;   // 2-A (em 1.0 가정)
+    check(near(paintedWithInk, finishedMm, 1e-9),
+          "ink-based scale paints exactly the requested finished height");
+    check(!near(paintedWithEm, finishedMm, 1.0),
+          "em-based scale would miss the requested height for partial-ink text");
+}
+
 
 int main(int argc, char **argv)
 {
@@ -1384,6 +1515,11 @@ int main(int argc, char **argv)
     testUndistortLensDataWarning();
     testMissingChannelResolution();
     testRobotTimingEstimate();
+    testPaintProgressUsesSeparatePaintPaths();
+    testPaintProgressUsesPenPosition();
+    testFinishedDimensionEditorKeepsWireGeometrySemantic();
+    testTextHeightIsFinishedPaintHeight();
+    testPolylineBoundsDoesNotFallForNullRect();
     if (failures == 0) {
         std::cout << "motionprogram_tests: PASS\n";
         return 0;

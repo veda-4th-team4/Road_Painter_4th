@@ -16,7 +16,7 @@
 // 기본 도형: 한 변 0.30m 정사각형. 변마다 노즐을 내렸다 올린다(획 4개).
 //   NOZZLE down -> MOVE(paint) -> NOZZLE up -> TURN  x4
 //   변마다 노즐을 끊는 이유: NOZZLE op이 노즐 제어의 단일 결정권이라
-//   (server_PROTOCOL.md "수신: PATH"), 내리고 올리는 동작이 실제로 먹는지가
+//   (docs/PROTOCOL.md "수신: PATH"), 내리고 올리는 동작이 실제로 먹는지가
 //   이 테스트의 핵심이다. 한붓그리기로 보고 싶으면 --continuous.
 //
 // ⚠️ 방향은 "로봇 자기 기준"이다. 로봇은 phase="draw" PATH를 받는 순간 IMU 현재

@@ -59,9 +59,9 @@ void PathFollower::SetDriftOffset(float offset_deg) {
 }
 
 uint32_t PathFollower::CalculateTurnSteps(float angle_deg) const {
-  // Turn angle with 1.030f (+3%) hardware calibration factor
+  // Turn angle with 1.050f hardware calibration factor (adjusted from 1.053f to fix 0.3-deg over-turn)
   float turn_circ = M_PI * wheelbase_m;
-  float arc_len = turn_circ * (std::fabs(angle_deg) * 1.030f / 360.0f);
+  float arc_len = turn_circ * (std::fabs(angle_deg) * 1.050f / 360.0f);
   float wheel_circ = M_PI * wheel_diameter_m;
   float steps = (arc_len / wheel_circ) * steps_per_rev * gear_ratio;
   return static_cast<uint32_t>(std::round(steps));
@@ -96,6 +96,7 @@ bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps,
   if (has_imu) {
     // IMU Closed-loop feedback termination
     float target_yaw = turn_start_imu_yaw + turn_target_angle_deg;
+
     float yaw_error = std::fabs(cur_imu_yaw - target_yaw);
 
     // Check if IMU reached within 0.25 deg of target angle OR step guard safety limit (1.35x target steps)
@@ -121,15 +122,24 @@ bool PathFollower::UpdateTurn(int32_t cur_left_steps, int32_t cur_right_steps,
     return true;
   }
 
-  // Turn in progress (adaptive speed: 400 sps fast turn, deceleration to 180 sps when < 4.0 deg remaining)
-  int16_t turn_sps = 400; 
-  if (has_imu) {
-    float target_yaw = turn_start_imu_yaw + turn_target_angle_deg;
-    float yaw_error = std::fabs(cur_imu_yaw - target_yaw);
-    if (yaw_error <= 4.0f) {
-      turn_sps = 180; // Fine precision deceleration
-    }
+  // Turn in progress
+  float base_turn_sps = 400.0f; // Raised to 400 SPS for large angles
+  if (std::fabs(turn_target_angle_deg) <= 10.0f) {
+    base_turn_sps = 200.0f; // Gentle turn speed for ALIGN micro-turns
   }
+
+  // 1-Step Deceleration logic for Turn
+  uint32_t remaining_steps = (turn_target_steps > progress_steps) ? (turn_target_steps - progress_steps) : 0;
+  uint32_t decel_threshold = (turn_target_steps * 8) / 100; // 8% remaining threshold
+  
+  float current_turn_sps = base_turn_sps;
+
+  // Apply deceleration only if it's a large turn where base speed is high
+  if (base_turn_sps > 250.0f && decel_threshold > 0 && remaining_steps <= decel_threshold) {
+    current_turn_sps = 250.0f; // 1-step floor turn speed at 250 SPS
+  }
+
+  int16_t turn_sps = static_cast<int16_t>(current_turn_sps);
 
   if (turn_target_angle_deg > 0.0f) {
     // Left turn: Left wheel backward (-sps), Right wheel forward (+sps)
@@ -153,8 +163,8 @@ bool PathFollower::TrimTurn(float target_yaw, float cur_imu_yaw, Msg_SetSpeed_t 
     return true; // Micro-trim complete!
   }
 
-  // Ultra-slow micro pulse speed at 120 sps
-  int16_t trim_sps = 120;
+  // Ultra-slow micro pulse speed (raised to 350 sps to prevent resonance)
+  int16_t trim_sps = 350;
   if (cur_imu_yaw < target_yaw) {
     // cur_imu_yaw < target_yaw (e.g. -90.70 deg < -90.00 deg) -> needs positive rotation back towards -90.00 deg
     out_speed.left_sps = -trim_sps;
@@ -168,8 +178,8 @@ bool PathFollower::TrimTurn(float target_yaw, float cur_imu_yaw, Msg_SetSpeed_t 
 }
 
 uint32_t PathFollower::CalculateMoveSteps(float dist_m) const {
-  // Straight move distance with 1.010f (+1%) hardware calibration factor
-  float abs_dist = std::fabs(dist_m) * 1.010f;
+  // Straight move distance calibration factor: 1.021f (calibrated from 15cm +2.8mm overshoot: 1.040 * 150.0 / 152.8 = 1.0209f)
+  float abs_dist = std::fabs(dist_m) * 1.021f;
   float steps = abs_dist * 15433.09f;
   return static_cast<uint32_t>(std::round(steps));
 }
@@ -211,13 +221,15 @@ bool PathFollower::UpdateMove(int32_t cur_left_steps, int32_t cur_right_steps,
   // Straight move velocity (positive dist_m -> +move_speed_m_s forward, negative dist_m -> -move_speed_m_s reverse)
   float target_v = (move_dist_m >= 0.0f) ? move_speed_m_s : -move_speed_m_s;
 
-  // Smooth Linear Ramp Deceleration: When 20% or less of target steps remains, linearly ramp down speed from 100% to 20%
+  // 1-Step Deceleration: When 8% or less of target steps remains, step down speed instantly
   uint32_t remaining_steps = move_target_steps - progress_steps;
-  uint32_t decel_threshold = move_target_steps / 5; // 20% remaining threshold
+  uint32_t decel_threshold = (move_target_steps * 8) / 100; // 8% remaining threshold
   if (decel_threshold > 0 && remaining_steps <= decel_threshold) {
-    float ratio = static_cast<float>(remaining_steps) / static_cast<float>(decel_threshold); // 1.0 (start) -> 0.0 (destination)
-    float speed_factor = 0.20f + 0.80f * ratio; // Linear interpolation: 100% -> 20%
-    target_v *= speed_factor;
+    float base_sps = (std::abs(move_speed_m_s) / (M_PI * wheel_diameter_m)) * steps_per_rev * gear_ratio;
+    float min_factor = 300.0f / (base_sps > 0.1f ? base_sps : 0.1f); // Raised to 300 SPS floor speed
+    if (min_factor > 1.0f) min_factor = 1.0f; // Do not exceed max speed
+
+    target_v *= min_factor; // Drop instantly to minimum speed
   }
 
   // Protocol v2 sign convention: positive drift_offset_deg = turn right (CW) -> negative angular velocity (w)
@@ -285,11 +297,11 @@ bool PathFollower::UpdateArc(int32_t cur_l_steps, int32_t cur_r_steps,
   int32_t dl = std::abs(cur_l_steps - arc_start_l_steps);
   int32_t dr = std::abs(cur_r_steps - arc_start_r_steps);
 
-  // Outer wheel completion evaluation: Prevents premature termination when r_in ~ 0
-  bool outer_completed = arc_is_left ? (static_cast<uint32_t>(dr) >= arc_target_r_steps)
-                                     : (static_cast<uint32_t>(dl) >= arc_target_l_steps);
+  uint32_t outer_progress = arc_is_left ? static_cast<uint32_t>(dr) : static_cast<uint32_t>(dl);
+  uint32_t outer_target = arc_is_left ? arc_target_r_steps : arc_target_l_steps;
 
-  if (outer_completed) {
+  // Outer wheel completion evaluation: Prevents premature termination when r_in ~ 0
+  if (outer_progress >= outer_target) {
     out_speed.left_sps = 0;
     out_speed.right_sps = 0;
     is_arc = false;
@@ -297,6 +309,7 @@ bool PathFollower::UpdateArc(int32_t cur_l_steps, int32_t cur_r_steps,
     return true;
   }
 
+  // Pure constant-speed Arc execution (no deceleration per user request)
   out_speed.left_sps = arc_sps_l;
   out_speed.right_sps = arc_sps_r;
   return false;

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
@@ -63,6 +64,9 @@ bool LedStripManager::Open()
 {
     if (fd_ >= 0)
         return true;
+
+    /* Enforce GPIO 12 as PWM0_0 (ALT0) to fix boot-time overrides */
+    std::system("raspi-gpio set 12 a0 > /dev/null 2>&1");
 
     fd_ = ::open(dev_path_.c_str(), O_WRONLY);
     if (fd_ < 0) {

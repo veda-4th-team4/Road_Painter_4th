@@ -20,6 +20,7 @@ ImuManager::ImuManager(uint8_t i2c_addr)
       fd(-1),
       is_initialized(false),
       rx_alive(false),
+      trigger_calibration(false),
       current_yaw(0.0f),
       gyro_z_offset(0.0)
 {
@@ -110,6 +111,11 @@ void ImuManager::ResetYaw(float new_yaw) {
     std::cout << "[ImuManager] Yaw heading reset to: " << new_yaw << " deg" << std::endl;
 }
 
+void ImuManager::Calibrate() {
+    trigger_calibration = true;
+    std::cout << "[ImuManager] Recalibration requested..." << std::endl;
+}
+
 float ImuManager::GetYaw() {
     std::lock_guard<std::mutex> lock(yaw_mutex);
     return current_yaw;
@@ -126,6 +132,29 @@ void ImuManager::imu_loop() {
     auto last_time = std::chrono::high_resolution_clock::now();
 
     while (rx_alive) {
+        if (trigger_calibration) {
+            std::cout << "[ImuManager] Recalibrating Gyro Z offset dynamically... Keep robot still!" << std::endl;
+            double offset_z_sum = 0;
+            int valid_samples = 0;
+            bool err = false;
+            for (int i = 0; i < 500; i++) {
+                short rz = read_raw_register(REG_GYRO_ZOUT_H, err);
+                if (!err) {
+                    offset_z_sum += rz;
+                    valid_samples++;
+                }
+                usleep(5000);
+            }
+            if (valid_samples > 0) {
+                gyro_z_offset = offset_z_sum / valid_samples;
+                std::cout << "[ImuManager] Dynamic Calibration complete! Gyro Z Offset: " << gyro_z_offset << std::endl;
+                // Note: We deliberately DO NOT reset current_yaw to 0.0f here so the global heading tracking is preserved!
+            }
+            trigger_calibration = false;
+            last_time = std::chrono::high_resolution_clock::now();
+            continue;
+        }
+
         auto current_time = std::chrono::high_resolution_clock::now();
         std::chrono::duration<float> elapsed = current_time - last_time;
         float dt = elapsed.count();

@@ -27,10 +27,11 @@
 //               + 주행 중이면 DRIFT. POS 원본은 QT에 중계하지 않는다 (POSE만 사용)
 //   CCTV  -> H_MATRIX  -> 캘리브레이션 번들(K,D,H_floor,H_marker) 수신,
 //               로그인 사용자에 영속 저장 + QT 중계
+//   CCTV  -> ZONE_EVENT Enter -> ROBOT TLS 세션으로 중계 (사람 진입 음성 경보)
 //   ROBOT/CCTV 접속·해제 -> QT에 PEERS{"robot":bool,"cctv":bool} 통지
 //               (QT 접속 시에도 현재 스냅샷 1회 전송)
 //
-// 🔴 로봇 대면 규격은 docs/PROTOCOL_v2_ROBOT.md가 정본이다. 아래 주석의 §n은
+// 🔴 로봇 대면 규격은 docs/PROTOCOL.md가 정본이다. 아래 주석의 §n은
 //   그 문서의 절 번호다. 튜닝 상수는 이 파일에 없다 - 전부 params.hpp/
 //   config/params.json에 있다 (params().xxx로 읽는다).
 #include "calib.hpp"
@@ -152,7 +153,7 @@ private:
     // ⚠️ 2026-08-13부터 QT도 이 방식을 개시할 수 있다. 예전 주석의 "calibFromQt_는
     //    이 방식에서 항상 false"는 더 이상 사실이 아니다 - 그 전제 위에 서 있던
     //    것들(세션이 CALIB_DONE에서 끝난다, 타임아웃에 Qt 제약이 없다)이 전부
-    //    바뀌었다. docs/ROBOT_ODOMETRY_HOMOGRAPHY_REQUEST_QT_20260813.md 참고.
+    //    바뀌었다. docs/CALIBRATION.md 참고.
     //
     // QT/ADMIN이 CALIB_START{method:"robot_motion", m_cm, n_cm, start_corner}를
     // 보내면 여기로 분기한다 (startCalib() 내부에서 method를 보고 갈라짐).

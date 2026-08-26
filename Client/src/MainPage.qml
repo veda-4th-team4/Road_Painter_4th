@@ -1274,7 +1274,7 @@ Item {
                                 }
                             }
                             Text {
-                                text: "mm"
+                                text: "mm 완성"
                                 color: Theme.muted
                                 font.pixelSize: 10
                                 font.family: Theme.fontFamily
@@ -1286,8 +1286,10 @@ Item {
                                 enabled: !Backend.jobActive
                                 ToolTip.visible: hovered
                                 ToolTip.text: "붓이 지나갈 획(중심선)으로 넣습니다.\n" +
-                                              "글자 높이는 붓 폭(" + Backend.strokeWidthMm.toFixed(0) +
-                                              "mm)의 2.5배 이상 권장"
+                                              "입력값은 완성 도색 높이입니다 — 붓 폭까지 포함한,\n" +
+                                              "실제로 칠해지는 세로 크기.\n" +
+                                              "붓 폭(" + Backend.strokeWidthMm.toFixed(0) +
+                                              "mm)의 3.5배 이상 권장"
                                 onClicked: tsCol.putText()
                             }
                         }
@@ -1415,7 +1417,9 @@ Item {
 
                         function putText() {
                             const h = Number(textHeight.text)
-                            if (!textInput.text.length || !isFinite(h) || h < 20) return
+                            // 하한 판정은 C++ 이 한다 — 붓 폭 기준이라 여기서 막으면
+                            // 조작자가 사유를 못 본다 (변 길이 입력창과 같은 방식).
+                            if (!textInput.text.length || !isFinite(h) || h <= 0) return
                             Backend.addTextWorldMm(textInput.text, h, false)
                         }
                     }
@@ -2876,7 +2880,7 @@ Item {
                         accent: Math.abs(Backend.strokeWidthMm - 60) < 0.01
                         onClicked: Backend.strokeWidthMm = 60
                         ToolTip.visible: hovered
-                        ToolTip.text: "60 mm 직각 팁"
+                        ToolTip.text: "60 mm 실측 도장 폭 (기본)"
                     }
                     Text {
                         text: "직접"
@@ -2992,6 +2996,18 @@ Item {
                                 penDisplayOffsetField.text = Backend.penDisplayOffsetMm.toFixed(0)
                         }
                     }
+                }
+
+                Text {
+                    width: parent.width
+                    text: "프로젝트 서버 기준값: 도장 폭 60 mm · 중심-펜 거리 172 mm. "
+                          + "Qt와 서버는 이 값을 자동 동기화하지 않으므로 서버 설정을 바꾸면 여기에도 같은 값을 입력하세요."
+                    color: (Math.abs(Backend.strokeWidthMm - 60) < 0.01
+                            && Math.abs(Backend.penDisplayOffsetMm - 172) < 0.01)
+                           ? Theme.muted : Theme.warn
+                    font.pixelSize: 10
+                    font.family: Theme.fontFamily
+                    wrapMode: Text.WordWrap
                 }
 
                 // ── 로봇 속도 ──────────────────────────────────────────

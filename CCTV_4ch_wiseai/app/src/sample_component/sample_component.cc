@@ -484,9 +484,8 @@ bool SampleComponent::Initialize() {
   try {
     if (central_tls_sender_init(CENTRAL_TLS_SERVER_IP, CENTRAL_TLS_SERVER_PORT,
                                 CENTRAL_TLS_CA_FILE) == 0) {
-      // Wired first, Wi-Fi as the fallback candidate -- see app_config.h's
-      // CENTRAL_TLS_SERVER_IP_FALLBACK comment for why (DHCP-stability,
-      // AND the current cert only verifying against the Wi-Fi address).
+      // The deployed/certificate-verified .8 address is primary. The wired .2
+      // candidate remains available after its SAN is added to the certificate.
       central_tls_sender_set_fallback(CENTRAL_TLS_SERVER_IP_FALLBACK);
       printf("[ArucoPosePNM] init: central TLS -> %s:%d (fallback %s)\n",
              CENTRAL_TLS_SERVER_IP, CENTRAL_TLS_SERVER_PORT, CENTRAL_TLS_SERVER_IP_FALLBACK);
@@ -2853,14 +2852,14 @@ void SampleComponent::SendPosePackets(int ch,
           {d.corners2d[2].x, d.corners2d[2].y},
           {d.corners2d[3].x, d.corners2d[3].y},
       };
-      // +1: server_PROTOCOL.md's channel convention (v0.4, "채널 규약") is
+      // +1: docs/PROTOCOL.md's channel convention (v0.4, "채널 규약") is
       // explicit that every wire-facing ch is 1-based, matching CH1..CH4 on
       // the camera's own web UI -- `ch` here is this app's internal 0-based
       // array index and was going out unconverted. The server's default (and
       // POS's) active channel is 1, so channel 0's robot POS packets were
       // being silently dropped by the server's active-channel gate every
       // time -- found 2026-08-11 cross-checking against the live
-      // server_PROTOCOL.md on the Pi, not just the historical action-items
+      // docs/PROTOCOL.md on the Pi, not just the historical action-items
       // doc (docs/08.06/CCTV_ACTION_ITEMS_20260806.md C-1), whose own example
       // code left the base/offset unstated.
       central_tls_sender_send_pos(ch + 1, central_corners);
@@ -4774,7 +4773,7 @@ bool SampleComponent::HandleCentral(const char* cmd) {
   // C-3) and this app does not re-serialise it from homography_/calib_'s own
   // state. This app, unlike cctv_app, actually HAS K/D/H_marker per channel
   // (homography_mapper.h) and could assemble the bundle itself — deliberately
-  // not done here: server_PROTOCOL.md's mm-vs-m field-by-field convention
+  // not done here: docs/PROTOCOL.md's mm-vs-m field-by-field convention
   // (H_floor/H_marker stay mm, only marker_height_m converts) needs its own
   // pass, and it's not yet decided whether that should fire automatically on
   // every calibration change or stay operator-triggered like this. Passthrough
@@ -4940,7 +4939,7 @@ void SampleComponent::ReportCentral(const char* action, const char* detail) cons
  * smaller vocabulary than the RPi dashboard's, and not funnelled through
  * DispatchCommand()/HandleCentral() above: those answer commands from the
  * OTHER transport (pose_sender), and CALIB_START/SELECT_CHANNEL arrive bare
- * (no "CENTRAL_" prefix, per server_PROTOCOL.md) so mixing the two tables
+ * (no "CENTRAL_" prefix, per docs/PROTOCOL.md) so mixing the two tables
  * would risk a collision with an unrelated dashboard command.
  *
  * SELECT_CHANNEL is accepted and acknowledged but otherwise a no-op here:
@@ -5629,7 +5628,7 @@ void SampleComponent::ReportCentralCapture(int ch, int point_index, bool ok,
                                            const char* reason,
                                            const char* request_id) const {
   char json[320];
-  // ch 는 와이어로 나갈 때 다시 1-based (server_PROTOCOL.md "채널 규약").
+  // ch 는 와이어로 나갈 때 다시 1-based (docs/PROTOCOL.md "채널 규약").
   // reason 은 이 파일이 만든 고정 문자열만 들어온다 — 네트워크에서 온 문자열을
   // 그대로 되돌려 보내지 않는다(JSON 이스케이프가 필요해진다).
   snprintf(json, sizeof(json),

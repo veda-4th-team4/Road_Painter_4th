@@ -248,6 +248,7 @@ Rectangle {
             if (Backend.jobActive) return
             vertexEditor.close()
             edgeEditor.edgeIndex = index
+            edgeEditor.validationMessage = ""
             edgeField.text = mm.toFixed(mm >= 100 ? 0 : 1)
             edgeEditor.x = Math.max(6, Math.min(pane.width - edgeEditor.width - 6,
                                                 vx - edgeEditor.width / 2))
@@ -427,34 +428,50 @@ Rectangle {
         id: edgeEditor
         z: 6
         visible: false
-        width: editRow.implicitWidth + 16
-        height: 40
+        width: Math.max(editRow.implicitWidth + 16, validationText.implicitWidth + 16)
+        height: validationMessage.length > 0 ? 62 : 40
         radius: 6
         color: Theme.surface
         border.color: Theme.accent
         border.width: 1
         property int edgeIndex: -1
         property bool activeEdit: false
+        property string validationMessage: ""
 
         function apply() {
             const v = Number(edgeField.text)
-            if (!isFinite(v) || v <= 0) { close(); return }
+            if (!isFinite(v) || v <= 0) {
+                validationMessage = "0보다 큰 완성 길이를 입력하세요."
+                edgeField.selectAll()
+                edgeField.forceActiveFocus()
+                return
+            }
             activeEdit = true
-            vv.setEdgeLengthMm(edgeIndex, v)
+            const applied = vv.setEdgeLengthMm(edgeIndex, v)
             activeEdit = false
+            if (!applied) {
+                validationMessage = "완성 길이는 펜 폭("
+                                  + Backend.strokeWidthMm.toFixed(0) + " mm)보다 길어야 합니다."
+                edgeField.selectAll()
+                edgeField.forceActiveFocus()
+                return
+            }
             close()
         }
         function close() {
             visible = false
             edgeIndex = -1
+            validationMessage = ""
         }
 
         Row {
             id: editRow
-            anchors.centerIn: parent
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.top: parent.top
+            anchors.topMargin: 6
             spacing: 6
             Text {
-                text: "완성 외곽 · 변 " + (edgeEditor.edgeIndex + 1)
+                text: "완성 도색 · 구간 " + (edgeEditor.edgeIndex + 1)
                 color: Theme.muted
                 font.pixelSize: 11
                 font.family: Theme.fontFamily
@@ -503,6 +520,17 @@ Rectangle {
                 ToolTip.text: "취소 (Esc)"
                 onClicked: edgeEditor.close()
             }
+        }
+        Text {
+            id: validationText
+            visible: edgeEditor.validationMessage.length > 0
+            text: edgeEditor.validationMessage
+            color: Theme.danger
+            font.pixelSize: 10
+            font.family: Theme.fontFamily
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: 5
         }
     }
 

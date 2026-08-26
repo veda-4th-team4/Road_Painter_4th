@@ -32,7 +32,7 @@ enum class LedState {
  */
 class LedStripManager {
 public:
-    static constexpr int kDefaultLedCount = 7;
+    static constexpr int kDefaultLedCount = 5;
     static constexpr int kFrameIntervalMs = 33;   // ~30 fps
 
     explicit LedStripManager(int led_count = kDefaultLedCount,
