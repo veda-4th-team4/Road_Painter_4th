@@ -44,16 +44,14 @@ void ParseWiseAiMetadata(const std::string& xml, int channel,
 
 // One <tt:Event> whose Topic names IvaArea -- a WiseAI IVA-area rule firing
 // (object entered/exited/intruded the polygon set via PUT
-// /configuration/ivaarea). See ParseWiseAiIvaAreaEvents()'s comment: this is
-// UNVERIFIED against a real capture, written from WiseAI.html's documented
-// ONVIF event schema alone.
+// /configuration/ivaarea). The shape below was confirmed against live
+// Enter/Exit captures on 2026-08-19; see the parser declaration below.
 struct WiseAiIvaAreaEvent {
   std::string rule_name;    // <tt:Source> SimpleItem "RuleName" -- matches
                              // definedArea[].name from the PUT that set it up
   std::string object_id;    // <tt:Data> SimpleItem "ObjectId"
-  std::string action;       // <tt:Data> SimpleItem "Action" -- "Enter"/"Exit"/
-                             // "Intrusion"/... per the doc; exact vocabulary
-                             // for THIS event unconfirmed until captured live
+  std::string action;       // <tt:Data> SimpleItem "Action" -- live-confirmed
+                             // "Enter"/"Exit" (other configured modes pass through)
   bool state = false;       // <tt:Data> SimpleItem "State"
   // <tt:Message UtcTime="..."> -- when WiseAI decided the rule fired, epoch
   // milliseconds, 0 if absent. Same clock as WiseAiDetection::utc_ms, which
@@ -74,15 +72,3 @@ struct WiseAiIvaAreaEvent {
 // WiseAI.html's documented ONVIF event schema alone, before that capture.
 void ParseWiseAiIvaAreaEvents(const std::string& xml,
                               std::vector<WiseAiIvaAreaEvent>* out);
-
-struct PixelPoint {
-  float x = 0.0f, y = 0.0f;
-};
-
-// Rough, pixel-space distance from a point to a polygon: 0 if the point is
-// inside, otherwise the distance to the nearest edge. NOT a world-mm
-// distance -- there is no homography involved, so this is only a proxy
-// (screen distance, not physical distance) good enough for a rough read.
-// Returns -1 if the polygon has fewer than 3 points.
-float PointToPolygonDistancePx(float px, float py,
-                                const std::vector<PixelPoint>& polygon);

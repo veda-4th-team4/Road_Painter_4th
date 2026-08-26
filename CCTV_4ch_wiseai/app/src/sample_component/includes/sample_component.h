@@ -40,7 +40,7 @@ class SampleComponent : public Component, public ISampleComponent {
 
   // Raw-video path: NV12 Y plane -> ArUco detect -> CAM_POSE over TCP.
   void ProcessRawVideo(Event* event);
-  // WiseAI bbox 이벤트 — 지금은 원문 XML을 로그로 남기기만 한다 (실측 전).
+  // WiseAI bbox/event metadata -> foot-point zone and proximity processing.
   void ProcessWiseAiMetadata(Event* event);
   // t_capture / queue_ms travel with every packet so the server can see the
   // frame's true age, not just this channel's detect time.
@@ -480,10 +480,6 @@ class SampleComponent : public Component, public ISampleComponent {
     char reason[192];
   } anchor_cmd_;
 
-  // BISECT 2026-08-18 step 2: member re-enabled (+ constructor init only,
-  // command handler + BuildStatusJson emission still #if 0'd in the .cc) to
-  // test whether SampleComponent's size/layout alone is the crash trigger.
-  //
   // Result of the most recent IVA_SYNC, in /status for the same reason
   // hg_map_/anchor_cmd_ are: the operator drives this camera by curl, and a
   // command whose answer only exists as a stdout line is invisible to them.
