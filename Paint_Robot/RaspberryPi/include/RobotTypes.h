@@ -38,7 +38,7 @@ typedef enum {
 
 /** @brief RPi에서 설정하여 부팅 시 STM32로 동적 전송할 서보모터 PWM 펄스 폭 [us] */
 #define RPI_SERVO_OFF_US 1600U  /* 노즐 OFF (UP) 위치 */
-#define RPI_SERVO_ON_US  1200U  /* 노즐 ON (DOWN) 위치 (200us 줄인 각도) */
+#define RPI_SERVO_ON_US  1300U  /* 노즐 ON (DOWN) 위치 (1300us 안착) */
 
 #define UART_CMD_SET_SERVO_CONFIG 0x07
 

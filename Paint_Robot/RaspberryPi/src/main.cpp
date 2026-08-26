@@ -92,6 +92,19 @@ int main(int argc, char **argv) {
   uint8_t manual_nozzle = 0;
   uint8_t auto_nozzle = 0;
 
+  auto smooth_lower_nozzle = [&](SerialManager &comm) {
+      comm.SendControlNozzle(1);
+      const uint16_t start_us = RPI_SERVO_OFF_US;
+      const uint16_t end_us   = RPI_SERVO_ON_US;
+      const int total_steps = 25; // 25 steps * 20ms = 500ms smooth transition
+      for (int i = 1; i <= total_steps; ++i) {
+          uint16_t cur_down_us = start_us - static_cast<uint16_t>((static_cast<int32_t>(start_us - end_us) * i) / total_steps);
+          comm.SendSetServoConfig(RPI_SERVO_OFF_US, cur_down_us);
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+      comm.SendSetServoConfig(RPI_SERVO_OFF_US, RPI_SERVO_ON_US);
+  };
+
   while (true) {
       // 1. Run network loop to check sockets and reconnect if needed
       net_manager.Process();
@@ -161,7 +174,7 @@ int main(int argc, char **argv) {
           } else if (cmd == "NOZZLE_DOWN" || cmd == "PAINT_ON") {
               manual_override = true; // §4.1 Fix: Enable manual override so IDLE manual nozzle persists
               manual_nozzle = 1;
-              robot_comm.SendControlNozzle(1);
+              smooth_lower_nozzle(robot_comm);
           } else if (cmd == "NOZZLE_UP" || cmd == "PAINT_OFF") {
               manual_override = true; // §4.1 Fix: Enable manual override so IDLE manual nozzle persists
               manual_nozzle = 0;
@@ -376,11 +389,17 @@ int main(int argc, char **argv) {
 
                       if (current_seg.op == "nozzle") {
                           auto_nozzle = current_seg.down ? 1 : 0;
-                          robot_comm.SendControlNozzle(auto_nozzle);
-                          std::cout << GetTimestampStr() << "[MAIN NOZZLE] Op " << active_op_index 
-                                    << " set (down=" << (current_seg.down ? "true" : "false") 
-                                    << ", 2500ms delay)..." << std::endl;
-                          std::this_thread::sleep_for(std::chrono::milliseconds(2500)); // 2500ms (2.5s) actuator & camera settling delay
+                          if (current_seg.down) {
+                              std::cout << GetTimestampStr() << "[MAIN NOZZLE] Op " << active_op_index 
+                                        << " Soft-Landing DOWN (500ms ramp + 2000ms delay)..." << std::endl;
+                              smooth_lower_nozzle(robot_comm);
+                              std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+                          } else {
+                              robot_comm.SendControlNozzle(0);
+                              std::cout << GetTimestampStr() << "[MAIN NOZZLE] Op " << active_op_index 
+                                        << " set UP (2500ms delay)..." << std::endl;
+                              std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+                          }
                           // R-4: Do NOT send SendReady here! AdvanceSegment() lets next loop iteration send READY(active_op_index + 1)
                           path_follower.AdvanceSegment();
                       } else if (current_seg.op == "move") {
