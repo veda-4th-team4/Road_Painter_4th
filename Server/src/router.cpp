@@ -469,7 +469,7 @@ void Router::onReady(int k) {
     // 오도메트리 캘리 경로는 별도 핸드셰이크를 탄다 (CALIB_CAPTURE ack까지
     // GO를 미룸) - 아래 도색용 판정 로직(ALIGN/MORE 대기 창)과는 무관하다.
     // planActive_는 sendPath()가 이미 세워뒀으므로 이 분기는 그 체크보다
-    // 먼저 와야 한다 (docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md §3).
+    // 먼저 와야 한다 (docs/CALIBRATION.md '오도메트리 주행 방식').
     if (activePhase_ == "calib") {
         onCalibReady(k);
         return;

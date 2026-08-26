@@ -1,8 +1,7 @@
 // 로봇 오도메트리 주행 캘리 회귀 테스트 (2026-08-12 신설).
 //   make odo_calib_test && ./tools/odo_calib_test
 //
-// 규격: docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md (정본),
-//       docs/ROBOT_ODOMETRY_HOMOGRAPHY_PLAN_20260811.md.
+// 규격: docs/CALIBRATION.md '오도메트리 주행 방식'.
 //
 // Router(TLS 연결·뮤텍스)를 띄우지 않고 ops_builder.hpp의 순수 함수만 테스트한다
 // (buildCalibRectOps/odoReadyToPoint/odoPointWorldMm) - 이 세션의 매칭 키·안전

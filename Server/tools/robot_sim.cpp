@@ -1,5 +1,5 @@
 // 로봇 + CCTV 대역 시뮬레이터 (서버 알고리즘 드라이런용) - TCP/TLS
-// 🔴 프로토콜 v2 (server-driven) - 규격: docs/PROTOCOL_v2_ROBOT.md
+// 🔴 프로토콜 v2 (server-driven) - 규격: docs/PROTOCOL.md
 //
 // 목적: 실제 로봇 없이 서버의 주행 알고리즘 전체를 닫힌 루프로 돌려본다.
 //   서버가 보낸 PATH를 실행 -> 그 결과 위치를 POS로 되돌려줌 -> 서버가 그걸 보고

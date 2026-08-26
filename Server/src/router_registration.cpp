@@ -1,6 +1,6 @@
 // 채널 간 정합(cross-channel registration) 수집 세션 (2026-08-15 신설).
 //
-// 규격: docs/REGISTER_WIRE_20260815.md (이 패치와 함께 추가).
+// 규격: docs/CALIBRATION.md '채널 간 정합'.
 // 카메라 쪽 구현: ArucoPosePNM_4ch, homography_mapper.h/.cc
 //   (StartRegistration/AddCorrespondencePoint/FinishRegistration/ApplyRegistration),
 //   sample_component.cc (CentralRegisterCapture/Done/Cancel).

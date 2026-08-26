@@ -1,5 +1,9 @@
 # RTSP 4채널 패스스루 중계
 
+> **카메라 영상 중계는?** 에 답하는 문서.
+> 관련: [../README.md](../README.md) · [docs/PROTOCOL](../docs/PROTOCOL.md) (`LOGIN_OK.stream`)
+
+
 카메라(PNM-C16083RVQ, 4채널 멀티디렉셔널) → **이 서버** → Qt 클라이언트로 영상을
 넘기는 중계. MediaMTX 를 써서 **디코드·재인코딩 없이 그대로 재발행**한다.
 

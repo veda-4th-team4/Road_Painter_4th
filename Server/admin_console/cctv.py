@@ -457,7 +457,7 @@ def set_calib_channel(ch):
     염두에 둔 문구였다). 그래도 이 명령은 여전히 필요하다: 서버가 지금 어느
     채널의 POS만 받아들일지(그리고 어느 채널 캘리브레이션으로 좌표를 바꿀지)를
     이걸로 정하기 때문이다 — 안 보내면 로봇 마커가 실제로 보이는 채널과 서버의
-    activeChannel이 어긋나서 POS가 조용히 버려진다(server_PROTOCOL.md "채널 규약").
+    activeChannel이 어긋나서 POS가 조용히 버려진다(docs/PROTOCOL.md "채널 규약").
     """
     global _calib_channel
     try:
@@ -2476,7 +2476,7 @@ PAGE = """<!doctype html>
     <p class="sub">로봇이 알려진 크기의 사각형을 돌며 정지점마다 CCTV가 마커 픽셀을 캡처하고,
        그 대응점으로 <code>H_marker</code>를 직접 구하는 방식입니다.</p>
     <div class="hint">
-      wire 규격(확정본): 파이 <code>~/Road_Painter_4th/Server/docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md</code>
+      wire 규격(확정본): 파이 <code>~/Road_Painter_4th/Server/docs/CALIBRATION.md</code>
     </div>
   </div>
 
@@ -2586,7 +2586,7 @@ PAGE = """<!doctype html>
       <b>로봇 탭(조이스틱)으로 로봇을 겹침 구역에 직접 몰 것</b> — 그동안 서버가
       <code>REGISTER_CAPTURE</code>를 주기적으로 반복 전송하고, 로봇이 실제로 두
       채널 시야 안에 있을 때만 카메라가 성공으로 답합니다.<br>
-      wire 규격: <code>~/Road_Painter_4th/Server/docs/REGISTER_WIRE_20260815.md</code>
+      wire 규격: <code>~/Road_Painter_4th/Server/docs/CALIBRATION.md</code>
     </div>
     <div class="hint">
       ⚠️ 정합은 두 채널 모두 <b>오도메트리를 먼저 완주</b>하고, <b>Odometry 탭에서
@@ -5706,7 +5706,7 @@ function fillCentralHmatrixTemplate(outId, noteId) {
   missing.push(`image_size (기준영상 없음 — ${size[0]}×${size[1]} 으로 가정)`);
 
   const bundle = {
-    // ch는 payload 최상위에 실어야 한다(server_PROTOCOL.md, docs/08.06/
+    // ch는 payload 최상위에 실어야 한다(docs/PROTOCOL.md, docs/08.06/
     // CCTV_ACTION_ITEMS_20260806.md C-3) — 안 실으면 서버가 전부 채널 1로
     // 보고, 4채널을 캘리해도 마지막 하나만 남는다. 그때의 자동 경로
     // (push_calib_to_server)는 이미 이렇게 하고 있었는데, 이 수동 버튼은
@@ -5734,7 +5734,7 @@ function fillCentralHmatrixTemplate(outId, noteId) {
     // 서버가 시차 보정에 쓰는 값. **mm 그대로** 싣는다 (2026-08-13 변경).
     //
     // 예전에는 이 필드만 m 로 바꿔 실었다("서버 스키마가 그렇다"). 그 근거가
-    // 지금은 반대다: wire 규격 §6, ROBOT_ODOMETRY_HOMOGRAPHY.md, EXEC_PLAN,
+    // 지금은 반대다: wire 규격, docs/CALIBRATION.md,
     // 서버팀 회신(REPLY_SERVER §166 "marker_height_mm처럼")이 전부 mm 이고,
     // 카메라가 주행 캘리에서 직접 조립해 올리는 번들(SendCalibBundle)도 이미
     // marker_height_mm 이다. m 로 쓰는 곳은 옛 TESTING.md 픽스처와 router.cpp
@@ -5794,7 +5794,7 @@ function fillCentralHmatrixLegacy() {
 
   const bundle = {
     // ch는 calib "안"이 아니라 payload 최상위(calib과 형제)에 실어야 한다
-    // (server_PROTOCOL.md, C-3) — 2026-08-11 발견, fillCentralHmatrixTemplate와
+    // (docs/PROTOCOL.md, C-3) — 2026-08-11 발견, fillCentralHmatrixTemplate와
     // 같은 이유로 여기도 빠져 있었다.
     ch: curCh() + 1,   // 1-based
     calib: {
