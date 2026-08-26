@@ -33,7 +33,7 @@ const char* central_tls_sender_active_ip(void);
 
 // ch is carried as payload.ch (see CCTV_ACTION_ITEMS_20260806.md C-1) so the
 // server does not silently attribute every channel's robot marker to
-// channel 1. ch is 1-based here (CH1..CH4, server_PROTOCOL.md's "채널 규약")
+// channel 1. ch is 1-based here (CH1..CH4, docs/PROTOCOL.md's "채널 규약")
 // -- callers pass this app's own 0-based channel index straight through
 // unconverted for a while (2026-08-11: fixed at the one call site, in
 // ProcessRawVideo/SendPosePackets) and channel 1 (index 0)'s POS silently

@@ -1,7 +1,6 @@
 // 로봇 오도메트리 주행 호모그래피 세션 (2026-08-12 신설).
 //
-// 규격: docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md (정본),
-//       docs/ROBOT_ODOMETRY_HOMOGRAPHY_PLAN_20260811.md (설계 근거).
+// 규격·설계 근거: docs/CALIBRATION.md '오도메트리 주행 방식'.
 //
 // router_calib.cpp(정적 앵커 캘리, 2026-08-10)과 calibActive_/calibReqId_/
 // calibCh_/calibStartMs_/calibFromQt_를 공유한다 - busy 판정이 method 무관하게
