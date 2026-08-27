@@ -24,7 +24,7 @@
 //   --arc <R>       사각형 대신 반지름 R의 반원(ARC) 하나를 도색 (기본 끄기)
 //                   -> 서버가 R_robot = sqrt(R^2 - 0.155^2)로 바꿔 보내는지,
 //                      그 결과 펜이 반지름 R의 호를 그리는지 검증
-//                      (docs/PROTOCOL_v2_ROBOT.md §5.4 / §11 남은항목 1)
+//                      (docs/PATH_GEOMETRY.md '반지름 치환')
 //   --port <n>      서버 포트 (기본 9000)
 #include "tls_client.hpp"
 #include <cmath>

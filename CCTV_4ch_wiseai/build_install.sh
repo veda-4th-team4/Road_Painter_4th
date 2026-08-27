@@ -159,6 +159,22 @@ if [ "$INSTALL_ONLY" = "1" ]; then
 else
 
 echo "=== [1/6] 빌드 ($APP_NAME, SOC=$SOC) ==="
+# 중앙 TLS는 인증서가 없으면 의도적으로 offline 상태를 유지한다. 빌드는 성공하지만
+# ZONE_EVENT/POS가 중앙 서버에 전혀 가지 않는 조용한 실패가 되므로 패키징 전에
+# 공개 인증서를 반드시 넣는다. 현장별 인증서는 CENTRAL_TLS_CERT로 덮어쓸 수 있고,
+# 모노레포 기본값은 중앙 서버가 실제 사용하는 공개 인증서다.
+CENTRAL_CERT_DST="$APP_DIR/app/res/cert/central_server.crt"
+CENTRAL_CERT_SRC="${CENTRAL_TLS_CERT:-$APP_DIR/../Server/certs/server.crt}"
+if [ -s "$CENTRAL_CERT_SRC" ]; then
+  mkdir -p "$(dirname "$CENTRAL_CERT_DST")"
+  cp "$CENTRAL_CERT_SRC" "$CENTRAL_CERT_DST"
+  echo "  중앙 TLS 인증서 포함: $CENTRAL_CERT_SRC"
+elif [ ! -s "$CENTRAL_CERT_DST" ]; then
+  echo "중앙 TLS 인증서가 없습니다: $CENTRAL_CERT_SRC"
+  echo "CENTRAL_TLS_CERT=/path/to/server.crt 를 지정하거나 Server/certs/server.crt 를 준비할 것"
+  exit 1
+fi
+
 # 기본은 증분 빌드. app/build 를 그대로 두면 make 가 바뀐 파일만 다시 컴파일한다.
 #
 # 예전에는 매번 build 를 build_stale 로 밀어내고 빈 디렉터리를 새로 만들었다.
@@ -187,7 +203,7 @@ mkdir -p app/build
 docker run --rm -v "$APP_DIR:/opt/$APP_NAME" -w "/opt/$APP_NAME" \
   -e XAPPN="$APP_NAME" -e XSOC="$SOC" -e XVER="$APP_VER" "$SDK_IMAGE" \
   bash -c 'cd "/opt/$XAPPN/app/build" && \
-           cmake -DSOC="$XSOC" ${XVER:+-DAPP_VERSION_STR="$XVER"} .. >/dev/null && sync' \
+           cmake -DSOC="$XSOC" -DAPP_VERSION_STR="${XVER:-0.3.0}" .. >/dev/null && sync' \
   || { echo "cmake 실패"; exit 1; }
 # --compile-only 면 make 에서 끊는다. 뒤의 두 단계는 카메라에 올릴 .cap 을 만드는
 # 일이고, 코드가 컴파일되는지만 볼 때는 필요 없다.

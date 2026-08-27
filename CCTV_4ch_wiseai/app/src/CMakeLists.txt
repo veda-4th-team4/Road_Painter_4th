@@ -15,16 +15,34 @@ file(COPY ${APP_DISPATCHER_SOURCE_DIR} DESTINATION ${APP_LIBS})
 file(MAKE_DIRECTORY ${APP_RES})
 file(MAKE_DIRECTORY ${APP_RES}/models)
 file(MAKE_DIRECTORY ${APP_RES}/settings)
+file(MAKE_DIRECTORY ${APP_RES}/cert)
 
 # Create storage, storage/settings
 file(MAKE_DIRECTORY ${APP_STORAGE})
 file(MAKE_DIRECTORY ${APP_STORAGE}/settings)
 
-# Get application execution binary and LCM manifests from AppSupportPackage
-# - this operation is executed in cmake command running time, not build time
+# Get the LCM manifests from AppSupportPackage. Copy the executable directly
+# to its final name below: the SDK sample copies it as `life_cycle_manager`
+# and then renames it, but re-configuring on vboxsf can fail with ETXTBSY when
+# the final executable already exists. It also leaves the source-named binary
+# behind whenever that rename fails.
 file(MAKE_DIRECTORY ${APP_BIN})
-file(COPY ${LCM_SOURCE_DIR}/ DESTINATION ${APP_BIN}/)
-file(RENAME ${APP_BIN}/life_cycle_manager ${APP_BIN}/${PROJECT_NAME})
+file(COPY ${LCM_SOURCE_DIR}/ DESTINATION ${APP_BIN}/
+     PATTERN "life_cycle_manager" EXCLUDE)
+
+set(LCM_SOURCE_EXE ${LCM_SOURCE_DIR}/life_cycle_manager)
+set(LCM_TARGET_EXE ${APP_BIN}/${PROJECT_NAME})
+file(SHA256 ${LCM_SOURCE_EXE} LCM_SOURCE_SHA256)
+set(LCM_TARGET_SHA256 "")
+if(EXISTS ${LCM_TARGET_EXE})
+  file(SHA256 ${LCM_TARGET_EXE} LCM_TARGET_SHA256)
+endif()
+if(NOT LCM_SOURCE_SHA256 STREQUAL LCM_TARGET_SHA256)
+  configure_file(${LCM_SOURCE_EXE} ${LCM_TARGET_EXE} COPYONLY)
+endif()
+
+# Clean up the source-named executable left by an older interrupted configure.
+file(REMOVE ${APP_BIN}/life_cycle_manager)
 
 # (Optional) Get 3rd Party library from Hanwha Vision Open Platform Docker Image
 #set(LIB_3RD_PARTY_DIR ${WISENET_PRODUCT_RELEASE_PATH}/3rd_party/lib)

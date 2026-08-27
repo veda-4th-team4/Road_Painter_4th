@@ -1,7 +1,5 @@
 #include "wiseai_metadata.h"
 
-#include <algorithm>
-#include <cmath>
 #include <cstdio>   // sscanf -- ParseOnvifUtcMs
 #include <cstdlib>
 #include <cstring>
@@ -104,6 +102,8 @@ long ParseOnvifUtcMs(const std::string& s) {
 void ParseWiseAiMetadata(const std::string& xml, int channel,
                           std::vector<WiseAiDetection>* out) {
   size_t pos = 0;
+  size_t cached_frame_pos = std::string::npos;
+  long cached_frame_ms = 0;
   while (true) {
     size_t obj_start = xml.find("<tt:Object", pos);
     if (obj_start == std::string::npos) break;
@@ -138,12 +138,20 @@ void ParseWiseAiMetadata(const std::string& xml, int channel,
     long frame_ms = 0;
     const size_t frame_pos = xml.rfind("<tt:Frame", obj_start);
     if (frame_pos != std::string::npos) {
-      const size_t frame_tag_end = xml.find('>', frame_pos);
-      if (frame_tag_end != std::string::npos) {
-        frame_ms = ParseOnvifUtcMs(
-            ExtractStringAttr(xml.substr(frame_pos, frame_tag_end - frame_pos),
-                              "UtcTime="));
+      // A frame can contain several objects. Parse its timestamp once and
+      // reuse it for every object in that frame instead of allocating and
+      // reparsing the same opening tag N times.
+      if (frame_pos != cached_frame_pos) {
+        cached_frame_pos = frame_pos;
+        cached_frame_ms = 0;
+        const size_t frame_tag_end = xml.find('>', frame_pos);
+        if (frame_tag_end != std::string::npos) {
+          cached_frame_ms = ParseOnvifUtcMs(
+              ExtractStringAttr(xml.substr(frame_pos, frame_tag_end - frame_pos),
+                                "UtcTime="));
+        }
       }
+      frame_ms = cached_frame_ms;
     }
 
     WiseAiDetection d;
@@ -210,39 +218,4 @@ void ParseWiseAiIvaAreaEvents(const std::string& xml,
     e.state = (state_str == "true" || state_str == "1" || state_str == "True");
     out->push_back(e);
   }
-}
-
-float PointToPolygonDistancePx(float px, float py,
-                                const std::vector<PixelPoint>& polygon) {
-  if (polygon.size() < 3) return -1.0f;
-
-  // Point-in-polygon via ray casting -- inside means "distance 0", the
-  // rough read this exists for has no notion of penetration depth.
-  bool inside = false;
-  for (size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
-    const PixelPoint& a = polygon[i];
-    const PixelPoint& b = polygon[j];
-    if (((a.y > py) != (b.y > py)) &&
-        (px < (b.x - a.x) * (py - a.y) / (b.y - a.y) + a.x)) {
-      inside = !inside;
-    }
-  }
-  if (inside) return 0.0f;
-
-  // Otherwise the minimum distance to any edge segment.
-  float min_d = -1.0f;
-  for (size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
-    const PixelPoint& a = polygon[i];
-    const PixelPoint& b = polygon[j];
-    const float vx = b.x - a.x, vy = b.y - a.y;
-    const float wx = px - a.x, wy = py - a.y;
-    const float len2 = vx * vx + vy * vy;
-    const float t = len2 > 0.0f
-                         ? std::max(0.0f, std::min(1.0f, (wx * vx + wy * vy) / len2))
-                         : 0.0f;
-    const float cx = a.x + t * vx, cy = a.y + t * vy;
-    const float d = std::hypot(px - cx, py - cy);
-    if (min_d < 0.0f || d < min_d) min_d = d;
-  }
-  return min_d;
 }

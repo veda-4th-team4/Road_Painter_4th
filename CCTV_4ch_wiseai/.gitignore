@@ -14,8 +14,9 @@ sky.env
 
 # 배포별 중앙 서버 인증서 — 공개키지만 SAN에 내부 IP/DNS 이름이 들어 있다.
 # cctv_app/.gitignore 의 동일 항목과 같은 이유. app_config.h의
-# CENTRAL_TLS_CA_FILE 이 가리키는 파일이며, 없어도 빌드는 되고 링크만
-# "offline"으로 남는다(fail-closed) — 카메라에 배포할 때 별도로 올릴 것.
+# CENTRAL_TLS_CA_FILE 이 가리키는 파일이다. build_install.sh가 빌드 직전에
+# CENTRAL_TLS_CERT 또는 ../Server/certs/server.crt에서 복사하며, 둘 다 없으면
+# 조용히 offline 패키지를 만들지 않고 빌드를 중단한다.
 app/res/cert/central_server.crt
 
 # --- 문서 -------------------------------------------------------------------

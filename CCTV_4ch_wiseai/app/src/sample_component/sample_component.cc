@@ -484,9 +484,8 @@ bool SampleComponent::Initialize() {
   try {
     if (central_tls_sender_init(CENTRAL_TLS_SERVER_IP, CENTRAL_TLS_SERVER_PORT,
                                 CENTRAL_TLS_CA_FILE) == 0) {
-      // Wired first, Wi-Fi as the fallback candidate -- see app_config.h's
-      // CENTRAL_TLS_SERVER_IP_FALLBACK comment for why (DHCP-stability,
-      // AND the current cert only verifying against the Wi-Fi address).
+      // The deployed/certificate-verified .8 address is primary. The wired .2
+      // candidate remains available after its SAN is added to the certificate.
       central_tls_sender_set_fallback(CENTRAL_TLS_SERVER_IP_FALLBACK);
       printf("[ArucoPosePNM] init: central TLS -> %s:%d (fallback %s)\n",
              CENTRAL_TLS_SERVER_IP, CENTRAL_TLS_SERVER_PORT, CENTRAL_TLS_SERVER_IP_FALLBACK);
@@ -2024,10 +2023,18 @@ void SampleComponent::ProcessWiseAiMetadata(Event* event) {
   IPMetadataManager::MetadataOutput param;
   param.DeserializeBaseObject(&param, ret);
   const int channel = param.channel();
+  const std::string& metadata = param.output();
+  bool wrote_log = false;
+#if ENABLE_WISEAI_FRAME_LOG
   printf("[ArucoPosePNM] WiseAI metadata ch=%d output=%s\n",
-         channel, param.output().c_str());
+         channel, metadata.c_str());
+  wrote_log = true;
+#endif
 
-  if (channel < 0 || channel >= kMaxChannels) { fflush(stdout); return; }
+  if (channel < 0 || channel >= kMaxChannels) {
+    if (wrote_log) fflush(stdout);
+    return;
+  }
   const long now_ms = epoch_ms();
 
   // Robot's last-known marker centre on this channel, if fresh enough to
@@ -2041,12 +2048,23 @@ void SampleComponent::ProcessWiseAiMetadata(Event* event) {
     break;
   }
 
+  // Every Human in this metadata frame is compared with the same recent
+  // robot sighting. Project that marker lazily, once per callback rather than
+  // once per person; callbacks containing only an IVA event pay no H work.
+  double robot_wx = 0.0, robot_wy = 0.0;
+  bool robot_world_checked = false;
+  bool robot_world_ready = false;
+
   std::vector<WiseAiDetection> detections;
-  ParseWiseAiMetadata(param.output(), channel, &detections);
+  if (metadata.find("<tt:Object") != std::string::npos)
+    ParseWiseAiMetadata(metadata, channel, &detections);
   for (const auto& d : detections) {
     if (d.class_type != "Human") continue;  // Face/Head parts aren't foot points
+#if ENABLE_WISEAI_FRAME_LOG
     printf("[ArucoPosePNM] WiseAI ch=%d Human foot_px=(%.1f,%.1f) likelihood=%.2f\n",
            channel, d.foot_u, d.foot_v, d.likelihood);
+    wrote_log = true;
+#endif
     // Our own zone verdict, on the foot point -- the one part of the bbox
     // that lies on the plane the zone was calibrated on. See iva_zone_'s
     // comment for the measurement that says WiseAI's own Enter/Exit cannot
@@ -2086,8 +2104,8 @@ void SampleComponent::ProcessWiseAiMetadata(Event* event) {
     } else if (have_zone) {
       zone_level = (zone_d <= foot_r) ? 3 : 0;   // 밀리미터가 없으면 2단계뿐
     }
-    // Enter/Exit still means "in the polygon or not" -- the bands are a
-    // graduated warning around it, not a redefinition of the zone itself.
+    // `inside` in the optional realtime feed remains the polygon verdict;
+    // ZONE_EVENT itself uses zone_alarm_level_ and may fire in an outer band.
     const int zone_now = (zone_level < 0) ? -1 : ((zone_level == 3) ? 1 : 0);
     const ZoneEdge edge = RememberWiseAiObject(channel, d, now_ms, zone_level);
     if (edge != kZoneNoChange) {
@@ -2096,48 +2114,56 @@ void SampleComponent::ProcessWiseAiMetadata(Event* event) {
       // and pixels are only meaningful to something holding this same lens's
       // calibration. Omitted, not zeroed, when PixelToWorld can't -- (0,0) is
       // a real point on the floor and a wrong claim to make.
-      double fwx = 0.0, fwy = 0.0;
-      const bool have_world =
-          homography_.PixelToWorld(channel, d.foot_u, d.foot_v, &fwx, &fwy, NULL);
-      char zjson[512];
-      int w = snprintf(zjson, sizeof(zjson),
-                       "{\"type\":\"ZONE_EVENT\",\"ch\":%d,\"object_id\":\"%.32s\","
+      char zpayload[512];
+      int w = snprintf(zpayload, sizeof(zpayload),
+                       "{\"ch\":%d,\"object_id\":\"%.32s\","
                        "\"action\":\"%s\",\"foot_u\":%.1f,\"foot_v\":%.1f,"
                        "\"left\":%.1f,\"top\":%.1f,\"right\":%.1f,\"bottom\":%.1f",
                        channel, d.object_id.c_str(),
                        (edge == kZoneEntered) ? "Enter" : "Exit",
                        d.foot_u, d.foot_v, d.left, d.top, d.right, d.bottom);
-      if (have_world && w > 0 && w < (int)sizeof(zjson)) {
-        w += snprintf(zjson + w, sizeof(zjson) - w,
+      if (foot_world && w > 0 && w < (int)sizeof(zpayload)) {
+        w += snprintf(zpayload + w, sizeof(zpayload) - w,
                       ",\"foot_wx\":%.0f,\"foot_wy\":%.0f", fwx, fwy);
       }
       // When the camera SAW this crossing, not when we are sending it. Absent
       // rather than 0 if the frame carried no parseable stamp -- 0 is a real
       // epoch millisecond (1970) and would read as a wildly stale event.
-      if (d.utc_ms != 0 && w > 0 && w < (int)sizeof(zjson)) {
-        w += snprintf(zjson + w, sizeof(zjson) - w, ",\"t_ms\":%ld", d.utc_ms);
+      if (d.utc_ms != 0 && w > 0 && w < (int)sizeof(zpayload)) {
+        w += snprintf(zpayload + w, sizeof(zpayload) - w, ",\"t_ms\":%ld", d.utc_ms);
       }
       // The disc that made this call, so the decision can be second-guessed
       // downstream without re-deriving it: radius used, and how far the foot
       // actually was from the zone (0 = the point itself was inside).
-      if (w > 0 && w < (int)sizeof(zjson)) {
-        w += snprintf(zjson + w, sizeof(zjson) - w,
+      if (w > 0 && w < (int)sizeof(zpayload)) {
+        w += snprintf(zpayload + w, sizeof(zpayload) - w,
                       ",\"foot_r\":%.1f,\"zone_d\":%.1f", foot_r, zone_d);
       }
-      if (have_mm && w > 0 && w < (int)sizeof(zjson)) {
-        w += snprintf(zjson + w, sizeof(zjson) - w, ",\"zone_mm\":%.0f", zone_mm);
+      if (have_mm && w > 0 && w < (int)sizeof(zpayload)) {
+        w += snprintf(zpayload + w, sizeof(zpayload) - w, ",\"zone_mm\":%.0f", zone_mm);
       }
       // 어느 단계를 넘어서 난 이벤트인지 -- 받는 쪽이 "접근금지였나 존 내부였나"를
       // 구분해 다른 소리를 낼 수 있게 한다.
-      if (zone_level >= 0 && w > 0 && w < (int)sizeof(zjson)) {
-        w += snprintf(zjson + w, sizeof(zjson) - w,
+      if (zone_level >= 0 && w > 0 && w < (int)sizeof(zpayload)) {
+        w += snprintf(zpayload + w, sizeof(zpayload) - w,
                       ",\"level\":%d,\"alarm_level\":%d", zone_level, zone_alarm_level_);
       }
-      if (w > 0 && w < (int)sizeof(zjson)) snprintf(zjson + w, sizeof(zjson) - w, "}");
+      if (w <= 0 || w >= (int)sizeof(zpayload) - 1) continue;
+      zpayload[w++] = '}';
+      zpayload[w] = '\0';
+
+      char zjson[544];
+      const int zw = snprintf(zjson, sizeof(zjson),
+                              "{\"type\":\"ZONE_EVENT\",%s", zpayload + 1);
+      if (zw <= 0 || zw >= (int)sizeof(zjson)) continue;
+
       printf("[ArucoPosePNM] %s\n", zjson);
+      wrote_log = true;
+      // 운영 경로: 카메라의 기존 role=CCTV TLS 세션으로 중앙 서버에 전달한다.
+      // 연결이 내려가 있으면 send_typed가 즉시 실패하고 영상 처리는 계속된다.
+      central_tls_sender_send_typed("ZONE_EVENT", zpayload);
       // Control line, not the realtime one, for the same reason IVA_EVENT uses
-      // it: this is the event an alarm hangs off, and a dropped Enter is not
-      // superseded by the next frame the way a dropped pose sample is.
+      // it: 관리자 화면 표시와 RP_CCTV_BRIDGE=1 과도기 경로도 유지한다.
       pose_sender_send_control_line(zjson);
     }
 
@@ -2185,13 +2211,18 @@ void SampleComponent::ProcessWiseAiMetadata(Event* event) {
     const char* why = "";
     if (robot == NULL) {
       why = "로봇 마커를 최근에 못 봄";
+    } else if (!foot_world) {
+      why = "사람 발끝의 월드 좌표를 못 구함 (호모그래피/왜곡 보정 확인 필요)";
     } else {
-      double human_wx = 0.0, human_wy = 0.0, robot_wx = 0.0, robot_wy = 0.0;
-      if (homography_.PixelToWorld(channel, d.foot_u, d.foot_v, &human_wx, &human_wy, &why) &&
-          homography_.PixelToWorldMarker(channel, robot->cx, robot->cy, &robot_wx, &robot_wy)) {
-        distance_mm = hypot(human_wx - robot_wx, human_wy - robot_wy);
+      if (!robot_world_checked) {
+        robot_world_checked = true;
+        robot_world_ready = homography_.PixelToWorldMarker(
+            channel, robot->cx, robot->cy, &robot_wx, &robot_wy);
+      }
+      if (robot_world_ready) {
+        distance_mm = hypot(fwx - robot_wx, fwy - robot_wy);
         have_distance = true;
-      } else if (!why || !*why) {
+      } else {
         why = "로봇 마커의 월드 좌표를 못 구함 (호모그래피/마커평면 미준비)";
       }
     }
@@ -2199,6 +2230,7 @@ void SampleComponent::ProcessWiseAiMetadata(Event* event) {
     const ProximityGuard::State st = have_distance
         ? proximity_guard_[channel].Update(distance_mm, now_ms)
         : proximity_guard_[channel].Hold();
+#if ENABLE_WISEAI_FRAME_LOG
     if (have_distance) {
       printf("[ArucoPosePNM] WiseAI ch=%d proximity dist_mm=%.0f state=%s\n",
              channel, distance_mm, ProximityStateName(st));
@@ -2206,21 +2238,25 @@ void SampleComponent::ProcessWiseAiMetadata(Event* event) {
       printf("[ArucoPosePNM] WiseAI ch=%d proximity 거리 계산 불가 (%s) state=%s(유지)\n",
              channel, why, ProximityStateName(st));
     }
+    wrote_log = true;
+#else
+    (void)st;
+    (void)why;
+#endif
   }
 
   // IVA area rule events (object entered/exited/intruded a polygon set via
-  // IVA_SYNC + tools/iva_push.sh). UNVERIFIED (2026-08-19) -- see
-  // ParseWiseAiIvaAreaEvents()'s comment: written from WiseAI.html's
-  // documented schema, never checked against a real Enter/Exit. Every event
-  // is reported, not just "Enter" -- the exact action vocabulary for THIS
-  // rule type isn't confirmed yet, and filtering here on a guessed value
-  // could silently drop the real one. Sent over the CONTROL line
+  // IVA_SYNC + tools/iva_push.sh). The parser and Enter/Exit vocabulary were
+  // confirmed against live captures on 2026-08-19. Every event is forwarded,
+  // not just Enter, so the receiver retains the camera's complete rule state.
+  // Sent over the CONTROL line
   // (pose_sender_send_control_line), not the drop-tolerant realtime one
   // CAM_POSE uses: an alarm-triggering event should survive a momentarily
   // busy link, unlike a pose sample where the next frame supersedes a
   // dropped one anyway.
   std::vector<WiseAiIvaAreaEvent> iva_events;
-  ParseWiseAiIvaAreaEvents(param.output(), &iva_events);
+  if (metadata.find("IvaArea") != std::string::npos)
+    ParseWiseAiIvaAreaEvents(metadata, &iva_events);
   for (const auto& e : iva_events) {
     // The bbox that goes with this event's object_id, if this channel's
     // bbox stream has seen it recently -- see RecentWiseAiObjectBbox()'s
@@ -2256,10 +2292,11 @@ void SampleComponent::ProcessWiseAiMetadata(Event* event) {
     if (w > 0 && w < (int)sizeof(json)) snprintf(json + w, sizeof(json) - w, "}");
 
     printf("[ArucoPosePNM] %s\n", json);
+    wrote_log = true;
     pose_sender_send_control_line(json);
   }
 
-  fflush(stdout);
+  if (wrote_log) fflush(stdout);
 }
 
 /**
@@ -2815,14 +2852,14 @@ void SampleComponent::SendPosePackets(int ch,
           {d.corners2d[2].x, d.corners2d[2].y},
           {d.corners2d[3].x, d.corners2d[3].y},
       };
-      // +1: server_PROTOCOL.md's channel convention (v0.4, "채널 규약") is
+      // +1: docs/PROTOCOL.md's channel convention (v0.4, "채널 규약") is
       // explicit that every wire-facing ch is 1-based, matching CH1..CH4 on
       // the camera's own web UI -- `ch` here is this app's internal 0-based
       // array index and was going out unconverted. The server's default (and
       // POS's) active channel is 1, so channel 0's robot POS packets were
       // being silently dropped by the server's active-channel gate every
       // time -- found 2026-08-11 cross-checking against the live
-      // server_PROTOCOL.md on the Pi, not just the historical action-items
+      // docs/PROTOCOL.md on the Pi, not just the historical action-items
       // doc (docs/08.06/CCTV_ACTION_ITEMS_20260806.md C-1), whose own example
       // code left the base/offset unstated.
       central_tls_sender_send_pos(ch + 1, central_corners);
@@ -4736,7 +4773,7 @@ bool SampleComponent::HandleCentral(const char* cmd) {
   // C-3) and this app does not re-serialise it from homography_/calib_'s own
   // state. This app, unlike cctv_app, actually HAS K/D/H_marker per channel
   // (homography_mapper.h) and could assemble the bundle itself — deliberately
-  // not done here: server_PROTOCOL.md's mm-vs-m field-by-field convention
+  // not done here: docs/PROTOCOL.md's mm-vs-m field-by-field convention
   // (H_floor/H_marker stay mm, only marker_height_m converts) needs its own
   // pass, and it's not yet decided whether that should fire automatically on
   // every calibration change or stay operator-triggered like this. Passthrough
@@ -4902,7 +4939,7 @@ void SampleComponent::ReportCentral(const char* action, const char* detail) cons
  * smaller vocabulary than the RPi dashboard's, and not funnelled through
  * DispatchCommand()/HandleCentral() above: those answer commands from the
  * OTHER transport (pose_sender), and CALIB_START/SELECT_CHANNEL arrive bare
- * (no "CENTRAL_" prefix, per server_PROTOCOL.md) so mixing the two tables
+ * (no "CENTRAL_" prefix, per docs/PROTOCOL.md) so mixing the two tables
  * would risk a collision with an unrelated dashboard command.
  *
  * SELECT_CHANNEL is accepted and acknowledged but otherwise a no-op here:
@@ -5591,7 +5628,7 @@ void SampleComponent::ReportCentralCapture(int ch, int point_index, bool ok,
                                            const char* reason,
                                            const char* request_id) const {
   char json[320];
-  // ch 는 와이어로 나갈 때 다시 1-based (server_PROTOCOL.md "채널 규약").
+  // ch 는 와이어로 나갈 때 다시 1-based (docs/PROTOCOL.md "채널 규약").
   // reason 은 이 파일이 만든 고정 문자열만 들어온다 — 네트워크에서 온 문자열을
   // 그대로 되돌려 보내지 않는다(JSON 이스케이프가 필요해진다).
   snprintf(json, sizeof(json),

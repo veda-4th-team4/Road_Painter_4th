@@ -1,10 +1,11 @@
-# 서버 구조 정리
+# 서버 구조
 
-**작성일**: 2026-08-10 · **기준**: `main` (프로토콜 v2 + v0.4 채널 + 캘리 세션)
+> **코드 어디를 고쳐야 하지?** 에 답하는 문서.
+> 관련: [PROTOCOL](PROTOCOL.md) (메시지 형식) · [PATH_GEOMETRY](PATH_GEOMETRY.md) (경로 계산) ·
+> [CALIBRATION](CALIBRATION.md) (호모그래피) · [TUNING](TUNING.md) (파라미터)
 
-소스 전체(4,024줄)를 읽고 정리한 것이다. 각 파일의 주석이 "왜 이렇게 했는가"를
-잘 남겨두고 있으므로, 이 문서는 그것을 반복하지 않고 **파일을 넘나드는 구조와
-불변식**, 그리고 **혼자 읽어서는 안 보이는 함정**에 집중한다.
+읽는 순서: **§2 파일 지도 → §5 좌표계 → §9 함정 모음.**
+그 셋만 알면 나머지는 코드를 따라가면서 읽을 수 있다.
 
 ---
 
@@ -27,25 +28,32 @@
 ## 2. 파일 지도
 
 ```
-main.cpp          부팅 · 스레드 3개 · 콘솔 명령
+main.cpp          부팅 · 스레드 4개 · 콘솔 명령
  └ tls_server.*   TLS · role 레지스트리 · JSON Lines · ADMIN 미러링
     └ router.*    ★ 전부. 라우팅 + 모든 상태 + 주행 판정
-       ├ router_channel.cpp   채널 전환
-       └ router_calib.cpp     호모그래피 세션 (2026-08-10)
+       ├ router_channel.cpp        채널 전환
+       ├ router_calib.cpp          호모그래피 세션 (정적 앵커)
+       ├ router_odocalib.cpp       호모그래피 세션 (오도메트리 주행)
+       └ router_registration.cpp   채널 간 정합 수집
 
 계산·데이터 (헤더 온리):
   protocol.hpp     메시지 계약 문서 + makeMsg/nowMs/채널 헬퍼
   calib.hpp        번들 파싱 · undistort · 호모그래피 적용
   path_planner.hpp POS 4코너 → pose (여기 "경로 생성"은 없다)
-  ops_builder.hpp  ★ Qt program → 로봇 op (부호·펜오프셋·호 위상)
+  ops_builder.hpp  ★ Qt program → 로봇 op (부호·펜오프셋·펜두께·호 위상·언더슛)
   params.hpp       튜닝 상수 전부 (X-매크로로 필드/로딩/검증 자동 생성)
   user_store.*     users.json / calib_latest.json / camera.json
   stream_cfg.hpp   LOGIN_OK.stream 3-상태
   log.hpp          logf + ADMIN 싱크
+
+도구:
+  tools/           테스트·시뮬레이터 (tools/README.md 참고)
+  admin_console/   관리자 웹 GUI (admin_console/README.md 참고)
+  relay/           4채널 RTSP 중계 (relay/README.md 참고)
 ```
 
-`protocol.hpp` 상단 300줄은 **주석으로 된 프로토콜 정본**이다. 메시지를 추가할
-때 여기부터 고치는 것이 관행이다.
+`protocol.hpp` 상단 주석은 **코드 안의 프로토콜 정본**이다. 메시지를 추가할 때
+여기부터 고치는 것이 관행이고, 사람이 읽는 판이 [PROTOCOL.md](PROTOCOL.md)다.
 
 ---
 
@@ -136,32 +144,25 @@ pose·POSE·BLUEPRINT·PATH와 로봇 프로토콜은 예전 그대로 **미터*
 반전 지점은 **`toRobotDeg()` 하나뿐**이다. 호출처는 `turnOp` / `ALIGN` / `DRIFT`
 세 곳. 다른 데서 또 뒤집으면 이중 반전이 된다.
 
-### ④ 펜 오프셋(a=0.155m)은 서버가 소유한다
-서버가 경로에 `move(±a)` op을 끼워 넣는다. **로봇은 자체 보정을 하지 않는다** —
-하면 이중 보정. Qt도 계산하지 않는다.
+### ④ 펜 오프셋·펜 두께·호 기하는 서버가 소유한다
 
-불변식:
+서버가 경로에 보정 op 을 끼워 넣는다. **로봇도 Qt 도 계산하지 않는다** — 하면 이중 보정이다.
+
 ```
 노즐 down ⟺ 마커 중심이 꼭짓점보다 진행방향으로 정확히 a 앞
 노즐 up   ⟺ 마커 중심이 꼭짓점 위
 ```
-보정 op은 이 두 상태를 오갈 때만 삽입된다. 그래서 도색 move가 연달아 나와도
-사이에 불필요한 노즐 up/down이 안 낀다.
 
-### ⑤ 도색 호는 차체가 접선을 향하면 안 된다
-ICR(회전 중심)은 좌우 바퀴 축선 위에 있고 그 축선은 마커 중심 C를 지난다.
-도면 원 중심 O에 ICR을 놓으려면 C가 O에서 `R_robot`, 펜에서 `a` 떨어져야 한다.
+이 불변식과 거기서 나오는 네 가지 계산(펜 오프셋 삽입, 펜 두께 연장,
+호 반지름 치환·진입 위상, 도색 언더슛)은 분량이 커서 따로 뺐다 →
+**[PATH_GEOMETRY](PATH_GEOMETRY.md)**.
 
-```
-R_robot = sqrt(R_paint² − a²)
-φ       = atan(a / R_robot)      ← 접선에서 호 안쪽으로 트는 각
-```
+고칠 코드는 전부 `ops_builder.hpp` 한 파일에 있다.
 
-빼먹으면 반지름은 맞는데 **원이 통째로 다른 자리에 그려진다.** 실측에서
-R=0.5m 반원의 펜 도착점이 0.31m 어긋났다(φ=18.06°).
+### ⑤ 캘리브레이션 번들은 채널마다 따로다
 
-검산: `R_paint = a`면 `R_robot = 0`, `φ = 90°` — 차체가 접선과 직각, 즉 마커
-중심이 원 중심에 가만히 있고 펜만 반지름 a로 도는 자명한 상황과 일치한다.
+채널마다 렌즈 방향이 달라 `K`·`D`·`H` 가 전부 다르다.
+저장·조회 규칙은 §8, 세션 계약과 방법 세 가지는 **[CALIBRATION](CALIBRATION.md)** 참고.
 
 ---
 
@@ -195,7 +196,7 @@ Qt가 중간에 누를 버튼은 없다. **단계 판단의 주인은 서버**�
 로봇 READY(op k)
    │
    ├─ 판정 대상 아님 ─────────────────────▶ GO
-   └─ 판정 대상 ──▶ 대기 창 2초 (POS 표본 수집)
+   └─ 판정 대상 ──▶ 대기 창 (feedback_wait_ms) (POS 표본 수집)
                       │
                       ├─ 표본 0장 ────────▶ GO  (같은 pose로 재판정 금지)
                       ├─ MORE (거리) ─────▶ 로봇 이동 후 같은 k로 READY 재수신
@@ -219,16 +220,16 @@ Qt가 중간에 누를 버튼은 없다. **단계 판단의 주인은 서버**�
 |---|---|---|
 | `MORE` | 직전 op이 role=path인 move/arc | 도착 꼭짓점을 알아야 목표가 생김 |
 | `ALIGN` | ① 직전이 path turn ② 도색 시작 직전 ③ **다음이 arc** | ③은 arc가 개루프라 진입각이 원 위치를 100% 결정 |
-| `DRIFT` | role=path인 move **실행 중**만 | arc는 개루프(중간에 틀면 원이 깨짐), 오프셋 move는 15.5cm라 보정할 게 없음 |
+| `DRIFT` | role=path인 move **실행 중**만 | arc는 개루프(중간에 틀면 원이 깨짐), 오프셋 move는 펜 오프셋 길이라 보정할 게 없음 |
 | `HOLD` | POS 2초 두절 | 서버가 눈 감은 채 로봇이 달리는 것 방지 |
 
 **MORE의 목표에 펜 오프셋이 들어간다**: 노즐이 내려가 있었다면 마커 중심의
-목표는 꼭짓점보다 a 앞이다. 이 항을 빼면 도색 구간마다 15.5cm 오차를 잡고 있다고
-착각해 매번 `MORE{-0.155}`를 쏜다.
+목표는 꼭짓점보다 a 앞이다. 이 항을 빼면 도색 구간마다 펜 오프셋만큼의 오차를 잡고 있다고
+착각해 매번 `MORE{−a}`를 쏜다.
 
 ### 이상치 게이트
 ```
-허용 = pose_gate_base_deg(3°) + pose_gate_rate_dps(40°/s) × Δt
+허용 = pose_gate_base_deg + pose_gate_rate_dps × Δt
 ```
 ⚠️ **상한을 두지 말 것.** POS가 1~2Hz인 현장에서는 간격이 5~8초까지 벌어지고
 그동안 로봇은 100° 넘게 정당하게 돈다 (실측에서 49° 회전이 5회 연속 폐기되어
@@ -310,29 +311,25 @@ POS·H_MATRIX의 하위호환용이다. **`SELECT_CHANNEL`·`CALIB_START`에는 
 
 ---
 
-## 10. 알려진 미해결 (2026-08-10 기준)
+## 10. 알려진 미해결
 
 | 항목 | 상태 |
 |---|---|
-| **CCTV가 `CALIB_START` payload를 문자열 검색으로만 처리** | 🔴 **미해결** — `ch`/`request_id`가 카메라 앱 경계에서 소멸. **종단간 시험을 막는 유일한 항목** |
-| 로봇 `CALIB_START`/`CALIB_STOPPED` | ✅ `feature/server-driven-v2` @`52aa849` — **main 미병합** |
-| 로봇 `CALIB_FAIL` | ⚠️ 송신 함수만 있고 **호출부 없음** — 주행 실패가 서버 타임아웃(3분)으로만 드러남 |
-| Qt TLS 검증 | ✅ PR #42 (`8717fc7`) — qrc 내장 + `VerifyPeer` + fail-closed |
-| **서버가 클라이언트를 인증하지 않음 (mTLS 없음)** | 🔴 누구나 `HELLO {role:"QT"}`로 진짜 Qt를 밀어낼 수 있음. Qt 수정만으로는 절반만 닫힘 |
-| 카메라 자격증명이 저장소에 평문 | ⚠️ 저장소가 공개라 이미 비밀이 아님 — 교체 권장 |
+| **서버가 클라이언트를 인증하지 않음 (mTLS 없음)** | 🔴 누구나 `HELLO{role:"QT"}` 로 진짜 Qt 를 밀어낼 수 있다. Qt 쪽 검증만으로는 절반만 닫힌다 |
+| 로봇 `CALIB_FAIL` 호출부 없음 | ⚠️ 송신 함수는 있는데 부르는 곳이 없다 — 캘리 주행 실패가 서버 타임아웃으로만 드러난다 |
+| 카메라 자격증명이 저장소에 평문 | ⚠️ 저장소가 공개라 이미 비밀이 아니다 — 교체 권장 |
+| `POS` 실측이 설계 전제보다 훨씬 느리다 | 🔴 설계는 15~30 Hz 전제인데 현장은 **1~2 Hz**, 도색 구간에서는 **0 Hz** 까지 떨어진다. 피드백 튜닝 문제 대부분이 여기서 나온다 — 카메라 검출율 개선이 선행 과제 |
 
 ---
 
 ## 11. 회귀 테스트
 
+로봇·카메라 없이 돌아가는 오프라인 테스트와, TLS 세션까지 태우는 시뮬레이터가 있다.
+사용법은 **[tools/README](../tools/README.md)** 에 모아뒀다.
+
 ```bash
-cd Server && make && ./server 9100 &          # ⚠️ 9000은 실제 카메라가 붙는다
-make calib_session_test && tools/calib_session_test 127.0.0.1 9100   # 21케이스
-make calib_channel_test && tools/calib_channel_test                  # 저장 포맷
-make sim && tools/robot_sim 127.0.0.1 --port 9100 &                  # 주행 왕복
-tools/draw_test 127.0.0.1 --port 9100 --nudge                        # ④ 회귀
+cd Server && make && ./server 9100 &     # ⚠️ 9000 은 실제 카메라가 붙는다
 ```
 
-`calib_session_test`는 끝날 때 활성 채널을 1로 되돌린다 — 안 그러면 이어 붙는
-`robot_sim`(항상 CH1 POS)의 관측이 전부 버려져 **피드백 회귀와 구분되지 않는
-증상**이 나온다 (실제로 한 번 오진했다).
+🔴 **테스트 서버는 반드시 다른 포트로 띄울 것.** 9000 에 띄우면 현장 카메라가
+CCTV 자리를 빼앗긴다(§4).

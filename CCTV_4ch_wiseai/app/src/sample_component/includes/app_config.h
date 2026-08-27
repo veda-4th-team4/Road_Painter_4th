@@ -92,26 +92,20 @@ static inline void CopyUtf8(char* dst, size_t dst_size, const char* src) {
 #define ENABLE_CENTRAL_TLS_STREAM 1
 #endif
 
-// Same RPi as POSE_SERVER_IP above, wired address (192.168.0.2) for the same
-// DHCP-stability reason, tried first. CENTRAL_TLS_SERVER_IP_FALLBACK below is
-// the Pi's Wi-Fi address (192.168.0.8) — wired first, wireless as a backup
-// path, not the other way round; see central_tls_sender_set_fallback().
+// The central server's currently deployed address/certificate is 192.168.0.8,
+// so that verified address is tried first. The wired 192.168.0.2 address stays
+// as a fallback candidate for deployments whose certificate SAN also includes
+// it; see central_tls_sender_set_fallback().
 //
 // CAUTION -- cert/IP mismatch, not a reachability problem: CENTRAL_TLS_CA_FILE's
 // current cert (copied from cctv_app, see below) has 127.0.0.1 and 192.168.0.8
-// in its Subject Alternative Name, NOT 192.168.0.2. central_tls_sender now
-// pins IP verification per-connection-attempt, so .2 will complete the TCP
-// connect but fail TLS verification EVERY time until the cert is reissued
-// with .2 in its SAN — this is expected to make every reconnect cycle fail
-// once on .2 before rotating to .8, not a bug to chase. Port 9000 was not
-// accepting connections on either address when this was checked (2026-08-10)
-// — no central-server process was listening at all; the link sits in
-// "offline"/rotates candidates and keeps retrying until one comes up.
+// in its Subject Alternative Name, NOT 192.168.0.2. The fallback therefore
+// fails closed until the cert is reissued with .2 in its SAN.
 #ifndef CENTRAL_TLS_SERVER_IP
-#define CENTRAL_TLS_SERVER_IP "192.168.0.2"
+#define CENTRAL_TLS_SERVER_IP "192.168.0.8"
 #endif
 #ifndef CENTRAL_TLS_SERVER_IP_FALLBACK
-#define CENTRAL_TLS_SERVER_IP_FALLBACK "192.168.0.8"
+#define CENTRAL_TLS_SERVER_IP_FALLBACK "192.168.0.2"
 #endif
 #ifndef CENTRAL_TLS_SERVER_PORT
 #define CENTRAL_TLS_SERVER_PORT 9000
@@ -374,9 +368,19 @@ static inline void CopyUtf8(char* dst, size_t dst_size, const char* src) {
 // recent_wiseai_obj_ 캐시(IVA_EVENT에 bbox를 실어 보내기 위한 object_id별 최근
 // bbox 기억)의 유효 기간. MARKER_HOLD_MS와 같은 성격 — bbox 스트림과 IVA 이벤트가
 // 같은 콜백에 안 실려 오므로, 이벤트가 왔을 때 "최근에 본" bbox를 찾는데 그 최근이
-// 얼마나 오래된 것까지 봐줄지. 값 자체는 잠정 — 실측 전.
+// 얼마나 오래된 것까지 봐줄지. 2026-08-19 실측에서는 9/9 이벤트가 이 창 안에서
+// bbox와 매칭됐지만, 메타데이터 지연이 다른 현장에서는 다시 확인할 수 있다.
 #ifndef WISEAI_OBJECT_HOLD_MS
 #define WISEAI_OBJECT_HOLD_MS 2000
+#endif
+
+// Per-frame WiseAI XML/person/proximity diagnostics. The original metadata
+// capture work needed the complete XML on stdout, but leaving that probe on in
+// normal operation writes several kilobytes per metadata frame and flushes the
+// camera log continuously. Event lines (ZONE_EVENT/IVA_EVENT) are unaffected.
+// Re-enable only for a short metadata-capture build.
+#ifndef ENABLE_WISEAI_FRAME_LOG
+#define ENABLE_WISEAI_FRAME_LOG 0
 #endif
 
 // ── WiseAI 근접 경고 (ProximityGuard) ────────────────────────────────────────
@@ -425,14 +429,6 @@ static inline void CopyUtf8(char* dst, size_t dst_size, const char* src) {
 #ifndef ZONE_MARGIN_WARN_MM
 #define ZONE_MARGIN_WARN_MM 500
 #endif
-
-// ch1 IVA 영역(사각형) — WiseAI REST API `GET /opensdk/WiseAI/configuration/ivaarea`
-// 실측 스냅샷 (2026-08-18, "name1"). 픽셀 좌표, 호모그래피 미적용 — 사람 발끝과의
-// 거리도 그래서 픽셀 단위의 "러프한" 값이지 실제 mm 거리가 아니다. 영역을 카메라
-// 쪽에서 다시 그리면 이 값도 갱신해야 함 — 동적으로 GET 해오는 게 아니라 그 시점의
-// 스냅샷을 박아둔 것.
-#define WISEAI_IVA_CH1_POLY \
-  {{744.0f, 787.0f}, {1691.0f, 774.0f}, {1795.0f, 1468.0f}, {634.0f, 1472.0f}}
 
 // ── 주행 캘리(오도메트리) ────────────────────────────────────────────────────
 // 서버팀과 합의 대기 중인 값과, 현장 실측으로 조정할 값이 섞여 있다. 한 곳에

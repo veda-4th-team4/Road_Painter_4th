@@ -36,7 +36,7 @@
 //
 // ============================================================================
 // [서버 <-> 로봇] 🔴 프로토콜 v2 (server-driven) - 규격 전문은
-//   docs/PROTOCOL_v2_ROBOT.md. 아래는 요약이고, 어긋나면 그 문서가 정본이다.
+//   docs/PROTOCOL.md. 아래는 요약이고, 어긋나면 그 문서가 정본이다.
 //
 //   v1과 달라진 핵심 4가지:
 //     1. 각도 부호     : 로봇에 나가는 모든 각도가 "양수 = 오른쪽으로 틀어라"
@@ -81,6 +81,9 @@
 //     - true: 실행 중인 op 도중이라도 즉시 정지 (op을 포기하지는 않는다)
 //       false: 멈춘 지점에서 같은 op을 남은 거리/각도부터 이어서 수행
 //     - HOLD 중에는 서버가 GO/ALIGN/MORE/DRIFT를 일절 보내지 않는다.
+//   ZONE_EVENT payload: {"action":"Enter", "ch":1, "object_id":"...", ...}
+//     - CCTV가 발끝 기준으로 판정한 사람 진입을 서버가 검증해 중계한다.
+//     - 로봇은 CMD와 별도 latch로 받아 PERSON_IN_ZONE 음성을 재생한다.
 //   CMD    payload: {"cmd": ...}  (응답 불필요, fire-and-forget)
 //     - 이벤트: "ESTOP" | "RESUME" | "CALIB_START"
 //     - 수동 조작(조이스틱, 누르는 동안 이동 / STOP=뗌, 이동량 없음):
@@ -186,13 +189,13 @@
 //         dist_m(호 길이)은 서버가 쓰지 않는다 - v2 로봇 arc의 정지 조건은
 //         "바퀴중심 기준" radius_m x θ_rad라 펜 기준 호 길이와 다르기 때문.
 //       - 🔴 서버가 R_robot = sqrt(radius_m² - 0.155²)로 바꿔서 로봇에 보낸다
-//         (docs/PROTOCOL_v2_ROBOT.md §5.4). Qt는 도면 그대로의 값만 주면 된다.
+//         (docs/PATH_GEOMETRY.md '반지름 치환'). Qt는 도면 그대로의 값만 주면 된다.
 //       - paint=true인 ARC의 radius_m이 params().min_paint_radius_m보다 작으면
 //         서버가 도면을 거부한다 (DRAW_FAIL reason="arc_too_tight"). 노즐이
 //         그릴 수 있는 최소 원의 반지름이 곧 펜 오프셋 0.155m이기 때문.
 //       - 🔴 도색 ARC는 차체가 접선을 향하면 안 된다. 서버가 진입 앞뒤에
 //         turn(±φ) 오프셋 op을 끼워 넣는다 (φ = atan(0.155 / R_robot),
-//         docs/PROTOCOL_v2_ROBOT.md §5.7). Qt는 도면 그대로의 값만 주면 된다.
+//         docs/PATH_GEOMETRY.md '진입 위상 보정'). Qt는 도면 그대로의 값만 주면 된다.
 //     공통 v     : 필수. 이 op가 "출발하는" 도면 꼭짓점 index.
 //       v2에서는 MORE(주행 거리 보정)의 목표 좌표를 여기서 얻는다: 방금 끝낸
 //       주행 op의 "도착" 꼭짓점 = 그다음 op의 v. 추측항법으로 누적하지 않고
@@ -248,7 +251,7 @@
 // ============================================================================
 // [로봇 주행 호모그래피 세션] (2026-08-10 신설, router_calib.cpp)
 //   규격 원본: QT_HOMOGRAPHY_SERVER_CONTRACT_2026-08-10.md (Qt팀 제안),
-//   서버 회신: docs/QT_HOMOGRAPHY_REPLY_20260810_SERVER.md
+//   서버 회신: docs/CALIBRATION.md
 //
 //   Qt는 "CH n 캘리 시작"만 보내고, 로봇 이동·샘플링·계산에는 관여하지 않는다.
 //   서버는 요청을 검증해 수락 여부를 즉시 회신하고, 끝날 때까지 반드시
@@ -298,6 +301,9 @@
 // ============================================================================
 //
 // [CCTV -> 서버]
+//   ZONE_EVENT payload: {"action":"Enter"|"Exit", "ch":1,
+//                        "object_id":"...", "foot_u":..., "foot_v":..., ...}
+//     - 서버는 Enter만 ROBOT의 ZONE_EVENT로 중계한다. UDP 우회 경로는 사용하지 않는다.
 //   H_MATRIX payload: {"ch":2, "request_id":"qt-...", "calib":{ …번들… }}
 //     번들(2026-08-11 정규형) = {"calib_id","created_at","image_size":[2592,1520],
 //       "coord_mode":"undistort","unit":"mm","K":[[...]x3],"D":[k1,k2,p1,p2,k3],

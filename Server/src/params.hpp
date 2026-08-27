@@ -10,7 +10,7 @@
 //   - 현장에서: config/params.json 편집 후 서버 재시작
 //   - 파일이 없으면 아래 기본값 그대로 동작한다 (파일은 선택 사항)
 //
-// 값의 근거는 docs/PROTOCOL_v2_ROBOT.md §10 상수표에 정리되어 있다.
+// 항목별 설명과 근거는 docs/TUNING.md 에 정리되어 있다.
 // 새 상수를 추가할 때는 아래 RP_PARAM_LIST에 한 줄 넣기만 하면
 // 구조체 필드 / JSON 로딩 / 시작 로그 덤프 / 오타 검출이 전부 따라온다.
 #include "log.hpp"
@@ -27,7 +27,7 @@ using json = nlohmann::json;
 // Qt 클라이언트 쪽 상수라 서버가 바꿀 수 없다 - params.json으로 덮어쓸 수 있게
 // 두면 "현장에서 늘렸는데 Qt는 그대로"라는 어긋남만 만든다. 그래서 코드 상수다.
 // 🔴 Qt팀이 이 값을 바꾸면 여기도 같이 바꿔야 한다
-// (docs/ROBOT_ODOMETRY_HOMOGRAPHY_REQUEST_QT_20260813.md §4).
+// (docs/CALIBRATION.md '타임아웃').
 inline constexpr long kQtCalibWaitMs = 300000L;
 // 서버가 쓸 수 있는 실효 예산. Qt가 스스로 포기하기 전에 서버가 먼저 종결
 // 응답을 보내야 하므로 한 뼘 짧게 잡는다.
@@ -50,7 +50,7 @@ inline constexpr long kQtOdoWaitCapMs = 590000L;
       "펜(노즐)이 마커 중심 뒤로 떨어진 거리 a. 로봇 PathFollower.h와 같아야 함")\
     X(double, pen_width_m, 0.05,                                               \
       "펜이 실제로 칠하는 폭 w (마커 사양 5cm). 도색 구간을 앞뒤로 w/2씩 늘려 "\
-      "꼭짓점 귀퉁이가 비지 않게 한다 - docs/PEN_WIDTH_COMPENSATION_20260813.md. "\
+      "꼭짓점 귀퉁이가 비지 않게 한다 - docs/PATH_GEOMETRY.md. "\
       "0으로 두면 보정이 통째로 꺼진다(예전 동작). 실측값을 넣을 것 - 마커 "   \
       "사양보다 압력·속도에 따라 달라진다")                                    \
     X(double, wheel_base_m, 0.166,                                             \
@@ -296,7 +296,7 @@ inline void sanitize(Params& p) {
     //   이 하한도 같이 올려야 한다. 속도를 바꿀 때 반드시 재계산할 것.
     //
     // 아래 검사는 그와 별개인 기하학적 하한이다. 펜이 중심 뒤 a에 달려 있는 이상
-    // 노즐이 그릴 수 있는 반지름은 a 미만이 될 수 없다 (PROTOCOL_v2_ROBOT.md §5.5).
+    // 노즐이 그릴 수 있는 반지름은 a 미만이 될 수 없다 (docs/PATH_GEOMETRY.md '최소 도색 반지름').
     if (p.min_paint_radius_m < p.pen_offset_m) {
         logf("[WARN] params 'min_paint_radius_m'=%g < 'pen_offset_m'=%g - "
              "물리 하한인 %g로 올림 (§5.5)",

@@ -17,7 +17,6 @@ import os
 import socket
 import ssl
 import struct
-import sys      # forward_event() 진단 출력
 import threading
 import time
 import urllib.error
@@ -60,43 +59,6 @@ HG_EXPERIMENT_DIR = f"{SNAPSHOT_DIR}/homography_experiments"
 # which read the same two names from the operator's shell rather than a
 # checked-in file). Read once at import so a typo shows up immediately in
 # push_iva_area()'s "not set" branch rather than failing silently mid-session.
-# ── 이벤트 UDP 중계 (테스트용) ────────────────────────────────────────────
-# ZONE_FORWARD="host:port" 가 있으면 ZONE_EVENT/IVA_EVENT 를 그 주소로 그대로
-# 한 줄씩 흘린다. 형식은 서버가 브라우저에 보내는 것과 같은 JSON.
-#
-# UDP인 이유: 이 전송이 print_msg 안, 즉 카메라 메시지 루프 위에서 일어난다.
-# TCP였다면 상대가 꺼져 있을 때 connect 타임아웃만큼 루프가 멈추고 그 뒤의
-# 카메라 메시지가 전부 밀린다 -- 테스트용 수신기 하나 때문에 본 기능이 서는 건
-# 말이 안 된다. UDP는 받는 쪽이 없으면 그냥 버려지고, 테스트 탭으로는 그게
-# 올바른 실패 방식이다.
-_FWD_ADDR = None
-_fwd_sock = None
-_fwd_fail_logged = False
-_fwd = os.environ.get("ZONE_FORWARD", "").strip()
-if _fwd:
-    try:
-        _h, _p = _fwd.rsplit(":", 1)
-        _FWD_ADDR = (_h, int(_p))
-        _fwd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    except (ValueError, OSError) as _e:
-        print(f"[iva] ZONE_FORWARD={_fwd!r} 해석 실패: {_e}", file=sys.stderr)
-        _FWD_ADDR = None
-
-
-def forward_event(line):
-    """Best-effort UDP tap. Never raises -- a test tap must not be able to
-    break the message loop it is spliced into."""
-    global _fwd_fail_logged
-    if not (_fwd_sock and _FWD_ADDR):
-        return
-    try:
-        _fwd_sock.sendto(line.encode("utf-8"), _FWD_ADDR)
-    except OSError as e:
-        if not _fwd_fail_logged:      # 한 번만 -- 매 이벤트마다 찍으면 로그가 잠긴다
-            _fwd_fail_logged = True
-            print(f"[iva] forward 실패 ({_FWD_ADDR}): {e}", file=sys.stderr)
-
-
 CAMERA_USER = os.environ.get("CAMERA_USER", "")
 CAMERA_PASS = os.environ.get("CAMERA_PASS", "")
 # The AppID WiseAI.html's Servers block documents as the default -- override
@@ -495,7 +457,7 @@ def set_calib_channel(ch):
     염두에 둔 문구였다). 그래도 이 명령은 여전히 필요하다: 서버가 지금 어느
     채널의 POS만 받아들일지(그리고 어느 채널 캘리브레이션으로 좌표를 바꿀지)를
     이걸로 정하기 때문이다 — 안 보내면 로봇 마커가 실제로 보이는 채널과 서버의
-    activeChannel이 어긋나서 POS가 조용히 버려진다(server_PROTOCOL.md "채널 규약").
+    activeChannel이 어긋나서 POS가 조용히 버려진다(docs/PROTOCOL.md "채널 규약").
     """
     global _calib_channel
     try:
@@ -1068,7 +1030,6 @@ def print_msg(msg, last_seq):
         # 링크(재시도 큐 포함)가 실제로 얼마나 밀렸는지가 나온다. 브라우저에서
         # 재면 뷰어 PC 시계가 섞여 들어가 측정이 안 된다.
         msg["rx_ms"] = int(now_ms)
-        forward_event(json.dumps(msg, ensure_ascii=False))
         broadcast("[iva] EVENT " + json.dumps(msg, ensure_ascii=False))
         return last_seq
     if mtype == "ZONE_EVENT":
@@ -1083,7 +1044,10 @@ def print_msg(msg, last_seq):
         # IVA_EVENT를 지우지 않고 나란히 두는 건 교차 검증용이다 -- 둘이 갈리는
         # 지점이 곧 위 오차이고, 화면에서 바로 보이는 편이 낫다.
         msg["rx_ms"] = int(now_ms)  # PY1과 같은 이유 -- 위 주석 참고
-        forward_event(json.dumps(msg, ensure_ascii=False))
+        # 과도기 bridge 모드에서만 이 프로세스가 CCTV role을 소유한다. 운영
+        # 직결 모드에서는 카메라 앱이 같은 ZONE_EVENT를 중앙 TLS로 직접 보낸다.
+        if CCTV_BRIDGE_ENABLED:
+            cctv_send("ZONE_EVENT", {k: v for k, v in msg.items() if k != "type"})
         broadcast("[iva] ZONE " + json.dumps(msg, ensure_ascii=False))
         return last_seq
     if mtype == "IVA_ZONE_SET":
@@ -2512,7 +2476,7 @@ PAGE = """<!doctype html>
     <p class="sub">로봇이 알려진 크기의 사각형을 돌며 정지점마다 CCTV가 마커 픽셀을 캡처하고,
        그 대응점으로 <code>H_marker</code>를 직접 구하는 방식입니다.</p>
     <div class="hint">
-      wire 규격(확정본): 파이 <code>~/Road_Painter_4th/Server/docs/ROBOT_ODOMETRY_HOMOGRAPHY_WIRE_20260812.md</code>
+      wire 규격(확정본): 파이 <code>~/Road_Painter_4th/Server/docs/CALIBRATION.md</code>
     </div>
   </div>
 
@@ -2622,7 +2586,7 @@ PAGE = """<!doctype html>
       <b>로봇 탭(조이스틱)으로 로봇을 겹침 구역에 직접 몰 것</b> — 그동안 서버가
       <code>REGISTER_CAPTURE</code>를 주기적으로 반복 전송하고, 로봇이 실제로 두
       채널 시야 안에 있을 때만 카메라가 성공으로 답합니다.<br>
-      wire 규격: <code>~/Road_Painter_4th/Server/docs/REGISTER_WIRE_20260815.md</code>
+      wire 규격: <code>~/Road_Painter_4th/Server/docs/CALIBRATION.md</code>
     </div>
     <div class="hint">
       ⚠️ 정합은 두 채널 모두 <b>오도메트리를 먼저 완주</b>하고, <b>Odometry 탭에서
@@ -5742,7 +5706,7 @@ function fillCentralHmatrixTemplate(outId, noteId) {
   missing.push(`image_size (기준영상 없음 — ${size[0]}×${size[1]} 으로 가정)`);
 
   const bundle = {
-    // ch는 payload 최상위에 실어야 한다(server_PROTOCOL.md, docs/08.06/
+    // ch는 payload 최상위에 실어야 한다(docs/PROTOCOL.md, docs/08.06/
     // CCTV_ACTION_ITEMS_20260806.md C-3) — 안 실으면 서버가 전부 채널 1로
     // 보고, 4채널을 캘리해도 마지막 하나만 남는다. 그때의 자동 경로
     // (push_calib_to_server)는 이미 이렇게 하고 있었는데, 이 수동 버튼은
@@ -5770,7 +5734,7 @@ function fillCentralHmatrixTemplate(outId, noteId) {
     // 서버가 시차 보정에 쓰는 값. **mm 그대로** 싣는다 (2026-08-13 변경).
     //
     // 예전에는 이 필드만 m 로 바꿔 실었다("서버 스키마가 그렇다"). 그 근거가
-    // 지금은 반대다: wire 규격 §6, ROBOT_ODOMETRY_HOMOGRAPHY.md, EXEC_PLAN,
+    // 지금은 반대다: wire 규격, docs/CALIBRATION.md,
     // 서버팀 회신(REPLY_SERVER §166 "marker_height_mm처럼")이 전부 mm 이고,
     // 카메라가 주행 캘리에서 직접 조립해 올리는 번들(SendCalibBundle)도 이미
     // marker_height_mm 이다. m 로 쓰는 곳은 옛 TESTING.md 픽스처와 router.cpp
@@ -5830,7 +5794,7 @@ function fillCentralHmatrixLegacy() {
 
   const bundle = {
     // ch는 calib "안"이 아니라 payload 최상위(calib과 형제)에 실어야 한다
-    // (server_PROTOCOL.md, C-3) — 2026-08-11 발견, fillCentralHmatrixTemplate와
+    // (docs/PROTOCOL.md, C-3) — 2026-08-11 발견, fillCentralHmatrixTemplate와
     // 같은 이유로 여기도 빠져 있었다.
     ch: curCh() + 1,   // 1-based
     calib: {
