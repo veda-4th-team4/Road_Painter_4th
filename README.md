@@ -19,7 +19,7 @@
 ## [ 프로젝트 공식 문서 & 아카이브 ]
 * **Team Confluence Wiki:** [[https://eosang60.atlassian.net/wiki/...](https://eosang60.atlassian.net/wiki/x/tQAR)]
 * **Jira Project Management:** [https://eosang60.atlassian.net/jira/software/projects/SCRUM/boards/1?filter=&groupBy=none&atlOrigin=eyJpIjoiOGY0MDE4OTY5ZDhlNGIyODk3ZGJlMTlkNWY4NWYzYjQiLCJwIjoiaiJ9]
-* **시연 영상 및 발표 자료:** [시연 영상 및 발표 PPTX 링크]
+* **시연 영상 및 발표 자료:** [[시연 영상 및 발표 PPTX 링크](https://github.com/veda-4th-team4/Road_Painter_4th/releases/tag/v1.0-final)]
 
 ---
 
