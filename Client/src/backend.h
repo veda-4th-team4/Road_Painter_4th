@@ -555,7 +555,7 @@ private:
     bool m_nozzleDown = false;
     QString m_robotLog;
     // 현재 작업 채널의 실제 RTSP URL. 채널 선택 시 CH1~CH4 중 하나로 바뀐다.
-    QString m_rtspUrl = "rtsp://admin:5hanwha!@192.168.0.13:554/0/profile2/media.smp";
+    QString m_rtspUrl = "";
     int m_brightness = 45, m_contrast = 8, m_sharpen = 0, m_saturation = 0;
 
     // ── 다채널 (PNM-C16083RVQ) ────────────────────────────────────────────
@@ -574,7 +574,7 @@ private:
     //    디코딩한다. 서브가 생기면 여기만 고치면 된다.
     //    현장 운용(2026-08-11): profile2는 4채널 모두 2592x1520 20fps.
     QString m_channelUrlTemplate =
-        QStringLiteral("rtsp://admin:5hanwha!@{ip}:554/{ch0}/profile2/media.smp");
+        QStringLiteral("");
     int m_channelCount = 4;
     int m_highlightedCh = 0;   // 클릭한 채널 (0 = 없음)
     int m_workingCh = 0;       // 작업 중인 채널 (0 = 그리드 화면)
