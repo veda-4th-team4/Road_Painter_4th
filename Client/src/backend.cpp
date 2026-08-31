@@ -3595,7 +3595,7 @@ void Backend::loadSettings()
     m_camIp = QLatin1String(kDefaultFourChannelCameraIp);
     m_channelCount = kFourChannelCount;
     m_channelUrlTemplate = QStringLiteral(
-        "rtsp://admin:5hanwha!@{ip}:554/{ch0}/profile2/media.smp");
+        "");
     s.remove("camera/rtspUrl");
     s.setValue("camera/ip", m_camIp);
     s.setValue("camera/channelIp", m_camIp);
