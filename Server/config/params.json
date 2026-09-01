@@ -2,7 +2,7 @@
   "_readme": "서버 튜닝 파라미터. 값을 고치고 서버만 재시작하면 적용된다(재컴파일 불필요). 항목 설명과 기본값은 src/params.hpp, 근거는 docs/TUNING.md. '_'로 시작하는 키는 주석 취급하고 무시한다. 지우거나 항목을 빼도 되며, 빠진 항목은 코드의 기본값을 쓴다.",
 
   "_1_기하": "로봇 하드웨어 실측값. pen_offset_m은 로봇 PathFollower.h NOZZLE_OFFSET_M과 반드시 같아야 한다 - 자동 동기화되지 않는다. wheel_base_m은 로봇팀 실측 확정값 0.166 (calibration_test.cpp WHEELBASE_M)",
-  "pen_offset_m": 0.172,
+  "pen_offset_m": 0.182,
   "wheel_base_m": 0.166,
 
   "_1a_펜두께": "펜이 실제로 칠하는 폭. 도색 구간을 앞뒤로 w/2씩 늘려 꼭짓점 귀퉁이가 비지 않게 한다(docs/PATH_GEOMETRY.md). 0으로 두면 보정이 통째로 꺼진다(2026-08-13 이전 동작). 🔴 마커 사양(5cm)이 아니라 직선 한 줄 긋고 자로 잰 실측값을 넣을 것 - 압력·속도·노면에 따라 달라진다",
@@ -16,7 +16,7 @@
   "align_max_tries": 6,
 
   "_3_MORE": "move/arc 직후 거리 보정. more_max_m를 넘는 값은 pose가 틀렸다고 보고 판정을 폐기한다",
-  "more_deadband_m": 0.005,
+  "more_deadband_m": 0.003,
   "more_max_m": 0.5,
   "more_max_tries": 4,
 
