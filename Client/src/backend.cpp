@@ -8,6 +8,7 @@
 #include "paintgeometry.h"
 #include "paintprogress.h"
 #include "paintdimensions.h"
+#include "camcreds.h"
 #include "robottiming.h"
 
 #include <QTimer>
@@ -1035,7 +1036,7 @@ void Backend::startWorker()
 {
     if (m_workerStarted) return;
     ++m_streamGen;                                   // 새 스트림 세대 시작
-    m_worker = new video_worker(m_rtspUrl, this);
+    m_worker = new video_worker(camcreds::apply(m_rtspUrl), this);
     m_worker->setVideoFilters(m_brightness, m_contrast, m_sharpen, m_saturation);
     wireWorker(m_worker);
     m_worker->start();
@@ -2149,25 +2150,46 @@ void Backend::setJobProgress(double p)
 
 void Backend::updatePaintContact(const QPointF &pen)
 {
-    if (m_paintPathIndex < 0 || m_paintPathIndex >= m_missionPaths.size()) return;
+    if (m_missionPaths.isEmpty()) return;
     if (m_missionPathProgress.size() != m_missionPaths.size())
         m_missionPathProgress = QList<double>(m_missionPaths.size(), 0.0);
+    if (m_paintPathIndex < 0) m_paintPathIndex = 0;
+    if (m_paintPathIndex >= m_missionPaths.size()) return;
 
-    const paintprogress::PathProjection hit = paintprogress::projectOnPath(
-        m_missionPaths[m_paintPathIndex],
-        m_missionClosed.value(m_paintPathIndex, false), pen);
     // 펜 반폭 + 측위 여유. 실행 차례의 획에 실제로 가까울 때만 주황색을 늘린다.
     const double strokeMm = m_topView ? m_topView->strokeWidthMm() : 60.0;
     const double contactToleranceM = qMax(0.04, strokeMm / 2000.0 + 0.03);
-    if (!hit.valid || hit.distanceM > contactToleranceM) return;
 
-    m_missionPathProgress[m_paintPathIndex] = qMax(
-        m_missionPathProgress[m_paintPathIndex], hit.progress01);
-    if (m_missionPathProgress[m_paintPathIndex] >= 0.985)
-        m_missionPathProgress[m_paintPathIndex] = 1.0;
+    // 🔴 현재 차례부터 **앞으로만** 훑는다. 두 가지를 동시에 지킨다:
+    //   · 뒤로 안 간다 — 이미 지난 획 옆을 지나가도 그 획으로 되돌아가지 않는다.
+    //   · 멈추지 않는다 — 예전에는 현재 획이 완료 판정을 못 받으면 인덱스가 영원히
+    //     제자리라, 그 뒤의 모든 획이 끝까지 주황색이 되지 않았다. 완료 판정은
+    //     onStatus 의 nozzle-up 한 경로뿐이라 한 번만 놓쳐도 화면이 통째로 굳는다.
+    // 로봇은 보낸 순서대로만 그리므로, 펜이 뒤쪽 획 위에 **도색 중으로** 올라와
+    // 있다면 그 앞의 획들은 실제로 이미 끝난 것이다 — 그때만 건너뛴다.
+    int hitIndex = -1;
+    paintprogress::PathProjection hit;
+    for (int i = m_paintPathIndex; i < m_missionPaths.size(); ++i) {
+        const paintprogress::PathProjection pr = paintprogress::projectOnPath(
+            m_missionPaths[i], m_missionClosed.value(i, false), pen);
+        if (pr.valid && pr.distanceM <= contactToleranceM) { hitIndex = i; hit = pr; break; }
+    }
+    if (hitIndex < 0) return;
+
+    for (int i = m_paintPathIndex; i < hitIndex; ++i)
+        m_missionPathProgress[i] = 1.0;
+    if (hitIndex != m_paintPathIndex) {
+        m_paintPathIndex = hitIndex;
+        m_paintPathLiftCount = 0;
+    }
+
+    m_missionPathProgress[hitIndex] = qMax(m_missionPathProgress[hitIndex], hit.progress01);
+    if (m_missionPathProgress[hitIndex] >= 0.985)
+        m_missionPathProgress[hitIndex] = 1.0;
     setJobProgress(paintprogress::weightedProgress(
         m_missionPaths, m_missionClosed, m_missionPathProgress));
 }
+
 
 // 서버가 주는 POSE(x, y)는 **ArUco 마커(ID 49)의 중심**이다. 로봇팀 제원(2026-07-30):
 //
@@ -2453,6 +2475,11 @@ QString Backend::channelUrl(int ch, bool sub) const
         return QStringLiteral("%1/ch%2%3").arg(m_relayBase).arg(ch)
                                           .arg(sub ? QStringLiteral("s") : QString());
 
+    // 🔴 자격증명이 없으면 주소를 만들지 않는다. 빈 아이디로 반복 접속하면
+    //    한화 카메라가 계정을 잠근다 (camcreds.h 참고).
+    if (m_channelUrlTemplate.contains(QStringLiteral("{user}")) && !camcreds::available())
+        return QString();
+
     if (m_channelUrlTemplate.contains(QStringLiteral("{ip}")) && m_camIp.isEmpty())
         return QString();
 
@@ -2463,7 +2490,7 @@ QString Backend::channelUrl(int ch, bool sub) const
     url.replace(QStringLiteral("{ip}"),  m_camIp);
     url.replace(QStringLiteral("{ch0}"), QString::number(ch - 1));
     url.replace(QStringLiteral("{ch}"),  QString::number(ch));
-    return url;
+    return camcreds::apply(url);   // {user}/{pass} 를 실행 시점에 채운다
 }
 
 QString Backend::mainUrl(int ch) const { return channelUrl(ch, false); }
@@ -3173,7 +3200,7 @@ void Backend::setRtsp(const QString &url)
     if (m_originalView) m_originalView->clearFrame();
 
     m_gotRealFrame = false;                              // 새 스트림 기준으로 다시 판단
-    m_worker = new video_worker(m_rtspUrl, this);
+    m_worker = new video_worker(camcreds::apply(m_rtspUrl), this);
     m_worker->setVideoFilters(m_brightness, m_contrast, m_sharpen, m_saturation);
     wireWorker(m_worker);
     m_worker->start();
@@ -3559,6 +3586,18 @@ void Backend::addTextWorldMm(const QString &text, double heightMm, bool outline)
     // ⚠️ 기준이 **완성 높이**로 바뀌었다. 예전 규칙은 '중심 높이 >= 붓폭 x 2.5' 였고,
     //    완성 = 중심 + 붓폭 이므로 완성 기준으로는 x 3.5 다. 문구의 권장값도 같이 쓴다.
     const double kMinRecommendedMm = m_strokeWidthMm * 3.5;
+    // 🔴 실제 도색 크기를 **화면 통지로도** 띄운다.
+    //    글자는 획이 여러 개라 치수 라벨이 활성 획 하나에만 붙는다 — 사각형처럼
+    //    변마다 숫자가 보이지 않는다. 조작자가 "내가 친 높이가 진짜 저 크기인가"를
+    //    확인할 곳이 로그밖에 없으면 놓친다. 경고가 있으면 아래 경고가 이긴다.
+    if (!outline && paintedMm.isValid() && paintedMm.width() > 0.0
+        && heightMm >= kMinRecommendedMm) {
+        setNotice(QStringLiteral("실제 도색 크기 %1 x %2 mm (가로 x 세로) — 붓 폭 %3 mm 포함")
+                      .arg(paintedMm.width(), 0, 'f', 0)
+                      .arg(paintedMm.height(), 0, 'f', 0)
+                      .arg(m_strokeWidthMm, 0, 'f', 0),
+                  QStringLiteral("info"));
+    }
     if (!outline && heightMm < kMinRecommendedMm) {
         setNotice(QStringLiteral("완성 도색 높이 %1 mm 는 붓 폭 %2 mm 에 비해 작아 뭉개질 수 있습니다. "
                                  "%3 mm 이상을 권장합니다.")
@@ -3687,7 +3726,7 @@ void Backend::loadSettings()
     m_camIp = QLatin1String(kDefaultFourChannelCameraIp);
     m_channelCount = kFourChannelCount;
     m_channelUrlTemplate = QStringLiteral(
-        "");
+        "rtsp://{user}:{pass}@{ip}:554/{ch0}/profile2/media.smp");
     s.remove("camera/rtspUrl");
     s.setValue("camera/ip", m_camIp);
     s.setValue("camera/channelIp", m_camIp);

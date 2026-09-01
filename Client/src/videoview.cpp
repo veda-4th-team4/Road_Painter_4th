@@ -996,13 +996,20 @@ void VideoView::paintMission(QPainter *p, double sx, double sy, double ox, doubl
     };
 
     QList<QVector<QPointF>> segsList;
+    // 🔴 segsList 는 점 2개 미만인 경로를 건너뛴다 — 그래서 **m_missionPaths 와
+    //    인덱스가 어긋날 수 있다.** 도형별 진행률을 인덱스로 바로 찾으면 엉뚱한
+    //    획이 칠해지거나, 크기 비교가 어긋나 옛 전역 진행률로 되돌아간다
+    //    (= 앞 글자가 통째로 주황색이 되던 그 증상). 원본 인덱스를 같이 들고 간다.
+    QList<int> segsSource;
     double total = 0.0;
-    for (const VVPath &mp : std::as_const(m_missionPaths)) {
+    for (int srcIndex = 0; srcIndex < m_missionPaths.size(); ++srcIndex) {
+        const VVPath &mp = m_missionPaths[srcIndex];
         if (mp.pts.size() < 2) continue;
         QVector<QPointF> segs = mp.pts;
         if (mp.closed && mp.pts.size() > 2)
             segs.append(mp.pts.first());
         segsList.append(segs);
+        segsSource.append(srcIndex);
         for (int i = 1; i < segs.size(); ++i)
             total += QLineF(segs[i - 1], segs[i]).length();
     }
@@ -1039,9 +1046,11 @@ void VideoView::paintMission(QPainter *p, double sx, double sy, double ox, doubl
         double pathLengthPx = 0.0;
         for (int i = 1; i < segs.size(); ++i)
             pathLengthPx += QLineF(segs[i - 1], segs[i]).length();
-        const double pathProgress = m_missionPathProgress.size() == segsList.size()
-            ? m_missionPathProgress.value(pathIndex, 0.0)
-            : m_missionProgress;
+        const int srcIndex = segsSource.value(pathIndex, -1);
+        const double pathProgress =
+            (srcIndex >= 0 && srcIndex < m_missionPathProgress.size())
+                ? m_missionPathProgress[srcIndex]
+                : m_missionProgress;
         double remain = pathLengthPx * qBound(0.0, pathProgress, 1.0);
         for (int i = 1; i < segs.size() && remain > 1e-9; ++i) {
             const QPointF a = segs[i - 1];

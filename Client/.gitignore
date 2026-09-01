@@ -14,3 +14,10 @@ src/.qtcreator/
 CMakeCache.txt
 CMakeFiles/
 *.user
+
+# 🔴 카메라 자격증명 — 절대 커밋하지 않는다.
+#    이 저장소는 공개(public)다. 실제 값은 실행 파일 옆의 camera.env 에 두고,
+#    형식은 camera.env.example 로만 공유한다 (src/camcreds.h 참고).
+camera.env
+*.env
+!*.env.example

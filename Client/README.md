@@ -56,9 +56,11 @@ Client/
 │   ├── routeplan.h                   • 다중 경로 순서 및 이동 구간 계획
 │   ├── motionprogram.h               • MOVE·TURN·ARC·NOZZLE 명령 생성
 │   ├── robottiming.h                 • 예상 작업 시간 계산
+│   ├── camcreds.h                    • 카메라 자격증명 로더 (환경변수 / camera.env)
 │   ├── certs/server.crt              • TLS 서버 인증서
 │   └── tests/
 │       └── motionprogram_tests.cpp   • 경로 및 명령 생성 회귀 테스트
+├── camera.env.example                • 자격증명 형식 (실제 값은 camera.env, 커밋 제외)
 ├── BUILD.md                          • 빌드 및 배포 상세 문서
 ├── RoadPainter.exe                   • Windows 실행 파일
 └── Qt·OpenCV 런타임 파일             • 독립 실행형 배포 구성
@@ -86,6 +88,14 @@ Client/RoadPainter.exe
 ```
 
 Qt와 OpenCV 런타임 파일이 `Client/` 폴더에 함께 포함되어 있으므로 별도 설치 없이 실행할 수 있습니다.
+
+처음 한 번만, 카메라 계정을 설정합니다. 자격증명은 저장소에 포함되지 않습니다.
+
+```text
+copy camera.env.example camera.env
+```
+
+`camera.env` 는 `.gitignore` 대상이며, 환경변수 `RP_CAM_USER` / `RP_CAM_PASS` 가 있으면 그쪽이 우선합니다. 값이 없으면 영상 채널이 켜지지 않습니다.
 
 ### 3) CMake 릴리즈 빌드
 
