@@ -1376,6 +1376,138 @@ void testPaintProgressUsesPenPosition()
           "paint progress must follow the nozzle projection");
 }
 
+void testOrderedTextPathsAreNeverRearranged()
+{
+    // H의 가운데 획 바로 옆에서 시작하면 기존 greedy 계획은 가운데 획을 먼저
+    // 골랐고, 그 다음에는 더 가까운 A 획로 건너갔다. 글자 도장은 입력 필순을
+    // 잠그므로 현재 로봇 위치와 무관하게 H 세 획 -> A 두 획 순서여야 한다.
+    const QList<QList<QPointF>> paths{
+        {QPointF(0.0, 0.0), QPointF(0.0, 0.24)},
+        {QPointF(0.13, 0.0), QPointF(0.13, 0.24)},
+        {QPointF(0.0, 0.12), QPointF(0.13, 0.12)},
+        {QPointF(0.20, 0.0), QPointF(0.27, 0.24), QPointF(0.34, 0.0)},
+        {QPointF(0.22, 0.12), QPointF(0.32, 0.12)}
+    };
+    const QList<bool> closed(paths.size(), false);
+    const routeplan::Route route = routeplan::plan(
+        paths, closed, QPointF(-0.005, 0.12), true, 0.01, {}, true);
+    check(route.order == QList<int>({0, 1, 2, 3, 4}),
+          "ordered text must keep H strokes before A strokes");
+    check(route.flipped == QList<bool>({false, false, false, false, false}),
+          "ordered text must keep every stroke direction");
+}
+
+void testPerPathProgressDoesNotPaintPassedLaterStroke()
+{
+    const QList<QList<QPointF>> paths{
+        {QPointF(0.0, 0.0), QPointF(1.0, 0.0)},
+        {QPointF(10.0, 0.0), QPointF(11.0, 0.0)}
+    };
+    const QList<bool> closed{false, false};
+
+    const paintprogress::PathProjection expected =
+        paintprogress::projectOnPath(paths[0], false, QPointF(10.5, 0.0));
+    check(expected.valid && expected.distanceM > 9.0,
+          "passing a later stroke must not count as contact with the current stroke");
+    check(near(paintprogress::weightedProgress(paths, closed, {0.0, 0.5}), 0.25),
+          "only the explicitly contacted path may contribute orange progress");
+    check(paintprogress::prefixPathProgress(paths, closed, 0.25)
+              == QList<double>({0.5, 0.0}),
+          "test-mode scalar progress must still map to the planned prefix");
+}
+
+// 🔴 현장 요구 그대로: "HANWHA 를 어디에서 시작하든 H 의 왼쪽 세로획부터,
+//    획을 하나씩 차례로." 합성 좌표가 아니라 **실제 strokefont 글리프**로 검증한다.
+void testHanwhaAlwaysStartsAtFirstStrokeAndKeepsOrder()
+{
+    double emW = 1.0;
+    const QList<strokefont::Stroke> strokes =
+        strokefont::layout(QStringLiteral("HANWHA"), &emW);
+    check(!strokes.isEmpty(), "HANWHA must lay out");
+
+    // em -> 미터 (글자 높이 0.28 m = 완성 340mm - 펜 60mm)
+    const double sc = 0.28;
+    QList<QList<QPointF>> paths;
+    for (const strokefont::Stroke &st : strokes) {
+        QList<QPointF> pts;
+        for (const QPointF &q : st) pts.append(QPointF(q.x() * sc, q.y() * sc));
+        if (pts.size() >= 2) paths.append(pts);
+    }
+    const QList<bool> closed(paths.size(), false);
+    check(paths.size() >= 12, "HANWHA has at least 12 strokes (H3 A2 N1 W1 H3 A2)");
+
+    // 로봇을 **마지막 획 바로 옆**에 둔다 — greedy 계획이라면 거기부터 집어간다.
+    const QPointF nearLast = paths.last().first() + QPointF(0.004, 0.0);
+    const routeplan::Route route =
+        routeplan::plan(paths, closed, nearLast, true, 0.01, {}, true);
+
+    QList<int> expected;
+    for (int i = 0; i < paths.size(); ++i) expected.append(i);
+    check(route.order == expected,
+          "HANWHA strokes must run in input order no matter where the robot starts");
+    check(!route.flipped.contains(true),
+          "HANWHA strokes must keep their drawing direction");
+
+    // 첫 획은 H 의 왼쪽 세로획이어야 한다 (x 가 일정하고 세로를 꽉 채운다).
+    const QList<QPointF> &first = paths[route.order.first()];
+    check(first.size() == 2, "first stroke is a single straight segment");
+    check(near(first[0].x(), first[1].x(), 1e-9), "first stroke is vertical");
+    check(near(std::abs(first[1].y() - first[0].y()), sc, 1e-9),
+          "first stroke spans the full glyph height");
+    check(near(first[0].x(), 0.0, 1e-9), "first stroke is the left-most vertical of H");
+}
+
+
+// 🔴 UI 가 말하는 크기 == 실제로 칠해지는 크기. 실제 글리프로 끝까지 계산한다.
+//    입력(완성 높이) -> 글리프 -> 전송 좌표 -> 서버가 칠하는 바깥 크기 순서다.
+void testHanwhaPaintedSizeMatchesTheUiNumbers()
+{
+    const double finishedH = 340.0, penMm = 60.0;
+
+    // ① UI 입력은 완성 도색 높이 -> 글리프는 펜 폭만큼 작다.
+    double glyphH = 0.0;
+    check(paintdimensions::storedSegmentMm(finishedH, penMm, false, &glyphH),
+          "340mm finished height with a 60mm pen is valid");
+    check(near(glyphH, 280.0), "glyph height = finished - pen");
+
+    // ② 배율은 잉크 세로 범위 기준. HANWHA 는 em 을 꽉 채운다.
+    double emW = 1.0;
+    const QList<strokefont::Stroke> strokes =
+        strokefont::layout(QStringLiteral("HANWHA"), &emW);
+    const double ink = strokefont::inkHeightEm(strokes);
+    check(near(ink, 1.0, 1e-9), "HANWHA fills the em vertically");
+    const double sc = glyphH / ink;
+
+    // ③ 서버로 가는 좌표(= 글리프)의 바운딩 박스.
+    QList<QVector<QPointF>> polys;
+    for (const strokefont::Stroke &st : strokes) {
+        QVector<QPointF> v;
+        for (const QPointF &q : st) v.append(QPointF(q.x() * sc, q.y() * sc));
+        polys.append(v);
+    }
+    double x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    check(strokefont::polylineBounds(polys, &x0, &y0, &x1, &y1), "bounds must exist");
+
+    // ④ 실제 도색 크기 = 바운딩 박스 + 펜 폭.
+    //    서버가 양끝을 hw 씩 늘리고 폭 60mm 로 칠하므로 가로·세로 모두 +펜폭이다.
+    const double paintedH = (y1 - y0) + penMm;
+    const double paintedW = (x1 - x0) + penMm;
+    check(near(paintedH, finishedH, 1e-9),
+          "painted height must equal the height typed in the UI");
+    check(near(paintedW, 1404.0, 1e-6),
+          "HANWHA at 340mm paints 1404mm wide");
+
+    // ⚠️ 폭은 **잉크 bbox(4.80em)** 이지 자간을 포함한 advance(4.92em) 가 아니다.
+    //    advance 로 계산하면 1437.6mm 가 나와 33.6mm 를 과다 표시한다.
+    check(!near(paintedW, emW * glyphH + penMm, 1.0),
+          "advance width is not the painted width");
+
+    // ⑤ 화면의 획 길이 라벨도 같은 규칙을 쓴다: 글리프 280 -> 라벨 340.
+    check(near(paintdimensions::finishedSegmentMm(glyphH, penMm, false), finishedH, 1e-9),
+          "edge label and glyph conversion are mutually inverse");
+}
+
+
 void testFinishedDimensionEditorKeepsWireGeometrySemantic()
 {
     // 중심선 획(H/V/직선/화살표 등): 서버가 60mm 폭의 양끝을 30mm씩
@@ -1517,6 +1649,10 @@ int main(int argc, char **argv)
     testRobotTimingEstimate();
     testPaintProgressUsesSeparatePaintPaths();
     testPaintProgressUsesPenPosition();
+    testOrderedTextPathsAreNeverRearranged();
+    testPerPathProgressDoesNotPaintPassedLaterStroke();
+    testHanwhaAlwaysStartsAtFirstStrokeAndKeepsOrder();
+    testHanwhaPaintedSizeMatchesTheUiNumbers();
     testFinishedDimensionEditorKeepsWireGeometrySemantic();
     testTextHeightIsFinishedPaintHeight();
     testPolylineBoundsDoesNotFallForNullRect();

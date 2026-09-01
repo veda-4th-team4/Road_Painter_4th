@@ -96,6 +96,7 @@ public:
     int undoDepth() const;
     bool hasActiveShape() const { return m_points.size() >= 2; }
     double strokeWidthMm() const { return m_strokeMm; }
+    bool preservePathOrder() const { return m_preservePathOrder; }
     void setStrokeWidthMm(double mm);
     bool zoomTool() const { return m_zoomTool; }
     void setZoomTool(bool on);
@@ -119,6 +120,7 @@ public:
     void setMissionPathsMeters(const QList<QList<QPointF>> &metersPaths, const QList<bool> &closed);
     void setMissionPathsPixels(const QList<QList<QPointF>> &imagePx, const QList<bool> &closed);
     void setMissionProgress(double progress01);
+    void setMissionPathProgress(const QList<double> &progress01);
     void setRobotPose(double xM, double yM, double thetaDeg, bool valid);
     // 펜(노즐) 끝 위치. 회전중심 뒤 d 에 있어서 로봇 아이콘만 봐서는 어디를 칠하는지
     // 알 수 없다 — 꼭짓점 후진/제자리회전이 눈에 보이게 따로 찍어 준다.
@@ -269,6 +271,7 @@ private:
         bool closed = false;
         bool outerContour = false;
         bool drawing = false;
+        bool preservePathOrder = false;
     };
     void pushUndo();
     // 드래그는 "실제로 움직였을 때만" 되돌리기에 올린다.
@@ -303,6 +306,9 @@ private:
     QVector<QPointF> m_points;
     bool m_closed = false;
     bool m_outerContour = false;
+    // 글자 획은 입력 순서가 곧 필순이다. 하나라도 글자를 넣은 편집본은 서버 전송
+    // 직전의 이동거리 최적화가 획/글자를 섞지 않도록 전체 순서를 잠근다.
+    bool m_preservePathOrder = false;
     QList<VVPath> m_done;
     QPointF m_mouse;
     bool m_hover = false;
@@ -393,6 +399,7 @@ private:
     // 미션 오버레이 (표시 프레임 px)
     QList<VVPath> m_missionPaths;
     double m_missionProgress = 0.0;
+    QList<double> m_missionPathProgress;
     bool m_robotValid = false;
     bool m_penValid = false;
     bool m_penDown = false;

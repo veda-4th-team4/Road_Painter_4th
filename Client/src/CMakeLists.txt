@@ -41,6 +41,7 @@ qt_add_executable(RoadPainterQml
     robottiming.h
     paintgeometry.h
     paintdimensions.h
+    camcreds.h
     motionsim.h
     camcalib.h
     strokefont.h

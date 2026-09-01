@@ -8,6 +8,7 @@
 #include "paintgeometry.h"
 #include "paintprogress.h"
 #include "paintdimensions.h"
+#include "camcreds.h"
 #include "robottiming.h"
 
 #include <QTimer>
@@ -1035,7 +1036,7 @@ void Backend::startWorker()
 {
     if (m_workerStarted) return;
     ++m_streamGen;                                   // 새 스트림 세대 시작
-    m_worker = new video_worker(m_rtspUrl, this);
+    m_worker = new video_worker(camcreds::apply(m_rtspUrl), this);
     m_worker->setVideoFilters(m_brightness, m_contrast, m_sharpen, m_saturation);
     wireWorker(m_worker);
     m_worker->start();
@@ -1258,7 +1259,8 @@ int Backend::pathPointCount() const
 // 도형들을 로봇 현재 위치에서 가장 가깝게 이어지도록 재배열·뒤집어 한 줄로 만든다.
 // 로봇 위치를 모르면(POSE 미수신) 첫 도형은 작도 순서·방향을 그대로 존중한다.
 routeplan::Route Backend::buildRoute(const QList<QList<QPointF>> &paths,
-                                     const QList<bool> &closed) const
+                                     const QList<bool> &closed,
+                                     bool preserveInputOrder) const
 {
     QList<bool> preservePoints;
     preservePoints.reserve(paths.size());
@@ -1276,7 +1278,7 @@ routeplan::Route Backend::buildRoute(const QList<QList<QPointF>> &paths,
         preservePoints.append(oneArc);
     }
     return routeplan::plan(paths, closed, QPointF(m_poseX, m_poseY), m_poseValid,
-                           0.01, preservePoints);
+                           0.01, preservePoints, preserveInputOrder);
 }
 
 // 계획 결과를 사람이 읽을 수 있게 로그로 남긴다 — "왜 이 순서로 도는가"를
@@ -1290,7 +1292,14 @@ void Backend::logRoute(const routeplan::Route &route,
     if (dropped > 0)
         const_cast<Backend *>(this)->appendLog(
             QString("경로 단순화 — 1cm 이하 꺾임 %1점 정리 (로봇이 헛멈추지 않게)").arg(dropped));
-    if (route.shapeCount > 1) {
+    bool rearranged = false;
+    for (int i = 0; i < route.order.size(); ++i) {
+        if (route.order[i] != i || route.flipped.value(i, false)) {
+            rearranged = true;
+            break;
+        }
+    }
+    if (route.shapeCount > 1 && rearranged) {
         const double before = routeplan::naiveTravel(paths, closed,
                                                      QPointF(m_poseX, m_poseY), m_poseValid);
         const_cast<Backend *>(this)->appendLog(
@@ -1301,6 +1310,10 @@ void Backend::logRoute(const routeplan::Route &route,
                 .arg(route.paintM, 0, 'f', 2));
         const_cast<Backend *>(this)->appendLog(
             QStringLiteral("도형 사이 이동 구간은 pen-up(paint=false) 으로 보냅니다 — 칠하지 않고 지나갑니다"));
+    } else if (route.shapeCount > 1) {
+        const_cast<Backend *>(this)->appendLog(
+            QString("도형 %1개 입력 순서·방향 유지 — 글자 획 순서 보호 (도색 %2 m)")
+                .arg(route.shapeCount).arg(route.paintM, 0, 'f', 2));
     }
 }
 
@@ -1354,10 +1367,10 @@ void Backend::commitDrawing()
     if (m_jobActive) { appendLog("이미 작업이 진행 중입니다."); return; }
 
     // 프로토콜의 BLUEPRINT 는 폴리라인 1개다 → 도형들을 한 줄로 이어야 한다.
-    // 작도 순서 그대로 이으면 로봇이 도형 사이를 가로지르며 현장을 활보하고, 그
-    // 이동 구간까지 도색된다. 여기서 순서·진행 방향을 다시 잡고 이동 구간에는
-    // pen-up(paint=false) 을 붙인다. (routeplan.h)
-    const routeplan::Route route = buildRoute(paths, closed);
+    // 일반 도형은 빈 이동을 줄이도록 순서·방향을 계획하고, 글자 도장은 필순을
+    // 그대로 잠근다. 어느 경우든 도형 사이 이동에는 pen-up(paint=false)을 붙인다.
+    const bool preserveInputOrder = m_topView->preservePathOrder();
+    const routeplan::Route route = buildRoute(paths, closed, preserveInputOrder);
     const QList<QPointF> &blueprint = route.pts;
     if (blueprint.size() < 2) { appendLog("작도된 경로가 없습니다."); return; }
 
@@ -1508,8 +1521,17 @@ void Backend::completeAbort(bool wasActive, bool requestedHere)
     m_paintingSeen = false;
     m_jobElapsedValid = false;
     m_jobProgress = 0.0;
-    if (m_topView) m_topView->setMissionProgress(0.0);
-    if (m_originalView) m_originalView->setMissionProgress(0.0);
+    m_missionPathProgress = QList<double>(m_missionPaths.size(), 0.0);
+    m_paintPathIndex = 0;
+    m_paintPathLiftCount = 0;
+    if (m_topView) {
+        m_topView->setMissionProgress(0.0);
+        m_topView->setMissionPathProgress(m_missionPathProgress);
+    }
+    if (m_originalView) {
+        m_originalView->setMissionProgress(0.0);
+        m_originalView->setMissionPathProgress(m_missionPathProgress);
+    }
     updateJobRecord(m_currentJobId, QStringLiteral("중단"), 0.0);
     setNotice(requestedHere
                   ? QStringLiteral("작업이 취소됐습니다. 같은 도면을 다시 시작하거나 경로를 수정할 수 있습니다.")
@@ -1549,6 +1571,9 @@ void Backend::editMission()
     if (m_originalView) m_originalView->clearMission();
     m_missionPaths.clear();
     m_missionClosed.clear();
+    m_missionPathProgress.clear();
+    m_paintPathIndex = 0;
+    m_paintPathLiftCount = 0;
     m_missionEditPaths.clear();
     m_missionEditClosed.clear();
     m_missionEditOuter.clear();
@@ -1586,6 +1611,9 @@ void Backend::clearMission()
     stopTestProgressSim();
     m_missionPaths.clear();
     m_missionClosed.clear();
+    m_missionPathProgress.clear();
+    m_paintPathIndex = 0;
+    m_paintPathLiftCount = 0;
     m_missionEditPaths.clear();
     m_missionEditClosed.clear();
     m_missionEditOuter.clear();
@@ -1614,6 +1642,9 @@ void Backend::storeMission(const QList<QList<QPointF>> &paths, const QList<bool>
 {
     m_missionPaths = paths;
     m_missionClosed = closed;
+    m_missionPathProgress = QList<double>(paths.size(), 0.0);
+    m_paintPathIndex = 0;
+    m_paintPathLiftCount = 0;
     m_jobActive = false;
     m_jobProgress = 0.0;
     m_pathLengthM = pathsLength(paths, closed);
@@ -1631,6 +1662,9 @@ void Backend::beginPainting()
     m_abortPending = false;
     m_paintingSeen = false;
     m_jobProgress = 0.0;
+    m_missionPathProgress = QList<double>(m_missionPaths.size(), 0.0);
+    m_paintPathIndex = 0;
+    m_paintPathLiftCount = 0;
     m_waypointIndex = 0;
     m_jobElapsed.restart();
     m_jobElapsedValid = true;
@@ -1650,6 +1684,9 @@ void Backend::finishJob(const QString &reason)
     // STATUS.painting=false가 마지막 POSE보다 먼저 도착하면 표시 진행률이 잠시
     // 마지막 투영값에 머물 수 있다. 완료의 유일한 권위인 DRAW_DONE이 이 함수로
     // 들어오면 반드시 100%로 확정하므로 "완료인데 96%" 상태는 남지 않는다.
+    m_missionPathProgress = QList<double>(m_missionPaths.size(), 1.0);
+    m_paintPathIndex = m_missionPaths.size();
+    m_paintPathLiftCount = 0;
     setJobProgress(1.0);
     m_waypointIndex = qMax(0, m_waypointCount - 1);
     m_phase = "done";
@@ -1672,7 +1709,8 @@ QList<motionprogram::Op> Backend::currentProgram() const
         return motionprogram::build(m_routePts, m_routePaint, m_speeds);
     if (!m_topView) return {};
     QList<bool> closed;
-    const routeplan::Route r = buildRoute(m_topView->pathsToMeters(&closed), closed);
+    const routeplan::Route r = buildRoute(m_topView->pathsToMeters(&closed), closed,
+                                          m_topView->preservePathOrder());
     return motionprogram::build(r.pts, r.paint, m_speeds);
 }
 
@@ -2042,6 +2080,7 @@ void Backend::pushMissionToView()
     if (m_topView) {
         m_topView->setMissionPathsMeters(m_missionPaths, m_missionClosed);
         m_topView->setMissionProgress(m_jobProgress);
+        m_topView->setMissionPathProgress(m_missionPathProgress);
         if (m_poseValid)
             pushPoseToView(true);
     }
@@ -2059,6 +2098,7 @@ void Backend::pushMissionToView()
         }
         m_originalView->setMissionPathsPixels(cctvPaths, cctvClosed);
         m_originalView->setMissionProgress(m_jobProgress);
+        m_originalView->setMissionPathProgress(m_missionPathProgress);
     }
 }
 
@@ -2080,25 +2120,76 @@ void Backend::setJobProgress(double p)
     // monotonic during job
     if (m_jobActive && p < m_jobProgress)
         p = m_jobProgress;
+    if (m_testMode && m_jobActive)
+        m_missionPathProgress = paintprogress::prefixPathProgress(
+            m_missionPaths, m_missionClosed, p);
     if (qFuzzyCompare(p, m_jobProgress)) {
-        if (m_topView) m_topView->setMissionProgress(m_jobProgress);
-        if (m_originalView) m_originalView->setMissionProgress(m_jobProgress);
+        if (m_topView) {
+            m_topView->setMissionProgress(m_jobProgress);
+            m_topView->setMissionPathProgress(m_missionPathProgress);
+        }
+        if (m_originalView) {
+            m_originalView->setMissionProgress(m_jobProgress);
+            m_originalView->setMissionPathProgress(m_missionPathProgress);
+        }
         return;
     }
     m_jobProgress = p;
-    if (m_topView)
+    if (m_topView) {
         m_topView->setMissionProgress(m_jobProgress);
-    if (m_originalView)
+        m_topView->setMissionPathProgress(m_missionPathProgress);
+    }
+    if (m_originalView) {
         m_originalView->setMissionProgress(m_jobProgress);
+        m_originalView->setMissionPathProgress(m_missionPathProgress);
+    }
     refreshJobMetrics();
     emit jobChanged();
     updatePhase();
 }
 
-double Backend::progressAlongPath(const QPointF &pen) const
+void Backend::updatePaintContact(const QPointF &pen)
 {
-    return paintprogress::progressAlongPaths(m_missionPaths, m_missionClosed, pen);
+    if (m_missionPaths.isEmpty()) return;
+    if (m_missionPathProgress.size() != m_missionPaths.size())
+        m_missionPathProgress = QList<double>(m_missionPaths.size(), 0.0);
+    if (m_paintPathIndex < 0) m_paintPathIndex = 0;
+    if (m_paintPathIndex >= m_missionPaths.size()) return;
+
+    // 펜 반폭 + 측위 여유. 실행 차례의 획에 실제로 가까울 때만 주황색을 늘린다.
+    const double strokeMm = m_topView ? m_topView->strokeWidthMm() : 60.0;
+    const double contactToleranceM = qMax(0.04, strokeMm / 2000.0 + 0.03);
+
+    // 🔴 현재 차례부터 **앞으로만** 훑는다. 두 가지를 동시에 지킨다:
+    //   · 뒤로 안 간다 — 이미 지난 획 옆을 지나가도 그 획으로 되돌아가지 않는다.
+    //   · 멈추지 않는다 — 예전에는 현재 획이 완료 판정을 못 받으면 인덱스가 영원히
+    //     제자리라, 그 뒤의 모든 획이 끝까지 주황색이 되지 않았다. 완료 판정은
+    //     onStatus 의 nozzle-up 한 경로뿐이라 한 번만 놓쳐도 화면이 통째로 굳는다.
+    // 로봇은 보낸 순서대로만 그리므로, 펜이 뒤쪽 획 위에 **도색 중으로** 올라와
+    // 있다면 그 앞의 획들은 실제로 이미 끝난 것이다 — 그때만 건너뛴다.
+    int hitIndex = -1;
+    paintprogress::PathProjection hit;
+    for (int i = m_paintPathIndex; i < m_missionPaths.size(); ++i) {
+        const paintprogress::PathProjection pr = paintprogress::projectOnPath(
+            m_missionPaths[i], m_missionClosed.value(i, false), pen);
+        if (pr.valid && pr.distanceM <= contactToleranceM) { hitIndex = i; hit = pr; break; }
+    }
+    if (hitIndex < 0) return;
+
+    for (int i = m_paintPathIndex; i < hitIndex; ++i)
+        m_missionPathProgress[i] = 1.0;
+    if (hitIndex != m_paintPathIndex) {
+        m_paintPathIndex = hitIndex;
+        m_paintPathLiftCount = 0;
+    }
+
+    m_missionPathProgress[hitIndex] = qMax(m_missionPathProgress[hitIndex], hit.progress01);
+    if (m_missionPathProgress[hitIndex] >= 0.985)
+        m_missionPathProgress[hitIndex] = 1.0;
+    setJobProgress(paintprogress::weightedProgress(
+        m_missionPaths, m_missionClosed, m_missionPathProgress));
 }
+
 
 // 서버가 주는 POSE(x, y)는 **ArUco 마커(ID 49)의 중심**이다. 로봇팀 제원(2026-07-30):
 //
@@ -2180,7 +2271,7 @@ void Backend::onPose(double x, double y, double thetaDeg)
         const double displayOffsetM = m_penDisplayOffsetMm / 1000.0;
         const QPointF pen = paintgeometry::penMarkerFromRobotCenter(
             x, y, thetaDeg, displayOffsetM);
-        setJobProgress(progressAlongPath(pen));
+        updatePaintContact(pen);
     }
 
     // ⚠️ 완료 판정은 하지 않는다. 끝은 서버의 DRAW_DONE 하나뿐이다.
@@ -2192,10 +2283,33 @@ void Backend::onStatus(const QString &state, bool painting)
     // STATUS 는 로봇이 초당 여러 번 보낸다 — 값이 그대로면 로그에 남기지 않는다.
     // 예전에는 무조건 찍어서 `STATUS IDLE painting=false` 가 로그를 통째로 덮었고,
     // 정작 봐야 할 줄이 스크롤 밖으로 밀려났다. 상태 자체는 상단 표시로 항상 보인다.
+    const bool wasPainting = m_painting;
     const bool changed = (state != m_robotState) || (painting != m_painting);
 
     m_robotState = state;
     m_painting = painting;
+    // 마지막 true POSE가 끝점 직전에 찍혀도 정상적인 nozzle-up 전환을 놓치지 않는다.
+    // 단일 직선은 한 번, 짧은 꺾은선 글자는 선분 수만큼의 lift를 완료 근거로 쓴다.
+    if (wasPainting && !painting && m_jobActive && !m_testMode
+        && m_paintPathIndex >= 0 && m_paintPathIndex < m_missionPathProgress.size()) {
+        ++m_paintPathLiftCount;
+        const int pointCount = m_missionPaths.value(m_paintPathIndex).size();
+        const int segmentCount = qMax(1, pointCount - 1
+            + (m_missionClosed.value(m_paintPathIndex, false) && pointCount > 2 ? 1 : 0));
+        // 한 구간 획은 짧아서 POSE 표본이 하나도 없어도 down->up 자체가 실제 도색
+        // 완료 증거다. H/A/N/W 같은 짧은 꺾은선은 각 TURN마다 펜을 들기 때문에
+        // 선분 수만큼 lift를 보았을 때 완료한다. 샘플이 많은 ARC는 투영률로 끝을 안다.
+        const bool completed = pointCount == 2
+            || m_missionPathProgress[m_paintPathIndex] >= 0.90
+            || (segmentCount <= 6 && m_paintPathLiftCount >= segmentCount);
+        if (completed) {
+            m_missionPathProgress[m_paintPathIndex] = 1.0;
+            ++m_paintPathIndex;
+            m_paintPathLiftCount = 0;
+            setJobProgress(paintprogress::weightedProgress(
+                m_missionPaths, m_missionClosed, m_missionPathProgress));
+        }
+    }
     // 접근이 끝나고 도색으로 넘어가는 순간은 통지되지 않는다 → painting 으로 유추
     if (painting && m_jobActive && !m_paintingSeen) {
         m_paintingSeen = true;
@@ -2361,6 +2475,11 @@ QString Backend::channelUrl(int ch, bool sub) const
         return QStringLiteral("%1/ch%2%3").arg(m_relayBase).arg(ch)
                                           .arg(sub ? QStringLiteral("s") : QString());
 
+    // 🔴 자격증명이 없으면 주소를 만들지 않는다. 빈 아이디로 반복 접속하면
+    //    한화 카메라가 계정을 잠근다 (camcreds.h 참고).
+    if (m_channelUrlTemplate.contains(QStringLiteral("{user}")) && !camcreds::available())
+        return QString();
+
     if (m_channelUrlTemplate.contains(QStringLiteral("{ip}")) && m_camIp.isEmpty())
         return QString();
 
@@ -2371,7 +2490,7 @@ QString Backend::channelUrl(int ch, bool sub) const
     url.replace(QStringLiteral("{ip}"),  m_camIp);
     url.replace(QStringLiteral("{ch0}"), QString::number(ch - 1));
     url.replace(QStringLiteral("{ch}"),  QString::number(ch));
-    return url;
+    return camcreds::apply(url);   // {user}/{pass} 를 실행 시점에 채운다
 }
 
 QString Backend::mainUrl(int ch) const { return channelUrl(ch, false); }
@@ -3081,7 +3200,7 @@ void Backend::setRtsp(const QString &url)
     if (m_originalView) m_originalView->clearFrame();
 
     m_gotRealFrame = false;                              // 새 스트림 기준으로 다시 판단
-    m_worker = new video_worker(m_rtspUrl, this);
+    m_worker = new video_worker(camcreds::apply(m_rtspUrl), this);
     m_worker->setVideoFilters(m_brightness, m_contrast, m_sharpen, m_saturation);
     wireWorker(m_worker);
     m_worker->start();
@@ -3467,6 +3586,18 @@ void Backend::addTextWorldMm(const QString &text, double heightMm, bool outline)
     // ⚠️ 기준이 **완성 높이**로 바뀌었다. 예전 규칙은 '중심 높이 >= 붓폭 x 2.5' 였고,
     //    완성 = 중심 + 붓폭 이므로 완성 기준으로는 x 3.5 다. 문구의 권장값도 같이 쓴다.
     const double kMinRecommendedMm = m_strokeWidthMm * 3.5;
+    // 🔴 실제 도색 크기를 **화면 통지로도** 띄운다.
+    //    글자는 획이 여러 개라 치수 라벨이 활성 획 하나에만 붙는다 — 사각형처럼
+    //    변마다 숫자가 보이지 않는다. 조작자가 "내가 친 높이가 진짜 저 크기인가"를
+    //    확인할 곳이 로그밖에 없으면 놓친다. 경고가 있으면 아래 경고가 이긴다.
+    if (!outline && paintedMm.isValid() && paintedMm.width() > 0.0
+        && heightMm >= kMinRecommendedMm) {
+        setNotice(QStringLiteral("실제 도색 크기 %1 x %2 mm (가로 x 세로) — 붓 폭 %3 mm 포함")
+                      .arg(paintedMm.width(), 0, 'f', 0)
+                      .arg(paintedMm.height(), 0, 'f', 0)
+                      .arg(m_strokeWidthMm, 0, 'f', 0),
+                  QStringLiteral("info"));
+    }
     if (!outline && heightMm < kMinRecommendedMm) {
         setNotice(QStringLiteral("완성 도색 높이 %1 mm 는 붓 폭 %2 mm 에 비해 작아 뭉개질 수 있습니다. "
                                  "%3 mm 이상을 권장합니다.")
@@ -3595,7 +3726,7 @@ void Backend::loadSettings()
     m_camIp = QLatin1String(kDefaultFourChannelCameraIp);
     m_channelCount = kFourChannelCount;
     m_channelUrlTemplate = QStringLiteral(
-        "");
+        "rtsp://{user}:{pass}@{ip}:554/{ch0}/profile2/media.smp");
     s.remove("camera/rtspUrl");
     s.setValue("camera/ip", m_camIp);
     s.setValue("camera/channelIp", m_camIp);

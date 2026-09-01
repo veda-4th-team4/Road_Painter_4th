@@ -25,6 +25,14 @@
 
 ## 1. 그냥 실행만 할 사람 (팀원 대부분)
 
+> ⚠️ **처음 한 번만**: `camera.env.example` 을 `camera.env` 로 복사하고 카메라 계정을
+> 채워 넣으세요. 자격증명은 저장소에 올리지 않습니다(`camera.env` 는 .gitignore 대상).
+> 값이 없으면 영상 채널이 켜지지 않습니다.
+>
+> ```
+> copy camera.env.example camera.env
+> ```
+
 ```bash
 git pull
 ```

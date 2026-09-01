@@ -460,7 +460,8 @@ private:
     void storeMission(const QList<QList<QPointF>> &paths, const QList<bool> &closed);
     // 도형들을 로봇 주행 순서로 재배열해 한 줄 경로로 만든다 (routeplan.h)
     routeplan::Route buildRoute(const QList<QList<QPointF>> &paths,
-                                const QList<bool> &closed) const;
+                                const QList<bool> &closed,
+                                bool preserveInputOrder = false) const;
     void logRoute(const routeplan::Route &route,
                   const QList<QList<QPointF>> &paths, const QList<bool> &closed) const;
     // 계획된 폴리라인을 다시 도형 단위로 쪼갠다 (미션 표시·이력용)
@@ -477,8 +478,8 @@ private:
     // 테스트 재생용 — 위와 거울 관계(재생기 좌표가 노즐이라 섀시를 앞으로 민다).
     void pushSimPoseToView(const QPointF &nozzleM, double headingDeg, bool down);
     void onStatus(const QString &state, bool painting);
-    // 실제 노즐 위치를 도색 경로에 투영한 진행률. 펜을 든 이동 거리는 제외한다.
-    double progressAlongPath(const QPointF &pen) const;
+    // 실제 노즐 위치를 현재 실행 차례의 획에만 투영한다.
+    void updatePaintContact(const QPointF &pen);
     void pushMissionToView();
     void pushOverlayToOriginal();
     void onAruco(const QList<int> &ids, const QList<QPolygonF> &corners);
@@ -555,7 +556,7 @@ private:
     bool m_nozzleDown = false;
     QString m_robotLog;
     // 현재 작업 채널의 실제 RTSP URL. 채널 선택 시 CH1~CH4 중 하나로 바뀐다.
-    QString m_rtspUrl = "";
+    QString m_rtspUrl = "rtsp://{user}:{pass}@192.168.0.13:554/0/profile2/media.smp";
     int m_brightness = 45, m_contrast = 8, m_sharpen = 0, m_saturation = 0;
 
     // ── 다채널 (PNM-C16083RVQ) ────────────────────────────────────────────
@@ -574,7 +575,7 @@ private:
     //    디코딩한다. 서브가 생기면 여기만 고치면 된다.
     //    현장 운용(2026-08-11): profile2는 4채널 모두 2592x1520 20fps.
     QString m_channelUrlTemplate =
-        QStringLiteral("");
+        QStringLiteral("rtsp://{user}:{pass}@{ip}:554/{ch0}/profile2/media.smp");
     int m_channelCount = 4;
     int m_highlightedCh = 0;   // 클릭한 채널 (0 = 없음)
     int m_workingCh = 0;       // 작업 중인 채널 (0 = 그리드 화면)
@@ -638,6 +639,11 @@ private:
     QString m_phaseHint = "경로를 작성한 뒤 작업을 시작하세요.";
     QList<QList<QPointF>> m_missionPaths;   // 미터 좌표, 도형별
     QList<bool> m_missionClosed;            // 도형별 닫힘 여부
+    // 주황색 표시를 전체 단일 값으로 관리하면 뒤쪽 획 근처를 지날 때 앞부분이
+    // 통째로 칠해진다. 실제 실행 차례의 획만 별도로 누적한다.
+    QList<double> m_missionPathProgress;
+    int m_paintPathIndex = 0;
+    int m_paintPathLiftCount = 0;
     QList<QList<QPointF>> m_missionEditPaths; // 편집용 완성 외곽(미터)
     QList<bool> m_missionEditClosed;
     QList<bool> m_missionEditOuter;
